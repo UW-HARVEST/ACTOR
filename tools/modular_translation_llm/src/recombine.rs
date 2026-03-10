@@ -1,8 +1,8 @@
 //! Utilities for recombining translated Rust declarations into a Cargo package.
 
+use build_project_spec::ProjectKind;
 use full_source::CargoPackage;
 use harvest_core::fs::RawDir;
-use identify_project_kind::ProjectKind;
 use std::collections::HashSet;
 use tracing::debug;
 

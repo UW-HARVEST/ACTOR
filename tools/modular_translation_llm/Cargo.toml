@@ -6,9 +6,9 @@ edition = "2024"
 [dependencies]
 c_ast.workspace = true
 clang-ast.workspace = true
+build_project_spec.workspace = true
 full_source.workspace = true
 harvest_core.workspace = true
-identify_project_kind.workspace = true
 serde.workspace = true 
 serde_json.workspace = true
 tracing.workspace = true 

@@ -6,13 +6,13 @@
 //! - Interface (FunctionDecl and VarDecl signatures) use type context
 //! - Functions and globals (FunctionDecl, VarDecl) use type/interface context
 
+use build_project_spec::{ProjectKind, ProjectSpec};
 use c_ast::ClangAst;
 use full_source::RawSource;
 use harvest_core::config::unknown_field_warning;
 use harvest_core::llm::LLMConfig;
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
-use identify_project_kind::ProjectKind;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -76,11 +76,11 @@ fn extract_args<'a>(
         .ir_snapshot
         .get::<ClangAst>(inputs[1])
         .ok_or("No ClangAst representation found in IR")?;
-    let project_kind = context
+    let project_spec = context
         .ir_snapshot
-        .get::<ProjectKind>(inputs[2])
-        .ok_or("No ProjectKind representation found in IR")?;
-    Ok((raw_source, clang_ast, project_kind))
+        .get::<ProjectSpec>(inputs[2])
+        .ok_or("No ProjectSpec representation found in IR")?;
+    Ok((raw_source, clang_ast, &project_spec.kind))
 }
 
 impl Tool for ModularTranslationLlm {

@@ -1,5 +1,5 @@
 [workspace]
-members = ["benchmark", "core", "tools/full_source", "tools/identify_project_kind", "tools/load_raw_source", "tools/raw_source_to_cargo_llm", "tools/try_cargo_build", "translate", "tools/c_ast", "tools/modular_translation_llm" ]
+members = ["benchmark", "core", "tools/full_source", "tools/build_project_spec", "tools/load_raw_source", "tools/raw_source_to_cargo_llm", "tools/try_cargo_build", "translate", "tools/c_ast", "tools/modular_translation_llm" ]
 resolver = "3"
 
 [workspace.dependencies]
@@ -7,7 +7,7 @@ clap = { version = "4.5.45", features = ["derive"] }
 harvest_core = { path = "core" }
 harvest_translate = { path = "translate" }
 full_source = { path = "tools/full_source" }
-identify_project_kind = { path = "tools/identify_project_kind" }
+build_project_spec = { path = "tools/build_project_spec" }
 load_raw_source = { path = "tools/load_raw_source" }
 raw_source_to_cargo_llm = { path = "tools/raw_source_to_cargo_llm" }
 try_cargo_build = { path = "tools/try_cargo_build" }

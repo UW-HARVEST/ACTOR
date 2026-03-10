@@ -8,8 +8,8 @@
 //! - No ordering constraints of function translations
 //! - Cargo.toml generated after function/global translation using aggregated dependencies
 
+use build_project_spec::ProjectKind;
 use full_source::RawSource;
-use identify_project_kind::ProjectKind;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use tracing::{debug, error, info};

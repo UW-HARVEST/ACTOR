@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 full_source.workspace = true
 harvest_core.workspace = true
-identify_project_kind.workspace = true
+build_project_spec.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

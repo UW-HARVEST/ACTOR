@@ -1,6 +1,7 @@
 //! Attempts to directly turn a C project into a Cargo project by throwing it at
 //! an LLM via the `llm` crate.
 
+use build_project_spec::{ProjectKind, ProjectSpec};
 use full_source::{CargoPackage, RawSource};
 use harvest_core::config::unknown_field_warning;
 use harvest_core::fs::RawDir;
@@ -13,8 +14,6 @@ use std::collections::HashMap;
 use std::fs::read_to_string;
 use std::path::PathBuf;
 use tracing::{debug, info, trace};
-
-use identify_project_kind::ProjectKind;
 
 /// Structured output JSON schema for Ollama.
 const STRUCTURED_OUTPUT_SCHEMA: &str = include_str!("structured_schema.json");
@@ -37,15 +36,16 @@ impl Tool for RawSourceToCargoLlm {
         let config =
             Config::deserialize(context.config.tools.get("raw_source_to_cargo_llm").unwrap())?;
         debug!("LLM Configuration {config:?}");
-        // Get both inputs: RawSource and ProjectKind
+        // Get both inputs: RawSource and ProjectSpec
         let in_dir = context
             .ir_snapshot
             .get::<RawSource>(inputs[0])
             .ok_or("No RawSource representation found in IR")?;
-        let project_kind = context
+        let project_spec = context
             .ir_snapshot
-            .get::<ProjectKind>(inputs[1])
-            .ok_or("No ProjectKind representation found in IR")?;
+            .get::<ProjectSpec>(inputs[1])
+            .ok_or("No ProjectSpec representation found in IR")?;
+        let project_kind = &project_spec.kind;
 
         // Use the llm crate to connect to the LLM.
         // Select system prompt based on project kind

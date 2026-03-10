@@ -1,9 +1,9 @@
 //! LLM abstraction layer for modular translation.
 //! Abstracts away all the string management needed for building dynamically generated prompts and
 //! provides a clean well-typed interface for use by the rest of the transpiler.
+use build_project_spec::ProjectKind;
 use full_source::RawSource;
 use harvest_core::llm::{HarvestLLM, LLMUsageTotals, Usage, build_request};
-use identify_project_kind::ProjectKind;
 use serde::Deserialize;
 use serde::Serialize;
 use std::sync::Mutex;
