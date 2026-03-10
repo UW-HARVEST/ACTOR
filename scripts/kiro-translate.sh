@@ -2,24 +2,43 @@
 # kiro-translate.sh — Translate C test cases to Rust using kiro-cli
 #
 # Usage:
-#   ./kiro-translate.sh <test-corpus-dir> <output-dir> [--filter regex]
+#   ./scripts/kiro-translate.sh <battery> [--filter regex]
+#
+# Examples:
+#   ./scripts/kiro-translate.sh B01_synthetic
+#   ./scripts/kiro-translate.sh B01_organic --filter "hex2bin_lib$"
+#
+# The script uses submodule paths automatically:
+#   Input:  test-corpus/Public-Tests/<battery>/
+#   Output: results/<battery>/
 #
 # Features:
 #   - Skips already-completed cases (resume-friendly)
 #   - Writes per-case status to progress.csv in real-time
 #   - Safe to interrupt — completed cases are preserved
 #
-# Output is compatible with the Test-Corpus Rust runner:
-#   python3 -m runtests.rust --root <output-dir> --subset <output-dir> --keep-going
+# Validate results:
+#   ./scripts/validate.sh <battery>
 
 set -euo pipefail
 
-INPUT_DIR="${1:?Usage: $0 <test-corpus-dir> <output-dir> [--filter regex]}"
-OUTPUT_DIR="${2:?Usage: $0 <test-corpus-dir> <output-dir> [--filter regex]}"
-FILTER="${3:-}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+BATTERY="${1:?Usage: $0 <battery> [--filter regex]}"
+FILTER="${2:-}"
 
 if [[ "$FILTER" == "--filter" ]]; then
-    FILTER="${4:?--filter requires a regex argument}"
+    FILTER="${3:?--filter requires a regex argument}"
+fi
+
+INPUT_DIR="$REPO_ROOT/test-corpus/Public-Tests/$BATTERY"
+OUTPUT_DIR="$REPO_ROOT/results/$BATTERY"
+
+if [[ ! -d "$INPUT_DIR" ]]; then
+    echo "Error: battery not found: $INPUT_DIR"
+    echo "Available batteries:"
+    ls "$REPO_ROOT/test-corpus/Public-Tests/"
+    exit 1
 fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -83,10 +102,10 @@ for test_case in "$INPUT_DIR"/*/; do
     cp -r "$test_case/test_vectors" "$out/"
     if [[ -d "$test_case/runner" ]]; then
         cp -r "$test_case/runner" "$out/"
-        # Fix cando2 relative path to absolute
+        # Fix cando2 relative path to absolute (use submodule path)
         if [[ -f "$out/runner/Cargo.toml" ]]; then
-            CANDO2_ABS="$(cd "$INPUT_DIR" && realpath ../../../tools/cando2 2>/dev/null || realpath "$INPUT_DIR/../../tools/cando2" 2>/dev/null || echo "")"
-            if [[ -n "$CANDO2_ABS" && -d "$CANDO2_ABS" ]]; then
+            CANDO2_ABS="$REPO_ROOT/test-corpus/tools/cando2"
+            if [[ -d "$CANDO2_ABS" ]]; then
                 sed -i '' "s|path = \"../../../../tools/cando2\"|path = \"$CANDO2_ABS\"|" "$out/runner/Cargo.toml" 2>/dev/null || \
                 sed -i "s|path = \"../../../../tools/cando2\"|path = \"$CANDO2_ABS\"|" "$out/runner/Cargo.toml" 2>/dev/null || true
             fi
