@@ -2,41 +2,48 @@
 # kiro-translate.sh — Translate C test cases to Rust using kiro-cli
 #
 # Usage:
-#   ./scripts/kiro-translate.sh <battery> [--filter regex]
+#   ./scripts/kiro-translate.sh <test-suite>              # all cases
+#   ./scripts/kiro-translate.sh <test-suite>/<case>       # single case
+#   ./scripts/kiro-translate.sh <test-suite> --filter <regex>
 #
 # Examples:
 #   ./scripts/kiro-translate.sh B01_synthetic
+#   ./scripts/kiro-translate.sh B01_synthetic/001_helloworld
 #   ./scripts/kiro-translate.sh B01_organic --filter "hex2bin_lib$"
 #
 # The script uses submodule paths automatically:
-#   Input:  test-corpus/Public-Tests/<battery>/
-#   Output: results/<battery>/
+#   Input:  test-corpus/Public-Tests/<test-suite>/
+#   Output: results/<test-suite>/
 #
 # Features:
 #   - Skips already-completed cases (resume-friendly)
 #   - Writes per-case status to progress.csv in real-time
 #   - Safe to interrupt — completed cases are preserved
-#
-# Validate results:
-#   ./scripts/validate.sh <battery>
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-BATTERY="${1:?Usage: $0 <battery> [--filter regex]}"
-FILTER="${2:-}"
+ARG="${1:?Usage: $0 <test-suite>[/<case>] [--filter regex]}"
+FILTER=""
 
-if [[ "$FILTER" == "--filter" ]]; then
-    FILTER="${3:?--filter requires a regex argument}"
+# Handle test-suite/case syntax
+if [[ "$ARG" == */* ]]; then
+    BATTERY="${ARG%%/*}"
+    FILTER="${ARG#*/}$"
+else
+    BATTERY="$ARG"
+    if [[ "${2:-}" == "--filter" ]]; then
+        FILTER="${3:?--filter requires a regex argument}"
+    fi
 fi
 
 INPUT_DIR="$REPO_ROOT/test-corpus/Public-Tests/$BATTERY"
 OUTPUT_DIR="$REPO_ROOT/results/$BATTERY"
 
 if [[ ! -d "$INPUT_DIR" ]]; then
-    echo "Error: battery not found: $INPUT_DIR"
-    echo "Available batteries:"
+    echo "Error: test suite not found: $INPUT_DIR"
+    echo "Available:"
     ls "$REPO_ROOT/test-corpus/Public-Tests/"
     exit 1
 fi
