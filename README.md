@@ -111,6 +111,79 @@ cargo run --bin=benchmark --release -- $TEST_CORPUS_PATH/Public-Tests/B01_synthe
 cargo run --bin=benchmark --release -- $TEST_CORPUS_PATH/Public-Tests example_output/ --exclude="^test_"
 ```
 
+### Testing pre-translated results with `harvest-test`
+
+`harvest-test` is a standalone test runner that evaluates translated Rust code
+against the TRACTOR test corpus. It is decoupled from translation — you can use
+it to test output from any translator (HARVEST, kiro-cli, etc.).
+
+#### Build
+
+```bash
+cargo build --release --bin=harvest-test
+```
+
+#### Usage
+
+```bash
+./target/release/harvest-test <CORPUS_DIR> <RESULTS_DIR> [OPTIONS]
+```
+
+- `CORPUS_DIR` — a battery directory in Test-Corpus (e.g. `Public-Tests/B01_organic`)
+- `RESULTS_DIR` — directory of translated Rust projects, one subdirectory per case with `Cargo.toml` + `src/` at the root
+
+**Options:**
+
+| Flag | Description |
+|---|---|
+| `--filter <regex>` | Only run cases matching the pattern |
+| `--exclude <regex>` | Skip cases matching the pattern |
+| `--timeout <secs>` | Per-test-vector timeout (default: 10) |
+
+#### Examples
+
+```bash
+export TEST_CORPUS_PATH=/path/to/Test-Corpus
+
+# Test HARVEST e2e results on B01_organic
+./target/release/harvest-test \
+  $TEST_CORPUS_PATH/Public-Tests/B01_organic \
+  /path/to/harvest-translate-results/3_2_results/B01_organic/B01_organic_e2e_codex
+
+# Executables only (skip library cases)
+./target/release/harvest-test \
+  $TEST_CORPUS_PATH/Public-Tests/B01_synthetic \
+  /path/to/results/B01_synthetic \
+  --exclude ".*_lib$"
+
+# Single case
+./target/release/harvest-test \
+  $TEST_CORPUS_PATH/Public-Tests/B01_synthetic \
+  /path/to/results/B01_synthetic \
+  --filter "001_helloworld$"
+```
+
+#### How it works
+
+1. **Discover** — walks the results directory, finds cases with `Cargo.toml`, matches them with corpus test vectors
+2. **Build** — runs `cargo build --release` for each case in parallel
+3. **Prepare libs** — for library cases: copies runners from the corpus, sets up a shared cando2 dependency, ensures `crate-type = ["cdylib"]`, and builds the runner workspace
+4. **Test** — executes tests in parallel and writes `results.csv`
+
+#### Expected results directory layout
+
+```
+results_dir/
+├── 001_helloworld/
+│   ├── Cargo.toml
+│   └── src/main.rs
+├── some_lib/
+│   ├── Cargo.toml
+│   └── src/lib.rs
+```
+
+Each case directory must contain `Cargo.toml` at its root (flat layout, not nested in a subdirectory).
+
 ### Configuration
 
 Print config file location:

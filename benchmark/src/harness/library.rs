@@ -765,6 +765,12 @@ pub fn prepare_lib_workspace(
             }
         }
 
+        // 4b. Ensure Cargo.toml has crate-type = ["cdylib"] so cargo build produces a .so
+        let case_toml = results_case.join("Cargo.toml");
+        if case_toml.exists() {
+            cargo_utils::ensure_cdylib(&case_toml)?;
+        }
+
         // 5. Copy .so to where cando2 expects it
         // cando2 looks at: <case>/translated_rust/target/release/lib<name>.so
         // where <name> = CANDIDATE_NAME = case directory name (e.g. bin2hex_lib)
