@@ -94,6 +94,7 @@ fn main() -> HarvestResult<()> {
             stats.total_tests = test_cases.len();
 
             if is_lib {
+                // Translation is assumed successful since we're testing pre-translated results
                 stats.translation_success = true;
                 stats.rust_build_success = build_result.is_ok();
                 let runner_name = format!("_{}_runner", name);

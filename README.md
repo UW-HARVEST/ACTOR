@@ -172,7 +172,7 @@ export TEST_CORPUS_PATH=/path/to/Test-Corpus
 
 #### Expected results directory layout
 
-```
+```text
 results_dir/
 ├── 001_helloworld/
 │   ├── Cargo.toml

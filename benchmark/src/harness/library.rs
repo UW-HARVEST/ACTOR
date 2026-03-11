@@ -642,7 +642,7 @@ pub fn build_runners_batch(workspace_root: &Path, runner_names: &[String]) -> Ha
     if runner_names.is_empty() {
         return Ok(());
     }
-    let mut cmd = std::process::Command::new("cargo");
+    let mut cmd = Command::new("cargo");
     cmd.arg("build").arg("--release");
     for name in runner_names {
         cmd.arg("-p").arg(name);
