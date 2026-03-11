@@ -1,4 +1,4 @@
-use crate::error::HarvestResult;
+use harvest_benchmark::error::HarvestResult;
 use harvest_core::fs::RawDir;
 use harvest_core::HarvestIR;
 use std::path::PathBuf;

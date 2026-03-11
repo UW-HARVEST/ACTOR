@@ -1,23 +1,19 @@
 mod cli;
-mod error;
-mod harness;
-mod io;
 mod ir_utils;
 mod logger;
-mod runner;
-mod stats;
-use crate::cli::Args;
-use crate::error::HarvestResult;
-use crate::harness::{
+
+use cli::Args;
+use ir_utils::{cargo_build_result, raw_cargo_package, raw_source};
+use logger::TeeLogger;
+use harvest_benchmark::error::HarvestResult;
+use harvest_benchmark::harness::{
     cleanup_benchmarks, parse_benchmark_dir, parse_test_vectors, validate_binary_output,
 };
-use crate::io::{
+use harvest_benchmark::io::{
     collect_program_dirs, ensure_output_directory, log_failing_programs, log_found_programs,
     log_summary_stats, validate_input_directory, write_csv_results, write_error_file,
 };
-use crate::ir_utils::{cargo_build_result, raw_cargo_package, raw_source};
-use crate::logger::TeeLogger;
-use crate::stats::{ProgramEvalStats, SummaryStats, TestResult};
+use harvest_benchmark::stats::{ProgramEvalStats, SummaryStats, TestResult};
 use clap::Parser;
 use harvest_core::utils::get_version;
 use harvest_core::HarvestIR;
@@ -146,7 +142,7 @@ pub fn run_all_benchmarks(
 /// Run list of tests and output result/errors
 fn run_test_validation(
     binary_path: &Path,
-    test_cases: &[crate::harness::TestCase],
+    test_cases: &[harvest_benchmark::harness::TestCase],
     timeout: u64,
     output_dir: &Path,
 ) -> (Vec<TestResult>, Vec<String>, usize) {
@@ -299,7 +295,7 @@ fn benchmark_single_program(
 
     // Library and executable validation differ.
     let (test_results, error_messages, passed_tests) = if is_lib {
-        match harness::library::run_library_validation(
+        match harvest_benchmark::harness::library::run_library_validation(
             &program_name,
             program_dir,
             &output_dir,
