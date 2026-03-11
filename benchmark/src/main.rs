@@ -25,6 +25,7 @@ use harvest_translate::{transpile, util::set_user_only_umask};
 use regex::Regex;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 /// Encapsulate important results from transpilation
@@ -124,6 +125,8 @@ pub fn run_all_benchmarks(
     config_overrides: &[String],
     timeout: u64,
     modular: bool,
+    pre_translated: bool,
+    include_ub: bool,
 ) -> HarvestResult<Vec<ProgramEvalStats>> {
     // Process all examples
     let mut results = Vec::new();
@@ -134,8 +137,15 @@ pub fn run_all_benchmarks(
         log::info!("Processing example {} of {}", i + 1, total_examples);
         log::info!("{}", "=".repeat(80));
 
-        let result =
-            benchmark_single_program(program_dir, output_dir, config_overrides, timeout, modular);
+        let result = benchmark_single_program(
+            program_dir,
+            output_dir,
+            config_overrides,
+            timeout,
+            modular,
+            pre_translated,
+            include_ub,
+        );
 
         results.push(result);
     }
@@ -149,6 +159,7 @@ fn run_test_validation(
     test_cases: &[crate::harness::TestCase],
     timeout: u64,
     output_dir: &Path,
+    include_ub: bool,
 ) -> (Vec<TestResult>, Vec<String>, usize) {
     let mut test_results = Vec::new();
     let mut error_messages = Vec::new();
@@ -157,6 +168,16 @@ fn run_test_validation(
     log::info!("Validating Rust binary outputs against test cases...");
 
     for (i, test_case) in test_cases.iter().enumerate() {
+        // Skip has_ub test vectors (count as passed, matching MIT runtests)
+        if !include_ub && test_case.has_ub.is_some() {
+            passed_tests += 1;
+            test_results.push(TestResult {
+                filename: test_case.filename.clone(),
+                passed: true,
+            });
+            continue;
+        }
+
         log::info!(
             "Running test case {} ({} of {})...",
             test_case.filename,
@@ -205,6 +226,8 @@ fn benchmark_single_program(
     config_overrides: &[String],
     timeout: u64,
     modular: bool,
+    pre_translated: bool,
+    include_ub: bool,
 ) -> ProgramEvalStats {
     let program_name = program_dir
         .file_name()
@@ -225,6 +248,12 @@ fn benchmark_single_program(
     // Get program output directory
     let output_dir = output_root_dir.join(&program_name);
     log::info!("Output directory: {}", output_dir.display());
+
+    // In pre-translated mode, skip cases without a Cargo.toml (not translated)
+    if pre_translated && !output_dir.join("Cargo.toml").exists() {
+        log::info!("⏭️  Skipping {} (no translation found)", program_name);
+        return result;
+    }
 
     // Check for required subdirectories & log error if we don't find them
     // We use the test_case root (not src/) so translate can see CMakeLists.txt.
@@ -252,49 +281,88 @@ fn benchmark_single_program(
         log::info!("✅ Successfully parsed {} test case(s)", test_cases.len());
     }
 
-    // Do the actual translation
-    let translation_result = translate_c_directory_to_rust_project(
-        &test_case_dir,
-        &output_dir,
-        config_overrides,
-        modular,
-    );
-
-    result.translation_success = translation_result.translation_success;
-    result.rust_build_success = translation_result.build_success;
-
-    if translation_result.translation_success {
-        log::info!("✅ Translation completed successfully!");
+    // Do the actual translation (or skip if pre-translated)
+    let rust_binary_path;
+    if pre_translated {
+        result.translation_success = true;
+        // Build the pre-translated project
+        let build_output = Command::new("cargo")
+            .args(["build", "--release", "--message-format=json"])
+            .current_dir(&output_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        match build_output {
+            Ok(output) if output.status.success() => {
+                result.rust_build_success = true;
+                // Discover binary from cargo JSON output (exec cases only)
+                rust_binary_path = if !is_lib {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    stdout
+                        .lines()
+                        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                        .find_map(|v| {
+                            if v["reason"] == "compiler-artifact"
+                                && v["target"]["kind"]
+                                    .as_array()
+                                    .is_some_and(|k| k.iter().any(|e| e == "bin"))
+                            {
+                                v["executable"].as_str().map(PathBuf::from)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default()
+                } else {
+                    PathBuf::new()
+                };
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                result.error_message = Some(format!("cargo build --release failed: {}", stderr));
+                return result;
+            }
+            Err(e) => {
+                result.error_message = Some(format!("Failed to run cargo build: {}", e));
+                return result;
+            }
+        }
     } else {
-        let error = format!(
-            "Failed to translate C project: {:?}",
-            translation_result.build_error
+        let translation_result = translate_c_directory_to_rust_project(
+            &test_case_dir,
+            &output_dir,
+            config_overrides,
+            modular,
         );
-        result.error_message = Some(error.clone());
-        log::info!("❌ Translation failed");
-        return result;
-    }
 
-    if translation_result.build_success {
-        log::info!("✅ Rust build completed successfully!");
-    } else {
-        let error = format!(
-            "Failed to build Rust project: {:?}",
-            translation_result.build_error
-        );
-        result.error_message = Some(error.clone());
-        log::info!("❌ Rust build failed");
-        return result;
-    }
+        result.translation_success = translation_result.translation_success;
+        result.rust_build_success = translation_result.build_success;
 
-    if !is_lib && !translation_result.rust_binary_path.exists() {
-        let error = format!(
-            "Rust build reported success, but expected output artifact was not found at {:?}",
-            translation_result.rust_binary_path
-        );
-        log::error!("{}", error);
-        result.error_message = Some(error);
-        return result;
+        if !translation_result.translation_success {
+            result.error_message = Some(format!(
+                "Failed to translate C project: {:?}",
+                translation_result.build_error
+            ));
+            return result;
+        }
+
+        if !translation_result.build_success {
+            result.error_message = Some(format!(
+                "Failed to build Rust project: {:?}",
+                translation_result.build_error
+            ));
+            return result;
+        }
+
+        rust_binary_path = translation_result.rust_binary_path;
+
+        if !is_lib && !rust_binary_path.exists() {
+            result.error_message = Some(format!(
+                "Rust build reported success, but expected output artifact was not found at {:?}",
+                rust_binary_path
+            ));
+            return result;
+        }
     }
 
     // Library and executable validation differ.
@@ -305,6 +373,7 @@ fn benchmark_single_program(
             &output_dir,
             &test_cases,
             timeout,
+            include_ub,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -316,10 +385,11 @@ fn benchmark_single_program(
         }
     } else {
         run_test_validation(
-            &translation_result.rust_binary_path,
+            &rust_binary_path,
             &test_cases,
             timeout,
             &output_dir,
+            include_ub,
         )
     };
 
@@ -446,6 +516,8 @@ fn run(args: Args) -> HarvestResult<()> {
         &args.config,
         args.timeout,
         args.modular,
+        args.pre_translated,
+        args.include_ub,
     )?;
     let csv_output_path = args.output_dir.join("results.csv");
     write_csv_results(&csv_output_path, &results)?;

@@ -80,6 +80,7 @@ pub fn run_library_validation(
     output_dir: &Path,
     test_cases: &[TestCase],
     timeout: u64,
+    include_ub: bool,
 ) -> HarvestResult<(Vec<TestResult>, Vec<String>, usize)> {
     // === Library-specific preparation ===
 
@@ -134,7 +135,13 @@ pub fn run_library_validation(
     log::info!("Runner binary located at: {}", runner_bin.display());
 
     // Run tests
-    run_test_suite(&runner_bin, &ld_library_path, test_cases, timeout)
+    run_test_suite(
+        &runner_bin,
+        &ld_library_path,
+        test_cases,
+        timeout,
+        include_ub,
+    )
 }
 
 /// Locates the compiled shared library artifact in the target directory.
@@ -150,25 +157,42 @@ pub fn run_library_validation(
 /// # Returns
 /// Path to the shared library file (.so, .dylib, or .dll)
 pub fn locate_compiled_library(output_dir: &Path, program_name: &str) -> HarvestResult<PathBuf> {
-    let pkg_name = cargo_utils::read_package_name(&output_dir.join("Cargo.toml"))
-        .unwrap_or_else(|| program_name.to_string());
+    let cargo_toml = output_dir.join("Cargo.toml");
     let target_release = output_dir.join("target").join("release");
 
-    // Construct expected library name from package name
-    let lib_stem = format!("lib{}", pkg_name.replace('-', "_"));
+    // Try [lib] name first (cargo uses this for the .so filename), then package name
+    let candidates: Vec<String> = {
+        let mut c = Vec::new();
+        if let Ok(contents) = fs::read_to_string(&cargo_toml) {
+            if let Ok(doc) = contents.parse::<toml_edit::DocumentMut>() {
+                if let Some(name) = doc
+                    .get("lib")
+                    .and_then(|l| l.get("name"))
+                    .and_then(|n| n.as_str())
+                {
+                    c.push(name.replace('-', "_"));
+                }
+            }
+        }
+        let pkg_name =
+            cargo_utils::read_package_name(&cargo_toml).unwrap_or_else(|| program_name.to_string());
+        c.push(pkg_name.replace('-', "_"));
+        c
+    };
 
-    // Try common extensions
-    for ext in LIBRARY_EXTENSIONS {
-        let lib_path = target_release.join(format!("{}.{}", lib_stem, ext));
-        if lib_path.exists() {
-            return Ok(lib_path);
+    for name in &candidates {
+        let lib_stem = format!("lib{}", name);
+        for ext in LIBRARY_EXTENSIONS {
+            let lib_path = target_release.join(format!("{}.{}", lib_stem, ext));
+            if lib_path.exists() {
+                return Ok(lib_path);
+            }
         }
     }
 
-    // If not found, return error with helpful message
     Err(format!(
-        "Library not found: expected {} in {}",
-        lib_stem,
+        "Library not found: tried {:?} in {}",
+        candidates,
         target_release.display()
     )
     .into())
@@ -460,6 +484,7 @@ pub fn run_test_suite(
     ld_library_path: &str,
     test_cases: &[TestCase],
     timeout: u64,
+    include_ub: bool,
 ) -> HarvestResult<(Vec<TestResult>, Vec<String>, usize)> {
     let mut test_results = Vec::new();
     let mut error_messages = Vec::new();
@@ -469,6 +494,16 @@ pub fn run_test_suite(
     log::info!("Validating library outputs against test cases...");
 
     for (i, test_case) in test_cases.iter().enumerate() {
+        // Skip has_ub test vectors (count as passed, matching MIT runtests)
+        if !include_ub && test_case.has_ub.is_some() {
+            passed_tests += 1;
+            test_results.push(TestResult {
+                filename: test_case.filename.clone(),
+                passed: true,
+            });
+            continue;
+        }
+
         log::info!(
             "Running library test case {} ({} of {})...",
             test_case.filename,

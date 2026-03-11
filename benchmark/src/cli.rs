@@ -40,4 +40,12 @@ pub struct Args {
     /// Cannot be used together with --filter.
     #[arg(long, conflicts_with = "filter")]
     pub exclude: Option<String>,
+    /// Use pre-translated results instead of running translation.
+    /// When set, input_dir is the test corpus and output_dir has existing translations.
+    #[arg(long)]
+    pub pre_translated: bool,
+
+    /// Include test vectors with undefined behavior (skipped by default).
+    #[arg(long)]
+    pub include_ub: bool,
 }
