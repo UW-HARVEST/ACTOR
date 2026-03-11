@@ -670,7 +670,10 @@ pub fn run_lib_tests(
     test_cases: &[TestCase],
     timeout: u64,
 ) -> HarvestResult<(Vec<crate::stats::TestResult>, Vec<String>, usize)> {
-    let runner_bin = workspace_root.join("target").join("release").join(runner_name);
+    let runner_bin = workspace_root
+        .join("target")
+        .join("release")
+        .join(runner_name);
     if !runner_bin.exists() {
         return Err(format!("Runner binary not found: {}", runner_bin.display()).into());
     }
@@ -683,7 +686,10 @@ pub fn run_lib_tests(
     for test_case in test_cases {
         if test_case.has_ub.is_some() {
             passed += 1;
-            test_results.push(crate::stats::TestResult { filename: test_case.filename.clone(), passed: true });
+            test_results.push(crate::stats::TestResult {
+                filename: test_case.filename.clone(),
+                passed: true,
+            });
             continue;
         }
         let mut cmd = Command::new(&runner_bin);
@@ -701,7 +707,11 @@ pub fn run_lib_tests(
                 use wait_timeout::ChildExt;
                 match child.wait_timeout(timeout_duration) {
                     Ok(Some(_)) => child.wait_with_output().ok(),
-                    _ => { let _ = child.kill(); let _ = child.wait(); None }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        None
+                    }
                 }
             }
             Err(_) => None,
@@ -710,17 +720,26 @@ pub fn run_lib_tests(
         match result {
             Some(output) if output.status.success() => {
                 passed += 1;
-                test_results.push(crate::stats::TestResult { filename: test_case.filename.clone(), passed: true });
+                test_results.push(crate::stats::TestResult {
+                    filename: test_case.filename.clone(),
+                    passed: true,
+                });
             }
             Some(output) => {
                 let error = format_test_failure(&test_case.filename, &output);
                 error_messages.push(error);
-                test_results.push(crate::stats::TestResult { filename: test_case.filename.clone(), passed: false });
+                test_results.push(crate::stats::TestResult {
+                    filename: test_case.filename.clone(),
+                    passed: false,
+                });
             }
             None => {
                 let error = format!("{}: runner failed or timed out", test_case.filename);
                 error_messages.push(error);
-                test_results.push(crate::stats::TestResult { filename: test_case.filename.clone(), passed: false });
+                test_results.push(crate::stats::TestResult {
+                    filename: test_case.filename.clone(),
+                    passed: false,
+                });
             }
         }
     }
@@ -737,8 +756,8 @@ pub fn prepare_lib_workspace(
     // 1. Find and copy cando2 once to results_dir/tools/cando2/
     let cando2_dst = results_dir.join("tools").join("cando2");
     if !cando2_dst.exists() {
-        let cando2_src = find_cando2_source(corpus_dir)
-            .ok_or("Cannot find tools/cando2 in corpus ancestors")?;
+        let cando2_src =
+            find_cando2_source(corpus_dir).ok_or("Cannot find tools/cando2 in corpus ancestors")?;
         cargo_utils::copy_directory_recursive(&cando2_src, &cando2_dst)?;
     }
 
@@ -751,7 +770,9 @@ pub fn prepare_lib_workspace(
 
         // 2. Copy fresh runner from corpus (overwrites any HARVEST-modified version)
         if corpus_case.join("runner").exists() {
-            if runner_dst.exists() { let _ = fs::remove_dir_all(&runner_dst); }
+            if runner_dst.exists() {
+                let _ = fs::remove_dir_all(&runner_dst);
+            }
             cargo_utils::copy_directory_recursive(&corpus_case.join("runner"), &runner_dst)?;
         }
 
@@ -786,7 +807,10 @@ pub fn prepare_lib_workspace(
         // cando2 looks at: <case>/translated_rust/target/release/lib<name>.so
         // where <name> = CANDIDATE_NAME = case directory name (e.g. bin2hex_lib)
         let so_name = format!("lib{}.so", name);
-        let expected_dir = results_case.join("translated_rust").join("target").join("release");
+        let expected_dir = results_case
+            .join("translated_rust")
+            .join("target")
+            .join("release");
         let expected_so = expected_dir.join(&so_name);
 
         if !expected_so.exists() {
@@ -795,7 +819,7 @@ pub fn prepare_lib_workspace(
             if let Ok(entries) = fs::read_dir(&build_release) {
                 for entry in entries.flatten() {
                     let p = entry.path();
-                    if p.extension().map_or(false, |e| e == "so" || e == "dylib") {
+                    if p.extension().is_some_and(|e| e == "so" || e == "dylib") {
                         fs::create_dir_all(&expected_dir)?;
                         fs::copy(&p, &expected_so)?;
                         break;

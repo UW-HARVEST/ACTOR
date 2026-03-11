@@ -316,18 +316,27 @@ pub fn run_exec_tests(
     for test_case in test_cases {
         if test_case.has_ub.is_some() {
             passed += 1;
-            test_results.push(crate::stats::TestResult { filename: test_case.filename.clone(), passed: true });
+            test_results.push(crate::stats::TestResult {
+                filename: test_case.filename.clone(),
+                passed: true,
+            });
             continue;
         }
         match validate_binary_output(binary_path, test_case, Some(timeout)) {
             Ok(()) => {
                 passed += 1;
-                test_results.push(crate::stats::TestResult { filename: test_case.filename.clone(), passed: true });
+                test_results.push(crate::stats::TestResult {
+                    filename: test_case.filename.clone(),
+                    passed: true,
+                });
             }
             Err(e) => {
                 let error = format!("{}: {}", test_case.filename, e);
                 error_messages.push(error);
-                test_results.push(crate::stats::TestResult { filename: test_case.filename.clone(), passed: false });
+                test_results.push(crate::stats::TestResult {
+                    filename: test_case.filename.clone(),
+                    passed: false,
+                });
             }
         }
     }

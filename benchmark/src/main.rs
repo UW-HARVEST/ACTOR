@@ -2,9 +2,8 @@ mod cli;
 mod ir_utils;
 mod logger;
 
+use clap::Parser;
 use cli::Args;
-use ir_utils::{cargo_build_result, raw_cargo_package, raw_source};
-use logger::TeeLogger;
 use harvest_benchmark::error::HarvestResult;
 use harvest_benchmark::harness::{
     cleanup_benchmarks, parse_benchmark_dir, parse_test_vectors, validate_binary_output,
@@ -14,10 +13,11 @@ use harvest_benchmark::io::{
     log_summary_stats, validate_input_directory, write_csv_results, write_error_file,
 };
 use harvest_benchmark::stats::{ProgramEvalStats, SummaryStats, TestResult};
-use clap::Parser;
 use harvest_core::utils::get_version;
 use harvest_core::HarvestIR;
 use harvest_translate::{transpile, util::set_user_only_umask};
+use ir_utils::{cargo_build_result, raw_cargo_package, raw_source};
+use logger::TeeLogger;
 use regex::Regex;
 use std::fs::File;
 use std::path::{Path, PathBuf};

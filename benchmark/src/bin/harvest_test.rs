@@ -8,7 +8,10 @@ use regex::Regex;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "harvest-test", about = "Test pre-translated Rust projects against test vectors")]
+#[command(
+    name = "harvest-test",
+    about = "Test pre-translated Rust projects against test vectors"
+)]
 struct Args {
     /// Test corpus directory (test_case/, test_vectors/, runner/ per case)
     corpus_dir: PathBuf,
@@ -24,8 +27,14 @@ struct Args {
 
 fn main() -> HarvestResult<()> {
     let args = Args::parse();
-    let results_dir = args.results_dir.canonicalize().map_err(|e| format!("{}: {}", args.results_dir.display(), e))?;
-    let corpus_dir = args.corpus_dir.canonicalize().map_err(|e| format!("{}: {}", args.corpus_dir.display(), e))?;
+    let results_dir = args
+        .results_dir
+        .canonicalize()
+        .map_err(|e| format!("{}: {}", args.results_dir.display(), e))?;
+    let corpus_dir = args
+        .corpus_dir
+        .canonicalize()
+        .map_err(|e| format!("{}: {}", args.corpus_dir.display(), e))?;
 
     // Phase 1: Discover
     eprintln!("Phase 1: Discovering cases...");
@@ -45,19 +54,34 @@ fn main() -> HarvestResult<()> {
     }
     case_dirs.sort();
 
-    let lib_case_names: Vec<String> = case_dirs.iter()
-        .filter(|d| d.file_name().unwrap_or_default().to_string_lossy().ends_with("_lib"))
+    let lib_case_names: Vec<String> = case_dirs
+        .iter()
+        .filter(|d| {
+            d.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .ends_with("_lib")
+        })
         .map(|d| d.file_name().unwrap().to_string_lossy().to_string())
         .collect();
     let n_exec = case_dirs.len() - lib_case_names.len();
-    eprintln!("  Found {} cases ({} exec, {} lib)", case_dirs.len(), n_exec, lib_case_names.len());
+    eprintln!(
+        "  Found {} cases ({} exec, {} lib)",
+        case_dirs.len(),
+        n_exec,
+        lib_case_names.len()
+    );
 
     // Phase 2: Build all translations in parallel
     eprintln!("Phase 2: Building translations...");
     let build_results: Vec<(String, Result<PathBuf, String>)> = case_dirs
         .par_iter()
         .map(|dir| {
-            let name = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let name = dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             let result = discover_binary(dir).map_err(|e| e.to_string());
             (name, result)
         })
@@ -89,7 +113,10 @@ fn main() -> HarvestResult<()> {
             let tv_dir = corpus_dir.join(&name).join("test_vectors");
             let test_cases = match parse_test_vectors(&tv_dir) {
                 Ok(tc) => tc,
-                Err(e) => { stats.error_message = Some(e.to_string()); return stats; }
+                Err(e) => {
+                    stats.error_message = Some(e.to_string());
+                    return stats;
+                }
             };
             stats.total_tests = test_cases.len();
 
@@ -102,9 +129,13 @@ fn main() -> HarvestResult<()> {
                     Ok((tr, errs, passed)) => {
                         stats.test_results = tr;
                         stats.passed_tests = passed;
-                        if !errs.is_empty() { stats.error_message = Some(errs.join("\n")); }
+                        if !errs.is_empty() {
+                            stats.error_message = Some(errs.join("\n"));
+                        }
                     }
-                    Err(e) => { stats.error_message = Some(e.to_string()); }
+                    Err(e) => {
+                        stats.error_message = Some(e.to_string());
+                    }
                 }
             } else {
                 match build_result {
@@ -114,9 +145,13 @@ fn main() -> HarvestResult<()> {
                         let (tr, errs, passed) = run_exec_tests(&bin, &test_cases, timeout);
                         stats.test_results = tr;
                         stats.passed_tests = passed;
-                        if !errs.is_empty() { stats.error_message = Some(errs.join("\n")); }
+                        if !errs.is_empty() {
+                            stats.error_message = Some(errs.join("\n"));
+                        }
                     }
-                    Err(e) => { stats.error_message = Some(e); }
+                    Err(e) => {
+                        stats.error_message = Some(e);
+                    }
                 }
             }
             stats
@@ -130,19 +165,33 @@ fn main() -> HarvestResult<()> {
     let summary = SummaryStats::from_results(&results);
     let total: usize = results.iter().map(|r| r.total_tests).sum();
     let passed: usize = results.iter().map(|r| r.passed_tests).sum();
-    let n_passing = results.iter().filter(|r| r.passed_tests == r.total_tests && r.total_tests > 0).count();
+    let n_passing = results
+        .iter()
+        .filter(|r| r.passed_tests == r.total_tests && r.total_tests > 0)
+        .count();
 
     eprintln!("\n{}", "=".repeat(60));
-    eprintln!("  Test vectors: {}/{} passed ({:.1}%)", passed, total, summary.overall_success_rate());
+    eprintln!(
+        "  Test vectors: {}/{} passed ({:.1}%)",
+        passed,
+        total,
+        summary.overall_success_rate()
+    );
     eprintln!("  Cases: {}/{} fully passing", n_passing, results.len());
     eprintln!("{}", "=".repeat(60));
 
-    let failed: Vec<_> = results.iter().filter(|r| r.passed_tests < r.total_tests || r.total_tests == 0).collect();
+    let failed: Vec<_> = results
+        .iter()
+        .filter(|r| r.passed_tests < r.total_tests || r.total_tests == 0)
+        .collect();
     if !failed.is_empty() {
         eprintln!("\nFailing cases:");
         for r in &failed {
-            let reason = if r.total_tests == 0 { "no vectors".to_string() }
-                else { format!("{}/{}", r.passed_tests, r.total_tests) };
+            let reason = if r.total_tests == 0 {
+                "no vectors".to_string()
+            } else {
+                format!("{}/{}", r.passed_tests, r.total_tests)
+            };
             eprintln!("  {} ({})", r.program_name, reason);
         }
     }
