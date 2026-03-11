@@ -301,3 +301,59 @@ pub fn validate_binary_output(
         ).into())
     }
 }
+
+/// Run all exec test vectors against a built binary.
+/// Returns (test_results, error_messages, passed_count).
+pub fn run_exec_tests(
+    binary_path: &Path,
+    test_cases: &[TestCase],
+    timeout: u64,
+) -> (Vec<crate::stats::TestResult>, Vec<String>, usize) {
+    let mut test_results = Vec::new();
+    let mut error_messages = Vec::new();
+    let mut passed = 0;
+
+    for test_case in test_cases {
+        match validate_binary_output(binary_path, test_case, Some(timeout)) {
+            Ok(()) => {
+                passed += 1;
+                test_results.push(crate::stats::TestResult { filename: test_case.filename.clone(), passed: true });
+            }
+            Err(e) => {
+                let error = format!("{}: {}", test_case.filename, e);
+                error_messages.push(error);
+                test_results.push(crate::stats::TestResult { filename: test_case.filename.clone(), passed: false });
+            }
+        }
+    }
+    (test_results, error_messages, passed)
+}
+
+/// Build a case and discover the binary path from cargo JSON output.
+pub fn discover_binary(project_dir: &Path) -> HarvestResult<PathBuf> {
+    let output = std::process::Command::new("cargo")
+        .args(["build", "--release", "--message-format=json"])
+        .current_dir(project_dir)
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("cargo build failed: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("cargo build failed:\n{}", stderr).into());
+    }
+
+    // Parse the last compiler-artifact message with an executable
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines().rev() {
+        if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {
+            if msg.get("reason").and_then(|r| r.as_str()) == Some("compiler-artifact") {
+                if let Some(exe) = msg.get("executable").and_then(|e| e.as_str()) {
+                    return Ok(PathBuf::from(exe));
+                }
+            }
+        }
+    }
+    Err("No executable found in cargo build output".into())
+}

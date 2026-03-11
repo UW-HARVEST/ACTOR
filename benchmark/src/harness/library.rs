@@ -636,3 +636,169 @@ fn read_library_stem_hint(output_dir: &Path) -> Option<String> {
     }
     None
 }
+
+/// Build all lib runners in one cargo command from the workspace root.
+pub fn build_runners_batch(workspace_root: &Path, runner_names: &[String]) -> HarvestResult<()> {
+    if runner_names.is_empty() {
+        return Ok(());
+    }
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.arg("build").arg("--release");
+    for name in runner_names {
+        cmd.arg("-p").arg(name);
+    }
+    let output = cmd
+        .current_dir(workspace_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("cargo build runners failed: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Runner batch build failed:\n{}", stderr).into());
+    }
+    Ok(())
+}
+
+/// Run lib tests using a pre-built runner from the workspace target dir.
+/// The runner binary is at `workspace_root/target/release/<runner_name>`.
+/// Sets RUST_ARTIFACTS="" so cando2 loads from translated_rust/target/release/.
+pub fn run_lib_tests(
+    workspace_root: &Path,
+    runner_name: &str,
+    test_cases: &[TestCase],
+    timeout: u64,
+) -> HarvestResult<(Vec<crate::stats::TestResult>, Vec<String>, usize)> {
+    let runner_bin = workspace_root.join("target").join("release").join(runner_name);
+    if !runner_bin.exists() {
+        return Err(format!("Runner binary not found: {}", runner_bin.display()).into());
+    }
+
+    let mut test_results = Vec::new();
+    let mut error_messages = Vec::new();
+    let mut passed = 0;
+    let timeout_duration = Duration::from_secs(timeout);
+
+    for test_case in test_cases {
+        let mut cmd = Command::new(&runner_bin);
+        cmd.arg("lib")
+            .arg("-c")
+            .arg(&test_case.filename)
+            .current_dir(workspace_root)
+            .env(RUST_ARTIFACTS_ENV, "")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let result = match cmd.spawn() {
+            Ok(mut child) => {
+                use wait_timeout::ChildExt;
+                match child.wait_timeout(timeout_duration) {
+                    Ok(Some(_)) => child.wait_with_output().ok(),
+                    _ => { let _ = child.kill(); let _ = child.wait(); None }
+                }
+            }
+            Err(_) => None,
+        };
+
+        match result {
+            Some(output) if output.status.success() => {
+                passed += 1;
+                test_results.push(crate::stats::TestResult { filename: test_case.filename.clone(), passed: true });
+            }
+            Some(output) => {
+                let error = format_test_failure(&test_case.filename, &output);
+                error_messages.push(error);
+                test_results.push(crate::stats::TestResult { filename: test_case.filename.clone(), passed: false });
+            }
+            None => {
+                let error = format!("{}: runner failed or timed out", test_case.filename);
+                error_messages.push(error);
+                test_results.push(crate::stats::TestResult { filename: test_case.filename.clone(), passed: false });
+            }
+        }
+    }
+    Ok((test_results, error_messages, passed))
+}
+
+/// Prepare lib cases for batch testing: copy cando2 once, copy runners, generate workspace.
+/// Returns the list of runner package names for batch building.
+pub fn prepare_lib_workspace(
+    corpus_dir: &Path,
+    results_dir: &Path,
+    lib_case_names: &[String],
+) -> HarvestResult<Vec<String>> {
+    // 1. Find and copy cando2 once to results_dir/tools/cando2/
+    let cando2_dst = results_dir.join("tools").join("cando2");
+    if !cando2_dst.exists() {
+        let cando2_src = find_cando2_source(corpus_dir)
+            .ok_or("Cannot find tools/cando2 in corpus ancestors")?;
+        cargo_utils::copy_directory_recursive(&cando2_src, &cando2_dst)?;
+    }
+
+    let mut runner_names = Vec::new();
+
+    for name in lib_case_names {
+        let corpus_case = corpus_dir.join(name);
+        let results_case = results_dir.join(name);
+        let runner_dst = results_case.join("runner");
+
+        // 2. Copy fresh runner from corpus (overwrites any HARVEST-modified version)
+        if corpus_case.join("runner").exists() {
+            if runner_dst.exists() { let _ = fs::remove_dir_all(&runner_dst); }
+            cargo_utils::copy_directory_recursive(&corpus_case.join("runner"), &runner_dst)?;
+        }
+
+        // 3. Rewrite cando2 path to shared copy
+        let runner_toml = runner_dst.join("Cargo.toml");
+        if runner_toml.exists() {
+            cargo_utils::update_dependency_path(&runner_toml, "cando2", "../../tools/cando2")?;
+        }
+
+        // 4. Copy test_vectors from corpus if not present
+        let tv_dst = results_case.join("test_vectors");
+        if !tv_dst.exists() {
+            let tv_src = corpus_case.join("test_vectors");
+            if tv_src.exists() {
+                cargo_utils::copy_directory_recursive(&tv_src, &tv_dst)?;
+            }
+        }
+
+        // 5. Copy .so to where cando2 expects it
+        // cando2 looks at: <case>/translated_rust/target/release/lib<name>.so
+        // where <name> = CANDIDATE_NAME = case directory name (e.g. bin2hex_lib)
+        let so_name = format!("lib{}.so", name);
+        let expected_dir = results_case.join("translated_rust").join("target").join("release");
+        let expected_so = expected_dir.join(&so_name);
+
+        if !expected_so.exists() {
+            // Find the actual .so in target/release/
+            let build_release = results_case.join("target").join("release");
+            if let Ok(entries) = fs::read_dir(&build_release) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().map_or(false, |e| e == "so" || e == "dylib") {
+                        fs::create_dir_all(&expected_dir)?;
+                        fs::copy(&p, &expected_so)?;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let runner_name = format!("_{}_runner", name);
+        runner_names.push(runner_name);
+    }
+
+    // 6. Generate workspace Cargo.toml
+    let ws_toml = results_dir.join("Cargo.toml");
+    let mut members = String::from("[workspace]\nresolver = \"2\"\nmembers = [\n");
+    for name in lib_case_names {
+        members.push_str(&format!("    \"{}/runner\",\n", name));
+    }
+    members.push_str("]\n");
+    fs::write(&ws_toml, members)?;
+
+    Ok(runner_names)
+}
