@@ -90,7 +90,7 @@ for test_case in "$INPUT_DIR"/*/; do
     current=$((current + 1))
 
     # Skip already-completed cases (resume support)
-    if [[ -f "$OUTPUT_DIR/$name/Cargo.toml" ]]; then
+    if [[ -f "$OUTPUT_DIR/$name/translated_rust/Cargo.toml" ]]; then
         skipped=$((skipped + 1))
         translated=$((translated + 1))
         echo "[$current/$total] ⏭️  $name (already done)"
@@ -100,10 +100,16 @@ for test_case in "$INPUT_DIR"/*/; do
     echo "[$current/$total] Translating: $name"
     start_time=$(date +%s)
 
-    # Set up output directory
+    # Set up output directory (MIT runtests expects translated_rust/ + test_vectors/)
     out="$OUTPUT_DIR/$name"
     rm -rf "$out"
-    mkdir -p "$out"
+    mkdir -p "$out/translated_rust"
+
+    # Copy test_vectors and runner from corpus (required by MIT runtests)
+    cp -r "$test_case/test_vectors" "$out/"
+    if [[ -d "$test_case/runner" ]]; then
+        cp -r "$test_case/runner" "$out/"
+    fi
 
     # Load prompt based on project type
     if [[ "$name" == *_lib ]]; then
@@ -114,7 +120,7 @@ for test_case in "$INPUT_DIR"/*/; do
 
     # Invoke kiro-cli, capturing failures without killing the script
     if (
-        cd "$out"
+        cd "$out/translated_rust"
         mkdir -p c_src
         cp -a "$test_case/test_case/." c_src/
 
@@ -126,10 +132,10 @@ for test_case in "$INPUT_DIR"/*/; do
     ); then
         end_time=$(date +%s)
         duration=$((end_time - start_time))
-        if [[ -f "$out/Cargo.toml" ]]; then
+        if [[ -f "$out/translated_rust/Cargo.toml" ]]; then
             # Add workspace isolation so this package isn't pulled into a parent workspace
-            if ! grep -q '\[workspace\]' "$out/Cargo.toml"; then
-                echo -e '\n[workspace]' >> "$out/Cargo.toml"
+            if ! grep -q '\[workspace\]' "$out/translated_rust/Cargo.toml"; then
+                echo -e '\n[workspace]' >> "$out/translated_rust/Cargo.toml"
             fi
             translated=$((translated + 1))
             echo "$name,success,$TIMESTAMP,${duration}" >> "$PROGRESS"
