@@ -156,5 +156,5 @@ echo "Done: $translated/$total translated, $failed failed, $skipped skipped (alr
 echo "Progress: $PROGRESS"
 echo "Logs: $LOG_DIR"
 echo ""
-echo "To test results:"
-echo "  cargo run --release --bin=harvest-test -- $INPUT_DIR $OUTPUT_DIR"
+echo "To test results (from test-corpus/deployment/scripts/github-actions/):"
+echo "  PYTHONPATH=. python3 -m runtests.rust --root $OUTPUT_DIR --subset $OUTPUT_DIR --keep-going"

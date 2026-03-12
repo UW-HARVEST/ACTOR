@@ -1,121 +1,57 @@
-# HARVEST code
+# harvest-agentic
 
-A place to put HARVEST code that has not yet been migrated into its own
-repository.
+Agentic C-to-Rust translation using [kiro-cli](https://github.com/aws/kiro-cli) for DARPA TRACTOR.
 
-## Building the Rust code
+## Repository Structure
 
-If you have [rustup](https://rustup.rs) installed, you can build the code by
-running:
+```text
+scripts/
+├── kiro-translate.sh       # Translation harness
+└── prompts/
+    ├── executable.md       # Prompt for executable cases
+    └── library.md          # Prompt for library cases
+test-corpus/                # MIT Test-Corpus (submodule)
+results/                    # kiro-cli translation results (submodule)
+```
+
+## Setup
 
 ```bash
-cargo build --release
+git submodule update --init
 ```
 
-If you do not use rustup, you will need a sufficiently-new stable Rust compiler
-(see rust-toolchain.toml for a toolchain version that is known to work).
-
-## LLM server
-
-You will also need an LLM server. This can be local, or remote. A couple options
-are given below:
-
-### Local Ollama instance
-
-You can follow Ollama's [download instructions](https://ollama.com/download), or
-download its [Docker image](https://hub.docker.com/r/ollama/ollama).
-
-Once you have it installed, you need to download a model. By default,
-harvest_translate uses `codellama:7b`:
+## Translate
 
 ```bash
-ollama pull codellama:7b                       # If installed in your system
-docker container run ollama pull codellama:7b  # If using Docker
+# Translate a full battery
+./scripts/kiro-translate.sh B01_synthetic
+
+# Translate a single case
+./scripts/kiro-translate.sh B01_synthetic/001_helloworld
+
+# Filter by regex
+./scripts/kiro-translate.sh B01_organic --filter "hex2bin_lib$"
 ```
 
-You will need to have Ollama running to run harvest_translate.
+The script is resume-friendly — it skips already-completed cases.
 
-### Remote OpenAI instance
+## Test
 
-First, you'll need to provision an [OpenAI API key](https://platform.openai.com/api-keys).
-
-Then, you'll need to set up a custom Harvest config file:
-```toml 
-[tools.raw_source_to_cargo_llm]
-backend = "openai"
-model = "gpt-4o"
-api_key = "your_key_here" # Will be read from environment if empty
-address = ""  # Not needed for OpenAI
-max_tokens = 16384
-```
-You should place this config at the OS-dependent harvest config location, which you can find by running:
-```bash
-cargo run -- --print-config-path
-``` 
-
-
-## Running
-
-Some of the examples below assume you have a local copy of the TRACTOR
-Test-Corpus repository in `export TEST_CORPUS_PATH=/path/to/test-corpus`.
-
-### Translate C code to Rust
-```bash
-cargo run --bin=translate --release -- /path/to/c/code -o /path/to/output
-```
-
-#### Test-Corpus Example:
+Testing uses MIT's `runtests` from the Test-Corpus:
 
 ```bash
-cargo run --bin=translate --release -- $TEST_CORPUS_PATH/Public-Tests/B01_synthetic/001_helloworld/test_case/ -o example_output/
+cd test-corpus/deployment/scripts/github-actions
+PYTHONPATH=. python3 -m runtests.rust \
+  --root ../../../../results/B01_synthetic \
+  --subset ../../../../results/B01_synthetic \
+  --keep-going
 ```
 
-### Running a set of TRACTOR benchmarks
+## Results
 
-```bash
-cargo run --bin=benchmark --release -- /path/to/input/dir /path/to/output/dir
-```
-
-#### Example: run all benchmarks
-
-```bash
-cargo run --bin=benchmark --release -- $TEST_CORPUS_PATH/Public-Tests/B01_synthetic example_output/
-```
-
-_Optional: add --filter=<regex> to keep only matching benchmarks (by directory name)_
-
-#### Example: run only library benchmarks (directories ending with \_lib)
-
-```bash
-cargo run --bin=benchmark --release -- $TEST_CORPUS_PATH/Public-Tests/B01_synthetic example_output/ --filter=".*_lib$"
-```
-
-#### Example: run only benchmarks starting with B01
-
-```bash
-cargo run --bin=benchmark --release -- $TEST_CORPUS_PATH/Public-Tests example_output/ --filter="^B01"
-```
-
-_Optional: add --exclude=<regex> to exclude matching benchmarks (by directory name)_
-_Note: --filter and --exclude are mutually exclusive_
-
-### Example: exclude library benchmarks (directories ending with \_lib)
-
-```bash
-cargo run --bin=benchmark --release -- $TEST_CORPUS_PATH/Public-Tests/B01_synthetic example_output/ --exclude=".*_lib$"
-```
-
-#### Example: exclude benchmarks starting with test\_
-
-```
-cargo run --bin=benchmark --release -- $TEST_CORPUS_PATH/Public-Tests example_output/ --exclude="^test_"
-```
-
-### Configuration
-
-Print config file location:
-```bash
-cargo run --bin=translate -- --print-config-path
-```
-
-You can find more information on configuration in [doc/Configuration.md].
+| Battery | Builds | Tests (no UB) |
+|---|---|---|
+| B01_synthetic | 83/83 (100%) | 390/412 (94.7%) |
+| B01_organic | 38/38 (100%) | 803/808 (99.4%) |
+| B02_synthetic | 42/42 (100%) | 969/1053 (92.0%) |
+| B02_organic | 42/43 (97.7%) | 260/267 (97.4%) |
