@@ -90,7 +90,7 @@ for test_case in "$INPUT_DIR"/*/; do
     current=$((current + 1))
 
     # Skip already-completed cases (resume support)
-    if [[ -f "$OUTPUT_DIR/$name/translated_rust/Cargo.toml" ]]; then
+    if [[ -f "$OUTPUT_DIR/$name/Cargo.toml" ]]; then
         skipped=$((skipped + 1))
         translated=$((translated + 1))
         echo "[$current/$total] ⏭️  $name (already done)"
@@ -103,21 +103,7 @@ for test_case in "$INPUT_DIR"/*/; do
     # Set up output directory
     out="$OUTPUT_DIR/$name"
     rm -rf "$out"
-    mkdir -p "$out/translated_rust"
-
-    # Copy test_vectors and runner (for _lib cases)
-    cp -r "$test_case/test_vectors" "$out/"
-    if [[ -d "$test_case/runner" ]]; then
-        cp -r "$test_case/runner" "$out/"
-        # Fix cando2 relative path to absolute (use submodule path)
-        if [[ -f "$out/runner/Cargo.toml" ]]; then
-            CANDO2_ABS="$REPO_ROOT/test-corpus/tools/cando2"
-            if [[ -d "$CANDO2_ABS" ]]; then
-                sed -i '' "s|path = \"../../../../tools/cando2\"|path = \"$CANDO2_ABS\"|" "$out/runner/Cargo.toml" 2>/dev/null || \
-                sed -i "s|path = \"../../../../tools/cando2\"|path = \"$CANDO2_ABS\"|" "$out/runner/Cargo.toml" 2>/dev/null || true
-            fi
-        fi
-    fi
+    mkdir -p "$out"
 
     # Load prompt based on project type
     if [[ "$name" == *_lib ]]; then
@@ -128,7 +114,7 @@ for test_case in "$INPUT_DIR"/*/; do
 
     # Invoke kiro-cli, capturing failures without killing the script
     if (
-        cd "$out/translated_rust"
+        cd "$out"
         mkdir -p c_src
         cp -a "$test_case/test_case/." c_src/
 
@@ -140,10 +126,10 @@ for test_case in "$INPUT_DIR"/*/; do
     ); then
         end_time=$(date +%s)
         duration=$((end_time - start_time))
-        if [[ -f "$out/translated_rust/Cargo.toml" ]]; then
+        if [[ -f "$out/Cargo.toml" ]]; then
             # Add workspace isolation so this package isn't pulled into a parent workspace
-            if ! grep -q '\[workspace\]' "$out/translated_rust/Cargo.toml"; then
-                echo -e '\n[workspace]' >> "$out/translated_rust/Cargo.toml"
+            if ! grep -q '\[workspace\]' "$out/Cargo.toml"; then
+                echo -e '\n[workspace]' >> "$out/Cargo.toml"
             fi
             translated=$((translated + 1))
             echo "$name,success,$TIMESTAMP,${duration}" >> "$PROGRESS"
@@ -166,26 +152,9 @@ echo ""
 echo "========================================"
 
 # Generate root workspace Cargo.toml for lib runners
-runners=""
-for runner_toml in "$OUTPUT_DIR"/*/runner/Cargo.toml; do
-    [[ -f "$runner_toml" ]] || continue
-    dir=$(dirname "$runner_toml")
-    rel=${dir#"$OUTPUT_DIR/"}
-    runners="$runners    \"$rel\","$'\n'
-done
-if [[ -n "$runners" ]]; then
-    cat > "$OUTPUT_DIR/Cargo.toml" << EOF
-[workspace]
-members = [
-$runners]
-resolver = "2"
-EOF
-    echo "Generated root workspace with $(echo "$runners" | wc -l | tr -d ' ') lib runners"
-fi
-
 echo "Done: $translated/$total translated, $failed failed, $skipped skipped (already done)"
 echo "Progress: $PROGRESS"
 echo "Logs: $LOG_DIR"
 echo ""
-echo "To validate, run from the Test-Corpus repo:"
-echo "  python3 -m runtests.rust --root $OUTPUT_DIR --subset $OUTPUT_DIR --keep-going"
+echo "To test results:"
+echo "  cargo run --release --bin=harvest-test -- $INPUT_DIR $OUTPUT_DIR"
