@@ -20,7 +20,7 @@
 #   - Writes per-case status to progress.csv in real-time
 #   - Safe to interrupt — completed cases are preserved
 
-set -euo pipefail
+set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -135,7 +135,8 @@ for test_case in "$INPUT_DIR"/*/; do
             --no-interactive \
             --trust-all-tools \
             "$prompt" \
-            2>&1 | tee "$LOG_DIR/$name.log" | tail -5
+            < /dev/null \
+            2>&1 | tee "$LOG_DIR/$name.log"
     ); then
         end_time=$(date +%s)
         duration=$((end_time - start_time))
