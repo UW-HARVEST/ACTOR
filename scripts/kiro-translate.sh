@@ -109,11 +109,18 @@ for test_case in "$INPUT_DIR"/*/; do
     cp -r "$test_case/test_vectors" "$out/"
     if [[ -d "$test_case/runner" ]]; then
         cp -r "$test_case/runner" "$out/"
+        # Fix cando2 relative path to absolute (submodule path)
+        if [[ -f "$out/runner/Cargo.toml" ]]; then
+            CANDO2_ABS="$REPO_ROOT/test-corpus/tools/cando2"
+            if [[ -d "$CANDO2_ABS" ]]; then
+                sed -i "s|path = \"../../../../tools/cando2\"|path = \"$CANDO2_ABS\"|" "$out/runner/Cargo.toml" 2>/dev/null || true
+            fi
+        fi
     fi
 
     # Load prompt based on project type
     if [[ "$name" == *_lib ]]; then
-        prompt=$(cat "$SCRIPT_DIR/prompts/library.md" | sed "s/LIBRARY_NAME_PLACEHOLDER/$name/")
+        prompt=$(cat "$SCRIPT_DIR/prompts/library.md")
     else
         prompt=$(cat "$SCRIPT_DIR/prompts/executable.md")
     fi
@@ -133,9 +140,31 @@ for test_case in "$INPUT_DIR"/*/; do
         end_time=$(date +%s)
         duration=$((end_time - start_time))
         if [[ -f "$out/translated_rust/Cargo.toml" ]]; then
-            # Add workspace isolation so this package isn't pulled into a parent workspace
-            if ! grep -q '\[workspace\]' "$out/translated_rust/Cargo.toml"; then
-                echo -e '\n[workspace]' >> "$out/translated_rust/Cargo.toml"
+            # === Post-processing: fix Cargo.toml for MIT compatibility ===
+            cargo_toml="$out/translated_rust/Cargo.toml"
+
+            # Add [workspace] isolation
+            if ! grep -q '\[workspace\]' "$cargo_toml"; then
+                echo -e '\n[workspace]' >> "$cargo_toml"
+            fi
+
+            if [[ "$name" == *_lib ]]; then
+                # Set [lib] name to match runner's expected library name
+                lib_name=$(grep 'library:' "$test_case/runner/src/main.rs" 2>/dev/null | sed 's/.*library: "\(.*\)".*/\1/' | head -1)
+                if [[ -n "$lib_name" ]]; then
+                    # Remove any existing [lib] section and rewrite it
+                    sed -i '/^\[lib\]/,/^\[/{/^\[lib\]/d;/^name\|^crate-type/d;}' "$cargo_toml"
+                    echo -e "\n[lib]\nname = \"$lib_name\"\ncrate-type = [\"cdylib\"]" >> "$cargo_toml"
+                elif ! grep -q 'cdylib' "$cargo_toml"; then
+                    echo -e "\n[lib]\ncrate-type = [\"cdylib\"]" >> "$cargo_toml"
+                fi
+            else
+                # Set [[bin]] name = "driver"
+                if grep -q '^\[\[bin\]\]' "$cargo_toml"; then
+                    sed -i '/^\[\[bin\]\]/,/^\[/ s/^name = .*/name = "driver"/' "$cargo_toml"
+                else
+                    echo -e '\n[[bin]]\nname = "driver"\npath = "src/main.rs"' >> "$cargo_toml"
+                fi
             fi
             translated=$((translated + 1))
             echo "$name,success,$TIMESTAMP,${duration}" >> "$PROGRESS"
@@ -158,6 +187,23 @@ echo ""
 echo "========================================"
 
 # Generate root workspace Cargo.toml for lib runners
+runners=""
+for runner_toml in "$OUTPUT_DIR"/*/runner/Cargo.toml; do
+    [[ -f "$runner_toml" ]] || continue
+    dir=$(dirname "$runner_toml")
+    rel=${dir#"$OUTPUT_DIR/"}
+    runners="$runners    \"$rel\","$'\n'
+done
+if [[ -n "$runners" ]]; then
+    cat > "$OUTPUT_DIR/Cargo.toml" << EOF
+[workspace]
+members = [
+$runners]
+resolver = "2"
+EOF
+    echo "Generated root workspace with $(echo "$runners" | wc -l | tr -d ' ') lib runners"
+fi
+
 echo "Done: $translated/$total translated, $failed failed, $skipped skipped (already done)"
 echo "Progress: $PROGRESS"
 echo "Logs: $LOG_DIR"

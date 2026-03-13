@@ -3,7 +3,6 @@ Translate the C code in c_src/ to Rust that produces **byte-identical output** f
 Write Cargo.toml and src/ files in the current directory (NOT in c_src/).
 
 This is a LIBRARY. Requirements:
-- The package name in Cargo.toml MUST be exactly: LIBRARY_NAME_PLACEHOLDER
 - Cargo.toml must have crate-type = ["cdylib"] under [lib]
 - All public C functions must use #[unsafe(no_mangle)] and extern "C"
 - Preserve the exact C function signatures (use *const c_char, c_int, etc. from std::ffi)
