@@ -1,0 +1,52 @@
+name: validate-translations
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.SUBMODULE_PAT }}
+
+      - name: Check out submodules
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.SUBMODULE_PAT }}@github.com/".insteadOf "https://github.com/"
+          git submodule update --init --depth=1 results test-corpus
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.94.0 --profile default
+          rustup default 1.94.0
+          cargo --version
+          rustc --version
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fix cando2 paths for CI
+        run: |
+          CANDO2_PATH="$GITHUB_WORKSPACE/test-corpus/tools/cando2"
+          find results/ -path "*/runner/Cargo.toml" -exec sed -i "s|path = \".*cando2\"|path = \"$CANDO2_PATH\"|" {} +
+
+      - name: Validate translations against expected results
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          echo "=== Environment ==="
+          uname -m
+          rustc --version
+          cargo --version
+          python3 --version
+          pkg-config --libs openssl || echo "pkg-config openssl not found"
+          echo "==================="
+          python3 scripts/validate.py
