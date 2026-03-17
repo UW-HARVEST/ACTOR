@@ -48,10 +48,6 @@ if [[ ! -d "$INPUT_DIR" ]]; then
     exit 1
 fi
 
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_DIR="$OUTPUT_DIR/logs_$TIMESTAMP"
-mkdir -p "$LOG_DIR"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROGRESS="$OUTPUT_DIR/progress.csv"
 
@@ -128,7 +124,7 @@ for test_case in "$INPUT_DIR"/*/; do
     # Invoke kiro-cli, capturing failures without killing the script
     if (
         cd "$out/translated_rust"
-        mkdir -p c_src
+        mkdir -p c_src "$out/logs"
         cp -a "$test_case/test_case/." c_src/
 
         kiro-cli chat \
@@ -136,7 +132,7 @@ for test_case in "$INPUT_DIR"/*/; do
             --trust-all-tools \
             "$prompt" \
             < /dev/null \
-            2>&1 | tee "$LOG_DIR/$name.log"
+            2>&1 | tee "$out/logs/translation.log"
     ); then
         end_time=$(date +%s)
         duration=$((end_time - start_time))
@@ -207,7 +203,6 @@ fi
 
 echo "Done: $translated/$total translated, $failed failed, $skipped skipped (already done)"
 echo "Progress: $PROGRESS"
-echo "Logs: $LOG_DIR"
 echo ""
 echo "To test results (from test-corpus/deployment/scripts/github-actions/):"
 echo "  PYTHONPATH=. python3 -m runtests.rust --root $OUTPUT_DIR --subset $OUTPUT_DIR --keep-going"
