@@ -1,6 +1,6 @@
 [submodule "test-corpus"]
 	path = test-corpus
-	url = git@github.com:UW-HARVEST/Test-Corpus.git
+	url = https://github.com/UW-HARVEST/Test-Corpus.git
 [submodule "results"]
 	path = results
-	url = git@github.com:UW-HARVEST/harvest-agentic-translate-results.git
+	url = https://github.com/UW-HARVEST/harvest-agentic-translate-results.git
