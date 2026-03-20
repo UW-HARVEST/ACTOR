@@ -64,19 +64,44 @@ skipped=0
 # Count total eligible cases first
 for test_case in "$INPUT_DIR"/*/; do
     name=$(basename "$test_case")
-    [[ -d "$test_case/test_case" && -d "$test_case/test_vectors" ]] || continue
+    [[ -d "$test_case/test_case" || -L "$test_case/test_case" ]] || continue
+    [[ -d "$test_case/test_vectors" ]] || continue
     if [[ -n "$FILTER" ]] && ! echo "$name" | grep -qE "$FILTER"; then
         continue
     fi
     total=$((total + 1))
 done
 
+# --- Detect shared test_case (symlinks → same source, build-time configurability) ---
+# Find the "real" case (non-symlink test_case) and all cases that symlink to it
+REAL_CASE=""
+declare -A SYMLINKED_CASES  # case_name → real_case_name
+for test_case in "$INPUT_DIR"/*/; do
+    name=$(basename "$test_case")
+    [[ -d "$test_case/test_case" || -L "$test_case/test_case" ]] || continue
+    if [[ -L "$test_case/test_case" ]]; then
+        # Resolve symlink to find the real case
+        real_dir=$(basename "$(dirname "$(realpath "$test_case/test_case")")")
+        SYMLINKED_CASES["$name"]="$real_dir"
+        if [[ -z "$REAL_CASE" ]]; then
+            REAL_CASE="$real_dir"
+        fi
+    fi
+done
+
+if [[ -n "$REAL_CASE" ]]; then
+    echo "Detected shared source: $REAL_CASE (${#SYMLINKED_CASES[@]} configurations)"
+    echo "Will translate once, then symlink translated_rust/ for all configurations"
+    echo ""
+fi
+
 current=0
 for test_case in "$INPUT_DIR"/*/; do
     name=$(basename "$test_case")
 
     # Must have test_case/ and test_vectors/
-    [[ -d "$test_case/test_case" && -d "$test_case/test_vectors" ]] || continue
+    [[ -d "$test_case/test_case" || -L "$test_case/test_case" ]] || continue
+    [[ -d "$test_case/test_vectors" ]] || continue
 
     # Apply filter if provided
     if [[ -n "$FILTER" ]] && ! echo "$name" | grep -qE "$FILTER"; then
@@ -84,6 +109,75 @@ for test_case in "$INPUT_DIR"/*/; do
     fi
 
     current=$((current + 1))
+
+    # --- Symlinked case: symlink translated_rust/ to the real case's translation ---
+    if [[ -n "${SYMLINKED_CASES[$name]:-}" ]]; then
+        real_name="${SYMLINKED_CASES[$name]}"
+        out="$OUTPUT_DIR/$name"
+
+        # Skip if already done
+        if [[ -f "$out/translated_rust/Cargo.toml" || -L "$out/translated_rust" ]]; then
+            skipped=$((skipped + 1))
+            translated=$((translated + 1))
+            echo "[$current/$total] ⏭️  $name (already done)"
+            continue
+        fi
+
+        # Wait for real case to be translated first
+        if [[ ! -f "$OUTPUT_DIR/$real_name/translated_rust/Cargo.toml" ]]; then
+            echo "[$current/$total] ⏭️  $name (waiting for $real_name to be translated)"
+            continue
+        fi
+
+        mkdir -p "$out"
+        # Copy test_vectors and runner from corpus
+        cp -r "$test_case/test_vectors" "$out/" 2>/dev/null || true
+        if [[ -d "$test_case/runner" ]]; then
+            cp -r "$test_case/runner" "$out/"
+            if [[ -f "$out/runner/Cargo.toml" ]]; then
+                CANDO2_ABS="$REPO_ROOT/test-corpus/tools/cando2"
+                [[ -d "$CANDO2_ABS" ]] && sed -i "s|path = \"../../../../tools/cando2\"|path = \"$CANDO2_ABS\"|" "$out/runner/Cargo.toml" 2>/dev/null || true
+            fi
+        fi
+
+        # Set up translated_rust with copied src and own Cargo.toml/target
+        mkdir -p "$out/translated_rust/src"
+        # Copy all source files from real case
+        cp "$OUTPUT_DIR/$real_name/translated_rust/src/"* "$out/translated_rust/src/"
+        # Copy Cargo.toml (will set per-case default features below)
+        cp "$OUTPUT_DIR/$real_name/translated_rust/Cargo.toml" "$out/translated_rust/Cargo.toml"
+        # Copy c_src for reference
+        [[ -d "$OUTPUT_DIR/$real_name/translated_rust/c_src" ]] && \
+            cp -a "$OUTPUT_DIR/$real_name/translated_rust/c_src" "$out/translated_rust/"
+        mkdir -p "$out/logs"
+
+        # Extract features from CMakePresets.json and set as default in Cargo.toml
+        if [[ -f "$test_case/CMakePresets.json" ]]; then
+            features=$(python3 -c "
+import json, sys
+d = json.load(open('$test_case/CMakePresets.json'))
+cv = d['configurePresets'][1]['cacheVariables']
+feats = [cv.get('HASH_BACKEND',''), cv.get('THASH',''), cv.get('SECPAR','')]
+print(','.join(f.lower() for f in feats if f))
+" 2>/dev/null)
+            if [[ -n "$features" ]]; then
+                # Set default features in Cargo.toml
+                feat_array=$(echo "$features" | tr ',' '\n' | sed 's/.*/"&"/' | paste -sd, -)
+                sed -i "/^default = /d" "$out/translated_rust/Cargo.toml"
+                sed -i "/^\[features\]/a default = [$feat_array]" "$out/translated_rust/Cargo.toml"
+            fi
+        fi
+
+        # Lib cases: remove [[bin]] section (only need cdylib)
+        # Exec cases: keep [[bin]] (need driver binary)
+        if [[ "$name" == *_lib ]]; then
+            sed -i '/^\[\[bin\]\]/,/^$/d' "$out/translated_rust/Cargo.toml"
+        fi
+
+        translated=$((translated + 1))
+        echo "[$current/$total] 🔗 $name → $real_name"
+        continue
+    fi
 
     # Skip already-completed cases (resume support)
     if [[ -f "$OUTPUT_DIR/$name/translated_rust/Cargo.toml" ]]; then
@@ -115,7 +209,9 @@ for test_case in "$INPUT_DIR"/*/; do
     fi
 
     # Load prompt based on project type
-    if [[ "$name" == *_lib ]]; then
+    if [[ -n "$REAL_CASE" && "$name" == "$REAL_CASE" ]]; then
+        prompt=$(cat "$SCRIPT_DIR/prompts/configurable.md")
+    elif [[ "$name" == *_lib ]]; then
         prompt=$(cat "$SCRIPT_DIR/prompts/library.md")
     else
         prompt=$(cat "$SCRIPT_DIR/prompts/executable.md")
@@ -145,7 +241,11 @@ for test_case in "$INPUT_DIR"/*/; do
                 echo -e '\n[workspace]' >> "$cargo_toml"
             fi
 
-            if [[ "$name" == *_lib ]]; then
+            # Skip lib/bin post-processing for shared-source real case
+            # (the configurable.md prompt already produces both [lib] and [[bin]])
+            if [[ -n "$REAL_CASE" && "$name" == "$REAL_CASE" ]]; then
+                : # no-op — LLM handles Cargo.toml structure
+            elif [[ "$name" == *_lib ]]; then
                 # Set [lib] name to match runner's expected library name
                 lib_name=$(grep 'library:' "$test_case/runner/src/main.rs" 2>/dev/null | sed 's/.*library: "\(.*\)".*/\1/' | head -1)
                 if [[ -n "$lib_name" ]]; then
@@ -164,18 +264,18 @@ for test_case in "$INPUT_DIR"/*/; do
                 fi
             fi
             translated=$((translated + 1))
-            echo "$name,success,$TIMESTAMP,${duration}" >> "$PROGRESS"
+            echo "$name,success,$(date -Iseconds),${duration}" >> "$PROGRESS"
             echo "  ✅ $name (${duration}s) [$translated translated, $failed failed of $current/$total]"
         else
             failed=$((failed + 1))
-            echo "$name,no_cargo_toml,$TIMESTAMP,${duration}" >> "$PROGRESS"
+            echo "$name,no_cargo_toml,$(date -Iseconds),${duration}" >> "$PROGRESS"
             echo "  ❌ $name — no Cargo.toml (${duration}s) [$translated translated, $failed failed of $current/$total]"
         fi
     else
         end_time=$(date +%s)
         duration=$((end_time - start_time))
         failed=$((failed + 1))
-        echo "$name,error,$TIMESTAMP,${duration}" >> "$PROGRESS"
+        echo "$name,error,$(date -Iseconds),${duration}" >> "$PROGRESS"
         echo "  ❌ $name — kiro-cli error (${duration}s) [$translated translated, $failed failed of $current/$total]"
     fi
 done
