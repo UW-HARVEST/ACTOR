@@ -24,8 +24,21 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-ARG="${1:?Usage: $0 <test-suite>[/<case>] [--filter regex]}"
+# Ensure OpenSSL is discoverable for C/Rust builds that need it
+export OPENSSL_DIR="${OPENSSL_DIR:-/usr}"
+
+ARG="${1:?Usage: $0 <test-suite>[/<case>] [--filter regex] [--verify]}"
 FILTER=""
+VERIFY=false
+
+shift || true
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --filter) FILTER="${2:?--filter requires a regex argument}"; shift 2 ;;
+        --verify) VERIFY=true; shift ;;
+        *) shift ;;
+    esac
+done
 
 # Handle test-suite/case syntax
 if [[ "$ARG" == */* ]]; then
@@ -33,9 +46,6 @@ if [[ "$ARG" == */* ]]; then
     FILTER="${ARG#*/}$"
 else
     BATTERY="$ARG"
-    if [[ "${2:-}" == "--filter" ]]; then
-        FILTER="${3:?--filter requires a regex argument}"
-    fi
 fi
 
 INPUT_DIR="$REPO_ROOT/test-corpus/Public-Tests/$BATTERY"
@@ -130,20 +140,11 @@ for test_case in "$INPUT_DIR"/*/; do
         fi
 
         mkdir -p "$out"
-        # Copy test_vectors and runner from corpus
-        cp -r "$test_case/test_vectors" "$out/" 2>/dev/null || true
-        if [[ -d "$test_case/runner" ]]; then
-            cp -r "$test_case/runner" "$out/"
-            if [[ -f "$out/runner/Cargo.toml" ]]; then
-                CANDO2_ABS="$REPO_ROOT/test-corpus/tools/cando2"
-                [[ -d "$CANDO2_ABS" ]] && sed -i "s|path = \"../../../../tools/cando2\"|path = \"$CANDO2_ABS\"|" "$out/runner/Cargo.toml" 2>/dev/null || true
-            fi
-        fi
 
         # Set up translated_rust with copied src and own Cargo.toml/target
-        mkdir -p "$out/translated_rust/src"
+        mkdir -p "$out/translated_rust"
         # Copy all source files from real case
-        cp "$OUTPUT_DIR/$real_name/translated_rust/src/"* "$out/translated_rust/src/"
+        cp -a "$OUTPUT_DIR/$real_name/translated_rust/src" "$out/translated_rust/"
         # Copy Cargo.toml (will set per-case default features below)
         cp "$OUTPUT_DIR/$real_name/translated_rust/Cargo.toml" "$out/translated_rust/Cargo.toml"
         # Copy c_src for reference
@@ -154,11 +155,25 @@ for test_case in "$INPUT_DIR"/*/; do
         # Extract features from CMakePresets.json and set as default in Cargo.toml
         if [[ -f "$test_case/CMakePresets.json" ]]; then
             features=$(python3 -c "
-import json, sys
+import json, re
 d = json.load(open('$test_case/CMakePresets.json'))
 cv = d['configurePresets'][1]['cacheVariables']
-feats = [cv.get('HASH_BACKEND',''), cv.get('THASH',''), cv.get('SECPAR','')]
-print(','.join(f.lower() for f in feats if f))
+backend = cv.get('HASH_BACKEND','').lower()
+thash = cv.get('THASH','').lower()
+secpar = cv.get('SECPAR','').lower()
+
+# Read Cargo.toml and find all defined feature names
+cargo = open('$out/translated_rust/Cargo.toml').read()
+defined = set(re.findall(r'^([a-zA-Z0-9][a-zA-Z0-9_-]*)\s*=\s*\[', cargo, re.MULTILINE)) - {'default'}
+
+result = []
+if backend in defined: result.append(backend)
+if thash in defined: result.append(thash)
+if secpar in defined: result.append(secpar)
+else:
+    composite = f'sphincs-{backend}-{secpar}'
+    if composite in defined: result.append(composite)
+print(','.join(result))
 " 2>/dev/null)
             if [[ -n "$features" ]]; then
                 # Set default features in Cargo.toml
@@ -168,11 +183,26 @@ print(','.join(f.lower() for f in feats if f))
             fi
         fi
 
-        # Lib cases: remove [[bin]] section (only need cdylib)
+        # Lib cases: remove [[bin]] section and set [lib] name from runner
         # Exec cases: keep [[bin]] (need driver binary)
         if [[ "$name" == *_lib ]]; then
             sed -i '/^\[\[bin\]\]/,/^$/d' "$out/translated_rust/Cargo.toml"
+            rm -f "$out/translated_rust/src/main.rs"
+            rm -rf "$out/translated_rust/tests"
+            # Set [lib] name from test corpus runner
+            corpus_runner="$INPUT_DIR/$name/runner/src/main.rs"
+            if [[ -f "$corpus_runner" ]]; then
+                lib_name=$(grep 'library:' "$corpus_runner" 2>/dev/null | sed 's/.*library: "\(.*\)".*/\1/' | head -1)
+                if [[ -n "$lib_name" ]]; then
+                    sed -i "/^\[lib\]/,/^\[/{/^name/d;}" "$out/translated_rust/Cargo.toml"
+                    sed -i "/^\[lib\]/a name = \"$lib_name\"" "$out/translated_rust/Cargo.toml"
+                fi
+            fi
         fi
+
+        # Save original for this config
+        rm -rf "$out/translated_rust_original"
+        cp -a "$out/translated_rust" "$out/translated_rust_original"
 
         translated=$((translated + 1))
         echo "[$current/$total] 🔗 $name → $real_name"
@@ -190,23 +220,10 @@ print(','.join(f.lower() for f in feats if f))
     echo "[$current/$total] Translating: $name"
     start_time=$(date +%s)
 
-    # Set up output directory (MIT runtests expects translated_rust/ + test_vectors/)
+    # Set up output directory
     out="$OUTPUT_DIR/$name"
     rm -rf "$out"
     mkdir -p "$out/translated_rust"
-
-    # Copy test_vectors and runner from corpus (required by MIT runtests)
-    cp -r "$test_case/test_vectors" "$out/"
-    if [[ -d "$test_case/runner" ]]; then
-        cp -r "$test_case/runner" "$out/"
-        # Fix cando2 relative path to absolute (submodule path)
-        if [[ -f "$out/runner/Cargo.toml" ]]; then
-            CANDO2_ABS="$REPO_ROOT/test-corpus/tools/cando2"
-            if [[ -d "$CANDO2_ABS" ]]; then
-                sed -i "s|path = \"../../../../tools/cando2\"|path = \"$CANDO2_ABS\"|" "$out/runner/Cargo.toml" 2>/dev/null || true
-            fi
-        fi
-    fi
 
     # Load prompt based on project type
     if [[ -n "$REAL_CASE" && "$name" == "$REAL_CASE" ]]; then
@@ -264,6 +281,9 @@ print(','.join(f.lower() for f in feats if f))
                 fi
             fi
             translated=$((translated + 1))
+            # Save original translation before any verification modifies it
+            rm -rf "$out/translated_rust_original"
+            cp -a "$out/translated_rust" "$out/translated_rust_original"
             echo "$name,success,$(date -Iseconds),${duration}" >> "$PROGRESS"
             echo "  ✅ $name (${duration}s) [$translated translated, $failed failed of $current/$total]"
         else
@@ -306,3 +326,13 @@ echo "Progress: $PROGRESS"
 echo ""
 echo "To test results (from test-corpus/deployment/scripts/github-actions/):"
 echo "  PYTHONPATH=. python3 -m runtests.rust --root $OUTPUT_DIR --subset $OUTPUT_DIR --keep-going"
+
+# --- Optional: C-as-oracle verification ---
+if [[ "$VERIFY" == true ]]; then
+    echo ""
+    echo "========================================"
+    echo "Running C-as-oracle verification..."
+    verify_args=("$BATTERY")
+    [[ -n "$FILTER" ]] && verify_args+=(--include-regex "$FILTER")
+    "$SCRIPT_DIR/verify-translation.sh" "${verify_args[@]}"
+fi
