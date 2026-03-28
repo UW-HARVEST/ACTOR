@@ -63,7 +63,7 @@ def run_battery(battery: str) -> tuple[dict, dict[str, dict]]:
     env["PYTHONPATH"] = os.path.join(CORPUS_DIR, "deployment/scripts/github-actions") + ":" + env.get("PYTHONPATH", "")
 
     result = subprocess.run(
-        ["python3", "-m", "runtests.rust", "--root", results_dir, "--subset", results_dir, "--keep-going"],
+        ["python3", "-m", "runtests.rust", "--root", results_dir, "--subset", results_dir, "--keep-going", "--verbose"],
         capture_output=True, text=True, cwd=CORPUS_DIR, env=env,
     )
     output = result.stdout + result.stderr
