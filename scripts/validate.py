@@ -51,6 +51,14 @@ def run_battery(battery: str) -> tuple[dict, dict[str, dict]]:
         and per_case maps case name -> {"case", "battery", "vectors_failed", "passed"}.
     """
     results_dir = os.path.join(RESULTS_DIR, battery)
+
+    # Clean build artifacts to prevent stale cached binaries
+    for case in os.listdir(results_dir):
+        target = os.path.join(results_dir, case, "translated_rust", "target")
+        if os.path.isdir(target):
+            import shutil
+            shutil.rmtree(target)
+
     env = os.environ.copy()
     env["PYTHONPATH"] = os.path.join(CORPUS_DIR, "deployment/scripts/github-actions") + ":" + env.get("PYTHONPATH", "")
 
@@ -87,7 +95,7 @@ def run_battery(battery: str) -> tuple[dict, dict[str, dict]]:
 
     summary = {
         "cases_tested": extract(r"Test Cases Tested:\s+(\d+)"),
-        "cases_passed": extract(r"Test Cases Tested:\s+(\d+)") - extract(r"Test Cases Failed:\s+(\d+)"),
+        "cases_passed": max(0, extract(r"Test Cases Tested:\s+(\d+)") - extract(r"Test Cases Failed:\s+(\d+)")),
         "vectors_passed": extract(r"Test Vectors Passed:\s+(\d+)"),
         "vectors_failed": extract(r"Test Vectors Failed:\s+(\d+)"),
         "vectors_skipped": extract(r"Test Vectors Skipped:\s+(\d+)"),

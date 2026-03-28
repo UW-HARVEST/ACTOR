@@ -29,6 +29,9 @@ pub fn run(repo_root: &Path, battery_name: &str, update: bool) -> Result<()> {
     // Copy test_vectors and runner from corpus
     copy_test_artifacts(&paths, battery_name)?;
 
+    // Clean build artifacts to prevent stale cached binaries
+    clean_targets(&output_dir)?;
+
     // Generate workspace Cargo.toml for lib runners
     generate_workspace(&output_dir)?;
 
@@ -85,6 +88,18 @@ pub fn run(repo_root: &Path, battery_name: &str, update: bool) -> Result<()> {
         summary.cases_passed, summary.cases_tested, summary.vectors_passed);
     println!("========================================");
 
+    Ok(())
+}
+
+fn clean_targets(output_dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(output_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() { continue; }
+        let target = entry.path().join("translated_rust/target");
+        if target.exists() {
+            std::fs::remove_dir_all(&target)?;
+        }
+    }
     Ok(())
 }
 
