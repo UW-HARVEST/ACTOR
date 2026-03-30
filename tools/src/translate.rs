@@ -127,11 +127,10 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
     let log_path = logs_dir.join("translation.log");
     let status = Command::new("bash")
         .arg("-c")
-        .arg(format!(
-            "set -o pipefail; timeout 1800 kiro-cli chat --no-interactive --trust-all-tools \"$PROMPT\" < /dev/null 2>&1 | tee \"$LOG\"",
-        ))
-        .env("PROMPT", prompt)
-        .env("LOG", &log_path)
+        .arg(r#"set -o pipefail; timeout 1800 kiro-cli chat --no-interactive --trust-all-tools "$1" < /dev/null 2>&1 | tee "$2""#)
+        .arg("--")
+        .arg(prompt)
+        .arg(&log_path)
         .env("OPENSSL_DIR", std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into()))
         .current_dir(&translated)
         .status()

@@ -145,13 +145,13 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str) -> Res
     std::fs::create_dir_all(&logs_dir)?;
     let log_path = logs_dir.join("verify.log");
 
+    // Invoke kiro-cli directly (no bash) to avoid shell mangling backticks in prompt
     let _status = Command::new("bash")
         .arg("-c")
-        .arg(format!(
-            "timeout 2700 kiro-cli chat --no-interactive --trust-all-tools \"$PROMPT\" < /dev/null 2>&1 | tee \"$LOG\"",
-        ))
-        .env("PROMPT", &prompt)
-        .env("LOG", &log_path)
+        .arg(format!(r#"timeout 2700 kiro-cli chat --no-interactive --trust-all-tools "$1" < /dev/null 2>&1 | tee "$2""#))
+        .arg("--")  // end of bash options
+        .arg(&prompt)
+        .arg(&log_path)
         .env("OPENSSL_DIR", std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into()))
         .current_dir(case_dir)
         .status()
