@@ -1,8 +1,18 @@
 use clap::Parser;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Agent {
+    Kiro,
+    Claude,
+}
+
 #[derive(Parser)]
 #[command(name = "harvest-tools", about = "C-to-Rust translation pipeline")]
 pub struct Cli {
+    /// Which LLM agent to use for translation
+    #[arg(long, value_enum, default_value_t = Agent::Kiro)]
+    pub agent: Agent,
+
     #[command(subcommand)]
     pub command: Command,
 }

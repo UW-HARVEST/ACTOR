@@ -1,3 +1,4 @@
+use crate::cli::Agent;
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::collections::HashMap;
@@ -253,14 +254,30 @@ pub struct Paths {
     pub corpus_dir: PathBuf,
     pub results_dir: PathBuf,
     pub prompts_dir: PathBuf,
+    pub agent: Agent,
 }
 
 impl Paths {
     pub fn new(repo_root: &Path) -> Self {
+        Self::with_agent(repo_root, Agent::Kiro)
+    }
+
+    pub fn with_agent(repo_root: &Path, agent: Agent) -> Self {
+        let (results_dir, prompts_dir) = match agent {
+            Agent::Kiro => (
+                repo_root.join("results"),
+                repo_root.join("scripts/prompts"),
+            ),
+            Agent::Claude => (
+                repo_root.join("results-claude"),
+                repo_root.join("scripts/prompts/claude"),
+            ),
+        };
         Self {
             corpus_dir: repo_root.join("test-corpus"),
-            results_dir: repo_root.join("results"),
-            prompts_dir: repo_root.join("scripts/prompts"),
+            results_dir,
+            prompts_dir,
+            agent,
         }
     }
 

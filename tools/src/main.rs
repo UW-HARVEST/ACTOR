@@ -11,6 +11,7 @@ use cli::{Cli, Command};
 fn main() -> Result<()> {
     let cli = Cli::parse_args();
     let repo_root = find_repo_root()?;
+    let agent = cli.agent;
 
     match cli.command {
         Command::Run {
@@ -19,18 +20,18 @@ fn main() -> Result<()> {
             include_regex,
         } => {
             let (battery_name, case_filter) = parse_target(target, include_regex.as_deref());
-            translate::run(&repo_root, &battery_name, case_filter.as_deref())?;
+            translate::run(&repo_root, &battery_name, case_filter.as_deref(), agent)?;
             if !no_verify {
-                verify::run(&repo_root, &battery_name, case_filter.as_deref(), false)?;
+                verify::run(&repo_root, &battery_name, case_filter.as_deref(), false, agent)?;
             }
-            test::run(&repo_root, &battery_name, true)?;
+            test::run(&repo_root, &battery_name, true, agent)?;
         }
         Command::Translate {
             ref target,
             include_regex,
         } => {
             let (battery_name, case_filter) = parse_target(target, include_regex.as_deref());
-            translate::run(&repo_root, &battery_name, case_filter.as_deref())?;
+            translate::run(&repo_root, &battery_name, case_filter.as_deref(), agent)?;
         }
         Command::Verify {
             ref target,
@@ -38,14 +39,14 @@ fn main() -> Result<()> {
             force,
         } => {
             let (battery_name, case_filter) = parse_target(target, include_regex.as_deref());
-            verify::run(&repo_root, &battery_name, case_filter.as_deref(), force)?;
+            verify::run(&repo_root, &battery_name, case_filter.as_deref(), force, agent)?;
         }
         Command::Test {
             ref target,
             update,
         } => {
             let (battery_name, _) = parse_target(target, None);
-            test::run(&repo_root, &battery_name, update)?;
+            test::run(&repo_root, &battery_name, update, agent)?;
         }
     }
     Ok(())
@@ -54,7 +55,7 @@ fn main() -> Result<()> {
 fn find_repo_root() -> Result<std::path::PathBuf> {
     let mut dir = std::env::current_dir()?;
     loop {
-        if dir.join("test-corpus").is_dir() && dir.join("results").is_dir() {
+        if dir.join("test-corpus").is_dir() && (dir.join("results").is_dir() || dir.join("results-claude").is_dir()) {
             return Ok(dir);
         }
         if !dir.pop() {

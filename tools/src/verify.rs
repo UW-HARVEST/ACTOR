@@ -1,12 +1,13 @@
 use crate::battery::{self, Case, Paths};
 use crate::cargo_toml;
+use crate::cli::Agent;
 use crate::translate::copy_dir_all;
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 
-pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>, force: bool) -> Result<()> {
-    let paths = Paths::new(repo_root);
+pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>, force: bool, agent: Agent) -> Result<()> {
+    let paths = Paths::with_agent(repo_root, agent);
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
     let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))?;
