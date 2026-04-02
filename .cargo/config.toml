@@ -1,0 +1,2 @@
+[alias]
+harvest = "run --manifest-path tools/Cargo.toml"

@@ -1,11 +1,17 @@
 use crate::battery::{self, Case, Paths};
 use crate::cargo_toml::{self, CargoToml};
+use crate::cli::Agent;
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
+use std::time::Instant;
 
-pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>) -> Result<()> {
-    let paths = Paths::new(repo_root);
+pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>, agent: Agent) -> Result<()> {
+    let paths = Paths::with_agent(repo_root, agent);
+
+    // Pre-flight: verify the agent CLI is available and print its version
+    preflight_check(agent)?;
+
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
     std::fs::create_dir_all(&output_dir)?;
@@ -27,19 +33,27 @@ pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>) -> Result
                     continue;
                 }
 
-                let prompt = if c.is_lib { "library.md" } else { "executable.md" };
+                let prompt = match paths.agent {
+                    Agent::Claude => "translate.md",
+                    _ => if c.is_lib { "library.md" } else { "executable.md" },
+                };
                 let prompt_text = std::fs::read_to_string(paths.prompts_dir.join(prompt))?;
 
+                let start = Instant::now();
                 match translate_case(&paths, battery_name, &c.name, &prompt_text) {
                     Ok(()) => {
+                        let elapsed = start.elapsed().as_secs();
+                        write_translation_metrics(&output_dir.join(&c.name), paths.agent, elapsed, true);
                         post_process_independent(&paths, battery_name, &c.name, c.is_lib)?;
                         save_original(&output_dir, &c.name)?;
                         translated += 1;
-                        println!("  ✅ {} [{translated} translated, {failed} failed of {current}/{total}]", c.name);
+                        println!("  ✅ {} ({elapsed}s) [{translated} translated, {failed} failed of {current}/{total}]", c.name);
                     }
                     Err(e) => {
+                        let elapsed = start.elapsed().as_secs();
+                        write_translation_metrics(&output_dir.join(&c.name), paths.agent, elapsed, false);
                         failed += 1;
-                        println!("  ❌ {} — {e} [{translated} translated, {failed} failed of {current}/{total}]", c.name);
+                        println!("  ❌ {} — {e} ({elapsed}s) [{translated} translated, {failed} failed of {current}/{total}]", c.name);
                     }
                 }
             }
@@ -51,12 +65,19 @@ pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>) -> Result
                     println!("[{current}/{total}] ⏭️  {} (already done)", group.real_case);
                     translated += 1;
                 } else {
+                    let prompt_file = match paths.agent {
+                        Agent::Claude => "translate.md",
+                        _ => "configurable.md",
+                    };
                     let prompt_text =
-                        std::fs::read_to_string(paths.prompts_dir.join("configurable.md"))?;
+                        std::fs::read_to_string(paths.prompts_dir.join(prompt_file))?;
 
                     println!("[{current}/{total}] Translating: {} (shared-source, {} configs)", group.real_case, group.configs.len());
+                    let start = Instant::now();
                     match translate_case(&paths, battery_name, &group.real_case, &prompt_text) {
                         Ok(()) => {
+                            let elapsed = start.elapsed().as_secs();
+                            write_translation_metrics(&real_dir, paths.agent, elapsed, true);
                             // Real case: add workspace, set both lib+bin (configurable prompt handles this)
                             let cargo_path = real_dir.join("translated_rust/Cargo.toml");
                             if cargo_path.exists() {
@@ -66,11 +87,13 @@ pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>) -> Result
                             }
                             save_original(&output_dir, &group.real_case)?;
                             translated += 1;
-                            println!("  ✅ {} [{translated} translated, {failed} failed of {current}/{total}]", group.real_case);
+                            println!("  ✅ {} ({elapsed}s) [{translated} translated, {failed} failed of {current}/{total}]", group.real_case);
                         }
                         Err(e) => {
+                            let elapsed = start.elapsed().as_secs();
+                            write_translation_metrics(&real_dir, paths.agent, elapsed, false);
                             failed += 1;
-                            println!("  ❌ {} — {e}", group.real_case);
+                            println!("  ❌ {} — {e} ({elapsed}s)", group.real_case);
                             // Skip configs if real case failed
                             current += group.configs.len();
                             continue;
@@ -110,36 +133,170 @@ pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>) -> Result
     Ok(())
 }
 
+/// Verify the agent CLI is on PATH and print its version.
+fn preflight_check(agent: Agent) -> Result<()> {
+    let (cmd, version_args): (&str, &[&str]) = match agent {
+        Agent::Kiro => ("kiro-cli", &["--version"]),
+        Agent::Claude => ("claude", &["--version"]),
+    };
+
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(format!("which {cmd} && {cmd} {}", version_args.join(" ")))
+        .output()
+        .with_context(|| format!("{cmd} not found — is it on PATH?"))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "{cmd} not found on PATH. Subprocess shell may not source ~/.bashrc.\n\
+             Try: export PATH=\"$PATH:$(dirname $(which {cmd}))\" in ~/.profile or ~/.bash_profile"
+        );
+    }
+
+    let info = String::from_utf8_lossy(&output.stdout);
+    for line in info.lines() {
+        println!("  {line}");
+    }
+
+    // For Claude, enforce minimum version 2.1
+    if agent == Agent::Claude {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Version line looks like: "2.1.89 (Claude Code)"
+        let version_str = stdout.lines()
+            .find(|l| l.chars().next().map_or(false, |c| c.is_ascii_digit()))
+            .unwrap_or("");
+        let parts: Vec<u32> = version_str
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let (major, minor) = (parts.first().copied().unwrap_or(0), parts.get(1).copied().unwrap_or(0));
+        if major < 2 || (major == 2 && minor < 1) {
+            anyhow::bail!(
+                "Claude Code version {version_str} is too old (need >= 2.1).\n\
+                 The subprocess may be using a different binary than your shell.\n\
+                 Subprocess resolved: {}",
+                stdout.lines().next().unwrap_or("unknown"),
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Result<()> {
     let case_dir = paths.case_dir(battery, name);
-    let translated = case_dir.join("translated_rust");
-    let c_src = translated.join("c_src");
-    let logs_dir = case_dir.join("logs");
 
-    std::fs::create_dir_all(&c_src)?;
+    // Clean any stale artifacts from previous runs (test_vectors, result.json, etc.)
+    if case_dir.exists() {
+        std::fs::remove_dir_all(&case_dir)?;
+    }
+
+    let logs_dir = case_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
 
-    // Copy C source
+    // Copy C source into the work directory
     let input_test_case = paths.input_dir(battery).join(name).join("test_case");
-    copy_dir_all(&input_test_case, &c_src)?;
-
-    // Invoke kiro-cli
     let log_path = logs_dir.join("translation.log");
-    let status = Command::new("bash")
-        .arg("-c")
-        .arg(format!(
-            "set -o pipefail; timeout 1800 kiro-cli chat --no-interactive --trust-all-tools \"$PROMPT\" < /dev/null 2>&1 | tee \"$LOG\"",
-        ))
-        .env("PROMPT", prompt)
-        .env("LOG", &log_path)
-        .env("OPENSSL_DIR", std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into()))
-        .current_dir(&translated)
-        .status()
-        .context("invoking kiro-cli")?;
+    let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
-    if !translated.join("Cargo.toml").exists() {
+    // For Claude: run in an isolated temp dir so the agent can't access
+    // test vectors, existing results, or other repo contents.
+    // For Kiro: run in-place (existing behavior).
+    let (work_dir, _tmp_guard) = match paths.agent {
+        Agent::Kiro => {
+            let translated = case_dir.join("translated_rust");
+            let c_src = translated.join("c_src");
+            std::fs::create_dir_all(&c_src)?;
+            copy_dir_all(&input_test_case, &c_src)?;
+            (translated, None)
+        }
+        Agent::Claude => {
+            let tmp = tempfile::Builder::new()
+                .prefix("harvest-translate-")
+                .tempdir()
+                .context("creating isolated temp dir")?;
+            let work = tmp.path().join("translated_rust");
+            let c_src = work.join("c_src");
+            std::fs::create_dir_all(&c_src)?;
+            copy_dir_all(&input_test_case, &c_src)?;
+
+            // Write sandbox settings to isolate Claude from the repo.
+            // - Sandbox denyRead blocks Bash commands (cat, find, etc.) from reading repo files
+            // - We omit Read/Glob/Grep from --allowedTools so Claude can only read via
+            //   sandboxed Bash (cat), which enforces the denyRead rules at OS level
+            let claude_dir = tmp.path().join(".claude");
+            std::fs::create_dir_all(&claude_dir)?;
+            let repo_root = paths.results_dir.parent().unwrap_or(Path::new("/"));
+            std::fs::write(
+                claude_dir.join("settings.json"),
+                serde_json::json!({
+                    "sandbox": {
+                        "enabled": true,
+                        "allowUnsandboxedCommands": false,
+                        "filesystem": {
+                            "denyRead": [repo_root.to_string_lossy()],
+                            "allowRead": [tmp.path().to_string_lossy()],
+                            "allowWrite": [tmp.path().to_string_lossy()]
+                        }
+                    }
+                }).to_string(),
+            )?;
+
+            (work, Some(tmp))
+        }
+    };
+
+    let status = match paths.agent {
+        Agent::Kiro => {
+            Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "set -o pipefail; timeout 1800 kiro-cli chat --no-interactive --trust-all-tools \"$PROMPT\" < /dev/null 2>&1 | tee \"$LOG\"",
+                ))
+                .env("PROMPT", prompt)
+                .env("LOG", &log_path)
+                .env("OPENSSL_DIR", &openssl_dir)
+                .current_dir(&work_dir)
+                .status()
+                .context("invoking kiro-cli")?
+        }
+        Agent::Claude => {
+            // Only allow Bash (sandboxed), Write, and Edit — no Read/Glob/Grep
+            // so Claude must use `cat` in Bash to read files, which is OS-level sandboxed
+            Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "set -o pipefail; timeout 10800 claude -p \"$PROMPT\" \
+                        --allowedTools 'Bash(*)' 'Write' 'Edit' \
+                        --max-turns 50 \
+                        --verbose \
+                        --output-format stream-json \
+                        < /dev/null 2>&1 | tee \"$LOG\"",
+                ))
+                .env("PROMPT", prompt)
+                .env("LOG", &log_path)
+                .env("OPENSSL_DIR", &openssl_dir)
+                .current_dir(&work_dir)
+                .status()
+                .context("invoking claude")?
+        }
+    };
+
+    if !work_dir.join("Cargo.toml").exists() {
         anyhow::bail!("no Cargo.toml produced (exit={})", status);
     }
+
+    // For Claude: move results from temp dir back to the real output location
+    if paths.agent == Agent::Claude {
+        let translated = case_dir.join("translated_rust");
+        if translated.exists() {
+            std::fs::remove_dir_all(&translated)?;
+        }
+        // Copy rather than rename (temp dir may be on different filesystem)
+        copy_dir_all(&work_dir, &translated)?;
+    }
+
     Ok(())
 }
 
@@ -226,6 +383,20 @@ fn propagate_config(
     }
 
     Ok(())
+}
+
+fn write_translation_metrics(case_dir: &Path, agent: Agent, duration_secs: u64, success: bool) {
+    let metrics = serde_json::json!({
+        "agent": format!("{agent:?}").to_lowercase(),
+        "duration_secs": duration_secs,
+        "success": success,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    let _ = std::fs::create_dir_all(case_dir);
+    let _ = std::fs::write(
+        case_dir.join("translation.json"),
+        serde_json::to_string_pretty(&metrics).unwrap_or_default() + "\n",
+    );
 }
 
 fn save_original(output_dir: &Path, name: &str) -> Result<()> {

@@ -1,4 +1,5 @@
 use crate::battery::Paths;
+use crate::cli::Agent;
 use crate::translate::copy_dir_all;
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -17,8 +18,8 @@ pub struct Summary {
     pub failed_cases: Vec<String>,
 }
 
-pub fn run(repo_root: &Path, battery_name: &str, update: bool) -> Result<()> {
-    let paths = Paths::new(repo_root);
+pub fn run(repo_root: &Path, battery_name: &str, update: bool, agent: Agent) -> Result<()> {
+    let paths = Paths::with_agent(repo_root, agent);
     let output_dir = paths.output_dir(battery_name);
 
     println!();

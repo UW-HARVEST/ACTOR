@@ -30,7 +30,7 @@ import subprocess, json, re, sys, os, glob
 from typing import Optional
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RESULTS_DIR = os.path.join(REPO_ROOT, "results")
+RESULTS_DIR = os.path.join(REPO_ROOT, "results", "kiro")
 CORPUS_DIR = os.path.join(REPO_ROOT, "test-corpus")
 
 
@@ -164,8 +164,21 @@ def write_summaries(all_batteries: dict[str, dict]) -> None:
 
 
 def main() -> None:
+    global RESULTS_DIR
     update_mode = "--update" in sys.argv
-    args = [a for a in sys.argv[1:] if a != "--update"]
+    raw_args = [a for a in sys.argv[1:] if a != "--update"]
+
+    # Parse --results-dir <path> (relative to REPO_ROOT)
+    args = []
+    i = 0
+    while i < len(raw_args):
+        if raw_args[i] == "--results-dir" and i + 1 < len(raw_args):
+            RESULTS_DIR = os.path.join(REPO_ROOT, raw_args[i + 1])
+            i += 2
+        else:
+            args.append(raw_args[i])
+            i += 1
+
     batteries = args or discover_batteries()
     all_ok = True
     all_results: dict[str, dict] = {}
