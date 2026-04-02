@@ -38,7 +38,7 @@ jobs:
           CANDO2_PATH="$GITHUB_WORKSPACE/test-corpus/tools/cando2"
           find results/ -path "*/runner/Cargo.toml" -exec sed -i "s|path = \".*cando2\"|path = \"$CANDO2_PATH\"|" {} +
 
-      - name: Validate translations against expected results
+      - name: Validate kiro translations
         env:
           CARGO_BUILD_JOBS: "2"
         run: |
@@ -49,4 +49,9 @@ jobs:
           python3 --version
           pkg-config --libs openssl || echo "pkg-config openssl not found"
           echo "==================="
-          python3 scripts/validate.py
+          python3 scripts/validate.py --results-dir results/kiro
+
+      - name: Validate claude translations
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: python3 scripts/validate.py --results-dir results/claude

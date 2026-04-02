@@ -55,7 +55,7 @@ fn main() -> Result<()> {
 fn find_repo_root() -> Result<std::path::PathBuf> {
     let mut dir = std::env::current_dir()?;
     loop {
-        if dir.join("test-corpus").is_dir() && (dir.join("results").is_dir() || dir.join("results-claude").is_dir()) {
+        if dir.join("test-corpus").is_dir() && dir.join("results").is_dir() {
             return Ok(dir);
         }
         if !dir.pop() {

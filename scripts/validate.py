@@ -30,7 +30,7 @@ import subprocess, json, re, sys, os, glob
 from typing import Optional
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RESULTS_DIR = os.path.join(REPO_ROOT, "results")
+RESULTS_DIR = os.path.join(REPO_ROOT, "results", "kiro")
 CORPUS_DIR = os.path.join(REPO_ROOT, "test-corpus")
 
 

@@ -269,11 +269,11 @@ impl Paths {
     pub fn with_agent(repo_root: &Path, agent: Agent) -> Self {
         let (results_dir, prompts_dir) = match agent {
             Agent::Kiro => (
-                repo_root.join("results"),
+                repo_root.join("results/kiro"),
                 repo_root.join("scripts/prompts"),
             ),
             Agent::Claude => (
-                repo_root.join("results-claude"),
+                repo_root.join("results/claude"),
                 repo_root.join("scripts/prompts/claude"),
             ),
         };
