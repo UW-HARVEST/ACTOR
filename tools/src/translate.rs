@@ -213,7 +213,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
         }
         Agent::Claude => {
             let tmp = tempfile::Builder::new()
-                .prefix(&format!("harvest-{name}-"))
+                .prefix("harvest-translate-")
                 .tempdir()
                 .context("creating isolated temp dir")?;
             let work = tmp.path().join("translated_rust");
@@ -267,7 +267,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
             Command::new("bash")
                 .arg("-c")
                 .arg(format!(
-                    "set -o pipefail; timeout 1800 claude -p \"$PROMPT\" \
+                    "set -o pipefail; timeout 10800 claude -p \"$PROMPT\" \
                         --allowedTools 'Bash(*)' 'Write' 'Edit' \
                         --max-turns 50 \
                         --verbose \

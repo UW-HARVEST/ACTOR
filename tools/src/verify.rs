@@ -46,7 +46,7 @@ pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>, force: bo
 
                 println!("[{current}/{total}] 🔬 {}", c.name);
                 let cmake_flags = get_cmake_flags(&paths, battery_name, &c.name);
-                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags)?;
+                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", agent)?;
 
                 if ok {
                     verified += 1;
@@ -68,9 +68,10 @@ pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>, force: bo
                     println!("[{current}/{total}] ⏭️  {} (already verified)", group.real_case);
                     skipped += 1;
                 } else {
-                    println!("[{current}/{total}] 🔬 {} (shared-source)", group.real_case);
+                    println!("[{current}/{total}] 🔬 {} (shared-source, {} configs)", group.real_case, group.configs.len());
                     let cmake_flags = get_cmake_flags(&paths, battery_name, &group.real_case);
-                    let ok = verify_case(&real_dir, &prompt_template, &cmake_flags)?;
+                    let configs_text = build_configs_text(&paths, battery_name, group);
+                    let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, agent)?;
 
                     if ok {
                         verified += 1;
@@ -118,7 +119,7 @@ pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>, force: bo
     Ok(())
 }
 
-fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str) -> Result<bool> {
+fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, configs_text: &str, agent: Agent) -> Result<bool> {
     let translated = case_dir.join("translated_rust");
     let original = case_dir.join("translated_rust_original");
 
@@ -136,30 +137,142 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str) -> Res
     if tv.exists() { std::fs::remove_dir_all(&tv)?; }
     if runner.exists() { std::fs::remove_dir_all(&runner)?; }
 
-    // Build prompt
-    let prompt = prompt_template
-        .replace("CASE_DIR_PLACEHOLDER", &case_dir.to_string_lossy())
-        .replace("CMAKE_BUILD_FLAGS", cmake_flags);
-
-    // Invoke kiro-cli with 45-minute timeout
     let logs_dir = case_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
     let log_path = logs_dir.join("verify.log");
+    let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
-    let _status = Command::new("bash")
-        .arg("-c")
-        .arg(format!(
-            "timeout 2700 kiro-cli chat --no-interactive --trust-all-tools \"$PROMPT\" < /dev/null 2>&1 | tee \"$LOG\"",
-        ))
-        .env("PROMPT", &prompt)
-        .env("LOG", &log_path)
-        .env("OPENSSL_DIR", std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into()))
-        .current_dir(case_dir)
-        .status()
-        .context("invoking kiro-cli for verification")?;
+    match agent {
+        Agent::Kiro => {
+            let prompt = prompt_template
+                .replace("CASE_DIR_PLACEHOLDER", &case_dir.to_string_lossy())
+                .replace("CMAKE_BUILD_FLAGS", cmake_flags)
+                .replace("ALL_CONFIGURATIONS", configs_text);
 
-    // kiro-cli done — mark as verified (actual correctness checked by MIT runtests in phase 3)
+            let _status = Command::new("bash")
+                .arg("-c")
+                .arg("timeout 2700 kiro-cli chat --no-interactive --trust-all-tools \"$PROMPT\" < /dev/null 2>&1 | tee \"$LOG\"")
+                .env("PROMPT", &prompt)
+                .env("LOG", &log_path)
+                .env("OPENSSL_DIR", &openssl_dir)
+                .current_dir(case_dir)
+                .status()
+                .context("invoking kiro-cli for verification")?;
+        }
+        Agent::Claude => {
+            let tmp = tempfile::Builder::new()
+                .prefix("harvest-verify-")
+                .tempdir()
+                .context("creating isolated temp dir for verify")?;
+
+            // Copy translated_rust into temp dir
+            let work = tmp.path().join("translated_rust");
+            copy_dir_all(&translated, &work)?;
+
+            // Write sandbox settings
+            let claude_dir = tmp.path().join(".claude");
+            std::fs::create_dir_all(&claude_dir)?;
+            let repo_root = case_dir.ancestors().nth(2).unwrap_or(Path::new("/"));
+            std::fs::write(
+                claude_dir.join("settings.json"),
+                serde_json::json!({
+                    "sandbox": {
+                        "enabled": true,
+                        "allowUnsandboxedCommands": false,
+                        "filesystem": {
+                            "denyRead": [repo_root.to_string_lossy()],
+                            "allowRead": [tmp.path().to_string_lossy()],
+                            "allowWrite": [tmp.path().to_string_lossy()]
+                        }
+                    }
+                }).to_string(),
+            )?;
+
+            let prompt = prompt_template
+                .replace("CMAKE_BUILD_FLAGS", cmake_flags)
+                .replace("ALL_CONFIGURATIONS", configs_text);
+
+            let _status = Command::new("bash")
+                .arg("-c")
+                .arg("set -o pipefail; claude -p \"$PROMPT\" \
+                    --allowedTools 'Bash(*)' 'Write' 'Edit' \
+                    --verbose \
+                    --output-format stream-json \
+                    < /dev/null 2>&1 | tee \"$LOG\"")
+                .env("PROMPT", &prompt)
+                .env("LOG", &log_path)
+                .env("OPENSSL_DIR", &openssl_dir)
+                .current_dir(&work)
+                .status()
+                .context("invoking claude for verification")?;
+
+            // Copy verified results back
+            let dst_src = translated.join("src");
+            if dst_src.exists() {
+                std::fs::remove_dir_all(&dst_src)?;
+            }
+            copy_dir_all(&work.join("src"), &dst_src)?;
+
+            // Copy tests/ if created
+            let work_tests = work.join("tests");
+            if work_tests.is_dir() {
+                let dst_tests = translated.join("tests");
+                if dst_tests.exists() {
+                    std::fs::remove_dir_all(&dst_tests)?;
+                }
+                copy_dir_all(&work_tests, &dst_tests)?;
+            }
+
+            // Copy updated Cargo.toml (may have added libloading)
+            if work.join("Cargo.toml").exists() {
+                std::fs::copy(work.join("Cargo.toml"), translated.join("Cargo.toml"))?;
+            }
+        }
+    }
+
     Ok(true)
+}
+
+/// Build a text block listing all distinct configurations for the verify prompt.
+fn build_configs_text(paths: &Paths, battery: &str, group: &battery::SharedSourceGroup) -> String {
+    // Collect unique feature sets (deduplicate configs that share the same features)
+    let mut seen = std::collections::HashSet::new();
+    let mut lines = Vec::new();
+
+    // Include the real case first
+    let real_flags = get_cmake_flags(paths, battery, &group.real_case);
+    let real_presets = paths.input_dir(battery).join(&group.real_case).join("CMakePresets.json");
+    let real_features = battery::extract_features_from_path(&real_presets).unwrap_or_default();
+    let real_key: Vec<String> = real_features.iter().cloned().collect();
+    if seen.insert(real_key) && !real_flags.is_empty() {
+        lines.push(format!(
+            "  cmake: {}  →  cargo features: {}",
+            real_flags,
+            real_features.join(","),
+        ));
+    }
+
+    for cfg in &group.configs {
+        let key: Vec<String> = cfg.features.clone();
+        if !seen.insert(key) {
+            continue; // skip duplicate feature sets
+        }
+        let cmake_flags = get_cmake_flags(paths, battery, &cfg.name);
+        if cmake_flags.is_empty() {
+            continue;
+        }
+        lines.push(format!(
+            "  cmake: {}  →  cargo features: {}",
+            cmake_flags,
+            cfg.features.join(","),
+        ));
+    }
+
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("Configurations to test:\n{}", lines.join("\n"))
+    }
 }
 
 fn get_cmake_flags(paths: &Paths, battery: &str, case_name: &str) -> String {

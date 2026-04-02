@@ -152,14 +152,13 @@ fn build_config(input_dir: &Path, name: &str) -> Result<Config> {
     })
 }
 
-/// Extract features from CMakePresets.json cache variables.
-fn extract_features(input_dir: &Path, case_name: &str) -> Result<Vec<String>> {
-    let presets_path = input_dir.join(case_name).join("CMakePresets.json");
+/// Extract features from a CMakePresets.json path directly.
+pub fn extract_features_from_path(presets_path: &Path) -> Result<Vec<String>> {
     if !presets_path.exists() {
         return Ok(vec![]);
     }
     let data: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&presets_path)
+        &std::fs::read_to_string(presets_path)
             .with_context(|| format!("reading {}", presets_path.display()))?,
     )?;
 
@@ -181,6 +180,11 @@ fn extract_features(input_dir: &Path, case_name: &str) -> Result<Vec<String>> {
         }
     }
     Ok(features)
+}
+
+/// Extract features from CMakePresets.json cache variables.
+fn extract_features(input_dir: &Path, case_name: &str) -> Result<Vec<String>> {
+    extract_features_from_path(&input_dir.join(case_name).join("CMakePresets.json"))
 }
 
 /// Extract [lib] name from the test corpus runner/src/main.rs.
