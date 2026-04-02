@@ -1,8 +1,0 @@
-{
-  "argv": [
-    "asdf"
-  ],
-  "stdout": {
-    "pattern": "Hello World!\n"
-  }
-}

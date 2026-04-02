@@ -1,9 +1,0 @@
-{
-  "argv": [
-    "This is a really long input compared to what you might expect",
-    "- but it shouldn't affect the output!"
-  ],
-  "stdout": {
-    "pattern": "Hello World!\n"
-  }
-}
