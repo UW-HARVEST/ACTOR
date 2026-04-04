@@ -21,6 +21,7 @@ jobs:
       - name: Set up Rust
         run: |
           rustup toolchain install 1.94.0 --profile default
+          rustup toolchain install nightly --profile minimal
           rustup default 1.94.0
           cargo --version
           rustc --version
@@ -55,3 +56,8 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
         run: python3 scripts/validate.py --results-dir results/claude
+
+      - name: Validate c2rust translations
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: python3 scripts/validate.py --results-dir results/c2rust
