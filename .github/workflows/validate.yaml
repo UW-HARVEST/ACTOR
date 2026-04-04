@@ -21,7 +21,7 @@ jobs:
       - name: Set up Rust
         run: |
           rustup toolchain install 1.94.0 --profile default
-          rustup toolchain install nightly --profile minimal
+          rustup toolchain install nightly --profile default
           rustup default 1.94.0
           cargo --version
           rustc --version
@@ -38,6 +38,16 @@ jobs:
         run: |
           CANDO2_PATH="$GITHUB_WORKSPACE/test-corpus/tools/cando2"
           find results/ -path "*/runner/Cargo.toml" -exec sed -i "s|path = \".*cando2\"|path = \"$CANDO2_PATH\"|" {} +
+
+      - name: Validate c2rust translations
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          if [ -d results/c2rust ]; then
+            python3 scripts/validate.py --results-dir results/c2rust
+          else
+            echo "No c2rust results found, skipping"
+          fi
 
       - name: Validate kiro translations
         env:
@@ -57,14 +67,4 @@ jobs:
             python3 scripts/validate.py --results-dir results/claude
           else
             echo "No claude results found, skipping"
-          fi
-
-      - name: Validate c2rust translations
-        env:
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          if [ -d results/c2rust ]; then
-            python3 scripts/validate.py --results-dir results/c2rust
-          else
-            echo "No c2rust results found, skipping"
           fi
