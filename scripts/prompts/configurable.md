@@ -19,8 +19,9 @@ Your Cargo.toml must have both `[lib]` with `crate-type = ["cdylib"]` and
 Instead:
 1. Analyze the C project structure and create a plan (TODO list) breaking the
    translation into subtasks (e.g., core/shared code, each backend, entry points)
-2. For each subtask, invoke a subagent using the use_subagent tool with
-   agent_name "kiro_plain" and a detailed query for that subtask.
+2. For each subtask, invoke a single subagent using the use_subagent tool with
+   agent_name "kiro_plain" and a detailed query for that subtask. Only invoke
+   one subagent at a time — wait for it to complete before starting the next.
 3. After each subagent completes, verify the work compiles before moving on
 4. Once all subtasks are done, wire up the feature gates and verify the full build
 
