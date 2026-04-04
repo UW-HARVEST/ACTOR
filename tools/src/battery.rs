@@ -1,3 +1,4 @@
+use crate::cli::Agent;
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::collections::HashMap;
@@ -151,14 +152,13 @@ fn build_config(input_dir: &Path, name: &str) -> Result<Config> {
     })
 }
 
-/// Extract features from CMakePresets.json cache variables.
-fn extract_features(input_dir: &Path, case_name: &str) -> Result<Vec<String>> {
-    let presets_path = input_dir.join(case_name).join("CMakePresets.json");
+/// Extract features from a CMakePresets.json path directly.
+pub fn extract_features_from_path(presets_path: &Path) -> Result<Vec<String>> {
     if !presets_path.exists() {
         return Ok(vec![]);
     }
     let data: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&presets_path)
+        &std::fs::read_to_string(presets_path)
             .with_context(|| format!("reading {}", presets_path.display()))?,
     )?;
 
@@ -180,6 +180,11 @@ fn extract_features(input_dir: &Path, case_name: &str) -> Result<Vec<String>> {
         }
     }
     Ok(features)
+}
+
+/// Extract features from CMakePresets.json cache variables.
+fn extract_features(input_dir: &Path, case_name: &str) -> Result<Vec<String>> {
+    extract_features_from_path(&input_dir.join(case_name).join("CMakePresets.json"))
 }
 
 /// Extract [lib] name from the test corpus runner/src/main.rs.
@@ -253,14 +258,34 @@ pub struct Paths {
     pub corpus_dir: PathBuf,
     pub results_dir: PathBuf,
     pub prompts_dir: PathBuf,
+    pub agent: Agent,
 }
 
 impl Paths {
     pub fn new(repo_root: &Path) -> Self {
+        Self::with_agent(repo_root, Agent::Kiro)
+    }
+
+    pub fn with_agent(repo_root: &Path, agent: Agent) -> Self {
+        let (results_dir, prompts_dir) = match agent {
+            Agent::Kiro => (
+                repo_root.join("results/kiro"),
+                repo_root.join("scripts/prompts"),
+            ),
+            Agent::Claude => (
+                repo_root.join("results/claude"),
+                repo_root.join("scripts/prompts/claude"),
+            ),
+            Agent::C2rust => (
+                repo_root.join("results/c2rust"),
+                repo_root.join("scripts/prompts"), // unused
+            ),
+        };
         Self {
             corpus_dir: repo_root.join("test-corpus"),
-            results_dir: repo_root.join("results"),
-            prompts_dir: repo_root.join("scripts/prompts"),
+            results_dir,
+            prompts_dir,
+            agent,
         }
     }
 

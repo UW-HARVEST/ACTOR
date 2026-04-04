@@ -1,8 +1,19 @@
 use clap::Parser;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Agent {
+    Kiro,
+    Claude,
+    C2rust,
+}
+
 #[derive(Parser)]
 #[command(name = "harvest-tools", about = "C-to-Rust translation pipeline")]
 pub struct Cli {
+    /// Which LLM agent to use for translation
+    #[arg(long, value_enum, default_value_t = Agent::Kiro)]
+    pub agent: Agent,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -41,6 +52,9 @@ pub enum Command {
         /// Update stored expected results
         #[arg(long)]
         update: bool,
+        /// CI mode: compare against stored summary.json, exit 1 on mismatch
+        #[arg(long, conflicts_with = "update")]
+        check: bool,
     },
 }
 
