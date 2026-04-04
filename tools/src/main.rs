@@ -18,28 +18,31 @@ fn main() -> Result<()> {
             ref target,
             no_verify,
             include_regex,
+            parallel,
         } => {
             let (battery_name, case_filter) = parse_target(target, include_regex.as_deref());
-            translate::run(&repo_root, &battery_name, case_filter.as_deref(), agent)?;
+            translate::run(&repo_root, &battery_name, case_filter.as_deref(), agent, parallel)?;
             if !no_verify {
-                verify::run(&repo_root, &battery_name, case_filter.as_deref(), false, agent)?;
+                verify::run(&repo_root, &battery_name, case_filter.as_deref(), false, agent, parallel)?;
             }
             test::run(&repo_root, &battery_name, test::TestMode::Update, agent)?;
         }
         Command::Translate {
             ref target,
             include_regex,
+            parallel,
         } => {
             let (battery_name, case_filter) = parse_target(target, include_regex.as_deref());
-            translate::run(&repo_root, &battery_name, case_filter.as_deref(), agent)?;
+            translate::run(&repo_root, &battery_name, case_filter.as_deref(), agent, parallel)?;
         }
         Command::Verify {
             ref target,
             include_regex,
             force,
+            parallel,
         } => {
             let (battery_name, case_filter) = parse_target(target, include_regex.as_deref());
-            verify::run(&repo_root, &battery_name, case_filter.as_deref(), force, agent)?;
+            verify::run(&repo_root, &battery_name, case_filter.as_deref(), force, agent, parallel)?;
         }
         Command::Test {
             ref target,

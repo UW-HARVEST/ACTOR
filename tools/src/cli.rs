@@ -30,12 +30,17 @@ pub enum Command {
         /// Only process cases matching regex
         #[arg(long)]
         include_regex: Option<String>,
+        /// Max parallel translations
+        #[arg(long, default_value_t = 1)]
+        parallel: usize,
     },
     /// Translate C to Rust
     Translate {
         target: String,
         #[arg(long)]
         include_regex: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        parallel: usize,
     },
     /// C-as-oracle verification
     Verify {
@@ -45,6 +50,8 @@ pub enum Command {
         /// Re-verify already-verified cases
         #[arg(long)]
         force: bool,
+        #[arg(long, default_value_t = 1)]
+        parallel: usize,
     },
     /// Run MIT runtests
     Test {

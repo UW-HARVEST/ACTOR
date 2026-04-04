@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 
-pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>, force: bool, agent: Agent) -> Result<()> {
+pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>, force: bool, agent: Agent, _parallel: usize) -> Result<()> {
     let paths = Paths::with_agent(repo_root, agent);
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
