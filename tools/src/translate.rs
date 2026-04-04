@@ -356,6 +356,14 @@ fn propagate_config(
     // Copy Cargo.toml
     std::fs::copy(real_dir.join("Cargo.toml"), translated.join("Cargo.toml"))?;
 
+    // Copy root-level files (lib.rs, build.rs, rust-toolchain.toml, etc.)
+    for entry in std::fs::read_dir(&real_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && entry.file_name() != "Cargo.toml" {
+            std::fs::copy(entry.path(), translated.join(entry.file_name()))?;
+        }
+    }
+
     // Copy c_src if present
     let c_src_src = real_dir.join("c_src");
     if c_src_src.is_dir() {

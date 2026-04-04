@@ -73,9 +73,10 @@ pub fn run(repo_root: &Path, target: &str, mode: TestMode, agent: Agent) -> Resu
     };
 
     let mut all_mismatches = Vec::new();
+    let mut check_rows: Vec<CheckRow> = Vec::new();
 
     for battery in &batteries {
-        let result = run_battery(&paths, battery, mode)?;
+        let result = run_battery(&paths, battery, mode, &mut check_rows)?;
         if let TestOutcome::Failed(ref mm) = result {
             all_mismatches.extend(mm.iter().map(|m| BatteryMismatch {
                 battery: m.battery.clone(),
@@ -84,11 +85,37 @@ pub fn run(repo_root: &Path, target: &str, mode: TestMode, agent: Agent) -> Resu
         }
     }
 
+    // Print recap table for --check mode
+    if matches!(mode, TestMode::Check) && !check_rows.is_empty() {
+        println!();
+        println!("========================================");
+        println!("  Check Summary");
+        println!("========================================");
+        println!("  {:<25} {:>15} {:>15}  {}", "Battery", "Stored", "Actual", "Status");
+        println!("  {}", "─".repeat(75));
+        for row in &check_rows {
+            let stored = format!("{}/{} ({}v)", row.expected.cases_passed, row.expected.cases_tested,
+                row.expected.vectors_passed);
+            let actual = format!("{}/{} ({}v)", row.actual.cases_passed, row.actual.cases_tested,
+                row.actual.vectors_passed);
+            let status = if row.ok { "✅" } else { "❌" };
+            println!("  {:<25} {:>15} {:>15}  {}", row.battery, stored, actual, status);
+        }
+        println!("========================================");
+    }
+
     match mode {
         TestMode::Check if !all_mismatches.is_empty() => Ok(TestOutcome::Failed(all_mismatches)),
         TestMode::Check => Ok(TestOutcome::Passed),
         _ => Ok(TestOutcome::Ok),
     }
+}
+
+struct CheckRow {
+    battery: String,
+    expected: Summary,
+    actual: Summary,
+    ok: bool,
 }
 
 // ── Battery discovery ──────────────────────────────────────────────────
@@ -118,7 +145,7 @@ fn discover_batteries(results_dir: &Path) -> Result<Vec<String>> {
 
 // ── Single battery ─────────────────────────────────────────────────────
 
-fn run_battery(paths: &Paths, battery: &str, mode: TestMode) -> Result<TestOutcome> {
+fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Vec<CheckRow>) -> Result<TestOutcome> {
     let output_dir = paths.output_dir(battery);
 
     if !output_dir.is_dir() {
@@ -166,7 +193,14 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode) -> Result<TestOutco
         TestMode::Check => {
             let expected = load_summary(&output_dir);
             let diffs = diff_summaries(&expected, &summary);
-            if diffs.is_empty() {
+            let ok = diffs.is_empty();
+            check_rows.push(CheckRow {
+                battery: battery.to_string(),
+                expected: expected.clone(),
+                actual: summary.clone(),
+                ok,
+            });
+            if ok {
                 println!("   ✅ {battery}: OK");
                 Ok(TestOutcome::Passed)
             } else {
