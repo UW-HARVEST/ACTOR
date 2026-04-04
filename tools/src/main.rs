@@ -24,7 +24,7 @@ fn main() -> Result<()> {
             if !no_verify {
                 verify::run(&repo_root, &battery_name, case_filter.as_deref(), false, agent)?;
             }
-            test::run(&repo_root, &battery_name, true, agent)?;
+            test::run(&repo_root, &battery_name, test::TestMode::Update, agent)?;
         }
         Command::Translate {
             ref target,
@@ -44,9 +44,24 @@ fn main() -> Result<()> {
         Command::Test {
             ref target,
             update,
+            check,
         } => {
+            let mode = if update {
+                test::TestMode::Update
+            } else if check {
+                test::TestMode::Check
+            } else {
+                test::TestMode::Run
+            };
             let (battery_name, _) = parse_target(target, None);
-            test::run(&repo_root, &battery_name, update, agent)?;
+            let outcome = test::run(&repo_root, &battery_name, mode, agent)?;
+            if let test::TestOutcome::Failed(ref mismatches) = outcome {
+                eprintln!("\n❌ {} battery(ies) mismatched:", mismatches.len());
+                for m in mismatches {
+                    eprintln!("  {}: {}", m.battery, m.diffs.join("; "));
+                }
+                std::process::exit(1);
+            }
         }
     }
     Ok(())

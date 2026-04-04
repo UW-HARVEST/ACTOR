@@ -23,30 +23,24 @@ jobs:
           rustup toolchain install 1.94.0 --profile default
           rustup toolchain install nightly --profile default
           rustup default 1.94.0
-          cargo --version
-          rustc --version
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev cmake
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Fix cando2 paths for CI
-        run: |
-          CANDO2_PATH="$GITHUB_WORKSPACE/test-corpus/tools/cando2"
-          find results/ -path "*/runner/Cargo.toml" -exec sed -i "s|path = \".*cando2\"|path = \"$CANDO2_PATH\"|" {} +
+      - name: Build harvest-tools
+        run: cargo build --release --manifest-path tools/Cargo.toml
 
       - name: Validate c2rust translations
         env:
           CARGO_BUILD_JOBS: "2"
         run: |
           if [ -d results/c2rust ]; then
-            python3 scripts/validate.py --results-dir results/c2rust
-          else
-            echo "No c2rust results found, skipping"
+            ./tools/target/release/harvest-tools --agent c2rust test all --check
           fi
 
       - name: Validate kiro translations
@@ -54,9 +48,7 @@ jobs:
           CARGO_BUILD_JOBS: "2"
         run: |
           if [ -d results/kiro ]; then
-            python3 scripts/validate.py --results-dir results/kiro
-          else
-            echo "No kiro results found, skipping"
+            ./tools/target/release/harvest-tools --agent kiro test all --check
           fi
 
       - name: Validate claude translations
@@ -64,7 +56,5 @@ jobs:
           CARGO_BUILD_JOBS: "2"
         run: |
           if [ -d results/claude ]; then
-            python3 scripts/validate.py --results-dir results/claude
-          else
-            echo "No claude results found, skipping"
+            ./tools/target/release/harvest-tools --agent claude test all --check
           fi
