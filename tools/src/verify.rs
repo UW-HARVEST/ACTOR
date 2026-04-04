@@ -150,10 +150,11 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                 .replace("ALL_CONFIGURATIONS", configs_text);
 
             let _status = Command::new("bash")
-                .arg("-c")
-                .arg("timeout 2700 kiro-cli chat --no-interactive --trust-all-tools \"$PROMPT\" < /dev/null 2>&1 | tee \"$LOG\"")
-                .env("PROMPT", &prompt)
-                .env("LOG", &log_path)
+                .arg("-lc")
+                .arg(r#"timeout 2700 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
+                .arg("--")
+                .arg(&prompt)
+                .arg(&log_path)
                 .env("OPENSSL_DIR", &openssl_dir)
                 .current_dir(case_dir)
                 .status()

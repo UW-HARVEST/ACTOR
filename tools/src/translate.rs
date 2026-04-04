@@ -251,12 +251,11 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
     match paths.agent {
         Agent::Kiro => {
             let status = Command::new("bash")
-                .arg("-c")
-                .arg(format!(
-                    "set -o pipefail; timeout 1800 kiro-cli chat --no-interactive --trust-all-tools \"$PROMPT\" < /dev/null 2>&1 | tee \"$LOG\"",
-                ))
-                .env("PROMPT", prompt)
-                .env("LOG", &log_path)
+                .arg("-lc")
+                .arg(r#"set -o pipefail; timeout 1800 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
+                .arg("--")
+                .arg(prompt)
+                .arg(&log_path)
                 .env("OPENSSL_DIR", &openssl_dir)
                 .current_dir(&work_dir)
                 .status()

@@ -43,15 +43,9 @@ Your task:
 **This may be a large verification task.** If the project has more than one
 configuration or code path to verify, you MUST invoke subagents — do NOT try
 to verify everything in a single session. Create a plan, then for each subtask
-run:
-```
-kiro-cli chat --no-interactive --trust-all-tools \
-  '<detailed prompt for this subtask>' \
-  < /dev/null
-```
-Give each subagent a focused prompt covering a specific subset of the code or
-functionality to verify and fix. After each subagent completes, check that its
-fixes didn't break anything else.
+use the use_subagent tool with agent_name "kiro_plain" and a focused query
+covering a specific subset of the code or functionality to verify and fix.
+After each subagent completes, check that its fixes didn't break anything else.
 
 Add `libloading = "0.8"` to [dev-dependencies] in translated_rust/Cargo.toml.
 Do NOT modify anything in c_src/.
