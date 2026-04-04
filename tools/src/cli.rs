@@ -4,6 +4,7 @@ use clap::Parser;
 pub enum Agent {
     Kiro,
     Claude,
+    C2rust,
 }
 
 #[derive(Parser)]
