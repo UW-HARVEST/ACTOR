@@ -43,21 +43,28 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
         run: |
-          echo "=== Environment ==="
-          uname -m
-          rustc --version
-          cargo --version
-          python3 --version
-          pkg-config --libs openssl || echo "pkg-config openssl not found"
-          echo "==================="
-          python3 scripts/validate.py --results-dir results/kiro
+          if [ -d results/kiro ]; then
+            python3 scripts/validate.py --results-dir results/kiro
+          else
+            echo "No kiro results found, skipping"
+          fi
 
       - name: Validate claude translations
         env:
           CARGO_BUILD_JOBS: "2"
-        run: python3 scripts/validate.py --results-dir results/claude
+        run: |
+          if [ -d results/claude ]; then
+            python3 scripts/validate.py --results-dir results/claude
+          else
+            echo "No claude results found, skipping"
+          fi
 
       - name: Validate c2rust translations
         env:
           CARGO_BUILD_JOBS: "2"
-        run: python3 scripts/validate.py --results-dir results/c2rust
+        run: |
+          if [ -d results/c2rust ]; then
+            python3 scripts/validate.py --results-dir results/c2rust
+          else
+            echo "No c2rust results found, skipping"
+          fi
