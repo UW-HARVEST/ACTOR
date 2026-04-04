@@ -169,7 +169,7 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
     generate_workspace(&output_dir)?;
 
     // Run MIT runtests
-    let (summary, per_case) = run_runtests(paths, battery)?;
+    let (summary, per_case) = run_runtests(paths, battery, mode)?;
 
     // Print summary line
     let vt = summary.vectors_passed + summary.vectors_failed;
@@ -328,7 +328,7 @@ fn generate_workspace(output_dir: &Path) -> Result<()> {
 
 // ── Run runtests ───────────────────────────────────────────────────────
 
-fn run_runtests(paths: &Paths, battery: &str) -> Result<(Summary, HashMap<String, serde_json::Value>)> {
+fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary, HashMap<String, serde_json::Value>)> {
     let output_dir = paths.output_dir(battery);
     let scripts_dir = paths.corpus_dir.join("deployment/scripts/github-actions");
 
@@ -350,7 +350,9 @@ fn run_runtests(paths: &Paths, battery: &str) -> Result<(Summary, HashMap<String
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    print!("{text}");
+    if !matches!(mode, TestMode::Check) {
+        print!("{text}");
+    }
 
     let extract = |pattern: &str| -> usize {
         Regex::new(pattern)
