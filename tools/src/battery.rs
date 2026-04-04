@@ -276,6 +276,10 @@ impl Paths {
                 repo_root.join("results/claude"),
                 repo_root.join("scripts/prompts/claude"),
             ),
+            Agent::C2rust => (
+                repo_root.join("results/c2rust"),
+                repo_root.join("scripts/prompts"), // unused
+            ),
         };
         Self {
             corpus_dir: repo_root.join("test-corpus"),

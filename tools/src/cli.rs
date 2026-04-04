@@ -4,6 +4,7 @@ use clap::Parser;
 pub enum Agent {
     Kiro,
     Claude,
+    C2rust,
 }
 
 #[derive(Parser)]
@@ -51,6 +52,9 @@ pub enum Command {
         /// Update stored expected results
         #[arg(long)]
         update: bool,
+        /// CI mode: compare against stored summary.json, exit 1 on mismatch
+        #[arg(long, conflicts_with = "update")]
+        check: bool,
     },
 }
 

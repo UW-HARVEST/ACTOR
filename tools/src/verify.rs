@@ -228,6 +228,10 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                 std::fs::copy(work.join("Cargo.toml"), translated.join("Cargo.toml"))?;
             }
         }
+        Agent::C2rust => {
+            // c2rust is deterministic — no verification needed
+            return Ok(true);
+        }
     }
 
     Ok(true)

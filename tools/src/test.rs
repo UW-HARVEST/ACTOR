@@ -5,10 +5,41 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+// ── Types ──────────────────────────────────────────────────────────────
+
+/// How the test subcommand should behave after running tests.
+#[derive(Debug, Clone, Copy)]
+pub enum TestMode {
+    /// Just run and print results.
+    Run,
+    /// Run, then write summary.json / result.json.
+    Update,
+    /// Run, then compare against stored summary.json. Returns failure on mismatch.
+    Check,
+}
+
+/// Outcome of running tests for one or more batteries.
+#[derive(Debug)]
+pub enum TestOutcome {
+    /// All batteries matched their stored summaries (--check).
+    Passed,
+    /// At least one battery mismatched (--check).
+    Failed(Vec<BatteryMismatch>),
+    /// Summaries were written (--update) or just printed (run).
+    Ok,
+}
+
+#[derive(Debug)]
+pub struct BatteryMismatch {
+    pub battery: String,
+    pub diffs: Vec<String>,
+}
+
+/// Parsed runtests output for a single battery.
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct Summary {
     pub cases_tested: usize,
     pub cases_passed: usize,
@@ -18,91 +49,175 @@ pub struct Summary {
     pub failed_cases: Vec<String>,
 }
 
-pub fn run(repo_root: &Path, battery_name: &str, update: bool, agent: Agent) -> Result<()> {
+/// RAII guard that removes test_vectors/ and runner/ from result dirs on drop.
+struct TestArtifactGuard {
+    output_dir: PathBuf,
+}
+
+impl Drop for TestArtifactGuard {
+    fn drop(&mut self) {
+        let _ = cleanup_test_artifacts(&self.output_dir);
+    }
+}
+
+// ── Public API ─────────────────────────────────────────────────────────
+
+/// Entry point: run tests for one battery or all batteries.
+pub fn run(repo_root: &Path, target: &str, mode: TestMode, agent: Agent) -> Result<TestOutcome> {
     let paths = Paths::with_agent(repo_root, agent);
-    let output_dir = paths.output_dir(battery_name);
+
+    let batteries = if target == "all" {
+        discover_batteries(&paths.results_dir)?
+    } else {
+        vec![target.to_string()]
+    };
+
+    let mut all_mismatches = Vec::new();
+    let mut check_rows: Vec<CheckRow> = Vec::new();
+
+    for battery in &batteries {
+        let result = run_battery(&paths, battery, mode, &mut check_rows)?;
+        if let TestOutcome::Failed(ref mm) = result {
+            all_mismatches.extend(mm.iter().map(|m| BatteryMismatch {
+                battery: m.battery.clone(),
+                diffs: m.diffs.clone(),
+            }));
+        }
+    }
+
+    // Print recap table for --check mode
+    if matches!(mode, TestMode::Check) && !check_rows.is_empty() {
+        println!();
+        println!("========================================");
+        println!("  Check Summary");
+        println!("========================================");
+        println!("  {:<25} {:>15} {:>15}  {}", "Battery", "Stored", "Actual", "Status");
+        println!("  {}", "─".repeat(75));
+        for row in &check_rows {
+            let stored = format!("{}/{} ({}v)", row.expected.cases_passed, row.expected.cases_tested,
+                row.expected.vectors_passed);
+            let actual = format!("{}/{} ({}v)", row.actual.cases_passed, row.actual.cases_tested,
+                row.actual.vectors_passed);
+            let status = if row.ok { "✅" } else { "❌" };
+            println!("  {:<25} {:>15} {:>15}  {}", row.battery, stored, actual, status);
+        }
+        println!("========================================");
+    }
+
+    match mode {
+        TestMode::Check if !all_mismatches.is_empty() => Ok(TestOutcome::Failed(all_mismatches)),
+        TestMode::Check => Ok(TestOutcome::Passed),
+        _ => Ok(TestOutcome::Ok),
+    }
+}
+
+struct CheckRow {
+    battery: String,
+    expected: Summary,
+    actual: Summary,
+    ok: bool,
+}
+
+// ── Battery discovery ──────────────────────────────────────────────────
+
+fn discover_batteries(results_dir: &Path) -> Result<Vec<String>> {
+    let mut batteries = Vec::new();
+    if !results_dir.is_dir() {
+        return Ok(batteries);
+    }
+    for entry in std::fs::read_dir(results_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Must contain at least one case with translated_rust/
+        let has_cases = std::fs::read_dir(entry.path())?
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().join("translated_rust").is_dir());
+        if has_cases {
+            batteries.push(name);
+        }
+    }
+    batteries.sort();
+    Ok(batteries)
+}
+
+// ── Single battery ─────────────────────────────────────────────────────
+
+fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Vec<CheckRow>) -> Result<TestOutcome> {
+    let output_dir = paths.output_dir(battery);
+
+    if !output_dir.is_dir() {
+        println!("⚠️  {battery}: no results directory, skipping");
+        return Ok(TestOutcome::Ok);
+    }
 
     println!();
     println!("========================================");
-    println!("  Testing translations");
+    println!("  Testing: {battery}");
     println!("========================================");
 
-    // Copy test_vectors and runner from corpus
-    copy_test_artifacts(&paths, battery_name)?;
+    // Copy test infra from corpus (cleaned up by guard on drop)
+    copy_test_artifacts(paths, battery)?;
+    let _guard = TestArtifactGuard { output_dir: output_dir.clone() };
 
-    // Clean build artifacts to prevent stale cached binaries
+    // Clean stale build artifacts
     clean_targets(&output_dir)?;
 
     // Generate workspace Cargo.toml for lib runners
     generate_workspace(&output_dir)?;
 
     // Run MIT runtests
-    let (summary, per_case) = run_runtests(&paths, battery_name)?;
+    let (summary, per_case) = run_runtests(paths, battery, mode)?;
 
-    if update {
-        // Write per-case result.json
-        for (case_name, data) in &per_case {
-            let case_dir = output_dir.join(case_name);
-            if case_dir.is_dir() {
-                let result_path = case_dir.join("result.json");
-                let json = serde_json::to_string_pretty(data)?;
-                std::fs::write(&result_path, format!("{json}\n"))?;
-            }
-        }
-
-        // Write battery summary.json
-        let summary_path = output_dir.join("summary.json");
-        let json = serde_json::to_string_pretty(&summary)?;
-        std::fs::write(&summary_path, format!("{json}\n"))?;
-
-        let vt = summary.vectors_passed + summary.vectors_failed;
-        println!("   📝 Updated: {}/{} cases, {}/{vt} vectors",
-            summary.cases_passed, summary.cases_tested, summary.vectors_passed);
-    } else {
-        // Compare against stored
-        let expected = load_summary(&output_dir);
-        let evt = expected.vectors_passed + expected.vectors_failed;
-        let avt = summary.vectors_passed + summary.vectors_failed;
-        println!("   stored:  {}/{} cases, {}/{evt} vectors",
-            expected.cases_passed, expected.cases_tested, expected.vectors_passed);
-        println!("   actual:  {}/{} cases, {}/{avt} vectors",
-            summary.cases_passed, summary.cases_tested, summary.vectors_passed);
-
-        let errors = check_battery(&expected, &summary);
-        if errors.is_empty() {
-            println!("   ✅ OK");
-        } else {
-            println!("   ❌ MISMATCH: {}", errors.join("; "));
-        }
-    }
-
-    // Print overall summary
+    // Print summary line
     let vt = summary.vectors_passed + summary.vectors_failed;
     let pct = if vt > 0 {
         format!("{:.1}%", 100.0 * summary.vectors_passed as f64 / vt as f64)
     } else {
         "N/A".to_string()
     };
-    println!();
-    println!("========================================");
-    println!("  {battery_name}: {}/{} cases, {}/{vt} vectors ({pct})",
+    println!("  {battery}: {}/{} cases, {}/{vt} vectors ({pct})",
         summary.cases_passed, summary.cases_tested, summary.vectors_passed);
     println!("========================================");
 
-    Ok(())
-}
-
-fn clean_targets(output_dir: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(output_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() { continue; }
-        let target = entry.path().join("translated_rust/target");
-        if target.exists() {
-            std::fs::remove_dir_all(&target)?;
+    match mode {
+        TestMode::Update => {
+            write_results(&output_dir, battery, &summary, &per_case)?;
+            let vt = summary.vectors_passed + summary.vectors_failed;
+            println!("   📝 Updated: {}/{} cases, {}/{vt} vectors",
+                summary.cases_passed, summary.cases_tested, summary.vectors_passed);
+            Ok(TestOutcome::Ok)
+        }
+        TestMode::Check => {
+            let expected = load_summary(&output_dir);
+            let diffs = diff_summaries(&expected, &summary);
+            let ok = diffs.is_empty();
+            check_rows.push(CheckRow {
+                battery: battery.to_string(),
+                expected: expected.clone(),
+                actual: summary.clone(),
+                ok,
+            });
+            if ok {
+                println!("   ✅ {battery}: OK");
+                Ok(TestOutcome::Passed)
+            } else {
+                println!("   ❌ {battery}: MISMATCH: {}", diffs.join("; "));
+                Ok(TestOutcome::Failed(vec![BatteryMismatch {
+                    battery: battery.to_string(),
+                    diffs,
+                }]))
+            }
+        }
+        TestMode::Run => {
+            Ok(TestOutcome::Ok)
         }
     }
-    Ok(())
 }
+
+// ── Test artifact management ───────────────────────────────────────────
 
 fn copy_test_artifacts(paths: &Paths, battery: &str) -> Result<()> {
     let input_dir = paths.input_dir(battery);
@@ -152,6 +267,44 @@ fn copy_test_artifacts(paths: &Paths, battery: &str) -> Result<()> {
     Ok(())
 }
 
+fn cleanup_test_artifacts(output_dir: &Path) -> Result<()> {
+    if !output_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(output_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for subdir in ["test_vectors", "runner"] {
+            let path = entry.path().join(subdir);
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path)?;
+            }
+        }
+    }
+    // Remove workspace Cargo.toml generated for lib runners
+    let ws_toml = output_dir.join("Cargo.toml");
+    if ws_toml.exists() {
+        let _ = std::fs::remove_file(&ws_toml);
+    }
+    Ok(())
+}
+
+fn clean_targets(output_dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(output_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() { continue; }
+        let target = entry.path().join("translated_rust/target");
+        if target.exists() {
+            std::fs::remove_dir_all(&target)?;
+        }
+    }
+    Ok(())
+}
+
+// ── Workspace generation ───────────────────────────────────────────────
+
 fn generate_workspace(output_dir: &Path) -> Result<()> {
     let mut members = Vec::new();
     for entry in std::fs::read_dir(output_dir)? {
@@ -173,7 +326,9 @@ fn generate_workspace(output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_runtests(paths: &Paths, battery: &str) -> Result<(Summary, HashMap<String, serde_json::Value>)> {
+// ── Run runtests ───────────────────────────────────────────────────────
+
+fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary, HashMap<String, serde_json::Value>)> {
     let output_dir = paths.output_dir(battery);
     let scripts_dir = paths.corpus_dir.join("deployment/scripts/github-actions");
 
@@ -183,7 +338,8 @@ fn run_runtests(paths: &Paths, battery: &str) -> Result<(Summary, HashMap<String
     }
 
     let output = Command::new("python3")
-        .args(["-m", "runtests.rust", "--root", &output_dir.to_string_lossy(), "--subset", &output_dir.to_string_lossy(), "--keep-going"])
+        .args(["-m", "runtests.rust", "--root", &output_dir.to_string_lossy(),
+               "--subset", &output_dir.to_string_lossy(), "--keep-going", "--verbose"])
         .env("PYTHONPATH", &pythonpath)
         .current_dir(&paths.corpus_dir)
         .output()
@@ -194,9 +350,10 @@ fn run_runtests(paths: &Paths, battery: &str) -> Result<(Summary, HashMap<String
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    print!("{text}");
+    if !matches!(mode, TestMode::Check) {
+        print!("{text}");
+    }
 
-    // Parse summary
     let extract = |pattern: &str| -> usize {
         Regex::new(pattern)
             .ok()
@@ -214,10 +371,8 @@ fn run_runtests(paths: &Paths, battery: &str) -> Result<(Summary, HashMap<String
     let vectors_failed = extract(r"Test Vectors Failed:\s+(\d+)");
     let vectors_skipped = extract(r"Test Vectors Skipped:\s+(\d+)");
 
-    // cases_failed includes build failures (not in cases_tested), so compute from discovered
     let cases_passed = cases_discovered.saturating_sub(cases_failed + cases_skipped);
 
-    // Parse per-case failures
     let fail_re = Regex::new(r"^- (\S+): Test failed")?;
     let mut failed_cases: Vec<String> = Vec::new();
     for line in text.lines() {
@@ -230,7 +385,6 @@ fn run_runtests(paths: &Paths, battery: &str) -> Result<(Summary, HashMap<String
     }
     failed_cases.sort();
 
-    // Parse per-case results
     let exec_re = Regex::new(r"Executing (\S+)")?;
     let mut per_case = HashMap::new();
     for caps in exec_re.captures_iter(&text) {
@@ -247,16 +401,34 @@ fn run_runtests(paths: &Paths, battery: &str) -> Result<(Summary, HashMap<String
         );
     }
 
-    let summary = Summary {
+    Ok((Summary {
         cases_tested,
         cases_passed,
         vectors_passed,
         vectors_failed,
         vectors_skipped,
         failed_cases,
-    };
+    }, per_case))
+}
 
-    Ok((summary, per_case))
+// ── Summary I/O ────────────────────────────────────────────────────────
+
+fn write_results(
+    output_dir: &Path,
+    _battery: &str,
+    summary: &Summary,
+    per_case: &HashMap<String, serde_json::Value>,
+) -> Result<()> {
+    for (case_name, data) in per_case {
+        let case_dir = output_dir.join(case_name);
+        if case_dir.is_dir() {
+            let json = serde_json::to_string_pretty(data)?;
+            std::fs::write(case_dir.join("result.json"), format!("{json}\n"))?;
+        }
+    }
+    let json = serde_json::to_string_pretty(summary)?;
+    std::fs::write(output_dir.join("summary.json"), format!("{json}\n"))?;
+    Ok(())
 }
 
 fn load_summary(output_dir: &Path) -> Summary {
@@ -267,19 +439,26 @@ fn load_summary(output_dir: &Path) -> Summary {
         .unwrap_or_default()
 }
 
-fn check_battery(expected: &Summary, actual: &Summary) -> Vec<String> {
-    let mut errors = Vec::new();
-    if actual.vectors_passed != expected.vectors_passed {
-        errors.push(format!("vectors_passed: {} -> {}", expected.vectors_passed, actual.vectors_passed));
+fn diff_summaries(expected: &Summary, actual: &Summary) -> Vec<String> {
+    let mut diffs = Vec::new();
+    macro_rules! cmp {
+        ($field:ident) => {
+            if actual.$field != expected.$field {
+                diffs.push(format!("{}: {} → {}", stringify!($field), expected.$field, actual.$field));
+            }
+        };
     }
-    if actual.vectors_failed != expected.vectors_failed {
-        errors.push(format!("vectors_failed: {} -> {}", expected.vectors_failed, actual.vectors_failed));
+    cmp!(vectors_passed);
+    cmp!(vectors_failed);
+    cmp!(cases_passed);
+    cmp!(cases_tested);
+    let added: Vec<_> = actual.failed_cases.iter().filter(|c| !expected.failed_cases.contains(c)).collect();
+    let removed: Vec<_> = expected.failed_cases.iter().filter(|c| !actual.failed_cases.contains(c)).collect();
+    if !added.is_empty() {
+        diffs.push(format!("new failures: {}", added.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
     }
-    if actual.cases_passed != expected.cases_passed {
-        errors.push(format!("cases_passed: {} -> {}", expected.cases_passed, actual.cases_passed));
+    if !removed.is_empty() {
+        diffs.push(format!("no longer failing: {}", removed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
     }
-    if actual.cases_tested != expected.cases_tested {
-        errors.push(format!("cases_tested: {} -> {}", expected.cases_tested, actual.cases_tested));
-    }
-    errors
+    diffs
 }

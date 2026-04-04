@@ -33,11 +33,14 @@ pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>, agent: Ag
                     continue;
                 }
 
-                let prompt = match paths.agent {
-                    Agent::Claude => "translate.md",
-                    _ => if c.is_lib { "library.md" } else { "executable.md" },
+                let prompt_text = match paths.agent {
+                    Agent::C2rust => String::new(),
+                    Agent::Claude => std::fs::read_to_string(paths.prompts_dir.join("translate.md"))?,
+                    Agent::Kiro => {
+                        let f = if c.is_lib { "library.md" } else { "executable.md" };
+                        std::fs::read_to_string(paths.prompts_dir.join(f))?
+                    }
                 };
-                let prompt_text = std::fs::read_to_string(paths.prompts_dir.join(prompt))?;
 
                 let start = Instant::now();
                 match translate_case(&paths, battery_name, &c.name, &prompt_text) {
@@ -65,12 +68,11 @@ pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>, agent: Ag
                     println!("[{current}/{total}] ⏭️  {} (already done)", group.real_case);
                     translated += 1;
                 } else {
-                    let prompt_file = match paths.agent {
-                        Agent::Claude => "translate.md",
-                        _ => "configurable.md",
+                    let prompt_text = match paths.agent {
+                        Agent::C2rust => String::new(),
+                        Agent::Claude => std::fs::read_to_string(paths.prompts_dir.join("translate.md"))?,
+                        Agent::Kiro => std::fs::read_to_string(paths.prompts_dir.join("configurable.md"))?,
                     };
-                    let prompt_text =
-                        std::fs::read_to_string(paths.prompts_dir.join(prompt_file))?;
 
                     println!("[{current}/{total}] Translating: {} (shared-source, {} configs)", group.real_case, group.configs.len());
                     let start = Instant::now();
@@ -138,6 +140,7 @@ fn preflight_check(agent: Agent) -> Result<()> {
     let (cmd, version_args): (&str, &[&str]) = match agent {
         Agent::Kiro => ("kiro-cli", &["--version"]),
         Agent::Claude => ("claude", &["--version"]),
+        Agent::C2rust => ("c2rust", &["--version"]),
     };
 
     let output = Command::new("bash")
@@ -211,7 +214,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
             copy_dir_all(&input_test_case, &c_src)?;
             (translated, None)
         }
-        Agent::Claude => {
+        Agent::Claude | Agent::C2rust => {
             let tmp = tempfile::Builder::new()
                 .prefix("harvest-translate-")
                 .tempdir()
@@ -221,35 +224,33 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
             std::fs::create_dir_all(&c_src)?;
             copy_dir_all(&input_test_case, &c_src)?;
 
-            // Write sandbox settings to isolate Claude from the repo.
-            // - Sandbox denyRead blocks Bash commands (cat, find, etc.) from reading repo files
-            // - We omit Read/Glob/Grep from --allowedTools so Claude can only read via
-            //   sandboxed Bash (cat), which enforces the denyRead rules at OS level
-            let claude_dir = tmp.path().join(".claude");
-            std::fs::create_dir_all(&claude_dir)?;
-            let repo_root = paths.results_dir.parent().unwrap_or(Path::new("/"));
-            std::fs::write(
-                claude_dir.join("settings.json"),
-                serde_json::json!({
-                    "sandbox": {
-                        "enabled": true,
-                        "allowUnsandboxedCommands": false,
-                        "filesystem": {
-                            "denyRead": [repo_root.to_string_lossy()],
-                            "allowRead": [tmp.path().to_string_lossy()],
-                            "allowWrite": [tmp.path().to_string_lossy()]
+            if paths.agent == Agent::Claude {
+                let claude_dir = tmp.path().join(".claude");
+                std::fs::create_dir_all(&claude_dir)?;
+                let repo_root = paths.results_dir.parent().unwrap_or(Path::new("/"));
+                std::fs::write(
+                    claude_dir.join("settings.json"),
+                    serde_json::json!({
+                        "sandbox": {
+                            "enabled": true,
+                            "allowUnsandboxedCommands": false,
+                            "filesystem": {
+                                "denyRead": [repo_root.to_string_lossy()],
+                                "allowRead": [tmp.path().to_string_lossy()],
+                                "allowWrite": [tmp.path().to_string_lossy()]
+                            }
                         }
-                    }
-                }).to_string(),
-            )?;
+                    }).to_string(),
+                )?;
+            }
 
             (work, Some(tmp))
         }
     };
 
-    let status = match paths.agent {
+    match paths.agent {
         Agent::Kiro => {
-            Command::new("bash")
+            let status = Command::new("bash")
                 .arg("-c")
                 .arg(format!(
                     "set -o pipefail; timeout 1800 kiro-cli chat --no-interactive --trust-all-tools \"$PROMPT\" < /dev/null 2>&1 | tee \"$LOG\"",
@@ -259,12 +260,11 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
                 .env("OPENSSL_DIR", &openssl_dir)
                 .current_dir(&work_dir)
                 .status()
-                .context("invoking kiro-cli")?
+                .context("invoking kiro-cli")?;
+            let _ = status; // LLM may produce Cargo.toml even on non-zero exit
         }
         Agent::Claude => {
-            // Only allow Bash (sandboxed), Write, and Edit — no Read/Glob/Grep
-            // so Claude must use `cat` in Bash to read files, which is OS-level sandboxed
-            Command::new("bash")
+            let status = Command::new("bash")
                 .arg("-c")
                 .arg(format!(
                     "set -o pipefail; timeout 10800 claude -p \"$PROMPT\" \
@@ -279,16 +279,20 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
                 .env("OPENSSL_DIR", &openssl_dir)
                 .current_dir(&work_dir)
                 .status()
-                .context("invoking claude")?
+                .context("invoking claude")?;
+            let _ = status;
+        }
+        Agent::C2rust => {
+            c2rust_translate(&work_dir, &log_path)?;
         }
     };
 
     if !work_dir.join("Cargo.toml").exists() {
-        anyhow::bail!("no Cargo.toml produced (exit={})", status);
+        anyhow::bail!("no Cargo.toml produced");
     }
 
-    // For Claude: move results from temp dir back to the real output location
-    if paths.agent == Agent::Claude {
+    // For Claude/C2rust: move results from temp dir back to the real output location
+    if matches!(paths.agent, Agent::Claude | Agent::C2rust) {
         let translated = case_dir.join("translated_rust");
         if translated.exists() {
             std::fs::remove_dir_all(&translated)?;
@@ -351,6 +355,14 @@ fn propagate_config(
 
     // Copy Cargo.toml
     std::fs::copy(real_dir.join("Cargo.toml"), translated.join("Cargo.toml"))?;
+
+    // Copy root-level files (lib.rs, build.rs, rust-toolchain.toml, etc.)
+    for entry in std::fs::read_dir(&real_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && entry.file_name() != "Cargo.toml" {
+            std::fs::copy(entry.path(), translated.join(entry.file_name()))?;
+        }
+    }
 
     // Copy c_src if present
     let c_src_src = real_dir.join("c_src");
@@ -432,4 +444,106 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Deterministic C-to-Rust transpilation via c2rust.
+fn c2rust_translate(work_dir: &Path, log_path: &Path) -> Result<()> {
+    let c_src = work_dir.join("c_src");
+    let build_dir = c_src.join("build");
+    std::fs::create_dir_all(&build_dir)?;
+
+    let mut log = std::fs::File::create(log_path)?;
+    use std::io::Write;
+
+    // 1. cmake with compile_commands.json
+    let cmake_out = Command::new("cmake")
+        .args(["..", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"])
+        .current_dir(&build_dir)
+        .output()
+        .context("running cmake")?;
+    log.write_all(&cmake_out.stdout)?;
+    log.write_all(&cmake_out.stderr)?;
+    if !cmake_out.status.success() {
+        anyhow::bail!("cmake failed: {}", String::from_utf8_lossy(&cmake_out.stderr));
+    }
+
+    let cc_json = build_dir.join("compile_commands.json");
+    if !cc_json.exists() {
+        anyhow::bail!("cmake did not produce compile_commands.json");
+    }
+
+    // 2. c2rust transpile with --emit-build-files --binary main
+    let c2r_out = Command::new("c2rust")
+        .args([
+            "transpile",
+            "--emit-build-files",
+            "--binary", "main",
+            &cc_json.to_string_lossy(),
+            "--output-dir", &work_dir.to_string_lossy(),
+        ])
+        .output()
+        .context("running c2rust transpile")?;
+    log.write_all(&c2r_out.stdout)?;
+    log.write_all(&c2r_out.stderr)?;
+    if !c2r_out.status.success() {
+        anyhow::bail!("c2rust transpile failed: {}", String::from_utf8_lossy(&c2r_out.stderr));
+    }
+
+    // 3. Patch the generated Cargo.toml: rename binary to "driver", add libc/f128, add [workspace]
+    let cargo_path = work_dir.join("Cargo.toml");
+    if cargo_path.exists() {
+        let mut cargo = std::fs::read_to_string(&cargo_path)?;
+        cargo = cargo.replace("name = \"main\"", "name = \"driver\"");
+        cargo = cargo.replace("name = \"rust_out\"", "name = \"driver\"");
+        // Fix package/lib name from output dir name
+        let re = regex::Regex::new(r#"name = "translated_rust[^"]*""#).unwrap();
+        cargo = re.replace_all(&cargo, r#"name = "driver""#).into_owned();
+        // Also fix Rust source files that import the old crate name
+        for entry in walkdir(work_dir)? {
+            if entry.extension().map_or(false, |e| e == "rs") {
+                let content = std::fs::read_to_string(&entry)?;
+                if content.contains("translated_rust") {
+                    std::fs::write(&entry, content.replace("translated_rust", "driver"))?;
+                }
+            }
+        }
+        // Add deps if missing
+        if !cargo.contains("libc") {
+            cargo = cargo.replace("[dependencies]", "[dependencies]\nlibc = \"0.2\"");
+        }
+        if !cargo.contains("[workspace]") {
+            cargo.push_str("\n[workspace]\n");
+        }
+        std::fs::write(&cargo_path, cargo)?;
+    }
+
+    // Override rust-toolchain.toml to use latest nightly (c2rust pins an old one)
+    std::fs::write(work_dir.join("rust-toolchain.toml"), "[toolchain]\nchannel = \"nightly\"\n")?;
+
+    // 4. Try to build
+    let build_out = Command::new("cargo")
+        .args(["+nightly", "build", "--release"])
+        .current_dir(work_dir)
+        .output()
+        .context("cargo build")?;
+    log.write_all(&build_out.stdout)?;
+    log.write_all(&build_out.stderr)?;
+    writeln!(log, "\nc2rust translation {}", if build_out.status.success() { "succeeded" } else { "FAILED to compile" })?;
+
+    Ok(())
+}
+
+/// Walk a directory recursively, returning all file paths.
+fn walkdir(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(walkdir(&path)?);
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(files)
 }
