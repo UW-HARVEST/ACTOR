@@ -42,6 +42,20 @@ pub struct Battery {
 }
 
 /// Discover all cases in a battery, resolving symlinks to group shared-source cases.
+/// List all battery names available in the corpus.
+pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
+    let public_tests = corpus_dir.join("Public-Tests");
+    anyhow::ensure!(public_tests.is_dir(), "Public-Tests not found: {}", public_tests.display());
+
+    let mut batteries: Vec<String> = std::fs::read_dir(&public_tests)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    batteries.sort();
+    Ok(batteries)
+}
+
 pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> Result<Battery> {
     let input_dir = corpus_dir.join("Public-Tests").join(battery_name);
     anyhow::ensure!(input_dir.is_dir(), "Battery not found: {}", input_dir.display());

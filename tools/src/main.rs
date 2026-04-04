@@ -12,6 +12,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse_args();
     let repo_root = find_repo_root()?;
     let agent = cli.agent;
+    let paths = battery::Paths::with_agent(&repo_root, agent);
 
     match cli.command {
         Command::Run {
@@ -20,20 +21,24 @@ fn main() -> Result<()> {
             include_regex,
             parallel,
         } => {
-            let (battery_name, case_filter) = parse_target(target, include_regex.as_deref());
-            translate::run(&repo_root, &battery_name, case_filter.as_deref(), agent, parallel)?;
-            if !no_verify {
-                verify::run(&repo_root, &battery_name, case_filter.as_deref(), false, agent, parallel)?;
+            for battery_name in resolve_batteries(&paths, target, include_regex.as_deref())? {
+                let (name, filter) = parse_target(&battery_name, None);
+                translate::run(&repo_root, &name, filter.as_deref(), agent, parallel)?;
+                if !no_verify {
+                    verify::run(&repo_root, &name, filter.as_deref(), false, agent, parallel)?;
+                }
+                test::run(&repo_root, &name, test::TestMode::Update, agent)?;
             }
-            test::run(&repo_root, &battery_name, test::TestMode::Update, agent)?;
         }
         Command::Translate {
             ref target,
             include_regex,
             parallel,
         } => {
-            let (battery_name, case_filter) = parse_target(target, include_regex.as_deref());
-            translate::run(&repo_root, &battery_name, case_filter.as_deref(), agent, parallel)?;
+            for battery_name in resolve_batteries(&paths, target, include_regex.as_deref())? {
+                let (name, filter) = parse_target(&battery_name, None);
+                translate::run(&repo_root, &name, filter.as_deref(), agent, parallel)?;
+            }
         }
         Command::Verify {
             ref target,
@@ -41,8 +46,10 @@ fn main() -> Result<()> {
             force,
             parallel,
         } => {
-            let (battery_name, case_filter) = parse_target(target, include_regex.as_deref());
-            verify::run(&repo_root, &battery_name, case_filter.as_deref(), force, agent, parallel)?;
+            for battery_name in resolve_batteries(&paths, target, include_regex.as_deref())? {
+                let (name, filter) = parse_target(&battery_name, None);
+                verify::run(&repo_root, &name, filter.as_deref(), force, agent, parallel)?;
+            }
         }
         Command::Test {
             ref target,
@@ -56,6 +63,7 @@ fn main() -> Result<()> {
             } else {
                 test::TestMode::Run
             };
+            // test already handles "all" internally
             let (battery_name, _) = parse_target(target, None);
             let outcome = test::run(&repo_root, &battery_name, mode, agent)?;
             if let test::TestOutcome::Failed(ref mismatches) = outcome {
@@ -79,6 +87,18 @@ fn find_repo_root() -> Result<std::path::PathBuf> {
         if !dir.pop() {
             anyhow::bail!("Could not find repo root (looking for test-corpus/ and results/)");
         }
+    }
+}
+
+/// Resolve "all" to every battery in the corpus, or return the single target.
+fn resolve_batteries(paths: &battery::Paths, target: &str, include_regex: Option<&str>) -> Result<Vec<String>> {
+    if target == "all" {
+        battery::all_batteries(&paths.corpus_dir)
+    } else if target.contains('/') || include_regex.is_some() {
+        // Single case or filtered — pass through as-is
+        Ok(vec![target.to_string()])
+    } else {
+        Ok(vec![target.to_string()])
     }
 }
 
