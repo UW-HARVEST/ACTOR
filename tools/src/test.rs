@@ -353,6 +353,7 @@ fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary
     if !matches!(mode, TestMode::Check) {
         print!("{text}");
     }
+    let _ = std::fs::write(output_dir.join("test.log"), &text);
 
     let extract = |pattern: &str| -> usize {
         Regex::new(pattern)
