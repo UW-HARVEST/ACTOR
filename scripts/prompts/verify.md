@@ -26,7 +26,10 @@ Your task:
    supports. Each configuration may exercise completely different code paths.
 2. Build the C code as a shared library for the default configuration
 3. Write Rust integration tests (in translated_rust/tests/) that use `libloading`
-   to load the C .so and compare C vs Rust function outputs
+   to load BOTH the C .so AND the Rust .so, and compare their outputs through
+   the FFI boundary. Never call Rust functions directly — always load the Rust
+   .so via libloading and call its exported symbols, exactly as an external
+   caller would. This tests the `#[no_mangle]` export wrappers too.
 4. Start with the lowest-level functions and work upward to higher-level ones.
    Look at the C headers to identify the public API and function call hierarchy.
 5. For each function: create fixed test inputs, call both C and Rust versions,
