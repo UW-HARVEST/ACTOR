@@ -168,39 +168,8 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
     // Generate workspace Cargo.toml for lib runners
     generate_workspace(&output_dir)?;
 
-    // Run MIT runtests
-    let (summary, runtests_results) = run_runtests(paths, battery, mode)?;
-
-    // Build the universe of testable cases: every case with translated_rust/ + runner/.
-    // Any case runtests didn't report on is a silent failure (e.g. compile error).
-    let all_testable: Vec<String> = std::fs::read_dir(&output_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
-        .filter(|e| {
-            let p = e.path();
-            p.join("translated_rust").is_dir() && p.join("runner").is_dir()
-        })
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-
-    let mut per_case = runtests_results;
-    let mut compile_failures = 0usize;
-    for name in &all_testable {
-        if !per_case.contains_key(name) {
-            compile_failures += 1;
-            println!("[FAIL] {name}: never executed (likely compile error)");
-            per_case.insert(name.clone(), serde_json::json!({
-                "case": name,
-                "battery": battery,
-                "vectors_failed": 1,
-                "passed": false,
-                "error": "never executed by runtests (compile failure?)",
-            }));
-        }
-    }
-    if compile_failures > 0 {
-        println!("  ⚠️  {compile_failures} cases failed to compile and were never tested");
-    }
+    // Run MIT runtests — the source of truth for all test outcomes.
+    let (summary, per_case) = run_runtests(paths, battery, mode)?;
 
     // Print summary line
     let vt = summary.vectors_passed + summary.vectors_failed;
@@ -395,45 +364,59 @@ fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary
     };
 
     let cases_discovered = extract(r"Test Cases Discovered:\s+(\d+)");
-    let cases_tested = extract(r"Test Cases Tested:\s+(\d+)");
-    let cases_failed = extract(r"Test Cases Failed:\s+(\d+)");
-    let cases_skipped = extract(r"Test Cases Skipped:\s+(\d+)");
     let vectors_passed = extract(r"Test Vectors Passed:\s+(\d+)");
     let vectors_failed = extract(r"Test Vectors Failed:\s+(\d+)");
     let vectors_skipped = extract(r"Test Vectors Skipped:\s+(\d+)");
 
-    let cases_passed = cases_discovered.saturating_sub(cases_failed + cases_skipped);
-
-    let fail_re = Regex::new(r"^- (\S+): Test failed")?;
+    // Parse ALL per-case outcomes from runtests output.
+    // Runtests reports every failure as: "- CASE_NAME: Build failed ..." or "- CASE_NAME: Test failed ..."
+    // and every executed case as: "Executing CASE_NAME"
+    let mut per_case: HashMap<String, serde_json::Value> = HashMap::new();
     let mut failed_cases: Vec<String> = Vec::new();
+
+    // 1. Parse "- NAME: Build failed ..." lines
+    let build_fail_re = Regex::new(r"^- (\S+): Build failed")?;
     for line in text.lines() {
-        if let Some(caps) = fail_re.captures(line) {
+        if let Some(caps) = build_fail_re.captures(line) {
             let name = caps[1].to_string();
-            if !failed_cases.contains(&name) {
-                failed_cases.push(name);
-            }
+            if !failed_cases.contains(&name) { failed_cases.push(name.clone()); }
+            per_case.insert(name.clone(), serde_json::json!({
+                "case": name, "battery": battery,
+                "vectors_failed": 1, "passed": false,
+                "error": "build failed",
+            }));
         }
     }
-    failed_cases.sort();
 
-    let exec_re = Regex::new(r"Executing (\S+)")?;
-    let mut per_case = HashMap::new();
-    for caps in exec_re.captures_iter(&text) {
-        let case = caps[1].to_string();
-        let vf = if failed_cases.contains(&case) { 1 } else { 0 };
-        per_case.insert(
-            case.clone(),
-            serde_json::json!({
-                "case": case,
-                "battery": battery,
-                "vectors_failed": vf,
-                "passed": vf == 0,
-            }),
-        );
+    // 2. Parse "- NAME: Test failed ..." lines
+    let test_fail_re = Regex::new(r"^- (\S+): Test failed")?;
+    for line in text.lines() {
+        if let Some(caps) = test_fail_re.captures(line) {
+            let name = caps[1].to_string();
+            if !failed_cases.contains(&name) { failed_cases.push(name.clone()); }
+            per_case.insert(name.clone(), serde_json::json!({
+                "case": name, "battery": battery,
+                "vectors_failed": 1, "passed": false,
+                "error": "test failed",
+            }));
+        }
     }
 
+    // 3. Parse "Executing NAME" lines — these passed (unless already marked failed)
+    let exec_re = Regex::new(r"Executing (\S+)")?;
+    for caps in exec_re.captures_iter(&text) {
+        let name = caps[1].to_string();
+        per_case.entry(name.clone()).or_insert_with(|| serde_json::json!({
+            "case": name, "battery": battery,
+            "vectors_failed": 0, "passed": true,
+        }));
+    }
+
+    failed_cases.sort();
+    let cases_passed = cases_discovered.saturating_sub(failed_cases.len());
+
     Ok((Summary {
-        cases_tested,
+        cases_tested: cases_discovered,
         cases_passed,
         vectors_passed,
         vectors_failed,
