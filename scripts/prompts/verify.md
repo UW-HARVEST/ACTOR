@@ -21,32 +21,37 @@ Working directory: CASE_DIR_PLACEHOLDER
 - Find the resulting .so files in the build output
 
 Your task:
-1. First, check CMakeLists.txt for build-time configurability (cache variables)
-   and Cargo.toml for features. Identify ALL distinct configurations the project
-   supports. Each configuration may exercise completely different code paths.
-2. Build the C code as a shared library for the default configuration
-3. Write Rust integration tests (in translated_rust/tests/) that use `libloading`
-   to load BOTH the C .so AND the Rust .so, and compare their outputs through
-   the FFI boundary. Never call Rust functions directly — always load the Rust
-   .so via libloading and call its exported symbols, exactly as an external
-   caller would. This tests the `#[no_mangle]` export wrappers too.
-4. Start with the lowest-level functions and work upward to higher-level ones.
+1. Read Cargo.toml [features] and c_src/CMakeLists.txt to understand all
+   build-time configurations. Enumerate every valid feature combination.
+2. Run `cargo check --no-default-features --features <combo>` for EVERY
+   combination. Fix all compile errors before proceeding. Modules or code
+   that only apply to certain backends must use `#[cfg(feature = "...")]`.
+3. Build the C code as a shared library for the default configuration.
+4. Write Rust integration tests (in translated_rust/tests/) that use
+   `libloading` to load BOTH the C .so AND the Rust .so, and compare their
+   outputs through the FFI boundary. Never call Rust functions directly —
+   always load the Rust .so via libloading and call its exported symbols,
+   exactly as an external caller would. This tests the `#[no_mangle]`
+   export wrappers too.
+5. Start with the lowest-level functions and work upward to higher-level ones.
    Look at the C headers to identify the public API and function call hierarchy.
-5. For each function: create fixed test inputs, call both C and Rust versions,
-   assert outputs match byte-for-byte
-6. Run `cargo test` and investigate any mismatches
-7. When you find a Rust function that produces different output than C,
-   fix the Rust code in translated_rust/src/ and re-run until the test passes
-8. Keep going until all public functions match
-9. Compare `nm -D` on the C .so and the Rust .so. Every symbol the C .so
+6. For each function: create test inputs, call both C and Rust via their .so
+   exports, assert outputs match byte-for-byte.
+7. Run `cargo test` and fix any mismatches.
+8. Compare `nm -D` on the C .so and the Rust .so. Every symbol the C .so
    exports, the Rust .so must also export with the exact same name. This
    includes symbols created by preprocessor macros. If the C .so exports it,
    the Rust .so must export it — no exceptions. Add missing exports.
-10. If the project has a main binary, build and run BOTH the C and Rust binaries
-    for EVERY configuration identified in step 1. Compare stdout byte-for-byte.
-    Fix any differences in any configuration or in any code path. You will be
-    evaluated on every configuration possible. Do not stop after testing only
-    the default configuration.
+9. Repeat steps 6-8 for EVERY feature combination from step 1. Switch features
+   with `cargo test --no-default-features --features <combo>`. Each combination
+   may exercise completely different code paths.
+10. Do not declare success until every function matches under every feature
+    combination.
+
+**Tip:** Write shell loops or scripts to automate repetitive work. For example,
+to check all feature combinations: extract them from Cargo.toml, loop over them,
+and run `cargo check` for each. Same for running tests across combinations.
+Do not manually repeat commands for each configuration — automate it.
 
 **This may be a large verification task.** If the project has more than one
 configuration or code path to verify, you MUST invoke subagents — do NOT try
