@@ -2,6 +2,10 @@
 Translate the C code in c_src/ to Rust that produces **byte-identical output** for the same inputs.
 Write Cargo.toml and src/ files in the current directory (NOT in c_src/).
 
+You MUST translate ALL C source files — no stubs, no placeholders, no empty
+functions. Every .c file MUST have a complete Rust equivalent. The binary MUST
+produce the same stdout as the C binary for the same inputs.
+
 This project has **build-time configurability** via CMake cache variables.
 Look at c_src/CMakeLists.txt — it uses variables to select which source files
 to compile and which parameter headers to include at build time.
