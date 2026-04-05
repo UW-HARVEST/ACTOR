@@ -169,7 +169,38 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
     generate_workspace(&output_dir)?;
 
     // Run MIT runtests
-    let (summary, per_case) = run_runtests(paths, battery, mode)?;
+    let (summary, runtests_results) = run_runtests(paths, battery, mode)?;
+
+    // Build the universe of testable cases: every case with translated_rust/ + runner/.
+    // Any case runtests didn't report on is a silent failure (e.g. compile error).
+    let all_testable: Vec<String> = std::fs::read_dir(&output_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+        .filter(|e| {
+            let p = e.path();
+            p.join("translated_rust").is_dir() && p.join("runner").is_dir()
+        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+
+    let mut per_case = runtests_results;
+    let mut compile_failures = 0usize;
+    for name in &all_testable {
+        if !per_case.contains_key(name) {
+            compile_failures += 1;
+            println!("[FAIL] {name}: never executed (likely compile error)");
+            per_case.insert(name.clone(), serde_json::json!({
+                "case": name,
+                "battery": battery,
+                "vectors_failed": 1,
+                "passed": false,
+                "error": "never executed by runtests (compile failure?)",
+            }));
+        }
+    }
+    if compile_failures > 0 {
+        println!("  ⚠️  {compile_failures} cases failed to compile and were never tested");
+    }
 
     // Print summary line
     let vt = summary.vectors_passed + summary.vectors_failed;
