@@ -2,6 +2,11 @@
 You are testing a C-to-Rust translation for correctness. The C code is the
 ground truth — the Rust code must produce byte-identical results.
 
+The C implementation is ALWAYS correct. Never second-guess the C code's logic,
+even if it looks unusual or inconsistent. Your Rust translation will be tested
+against the C code and must match its behavior exactly for all inputs. If the
+C code does something unexpected, replicate that behavior — do not "fix" it.
+
 Working directory: CASE_DIR_PLACEHOLDER
 
 - `translated_rust/c_src/` contains the original C source code
