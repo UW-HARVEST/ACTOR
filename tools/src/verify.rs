@@ -1,7 +1,7 @@
 use crate::battery::{self, Case, Paths};
 use crate::cargo_toml;
 use crate::cli::Agent;
-use crate::translate::copy_dir_all;
+use crate::translate::{copy_dir_all, IsolatedWorkDir};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -142,13 +142,16 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
     let log_path = logs_dir.join("verify.log");
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
+    // Work in an isolated temp dir — agent sees no config-specific path names
+    let work = IsolatedWorkDir::new(case_dir)?;
+
+    let prompt = prompt_template
+        .replace("CASE_DIR_PLACEHOLDER", &work.root().to_string_lossy())
+        .replace("CMAKE_BUILD_FLAGS", cmake_flags)
+        .replace("ALL_CONFIGURATIONS", configs_text);
+
     match agent {
         Agent::Kiro => {
-            let prompt = prompt_template
-                .replace("CASE_DIR_PLACEHOLDER", &case_dir.to_string_lossy())
-                .replace("CMAKE_BUILD_FLAGS", cmake_flags)
-                .replace("ALL_CONFIGURATIONS", configs_text);
-
             let _status = Command::new("bash")
                 .arg("-lc")
                 .arg(r#"timeout 2700 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
@@ -156,22 +159,13 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                 .arg(&prompt)
                 .arg(&log_path)
                 .env("OPENSSL_DIR", &openssl_dir)
-                .current_dir(case_dir)
+                .current_dir(work.root())
                 .status()
                 .context("invoking kiro-cli for verification")?;
         }
         Agent::Claude => {
-            let tmp = tempfile::Builder::new()
-                .prefix("harvest-verify-")
-                .tempdir()
-                .context("creating isolated temp dir for verify")?;
-
-            // Copy translated_rust into temp dir
-            let work = tmp.path().join("translated_rust");
-            copy_dir_all(&translated, &work)?;
-
-            // Write sandbox settings
-            let claude_dir = tmp.path().join(".claude");
+            // Write sandbox settings in temp dir
+            let claude_dir = work.root().join(".claude");
             std::fs::create_dir_all(&claude_dir)?;
             let repo_root = case_dir.ancestors().nth(2).unwrap_or(Path::new("/"));
             std::fs::write(
@@ -182,16 +176,12 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                         "allowUnsandboxedCommands": false,
                         "filesystem": {
                             "denyRead": [repo_root.to_string_lossy()],
-                            "allowRead": [tmp.path().to_string_lossy()],
-                            "allowWrite": [tmp.path().to_string_lossy()]
+                            "allowRead": [work.root().to_string_lossy()],
+                            "allowWrite": [work.root().to_string_lossy()]
                         }
                     }
                 }).to_string(),
             )?;
-
-            let prompt = prompt_template
-                .replace("CMAKE_BUILD_FLAGS", cmake_flags)
-                .replace("ALL_CONFIGURATIONS", configs_text);
 
             let _status = Command::new("bash")
                 .arg("-c")
@@ -203,38 +193,17 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                 .env("PROMPT", &prompt)
                 .env("LOG", &log_path)
                 .env("OPENSSL_DIR", &openssl_dir)
-                .current_dir(&work)
+                .current_dir(work.translated_rust())
                 .status()
                 .context("invoking claude for verification")?;
-
-            // Copy verified results back
-            let dst_src = translated.join("src");
-            if dst_src.exists() {
-                std::fs::remove_dir_all(&dst_src)?;
-            }
-            copy_dir_all(&work.join("src"), &dst_src)?;
-
-            // Copy tests/ if created
-            let work_tests = work.join("tests");
-            if work_tests.is_dir() {
-                let dst_tests = translated.join("tests");
-                if dst_tests.exists() {
-                    std::fs::remove_dir_all(&dst_tests)?;
-                }
-                copy_dir_all(&work_tests, &dst_tests)?;
-            }
-
-            // Copy updated Cargo.toml (may have added libloading)
-            if work.join("Cargo.toml").exists() {
-                std::fs::copy(work.join("Cargo.toml"), translated.join("Cargo.toml"))?;
-            }
         }
         Agent::C2rust => {
-            // c2rust is deterministic — no verification needed
             return Ok(true);
         }
     }
 
+    // Copy verified results back (skips target/ and c_src/)
+    work.finish()?;
     Ok(true)
 }
 

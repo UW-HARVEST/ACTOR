@@ -2,7 +2,7 @@ use crate::battery::{self, Case, Paths};
 use crate::cargo_toml::{self, CargoToml};
 use crate::cli::Agent;
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Condvar, Mutex};
 use std::time::Instant;
@@ -288,14 +288,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
     let (work_dir, _tmp_guard) = match paths.agent {
-        Agent::Kiro => {
-            let translated = case_dir.join("translated_rust");
-            let c_src = translated.join("c_src");
-            std::fs::create_dir_all(&c_src)?;
-            copy_dir_all(&input_test_case, &c_src)?;
-            (translated, None)
-        }
-        Agent::Claude | Agent::C2rust => {
+        Agent::Kiro | Agent::Claude | Agent::C2rust => {
             let tmp = tempfile::Builder::new()
                 .prefix("harvest-translate-")
                 .tempdir()
@@ -333,7 +326,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
         Agent::Kiro => {
             let _status = Command::new("bash")
                 .arg("-lc")
-                .arg(r#"set -o pipefail; timeout 1800 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
+                .arg(r#"set -o pipefail; timeout 5400 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
                 .arg("--")
                 .arg(prompt)
                 .arg(&log_path)
@@ -363,13 +356,12 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
         anyhow::bail!("no Cargo.toml produced");
     }
 
-    if matches!(paths.agent, Agent::Claude | Agent::C2rust) {
-        let translated = case_dir.join("translated_rust");
-        if translated.exists() {
-            std::fs::remove_dir_all(&translated)?;
-        }
-        copy_dir_all(&work_dir, &translated)?;
+    // Copy from temp dir back to results
+    let translated = case_dir.join("translated_rust");
+    if translated.exists() {
+        std::fs::remove_dir_all(&translated)?;
     }
+    copy_dir_all(&work_dir, &translated)?;
 
     Ok(())
 }
@@ -507,6 +499,83 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Copy a directory tree, skipping top-level directories in `skip`.
+pub fn copy_dir_filtered(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)
+        .with_context(|| format!("reading dir {}", src.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let dst_path = dst.join(&name);
+        if entry.file_type()?.is_dir() {
+            if skip.iter().any(|s| *s == &*name_str) {
+                continue;
+            }
+            copy_dir_all(&entry.path(), &dst_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// RAII isolated working directory. Copies translated_rust/ into a temp dir,
+/// agent works there, `finish()` copies results back. Drop without finish
+/// discards the temp dir (safe on failure).
+pub struct IsolatedWorkDir {
+    tmp: tempfile::TempDir,
+    dest: PathBuf,
+    finished: bool,
+}
+
+impl IsolatedWorkDir {
+    pub fn new(case_dir: &Path) -> Result<Self> {
+        let tmp = tempfile::Builder::new()
+            .prefix("harvest-work-")
+            .tempdir()
+            .context("creating isolated work dir")?;
+        let src = case_dir.join("translated_rust");
+        if src.is_dir() {
+            copy_dir_filtered(&src, &tmp.path().join("translated_rust"), &["target"])?;
+        }
+        Ok(Self { tmp, dest: case_dir.to_owned(), finished: false })
+    }
+
+    /// Path the agent should work in.
+    pub fn translated_rust(&self) -> PathBuf {
+        self.tmp.path().join("translated_rust")
+    }
+
+    /// Path to the temp root (for setting current_dir).
+    pub fn root(&self) -> &Path {
+        self.tmp.path()
+    }
+
+    /// Copy results back to the case dir. Consumes self.
+    /// Skips target/ and c_src/ (kept from original).
+    pub fn finish(mut self) -> Result<()> {
+        let dst = self.dest.join("translated_rust");
+        // Copy back everything except target/ and c_src/ (those stay from original)
+        copy_dir_filtered(
+            &self.tmp.path().join("translated_rust"),
+            &dst,
+            &["target", "c_src"],
+        )?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for IsolatedWorkDir {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Agent failed — temp dir discarded, original untouched
+        }
+    }
 }
 
 // ── c2rust ─────────────────────────────────────────────────────────────
