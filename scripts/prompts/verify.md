@@ -46,9 +46,9 @@ Your task:
    with `cargo test --no-default-features --features <combo>`. Each combination
    may exercise completely different code paths.
 10. Do not declare success until every function matches under every feature
-    combination. This code is shared across ALL configurations — not just the
-    one suggested by the directory name. You must build and test against C for
-    every backend and parameter set, not just the default.
+    combination. This code is shared across ALL configurations — you must
+    build and test against C for every backend and parameter set, not just
+    the default.
 
 **Tip:** Write shell loops or scripts to automate repetitive work. For example,
 to check all feature combinations: extract them from Cargo.toml, loop over them,
