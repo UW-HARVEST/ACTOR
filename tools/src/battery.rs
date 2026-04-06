@@ -59,8 +59,10 @@ pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
 // ── CRUST-bench project (validated newtype) ────────────────────────────
 
 const CRUST_SKIP: &[&str] = &[
-    "Genetic_neural_network_for_simple_control", // 50K-gen training loop, always times out
-    "Holdem_Odds", // contradictory tests, see https://github.com/anirudhkhatry/CRUST-bench/issues/37
+    "Genetic_neural_network_for_simple_control", // C test >120s with -O2, https://github.com/anirudhkhatry/CRUST-bench/issues/40
+    "Holdem_Odds", // contradictory tests, https://github.com/anirudhkhatry/CRUST-bench/issues/37
+    "bitset", // test uses bs.test() but C checks raw bits, https://github.com/anirudhkhatry/CRUST-bench/issues/41
+    "clog", // THIS_FILE hardcodes C filename, https://github.com/anirudhkhatry/CRUST-bench/issues/39
 ];
 
 /// A validated CRUST project. Can only be constructed through `discover()` or

@@ -130,8 +130,16 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
         }
         total += 1;
 
+        // Clean up test artifacts left by translation runs
+        for artifact in [".vsync"] {
+            let p = proj_dir.join(artifact);
+            if p.exists() { let _ = std::fs::remove_dir_all(&p); }
+        }
+
+        let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
         let output = Command::new("timeout")
             .args(["60", "cargo", "test"])
+            .env("OPENSSL_DIR", &openssl_dir)
             .current_dir(&proj_dir)
             .output()
             .with_context(|| format!("running cargo test in {}", proj_dir.display()))?;

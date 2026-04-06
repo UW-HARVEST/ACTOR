@@ -554,6 +554,24 @@ fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject) -> 
         .context("reading crust.md prompt")?;
 
     copy_dir_all(project.scaffold(), &work)?;
+    // Move interfaces/*.rs → src/ (matches CRUST-bench's format_into_compilable_rust)
+    // Skip main.rs — it conflicts with Cargo's binary crate detection
+    let interfaces = work.join("src/interfaces");
+    if interfaces.is_dir() {
+        let src = work.join("src");
+        for entry in std::fs::read_dir(&interfaces)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == "main.rs" { continue; }
+            if entry.path().extension().map_or(false, |e| e == "rs") {
+                std::fs::rename(entry.path(), src.join(&name))?;
+            }
+        }
+        // Don't remove interfaces/ if main.rs remains
+        if std::fs::read_dir(&interfaces)?.next().is_none() {
+            std::fs::remove_dir(&interfaces)?;
+        }
+    }
     let c_dst = work.join("c_src");
     std::fs::create_dir_all(&c_dst)?;
     copy_dir_all(project.c_source(), &c_dst)?;
@@ -564,7 +582,7 @@ fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject) -> 
         Agent::Kiro => {
             let _status = Command::new("bash")
                 .arg("-lc")
-                .arg(r#"set -o pipefail; timeout 5400 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
+                .arg(r#"set -o pipefail; timeout 1800 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
                 .arg("--")
                 .arg(&prompt)
                 .arg(&log_path)
@@ -605,9 +623,16 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         .with_context(|| format!("reading dir {}", src.display()))?
     {
         let entry = entry?;
-        let ty = entry.file_type()?;
         let dst_path = dst.join(entry.file_name());
-        if ty.is_dir() {
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            let target = std::fs::metadata(entry.path());
+            match target {
+                Ok(m) if m.is_dir() => copy_dir_all(&entry.path(), &dst_path)?,
+                Ok(_) => { std::fs::copy(entry.path(), &dst_path)?; }
+                Err(_) => continue, // dangling symlink
+            }
+        } else if ft.is_dir() {
             copy_dir_all(&entry.path(), &dst_path)?;
         } else {
             std::fs::copy(entry.path(), &dst_path)?;
@@ -626,7 +651,20 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         let dst_path = dst.join(&name);
-        if entry.file_type()?.is_dir() {
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            // Resolve symlink: if target is dir, recurse; if file, copy target
+            let target = std::fs::metadata(entry.path());
+            match target {
+                Ok(m) if m.is_dir() => {
+                    if !skip.iter().any(|s| *s == &*name_str) {
+                        copy_dir_all(&entry.path(), &dst_path)?;
+                    }
+                }
+                Ok(_) => { std::fs::copy(entry.path(), &dst_path)?; }
+                Err(_) => continue, // dangling symlink, skip
+            }
+        } else if ft.is_dir() {
             if skip.iter().any(|s| *s == &*name_str) {
                 continue;
             }
