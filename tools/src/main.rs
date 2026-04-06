@@ -6,13 +6,12 @@ mod translate;
 mod verify;
 
 use anyhow::Result;
-use cli::{Cli, Command};
+use cli::{Cli, Command, Dataset, TranslatePlan, VerifyPlan, TestPlan};
 
 fn main() -> Result<()> {
     let cli = Cli::parse_args();
     let repo_root = find_repo_root()?;
     let agent = cli.agent;
-    let paths = battery::Paths::with_agent(&repo_root, agent);
 
     match cli.command {
         Command::Run {
@@ -20,25 +19,36 @@ fn main() -> Result<()> {
             no_verify,
             include_regex,
             parallel,
+            limit,
         } => {
-            for battery_name in resolve_batteries(&paths, target, include_regex.as_deref())? {
-                let (name, filter) = parse_target(&battery_name, None);
-                translate::run(&repo_root, &name, filter.as_deref(), agent, parallel)?;
-                if !no_verify {
-                    verify::run(&repo_root, &name, filter.as_deref(), false, agent, parallel)?;
-                }
-                test::run(&repo_root, &name, test::TestMode::Update, agent)?;
-            }
+            let dataset = Dataset::detect(target);
+            let paths = battery::Paths::new(&repo_root, agent, dataset);
+            let inner = Dataset::strip_prefix(target);
+
+            let tp = make_translate_plan(&paths, inner, include_regex.as_deref(), parallel, limit)?;
+            let vp = if no_verify || dataset == Dataset::Crust {
+                VerifyPlan::Skip
+            } else {
+                make_verify_plan(&paths, inner, include_regex.as_deref(), parallel, false)?
+            };
+            let test_p = make_test_plan(&paths, inner, test::TestMode::Update)?;
+
+            execute_translate(&paths, &tp)?;
+            execute_verify(&repo_root, &paths, &vp)?;
+            execute_test(&paths, &test_p)?;
         }
         Command::Translate {
             ref target,
             include_regex,
             parallel,
+            limit,
         } => {
-            for battery_name in resolve_batteries(&paths, target, include_regex.as_deref())? {
-                let (name, filter) = parse_target(&battery_name, None);
-                translate::run(&repo_root, &name, filter.as_deref(), agent, parallel)?;
-            }
+            let dataset = Dataset::detect(target);
+            let paths = battery::Paths::new(&repo_root, agent, dataset);
+            let inner = Dataset::strip_prefix(target);
+
+            let plan = make_translate_plan(&paths, inner, include_regex.as_deref(), parallel, limit)?;
+            execute_translate(&paths, &plan)?;
         }
         Command::Verify {
             ref target,
@@ -46,16 +56,21 @@ fn main() -> Result<()> {
             force,
             parallel,
         } => {
-            for battery_name in resolve_batteries(&paths, target, include_regex.as_deref())? {
-                let (name, filter) = parse_target(&battery_name, None);
-                verify::run(&repo_root, &name, filter.as_deref(), force, agent, parallel)?;
-            }
+            let dataset = Dataset::detect(target);
+            let paths = battery::Paths::new(&repo_root, agent, dataset);
+            let inner = Dataset::strip_prefix(target);
+
+            let plan = make_verify_plan(&paths, inner, include_regex.as_deref(), parallel, force)?;
+            execute_verify(&repo_root, &paths, &plan)?;
         }
         Command::Test {
             ref target,
             update,
             check,
         } => {
+            let dataset = Dataset::detect(target);
+            let paths = battery::Paths::new(&repo_root, agent, dataset);
+            let inner = Dataset::strip_prefix(target);
             let mode = if update {
                 test::TestMode::Update
             } else if check {
@@ -63,9 +78,9 @@ fn main() -> Result<()> {
             } else {
                 test::TestMode::Run
             };
-            // test already handles "all" internally
-            let (battery_name, _) = parse_target(target, None);
-            let outcome = test::run(&repo_root, &battery_name, mode, agent)?;
+
+            let plan = make_test_plan(&paths, inner, mode)?;
+            let outcome = execute_test(&paths, &plan)?;
             if let test::TestOutcome::Failed(ref mismatches) = outcome {
                 eprintln!("\n❌ {} battery(ies) mismatched:", mismatches.len());
                 for m in mismatches {
@@ -76,6 +91,103 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ── Plan constructors ──────────────────────────────────────────────────
+
+fn make_translate_plan(
+    paths: &battery::Paths, target: &str, include_regex: Option<&str>,
+    parallel: usize, limit: Option<usize>,
+) -> Result<TranslatePlan> {
+    match paths.dataset {
+        Dataset::TestCorpus => {
+            let batteries = resolve_batteries(&paths.corpus_dir, target)?;
+            Ok(TranslatePlan::TestCorpus { batteries, parallel })
+        }
+        Dataset::Crust => Ok(TranslatePlan::Crust {
+            target: target.to_string(), parallel, limit,
+        }),
+    }
+}
+
+fn make_verify_plan(
+    paths: &battery::Paths, target: &str, _include_regex: Option<&str>,
+    parallel: usize, force: bool,
+) -> Result<VerifyPlan> {
+    match paths.dataset {
+        Dataset::TestCorpus => {
+            let batteries = resolve_batteries(&paths.corpus_dir, target)?;
+            Ok(VerifyPlan::TestCorpus { batteries, parallel, force })
+        }
+        Dataset::Crust => Ok(VerifyPlan::Skip),
+    }
+}
+
+fn make_test_plan(
+    paths: &battery::Paths, target: &str, mode: test::TestMode,
+) -> Result<TestPlan> {
+    match paths.dataset {
+        Dataset::TestCorpus => {
+            let batteries = resolve_batteries(&paths.corpus_dir, target)?;
+            Ok(TestPlan::TestCorpus { batteries, mode })
+        }
+        Dataset::Crust => Ok(TestPlan::Crust {
+            target: target.to_string(), mode,
+        }),
+    }
+}
+
+fn resolve_batteries(corpus_dir: &std::path::Path, target: &str) -> Result<Vec<String>> {
+    if target == "all" {
+        battery::all_batteries(corpus_dir)
+    } else {
+        Ok(vec![target.to_string()])
+    }
+}
+
+// ── Plan executors ─────────────────────────────────────────────────────
+
+fn execute_translate(paths: &battery::Paths, plan: &TranslatePlan) -> Result<()> {
+    match plan {
+        TranslatePlan::TestCorpus { batteries, parallel } => {
+            for bat in batteries {
+                let (name, filter) = parse_target(bat, None);
+                translate::run_test_corpus(paths, &name, filter.as_deref(), *parallel)?;
+            }
+        }
+        TranslatePlan::Crust { target, parallel, limit } => {
+            translate::run_crust(paths, target, *parallel, *limit)?;
+        }
+    }
+    Ok(())
+}
+
+fn execute_verify(repo_root: &std::path::Path, paths: &battery::Paths, plan: &VerifyPlan) -> Result<()> {
+    match plan {
+        VerifyPlan::TestCorpus { batteries, parallel, force } => {
+            for bat in batteries {
+                let (name, filter) = parse_target(bat, None);
+                verify::run(repo_root, paths, &name, filter.as_deref(), *force, *parallel)?;
+            }
+        }
+        VerifyPlan::Skip => {}
+    }
+    Ok(())
+}
+
+fn execute_test(paths: &battery::Paths, plan: &TestPlan) -> Result<test::TestOutcome> {
+    match plan {
+        TestPlan::TestCorpus { batteries, mode } => {
+            for bat in batteries {
+                test::run_test_corpus(paths, bat, *mode)?;
+            }
+            // TODO: aggregate outcomes properly
+            Ok(test::TestOutcome::Ok)
+        }
+        TestPlan::Crust { target, mode } => {
+            test::run_crust_test(paths, target, *mode)
+        }
+    }
 }
 
 fn find_repo_root() -> Result<std::path::PathBuf> {
@@ -90,15 +202,18 @@ fn find_repo_root() -> Result<std::path::PathBuf> {
     }
 }
 
-/// Resolve "all" to every battery in the corpus, or return the single target.
-fn resolve_batteries(paths: &battery::Paths, target: &str, include_regex: Option<&str>) -> Result<Vec<String>> {
-    if target == "all" {
-        battery::all_batteries(&paths.corpus_dir)
-    } else if target.contains('/') || include_regex.is_some() {
-        // Single case or filtered — pass through as-is
-        Ok(vec![target.to_string()])
-    } else {
-        Ok(vec![target.to_string()])
+/// Resolve "all" / "CRUST" to every target, or return the single target.
+fn resolve_targets(paths: &battery::Paths, target: &str, _include_regex: Option<&str>) -> Result<Vec<String>> {
+    match paths.dataset {
+        cli::Dataset::TestCorpus => {
+            if target == "all" {
+                battery::all_batteries(&paths.corpus_dir)
+            } else {
+                Ok(vec![target.to_string()])
+            }
+        }
+        // CRUST: pass target through as-is — run_crust handles discovery/limit/parallel
+        cli::Dataset::Crust => Ok(vec![target.to_string()]),
     }
 }
 

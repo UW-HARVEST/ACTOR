@@ -50,9 +50,8 @@ struct CaseResult {
 
 // ── Public entry point ─────────────────────────────────────────────────
 
-pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>, agent: Agent, parallel: usize) -> Result<()> {
-    let paths = Paths::with_agent(repo_root, agent);
-    preflight_check(agent)?;
+pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, parallel: usize) -> Result<()> {
+    preflight_check(paths.agent)?;
 
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
@@ -480,6 +479,142 @@ fn count_cases(battery: &battery::Battery) -> usize {
         Case::Independent(_) => 1,
         Case::SharedSource(g) => 1 + g.configs.len(),
     }).sum()
+}
+
+// ── CRUST-bench translation ────────────────────────────────────────────
+
+pub fn run_crust(paths: &Paths, project: &str, parallel: usize, limit: Option<usize>) -> Result<()> {
+    let mut projects: Vec<String> = if project == "all" || project.eq_ignore_ascii_case("crust") {
+        battery::all_crust_projects(&paths.corpus_dir)?
+    } else {
+        vec![project.to_string()]
+    };
+
+    if let Some(n) = limit {
+        projects.truncate(n);
+    }
+
+    let total = projects.len();
+    let sem = Semaphore::new(parallel);
+
+    let results: Vec<CaseResult> = std::thread::scope(|s| {
+        let handles: Vec<_> = projects.iter().map(|p| {
+            s.spawn(|| {
+                let _permit = sem.acquire();
+                translate_one_crust(paths, p)
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut translated = 0usize;
+    let mut failed = 0usize;
+    for (i, r) in results.iter().enumerate() {
+        let n = i + 1;
+        if r.skipped {
+            translated += 1;
+            println!("[{n}/{total}] ⏭️  {} (already done)", r.name);
+        } else if r.success {
+            translated += 1;
+            println!("[{n}/{total}] ✅ {} ({}s)", r.name, r.elapsed_secs);
+        } else {
+            failed += 1;
+            let err = r.error.as_deref().unwrap_or("unknown");
+            println!("[{n}/{total}] ❌ {} — {err} ({}s)", r.name, r.elapsed_secs);
+        }
+    }
+
+    println!("\nDone: {translated}/{total} translated, {failed} failed");
+    Ok(())
+}
+
+fn translate_one_crust(paths: &Paths, project: &str) -> CaseResult {
+    match translate_one_crust_inner(paths, project) {
+        Ok(r) => r,
+        Err(e) => CaseResult {
+            name: project.to_string(),
+            elapsed_secs: 0,
+            success: false,
+            error: Some(e.to_string()),
+            skipped: false,
+        },
+    }
+}
+
+fn translate_one_crust_inner(paths: &Paths, project: &str) -> Result<CaseResult> {
+    let out = paths.output_dir(project);
+
+    if out.join("Cargo.toml").exists() {
+        return Ok(CaseResult { name: project.into(), elapsed_secs: 0, success: true, error: None, skipped: true });
+    }
+
+    let scaffold = paths.scaffold_dir(project);
+    let c_source = paths.input_dir(project);
+    anyhow::ensure!(scaffold.is_dir(), "RBench scaffold not found: {}", scaffold.display());
+    anyhow::ensure!(c_source.is_dir(), "CBench source not found: {}", c_source.display());
+
+    let logs_dir = out.join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    let log_path = logs_dir.join("translation.log");
+
+    let prompt = std::fs::read_to_string(paths.prompts_dir.join("crust.md"))
+        .context("reading crust.md prompt")?;
+
+    let tmp = tempfile::Builder::new()
+        .prefix("harvest-crust-")
+        .tempdir()
+        .context("creating temp dir for CRUST")?;
+    let work = tmp.path().join("project");
+
+    copy_dir_all(&scaffold, &work)?;
+    let c_dst = work.join("c_src");
+    std::fs::create_dir_all(&c_dst)?;
+    copy_dir_all(&c_source, &c_dst)?;
+
+    let start = Instant::now();
+
+    match paths.agent {
+        Agent::Kiro => {
+            let _status = Command::new("bash")
+                .arg("-lc")
+                .arg(r#"set -o pipefail; timeout 5400 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
+                .arg("--")
+                .arg(&prompt)
+                .arg(&log_path)
+                .current_dir(&work)
+                .status()
+                .context("invoking kiro-cli for CRUST")?;
+        }
+        Agent::Claude => {
+            let _status = Command::new("bash")
+                .arg("-lc")
+                .arg(r#"set -o pipefail; timeout 10800 claude -p "$1" --allowedTools 'Bash(*)' 'Write' 'Edit' --max-turns 50 --verbose --output-format stream-json < /dev/null 2>&1 | tee "$2""#)
+                .arg("--")
+                .arg(&prompt)
+                .arg(&log_path)
+                .current_dir(&work)
+                .status()
+                .context("invoking claude for CRUST")?;
+        }
+        Agent::C2rust => anyhow::bail!("c2rust not supported for CRUST-bench"),
+    }
+
+    let elapsed = start.elapsed().as_secs();
+
+    if out.exists() {
+        std::fs::remove_dir_all(&out)?;
+    }
+    std::fs::create_dir_all(&out)?;
+    copy_dir_filtered(&work, &out, &["target", "c_src"])?;
+    std::fs::create_dir_all(out.join("logs"))?;
+    if log_path.exists() {
+        std::fs::copy(&log_path, out.join("logs/translation.log"))?;
+    }
+    copy_dir_all(&c_dst, &out.join("c_src"))?;
+
+    let success = out.join("Cargo.toml").exists();
+    write_translation_metrics(&out, paths.agent, elapsed, success);
+    Ok(CaseResult { name: project.into(), elapsed_secs: elapsed, success, error: None, skipped: false })
 }
 
 // ── Utilities ──────────────────────────────────────────────────────────

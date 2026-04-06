@@ -6,8 +6,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 
-pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>, force: bool, agent: Agent, _parallel: usize) -> Result<()> {
-    let paths = Paths::with_agent(repo_root, agent);
+pub fn run(repo_root: &Path, paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, _parallel: usize) -> Result<()> {
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
     let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))?;
@@ -46,7 +45,7 @@ pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>, force: bo
 
                 println!("[{current}/{total}] 🔬 {}", c.name);
                 let cmake_flags = get_cmake_flags(&paths, battery_name, &c.name);
-                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", agent)?;
+                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths.agent)?;
 
                 if ok {
                     verified += 1;
@@ -71,7 +70,7 @@ pub fn run(repo_root: &Path, battery_name: &str, filter: Option<&str>, force: bo
                     println!("[{current}/{total}] 🔬 {} (shared-source, {} configs)", group.real_case, group.configs.len());
                     let cmake_flags = get_cmake_flags(&paths, battery_name, &group.real_case);
                     let configs_text = build_configs_text(&paths, battery_name, group);
-                    let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, agent)?;
+                    let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, paths.agent)?;
 
                     if ok {
                         verified += 1;

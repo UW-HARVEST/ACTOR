@@ -1,4 +1,4 @@
-use crate::cli::Agent;
+use crate::cli::{Agent, Dataset};
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::collections::HashMap;
@@ -54,6 +54,37 @@ pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
         .collect();
     batteries.sort();
     Ok(batteries)
+}
+
+/// List all CRUST-bench project names (from RBench, which has canonical names).
+pub fn all_crust_projects(crust_datasets_dir: &Path) -> Result<Vec<String>> {
+    let rbench = crust_datasets_dir.join("RBench");
+    anyhow::ensure!(rbench.is_dir(), "RBench not found: {}", rbench.display());
+
+    let mut projects: Vec<String> = std::fs::read_dir(&rbench)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    projects.sort();
+    Ok(projects)
+}
+
+/// Resolve RBench project name to CBench directory (handles underscore/hyphen + proj_ prefix).
+pub fn cbench_dir(crust_datasets_dir: &Path, project: &str) -> Option<PathBuf> {
+    let cbench = crust_datasets_dir.join("CBench");
+    // Try exact
+    let exact = cbench.join(project);
+    if exact.is_dir() { return Some(exact); }
+    // Try underscores → hyphens
+    let hyph = cbench.join(project.replace('_', "-"));
+    if hyph.is_dir() { return Some(hyph); }
+    // Try strip proj_ prefix + underscores → hyphens
+    if let Some(stripped) = project.strip_prefix("proj_") {
+        let stripped_hyph = cbench.join(stripped.replace('_', "-"));
+        if stripped_hyph.is_dir() { return Some(stripped_hyph); }
+    }
+    None
 }
 
 pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> Result<Battery> {
@@ -273,38 +304,43 @@ pub struct Paths {
     pub results_dir: PathBuf,
     pub prompts_dir: PathBuf,
     pub agent: Agent,
+    pub dataset: Dataset,
 }
 
 impl Paths {
-    pub fn new(repo_root: &Path) -> Self {
-        Self::with_agent(repo_root, Agent::Kiro)
-    }
-
-    pub fn with_agent(repo_root: &Path, agent: Agent) -> Self {
-        let (results_dir, prompts_dir) = match agent {
-            Agent::Kiro => (
-                repo_root.join("results/kiro"),
-                repo_root.join("scripts/prompts"),
+    pub fn new(repo_root: &Path, agent: Agent, dataset: Dataset) -> Self {
+        let agent_name = match agent {
+            Agent::Kiro => "kiro",
+            Agent::Claude => "claude",
+            Agent::C2rust => "c2rust",
+        };
+        let (corpus_dir, results_dir) = match dataset {
+            Dataset::TestCorpus => (
+                repo_root.join("test-corpus"),
+                repo_root.join("results/Test-Corpus").join(agent_name),
             ),
-            Agent::Claude => (
-                repo_root.join("results/claude"),
-                repo_root.join("scripts/prompts/claude"),
-            ),
-            Agent::C2rust => (
-                repo_root.join("results/c2rust"),
-                repo_root.join("scripts/prompts"), // unused
+            Dataset::Crust => (
+                repo_root.join("crust-bench/datasets"),
+                repo_root.join("results/CRUST").join(agent_name),
             ),
         };
-        Self {
-            corpus_dir: repo_root.join("test-corpus"),
-            results_dir,
-            prompts_dir,
-            agent,
-        }
+        let prompts_dir = match agent {
+            Agent::Claude => repo_root.join("scripts/prompts/claude"),
+            _ => repo_root.join("scripts/prompts"),
+        };
+        Self { corpus_dir, results_dir, prompts_dir, agent, dataset }
     }
 
     pub fn input_dir(&self, battery: &str) -> PathBuf {
-        self.corpus_dir.join("Public-Tests").join(battery)
+        match self.dataset {
+            Dataset::TestCorpus => self.corpus_dir.join("Public-Tests").join(battery),
+            Dataset::Crust => cbench_dir(&self.corpus_dir, battery)
+                .unwrap_or_else(|| self.corpus_dir.join("CBench").join(battery)),
+        }
+    }
+
+    pub fn scaffold_dir(&self, project: &str) -> PathBuf {
+        self.corpus_dir.join("RBench").join(project)
     }
 
     pub fn output_dir(&self, battery: &str) -> PathBuf {

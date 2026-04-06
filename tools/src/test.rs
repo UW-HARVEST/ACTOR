@@ -1,5 +1,4 @@
 use crate::battery::Paths;
-use crate::cli::Agent;
 use crate::translate::copy_dir_all;
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -63,9 +62,7 @@ impl Drop for TestArtifactGuard {
 // ── Public API ─────────────────────────────────────────────────────────
 
 /// Entry point: run tests for one battery or all batteries.
-pub fn run(repo_root: &Path, target: &str, mode: TestMode, agent: Agent) -> Result<TestOutcome> {
-    let paths = Paths::with_agent(repo_root, agent);
-
+pub fn run_test_corpus(paths: &Paths, target: &str, mode: TestMode) -> Result<TestOutcome> {
     let batteries = if target == "all" {
         discover_batteries(&paths.results_dir)?
     } else {
@@ -116,6 +113,81 @@ struct CheckRow {
     expected: Summary,
     actual: Summary,
     ok: bool,
+}
+
+// ── CRUST-bench testing ────────────────────────────────────────────────
+
+pub fn run_crust_test(paths: &Paths, project: &str, mode: TestMode) -> Result<TestOutcome> {
+    let projects = if project == "all" {
+        discover_batteries(&paths.results_dir)?
+    } else {
+        vec![project.to_string()]
+    };
+
+    let mut total = 0usize;
+    let mut passed = 0usize;
+    let mut build_failed = 0usize;
+
+    for proj in &projects {
+        let proj_dir = paths.output_dir(proj);
+        if !proj_dir.join("Cargo.toml").exists() {
+            continue;
+        }
+        total += 1;
+
+        let output = Command::new("timeout")
+            .args(["60", "cargo", "test"])
+            .current_dir(&proj_dir)
+            .output()
+            .with_context(|| format!("running cargo test in {}", proj_dir.display()))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Write test log
+        let logs_dir = proj_dir.join("logs");
+        std::fs::create_dir_all(&logs_dir)?;
+        std::fs::write(logs_dir.join("test.log"), format!("{stdout}\n{stderr}"))?;
+
+        let oks = stdout.matches("... ok").count();
+        let fails = stdout.matches("... FAILED").count();
+
+        let result_json = serde_json::json!({
+            "project": proj,
+            "tests_ok": oks,
+            "tests_failed": fails,
+            "build_ok": !stderr.contains("error["),
+        });
+        std::fs::write(proj_dir.join("result.json"),
+            serde_json::to_string_pretty(&result_json)?)?;
+
+        if stderr.contains("error[") {
+            build_failed += 1;
+            println!("  ❌ {proj}: build failed");
+        } else if fails > 0 {
+            println!("  ⚠️  {proj}: {oks} ok, {fails} FAILED");
+        } else if oks > 0 {
+            passed += 1;
+            println!("  ✅ {proj}: {oks} ok");
+        } else {
+            println!("  ⚠️  {proj}: no tests ran");
+        }
+    }
+
+    println!();
+    println!("CRUST: {passed}/{total} projects pass ({build_failed} build failures)");
+
+    if matches!(mode, TestMode::Update) {
+        let summary = serde_json::json!({
+            "total": total,
+            "passed": passed,
+            "build_failed": build_failed,
+        });
+        std::fs::write(paths.results_dir.join("summary.json"),
+            serde_json::to_string_pretty(&summary)?)?;
+    }
+
+    Ok(TestOutcome::Ok)
 }
 
 // ── Battery discovery ──────────────────────────────────────────────────
