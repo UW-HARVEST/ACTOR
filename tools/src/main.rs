@@ -104,9 +104,14 @@ fn make_translate_plan(
             let batteries = resolve_batteries(&paths.corpus_dir, target)?;
             Ok(TranslatePlan::TestCorpus { batteries, parallel })
         }
-        Dataset::Crust => Ok(TranslatePlan::Crust {
-            target: target.to_string(), parallel, limit,
-        }),
+        Dataset::Crust => {
+            let projects = if target.eq_ignore_ascii_case("crust") || target == "all" {
+                battery::CrustProject::discover(&paths.corpus_dir, limit)?
+            } else {
+                vec![battery::CrustProject::validated(&paths.corpus_dir, target)?]
+            };
+            Ok(TranslatePlan::Crust { projects, parallel })
+        }
     }
 }
 
@@ -131,9 +136,14 @@ fn make_test_plan(
             let batteries = resolve_batteries(&paths.corpus_dir, target)?;
             Ok(TestPlan::TestCorpus { batteries, mode })
         }
-        Dataset::Crust => Ok(TestPlan::Crust {
-            target: target.to_string(), mode,
-        }),
+        Dataset::Crust => {
+            let projects = if target.eq_ignore_ascii_case("crust") || target == "all" {
+                battery::CrustProject::discover(&paths.corpus_dir, None)?
+            } else {
+                vec![battery::CrustProject::validated(&paths.corpus_dir, target)?]
+            };
+            Ok(TestPlan::Crust { projects, mode })
+        }
     }
 }
 
@@ -155,8 +165,8 @@ fn execute_translate(paths: &battery::Paths, plan: &TranslatePlan) -> Result<()>
                 translate::run_test_corpus(paths, &name, filter.as_deref(), *parallel)?;
             }
         }
-        TranslatePlan::Crust { target, parallel, limit } => {
-            translate::run_crust(paths, target, *parallel, *limit)?;
+        TranslatePlan::Crust { projects, parallel } => {
+            translate::run_crust(paths, projects, *parallel)?;
         }
     }
     Ok(())
@@ -184,8 +194,8 @@ fn execute_test(paths: &battery::Paths, plan: &TestPlan) -> Result<test::TestOut
             // TODO: aggregate outcomes properly
             Ok(test::TestOutcome::Ok)
         }
-        TestPlan::Crust { target, mode } => {
-            test::run_crust_test(paths, target, *mode)
+        TestPlan::Crust { projects, mode } => {
+            test::run_crust_test(paths, projects, *mode)
         }
     }
 }
@@ -199,21 +209,6 @@ fn find_repo_root() -> Result<std::path::PathBuf> {
         if !dir.pop() {
             anyhow::bail!("Could not find repo root (looking for test-corpus/ and results/)");
         }
-    }
-}
-
-/// Resolve "all" / "CRUST" to every target, or return the single target.
-fn resolve_targets(paths: &battery::Paths, target: &str, _include_regex: Option<&str>) -> Result<Vec<String>> {
-    match paths.dataset {
-        cli::Dataset::TestCorpus => {
-            if target == "all" {
-                battery::all_batteries(&paths.corpus_dir)
-            } else {
-                Ok(vec![target.to_string()])
-            }
-        }
-        // CRUST: pass target through as-is — run_crust handles discovery/limit/parallel
-        cli::Dataset::Crust => Ok(vec![target.to_string()]),
     }
 }
 

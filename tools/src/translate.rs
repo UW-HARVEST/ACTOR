@@ -483,16 +483,8 @@ fn count_cases(battery: &battery::Battery) -> usize {
 
 // ── CRUST-bench translation ────────────────────────────────────────────
 
-pub fn run_crust(paths: &Paths, project: &str, parallel: usize, limit: Option<usize>) -> Result<()> {
-    let mut projects: Vec<String> = if project == "all" || project.eq_ignore_ascii_case("crust") {
-        battery::all_crust_projects(&paths.corpus_dir)?
-    } else {
-        vec![project.to_string()]
-    };
-
-    if let Some(n) = limit {
-        projects.truncate(n);
-    }
+pub fn run_crust(paths: &Paths, projects: &[battery::CrustProject], parallel: usize) -> Result<()> {
+    preflight_check(paths.agent)?;
 
     let total = projects.len();
     let sem = Semaphore::new(parallel);
@@ -528,11 +520,11 @@ pub fn run_crust(paths: &Paths, project: &str, parallel: usize, limit: Option<us
     Ok(())
 }
 
-fn translate_one_crust(paths: &Paths, project: &str) -> CaseResult {
+fn translate_one_crust(paths: &Paths, project: &battery::CrustProject) -> CaseResult {
     match translate_one_crust_inner(paths, project) {
         Ok(r) => r,
         Err(e) => CaseResult {
-            name: project.to_string(),
+            name: project.name().to_string(),
             elapsed_secs: 0,
             success: false,
             error: Some(e.to_string()),
@@ -541,24 +533,16 @@ fn translate_one_crust(paths: &Paths, project: &str) -> CaseResult {
     }
 }
 
-fn translate_one_crust_inner(paths: &Paths, project: &str) -> Result<CaseResult> {
-    let out = paths.output_dir(project);
+fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject) -> Result<CaseResult> {
+    let out = paths.output_dir(project.name());
 
     if out.join("Cargo.toml").exists() {
-        return Ok(CaseResult { name: project.into(), elapsed_secs: 0, success: true, error: None, skipped: true });
+        return Ok(CaseResult { name: project.name().into(), elapsed_secs: 0, success: true, error: None, skipped: true });
     }
-
-    let scaffold = paths.scaffold_dir(project);
-    let c_source = paths.input_dir(project);
-    anyhow::ensure!(scaffold.is_dir(), "RBench scaffold not found: {}", scaffold.display());
-    anyhow::ensure!(c_source.is_dir(), "CBench source not found: {}", c_source.display());
 
     let logs_dir = out.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
     let log_path = logs_dir.join("translation.log");
-
-    let prompt = std::fs::read_to_string(paths.prompts_dir.join("crust.md"))
-        .context("reading crust.md prompt")?;
 
     let tmp = tempfile::Builder::new()
         .prefix("harvest-crust-")
@@ -566,10 +550,13 @@ fn translate_one_crust_inner(paths: &Paths, project: &str) -> Result<CaseResult>
         .context("creating temp dir for CRUST")?;
     let work = tmp.path().join("project");
 
-    copy_dir_all(&scaffold, &work)?;
+    let prompt = std::fs::read_to_string(paths.prompts_dir.join("crust.md"))
+        .context("reading crust.md prompt")?;
+
+    copy_dir_all(project.scaffold(), &work)?;
     let c_dst = work.join("c_src");
     std::fs::create_dir_all(&c_dst)?;
-    copy_dir_all(&c_source, &c_dst)?;
+    copy_dir_all(project.c_source(), &c_dst)?;
 
     let start = Instant::now();
 
@@ -601,20 +588,13 @@ fn translate_one_crust_inner(paths: &Paths, project: &str) -> Result<CaseResult>
 
     let elapsed = start.elapsed().as_secs();
 
-    if out.exists() {
-        std::fs::remove_dir_all(&out)?;
-    }
-    std::fs::create_dir_all(&out)?;
+    // Copy back code from temp, preserving logs dir
     copy_dir_filtered(&work, &out, &["target", "c_src"])?;
-    std::fs::create_dir_all(out.join("logs"))?;
-    if log_path.exists() {
-        std::fs::copy(&log_path, out.join("logs/translation.log"))?;
-    }
     copy_dir_all(&c_dst, &out.join("c_src"))?;
 
     let success = out.join("Cargo.toml").exists();
     write_translation_metrics(&out, paths.agent, elapsed, success);
-    Ok(CaseResult { name: project.into(), elapsed_secs: elapsed, success, error: None, skipped: false })
+    Ok(CaseResult { name: project.name().into(), elapsed_secs: elapsed, success, error: None, skipped: false })
 }
 
 // ── Utilities ──────────────────────────────────────────────────────────

@@ -107,9 +107,8 @@ pub enum TranslatePlan {
         parallel: usize,
     },
     Crust {
-        target: String,
+        projects: Vec<super::battery::CrustProject>,
         parallel: usize,
-        limit: Option<usize>,
     },
 }
 
@@ -130,7 +129,7 @@ pub enum TestPlan {
         mode: super::test::TestMode,
     },
     Crust {
-        target: String,
+        projects: Vec<super::battery::CrustProject>,
         mode: super::test::TestMode,
     },
 }

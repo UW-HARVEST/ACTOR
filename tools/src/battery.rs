@@ -56,35 +56,77 @@ pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
     Ok(batteries)
 }
 
-/// List all CRUST-bench project names (from RBench, which has canonical names).
-pub fn all_crust_projects(crust_datasets_dir: &Path) -> Result<Vec<String>> {
-    let rbench = crust_datasets_dir.join("RBench");
-    anyhow::ensure!(rbench.is_dir(), "RBench not found: {}", rbench.display());
+// ── CRUST-bench project (validated newtype) ────────────────────────────
 
-    let mut projects: Vec<String> = std::fs::read_dir(&rbench)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    projects.sort();
-    Ok(projects)
+const CRUST_SKIP: &[&str] = &[
+    "Genetic_neural_network_for_simple_control", // 50K-gen training loop, always times out
+    "Holdem_Odds", // contradictory tests, see https://github.com/anirudhkhatry/CRUST-bench/issues/37
+];
+
+/// A validated CRUST project. Can only be constructed through `discover()` or
+/// `validated()`, which enforce the skip list and resolve paths.
+#[derive(Debug, Clone)]
+pub struct CrustProject {
+    name: String,
+    scaffold: PathBuf,
+    c_source: PathBuf,
 }
 
-/// Resolve RBench project name to CBench directory (handles underscore/hyphen + proj_ prefix).
-pub fn cbench_dir(crust_datasets_dir: &Path, project: &str) -> Option<PathBuf> {
-    let cbench = crust_datasets_dir.join("CBench");
-    // Try exact
-    let exact = cbench.join(project);
-    if exact.is_dir() { return Some(exact); }
-    // Try underscores → hyphens
-    let hyph = cbench.join(project.replace('_', "-"));
-    if hyph.is_dir() { return Some(hyph); }
-    // Try strip proj_ prefix + underscores → hyphens
-    if let Some(stripped) = project.strip_prefix("proj_") {
-        let stripped_hyph = cbench.join(stripped.replace('_', "-"));
-        if stripped_hyph.is_dir() { return Some(stripped_hyph); }
+impl CrustProject {
+    pub fn name(&self) -> &str { &self.name }
+    pub fn scaffold(&self) -> &Path { &self.scaffold }
+    pub fn c_source(&self) -> &Path { &self.c_source }
+
+    /// Discover all valid CRUST projects, applying skip list and optional limit.
+    pub fn discover(datasets_dir: &Path, limit: Option<usize>) -> Result<Vec<Self>> {
+        let rbench = datasets_dir.join("RBench");
+        anyhow::ensure!(rbench.is_dir(), "RBench not found: {}", rbench.display());
+
+        let mut names: Vec<String> = std::fs::read_dir(&rbench)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !CRUST_SKIP.contains(&n.as_str()))
+            .collect();
+        names.sort();
+        if let Some(n) = limit { names.truncate(n); }
+
+        names.into_iter()
+            .map(|name| Self::resolve(datasets_dir, name))
+            .collect()
     }
-    None
+
+    /// Validate a single project name against the skip list and resolve paths.
+    pub fn validated(datasets_dir: &Path, name: &str) -> Result<Self> {
+        anyhow::ensure!(
+            !CRUST_SKIP.contains(&name),
+            "{name} is in the CRUST skip list"
+        );
+        Self::resolve(datasets_dir, name.to_string())
+    }
+
+    fn resolve(datasets_dir: &Path, name: String) -> Result<Self> {
+        let scaffold = datasets_dir.join("RBench").join(&name);
+        anyhow::ensure!(scaffold.is_dir(), "RBench scaffold not found: {}", scaffold.display());
+
+        let c_source = Self::find_cbench(datasets_dir, &name)
+            .with_context(|| format!("CBench source not found for {name}"))?;
+
+        Ok(Self { name, scaffold, c_source })
+    }
+
+    fn find_cbench(datasets_dir: &Path, project: &str) -> Option<PathBuf> {
+        let cbench = datasets_dir.join("CBench");
+        for candidate in [
+            project.to_string(),
+            project.replace('_', "-"),
+            project.strip_prefix("proj_").unwrap_or(project).replace('_', "-"),
+        ] {
+            let p = cbench.join(&candidate);
+            if p.is_dir() { return Some(p); }
+        }
+        None
+    }
 }
 
 pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> Result<Battery> {
@@ -332,15 +374,7 @@ impl Paths {
     }
 
     pub fn input_dir(&self, battery: &str) -> PathBuf {
-        match self.dataset {
-            Dataset::TestCorpus => self.corpus_dir.join("Public-Tests").join(battery),
-            Dataset::Crust => cbench_dir(&self.corpus_dir, battery)
-                .unwrap_or_else(|| self.corpus_dir.join("CBench").join(battery)),
-        }
-    }
-
-    pub fn scaffold_dir(&self, project: &str) -> PathBuf {
-        self.corpus_dir.join("RBench").join(project)
+        self.corpus_dir.join("Public-Tests").join(battery)
     }
 
     pub fn output_dir(&self, battery: &str) -> PathBuf {

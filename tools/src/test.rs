@@ -117,19 +117,14 @@ struct CheckRow {
 
 // ── CRUST-bench testing ────────────────────────────────────────────────
 
-pub fn run_crust_test(paths: &Paths, project: &str, mode: TestMode) -> Result<TestOutcome> {
-    let projects = if project == "all" {
-        discover_batteries(&paths.results_dir)?
-    } else {
-        vec![project.to_string()]
-    };
-
+pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], mode: TestMode) -> Result<TestOutcome> {
     let mut total = 0usize;
     let mut passed = 0usize;
     let mut build_failed = 0usize;
 
-    for proj in &projects {
-        let proj_dir = paths.output_dir(proj);
+    for project in projects {
+        let name = project.name();
+        let proj_dir = paths.output_dir(name);
         if !proj_dir.join("Cargo.toml").exists() {
             continue;
         }
@@ -153,7 +148,7 @@ pub fn run_crust_test(paths: &Paths, project: &str, mode: TestMode) -> Result<Te
         let fails = stdout.matches("... FAILED").count();
 
         let result_json = serde_json::json!({
-            "project": proj,
+            "project": name,
             "tests_ok": oks,
             "tests_failed": fails,
             "build_ok": !stderr.contains("error["),
@@ -163,14 +158,14 @@ pub fn run_crust_test(paths: &Paths, project: &str, mode: TestMode) -> Result<Te
 
         if stderr.contains("error[") {
             build_failed += 1;
-            println!("  ❌ {proj}: build failed");
+            println!("  ❌ {name}: build failed");
         } else if fails > 0 {
-            println!("  ⚠️  {proj}: {oks} ok, {fails} FAILED");
+            println!("  ⚠️  {name}: {oks} ok, {fails} FAILED");
         } else if oks > 0 {
             passed += 1;
-            println!("  ✅ {proj}: {oks} ok");
+            println!("  ✅ {name}: {oks} ok");
         } else {
-            println!("  ⚠️  {proj}: no tests ran");
+            println!("  ⚠️  {name}: no tests ran");
         }
     }
 

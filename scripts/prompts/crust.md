@@ -28,4 +28,7 @@ You are translating a C project to idiomatic, safe Rust.
 10. Run `timeout 60 cargo test` to verify correctness. Fix any failures.
     The 60-second timeout is strict — if tests are too slow, optimize your
     implementation (avoid unnecessary allocations, use iterators, etc.).
+    When tests fail, re-read the corresponding C function to understand the
+    exact behavior — do not guess fixes from the Rust code alone. The C code
+    is always the ground truth.
 11. Do NOT leave any `unimplemented!()`, `todo!()`, or `panic!()` placeholders.
