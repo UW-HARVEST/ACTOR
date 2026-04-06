@@ -39,6 +39,15 @@ jobs:
       - name: Build harvest-tools
         run: cargo build --release --manifest-path tools/Cargo.toml
 
+      - name: Validate CRUST-bench translations (kiro)
+        env:
+          CARGO_BUILD_JOBS: "2"
+          OPENSSL_DIR: /usr
+        run: |
+          if [ -f results/CRUST/kiro/expected.json ]; then
+            ./tools/target/release/harvest-tools --agent kiro test CRUST --check
+          fi
+
       - name: Validate c2rust translations
         env:
           CARGO_BUILD_JOBS: "2"
@@ -61,13 +70,4 @@ jobs:
         run: |
           if [ -d results/Test-Corpus/claude ]; then
             ./tools/target/release/harvest-tools --agent claude test all --check
-          fi
-
-      - name: Validate CRUST-bench translations (kiro)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          OPENSSL_DIR: /usr
-        run: |
-          if [ -f results/CRUST/kiro/expected.json ]; then
-            ./tools/target/release/harvest-tools --agent kiro test CRUST --check
           fi
