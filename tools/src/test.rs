@@ -117,80 +117,162 @@ struct CheckRow {
 
 // ── CRUST-bench testing ────────────────────────────────────────────────
 
+/// Per-project test result — strongly typed, not loose JSON.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct CrustTestResult {
+    tests_ok: usize,
+    tests_failed: usize,
+    build_ok: bool,
+}
+
+/// Stored expected baseline. Created by --update, consumed by --check.
+#[derive(Debug, Serialize, Deserialize)]
+struct CrustBaseline(std::collections::BTreeMap<String, CrustTestResult>);
+
+impl CrustBaseline {
+    fn store(&self, path: &Path) -> Result<()> {
+        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+
+    fn load(path: &Path) -> Result<Self> {
+        let data = std::fs::read_to_string(path)
+            .with_context(|| format!("no baseline at {} — run with --update first", path.display()))?;
+        Ok(serde_json::from_str(&data)?)
+    }
+}
+
+/// A single regression found during --check.
+#[derive(Debug)]
+struct Regression {
+    project: String,
+    field: &'static str,
+    expected: String,
+    actual: String,
+}
+
+/// Pure function: compare baseline vs actual, return regressions.
+fn find_regressions(expected: &CrustBaseline, actual: &CrustBaseline) -> Vec<Regression> {
+    let mut regressions = Vec::new();
+    for (name, exp) in &expected.0 {
+        match actual.0.get(name) {
+            None => regressions.push(Regression {
+                project: name.clone(), field: "missing",
+                expected: "present".into(), actual: "not found".into(),
+            }),
+            Some(act) => {
+                if act.tests_ok < exp.tests_ok {
+                    regressions.push(Regression {
+                        project: name.clone(), field: "tests_ok",
+                        expected: exp.tests_ok.to_string(), actual: act.tests_ok.to_string(),
+                    });
+                }
+                if act.tests_failed > exp.tests_failed {
+                    regressions.push(Regression {
+                        project: name.clone(), field: "tests_failed",
+                        expected: exp.tests_failed.to_string(), actual: act.tests_failed.to_string(),
+                    });
+                }
+                if exp.build_ok && !act.build_ok {
+                    regressions.push(Regression {
+                        project: name.clone(), field: "build_ok",
+                        expected: "true".into(), actual: "false".into(),
+                    });
+                }
+            }
+        }
+    }
+    regressions
+}
+
+/// Run cargo test on a single CRUST project, return typed result.
+fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
+    // Clean up test artifacts
+    for artifact in [".vsync"] {
+        let p = proj_dir.join(artifact);
+        if p.exists() { let _ = std::fs::remove_dir_all(&p); }
+    }
+
+    let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
+    let output = Command::new("timeout")
+        .args(["60", "cargo", "test"])
+        .env("OPENSSL_DIR", &openssl_dir)
+        .current_dir(proj_dir)
+        .output()
+        .with_context(|| format!("running cargo test in {}", proj_dir.display()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let logs_dir = proj_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    std::fs::write(logs_dir.join("test.log"), format!("{stdout}\n{stderr}"))?;
+
+    Ok(CrustTestResult {
+        tests_ok: stdout.matches("... ok").count(),
+        tests_failed: stdout.matches("... FAILED").count(),
+        build_ok: !stderr.contains("error["),
+    })
+}
+
 pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], mode: TestMode) -> Result<TestOutcome> {
-    let mut total = 0usize;
+    let baseline_path = paths.results_dir.join("expected.json");
+
+    // Run all tests, collect typed results
+    let mut results = CrustBaseline(std::collections::BTreeMap::new());
     let mut passed = 0usize;
     let mut build_failed = 0usize;
 
     for project in projects {
         let name = project.name();
         let proj_dir = paths.output_dir(name);
-        if !proj_dir.join("Cargo.toml").exists() {
-            continue;
-        }
-        total += 1;
+        if !proj_dir.join("Cargo.toml").exists() { continue; }
 
-        // Clean up test artifacts left by translation runs
-        for artifact in [".vsync"] {
-            let p = proj_dir.join(artifact);
-            if p.exists() { let _ = std::fs::remove_dir_all(&p); }
-        }
+        let r = test_one_crust(&proj_dir)?;
 
-        let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
-        let output = Command::new("timeout")
-            .args(["60", "cargo", "test"])
-            .env("OPENSSL_DIR", &openssl_dir)
-            .current_dir(&proj_dir)
-            .output()
-            .with_context(|| format!("running cargo test in {}", proj_dir.display()))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // Write test log
-        let logs_dir = proj_dir.join("logs");
-        std::fs::create_dir_all(&logs_dir)?;
-        std::fs::write(logs_dir.join("test.log"), format!("{stdout}\n{stderr}"))?;
-
-        let oks = stdout.matches("... ok").count();
-        let fails = stdout.matches("... FAILED").count();
-
-        let result_json = serde_json::json!({
-            "project": name,
-            "tests_ok": oks,
-            "tests_failed": fails,
-            "build_ok": !stderr.contains("error["),
-        });
-        std::fs::write(proj_dir.join("result.json"),
-            serde_json::to_string_pretty(&result_json)?)?;
-
-        if stderr.contains("error[") {
+        if !r.build_ok {
             build_failed += 1;
             println!("  ❌ {name}: build failed");
-        } else if fails > 0 {
-            println!("  ⚠️  {name}: {oks} ok, {fails} FAILED");
-        } else if oks > 0 {
+        } else if r.tests_failed > 0 {
+            println!("  ⚠️  {name}: {} ok, {} FAILED", r.tests_ok, r.tests_failed);
+        } else if r.tests_ok > 0 {
             passed += 1;
-            println!("  ✅ {name}: {oks} ok");
+            println!("  ✅ {name}: {} ok", r.tests_ok);
         } else {
             println!("  ⚠️  {name}: no tests ran");
         }
+
+        results.0.insert(name.to_string(), r);
     }
 
-    println!();
-    println!("CRUST: {passed}/{total} projects pass ({build_failed} build failures)");
+    let total = results.0.len();
+    println!("\nCRUST: {passed}/{total} projects pass ({build_failed} build failures)");
 
-    if matches!(mode, TestMode::Update) {
-        let summary = serde_json::json!({
-            "total": total,
-            "passed": passed,
-            "build_failed": build_failed,
-        });
-        std::fs::write(paths.results_dir.join("summary.json"),
-            serde_json::to_string_pretty(&summary)?)?;
+    match mode {
+        TestMode::Update => {
+            results.store(&baseline_path)?;
+            println!("📝 Baseline written to {}", baseline_path.display());
+            Ok(TestOutcome::Ok)
+        }
+        TestMode::Check => {
+            let expected = CrustBaseline::load(&baseline_path)?;
+            let regressions = find_regressions(&expected, &results);
+            if regressions.is_empty() {
+                println!("✅ No regressions");
+                Ok(TestOutcome::Passed)
+            } else {
+                println!("\n❌ {} regression(s):", regressions.len());
+                for r in &regressions {
+                    println!("  {}: {} expected={} actual={}", r.project, r.field, r.expected, r.actual);
+                }
+                Ok(TestOutcome::Failed(vec![BatteryMismatch {
+                    battery: "CRUST".into(),
+                    diffs: regressions.iter().map(|r| format!("{}: {}", r.project, r.field)).collect(),
+                }]))
+            }
+        }
+        TestMode::Run => Ok(TestOutcome::Ok),
     }
-
-    Ok(TestOutcome::Ok)
 }
 
 // ── Battery discovery ──────────────────────────────────────────────────
