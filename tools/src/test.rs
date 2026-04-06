@@ -195,11 +195,25 @@ fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
     std::fs::create_dir_all(&logs_dir)?;
     std::fs::write(logs_dir.join("test.log"), format!("{stdout}\n{stderr}"))?;
 
-    Ok(CrustTestResult {
-        tests_ok: stdout.matches("... ok").count(),
-        tests_failed: stdout.matches("... FAILED").count(),
-        build_ok: !stderr.contains("error["),
-    })
+    let tests_ok = stdout.matches("... ok").count();
+    let tests_failed = stdout.matches("... FAILED").count();
+    let build_ok = !stderr.contains("error[") && !stderr.contains("could not compile");
+
+    // Print diagnostic snippet when something went wrong
+    if !build_ok || tests_failed > 0 || (tests_ok == 0 && tests_failed == 0) {
+        // Show last few error lines from stderr
+        let err_lines: Vec<&str> = stderr.lines()
+            .filter(|l| l.contains("error") || l.contains("FAILED") || l.contains("cannot find") || l.contains("linking"))
+            .take(5)
+            .collect();
+        if !err_lines.is_empty() {
+            for line in &err_lines {
+                eprintln!("    │ {line}");
+            }
+        }
+    }
+
+    Ok(CrustTestResult { tests_ok, tests_failed, build_ok })
 }
 
 /// Load per-project result.json files into a baseline (for CI --check without re-running tests).
