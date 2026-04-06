@@ -215,6 +215,24 @@ fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
     })
 }
 
+/// Load per-project result.json files into a baseline (for CI --check without re-running tests).
+fn load_stored_results(paths: &Paths) -> Result<CrustBaseline> {
+    let mut results = std::collections::BTreeMap::new();
+    if !paths.results_dir.is_dir() { return Ok(CrustBaseline(results)); }
+    for entry in std::fs::read_dir(&paths.results_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() { continue; }
+        let result_path = entry.path().join("result.json");
+        if result_path.exists() {
+            let data = std::fs::read_to_string(&result_path)?;
+            if let Ok(r) = serde_json::from_str::<CrustTestResult>(&data) {
+                results.insert(entry.file_name().to_string_lossy().into_owned(), r);
+            }
+        }
+    }
+    Ok(CrustBaseline(results))
+}
+
 pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], mode: TestMode) -> Result<TestOutcome> {
     let baseline_path = paths.results_dir.join("expected.json");
 
@@ -256,7 +274,14 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
         }
         TestMode::Check => {
             let expected = CrustBaseline::load(&baseline_path)?;
-            let regressions = find_regressions(&expected, &results);
+            // In check mode, use stored result.json files if tests weren't run
+            // (e.g. CI without translated code)
+            let actual = if results.0.is_empty() {
+                load_stored_results(paths)?
+            } else {
+                results
+            };
+            let regressions = find_regressions(&expected, &actual);
             if regressions.is_empty() {
                 println!("✅ No regressions");
                 Ok(TestOutcome::Passed)
