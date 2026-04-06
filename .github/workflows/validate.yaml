@@ -44,7 +44,7 @@ jobs:
           CARGO_BUILD_JOBS: "2"
           OPENSSL_DIR: /usr
         run: |
-          if [ -f results/CRUST/kiro/expected.json ]; then
+          if [ -d results/CRUST/kiro ]; then
             ./tools/target/release/harvest-tools --agent kiro test CRUST --check
           fi
 

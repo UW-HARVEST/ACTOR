@@ -125,22 +125,9 @@ struct CrustTestResult {
     build_ok: bool,
 }
 
-/// Stored expected baseline. Created by --update, consumed by --check.
+/// Aggregated CRUST results keyed by project name.
 #[derive(Debug, Serialize, Deserialize)]
 struct CrustBaseline(std::collections::BTreeMap<String, CrustTestResult>);
-
-impl CrustBaseline {
-    fn store(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
-        Ok(())
-    }
-
-    fn load(path: &Path) -> Result<Self> {
-        let data = std::fs::read_to_string(path)
-            .with_context(|| format!("no baseline at {} — run with --update first", path.display()))?;
-        Ok(serde_json::from_str(&data)?)
-    }
-}
 
 /// A single regression found during --check.
 #[derive(Debug)]
@@ -234,9 +221,9 @@ fn load_stored_results(paths: &Paths) -> Result<CrustBaseline> {
 }
 
 pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], mode: TestMode) -> Result<TestOutcome> {
-    let baseline_path = paths.results_dir.join("expected.json");
+    // Load stored result.json files as the baseline (single source of truth).
+    let stored = load_stored_results(paths)?;
 
-    // Run all tests, collect typed results
     let mut results = CrustBaseline(std::collections::BTreeMap::new());
     let mut passed = 0usize;
     let mut build_failed = 0usize;
@@ -260,6 +247,12 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
             println!("  ⚠️  {name}: no tests ran");
         }
 
+        // --update: write result.json immediately
+        if matches!(mode, TestMode::Update) {
+            let json = serde_json::to_string_pretty(&r)?;
+            std::fs::write(proj_dir.join("result.json"), format!("{json}\n"))?;
+        }
+
         results.0.insert(name.to_string(), r);
     }
 
@@ -268,20 +261,16 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
 
     match mode {
         TestMode::Update => {
-            results.store(&baseline_path)?;
-            println!("📝 Baseline written to {}", baseline_path.display());
+            println!("📝 result.json written for {total} projects");
             Ok(TestOutcome::Ok)
         }
         TestMode::Check => {
-            let expected = CrustBaseline::load(&baseline_path)?;
-            // In check mode, use stored result.json files if tests weren't run
-            // (e.g. CI without translated code)
-            let actual = if results.0.is_empty() {
-                load_stored_results(paths)?
-            } else {
-                results
-            };
-            let regressions = find_regressions(&expected, &actual);
+            // If no tests ran (CI without translated code), nothing to regress against.
+            if results.0.is_empty() {
+                println!("✅ No translated projects found — nothing to check");
+                return Ok(TestOutcome::Passed);
+            }
+            let regressions = find_regressions(&stored, &results);
             if regressions.is_empty() {
                 println!("✅ No regressions");
                 Ok(TestOutcome::Passed)
