@@ -16,7 +16,11 @@ jobs:
       - name: Check out submodules
         run: |
           git config --global url."https://x-access-token:${{ secrets.SUBMODULE_PAT }}@github.com/".insteadOf "https://github.com/"
-          git submodule update --init --depth=1 results test-corpus
+          git submodule update --init --depth=1 results test-corpus crust-bench
+
+      - name: Unzip CRUST-bench datasets
+        run: |
+          cd crust-bench/datasets && unzip -q CRUST_bench.zip
 
       - name: Set up Rust
         run: |
@@ -39,7 +43,7 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
         run: |
-          if [ -d results/c2rust ]; then
+          if [ -d results/Test-Corpus/c2rust ]; then
             ./tools/target/release/harvest-tools --agent c2rust test all --check
           fi
 
@@ -47,7 +51,7 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
         run: |
-          if [ -d results/kiro ]; then
+          if [ -d results/Test-Corpus/kiro ]; then
             ./tools/target/release/harvest-tools --agent kiro test all --check
           fi
 
@@ -55,6 +59,15 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
         run: |
-          if [ -d results/claude ]; then
+          if [ -d results/Test-Corpus/claude ]; then
             ./tools/target/release/harvest-tools --agent claude test all --check
+          fi
+
+      - name: Validate CRUST-bench translations (kiro)
+        env:
+          CARGO_BUILD_JOBS: "2"
+          OPENSSL_DIR: /usr
+        run: |
+          if [ -f results/CRUST/kiro/expected.json ]; then
+            ./tools/target/release/harvest-tools --agent kiro test CRUST --check
           fi
