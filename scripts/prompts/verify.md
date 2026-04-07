@@ -2,6 +2,11 @@
 You are testing a C-to-Rust translation for correctness. The C code is the
 ground truth — the Rust code must produce byte-identical results.
 
+The C implementation is ALWAYS correct. Never second-guess the C code's logic,
+even if it looks unusual or inconsistent. Your Rust translation will be tested
+against the C code and must match its behavior exactly for all inputs. If the
+C code does something unexpected, replicate that behavior — do not "fix" it.
+
 Working directory: CASE_DIR_PLACEHOLDER
 
 - `translated_rust/c_src/` contains the original C source code
@@ -16,26 +21,54 @@ Working directory: CASE_DIR_PLACEHOLDER
 - Find the resulting .so files in the build output
 
 Your task:
-1. Build the C code as a shared library
-2. Write Rust integration tests (in translated_rust/tests/) that use `libloading`
-   to load the C .so and compare C vs Rust function outputs
-3. Start with the lowest-level functions and work upward to higher-level ones.
+1. Read Cargo.toml [features] and c_src/CMakeLists.txt to understand all
+   build-time configurations. Enumerate every valid feature combination.
+2. Run `cargo check --no-default-features --features <combo>` for EVERY
+   combination. Fix all compile errors before proceeding. Modules or code
+   that only apply to certain backends must use `#[cfg(feature = "...")]`.
+3. Build the C code as a shared library for the default configuration.
+4. Write Rust integration tests (in translated_rust/tests/) that use
+   `libloading` to load BOTH the C .so AND the Rust .so, and compare their
+   outputs through the FFI boundary. Never call Rust functions directly —
+   always load the Rust .so via libloading and call its exported symbols,
+   exactly as an external caller would. This tests the `#[no_mangle]`
+   export wrappers too.
+5. Start with the lowest-level functions and work upward to higher-level ones.
    Look at the C headers to identify the public API and function call hierarchy.
-4. For each function: create fixed test inputs, call both C and Rust versions,
-   assert outputs match byte-for-byte
-5. Run `cargo test` and investigate any mismatches
-6. When you find a Rust function that produces different output than C,
-   fix the Rust code in translated_rust/src/ and re-run until the test passes
-7. Keep going until all public functions match
-8. If the project has a main binary, run both the C binary and the Rust binary
-   with the same inputs and compare their stdout byte-for-byte. Fix any differences.
-9. Compare `nm -D` on the C .so and the Rust .so. Every symbol the C .so
+6. For each function: create test inputs, call both C and Rust via their .so
+   exports, assert outputs match byte-for-byte.
+7. Run `cargo test` and fix any mismatches.
+8. Compare `nm -D` on the C .so and the Rust .so. Every symbol the C .so
    exports, the Rust .so must also export with the exact same name. This
    includes symbols created by preprocessor macros. If the C .so exports it,
    the Rust .so must export it — no exceptions. Add missing exports.
+9. Repeat steps 6-8 for EVERY feature combination from step 1. Switch features
+   with `cargo test --no-default-features --features <combo>`. Each combination
+   may exercise completely different code paths.
+10. Do not declare success until every function matches under every feature
+    combination. This code is shared across ALL configurations — you must
+    build and test against C for every backend and parameter set, not just
+    the default.
+
+**Tip:** Write shell loops or scripts to automate repetitive work. For example,
+to check all feature combinations: extract them from Cargo.toml, loop over them,
+and run `cargo check` for each. Same for running tests across combinations.
+Do not manually repeat commands for each configuration — automate it.
+
+**This may be a large verification task.** If the project has more than one
+configuration or code path to verify, you MUST invoke subagents — do NOT try
+to verify everything in a single session. Create a plan, then for each subtask
+use the use_subagent tool with agent_name "kiro_plain" and a focused query
+covering a specific subset of the code or functionality to verify and fix.
+Only invoke one subagent at a time — wait for it to complete before starting
+the next. After each subagent completes, check that its fixes didn't break
+anything else.
 
 Add `libloading = "0.8"` to [dev-dependencies] in translated_rust/Cargo.toml.
 Do NOT modify anything in c_src/.
+
+IMPORTANT: If a file is too large to write in one tool call, build it up
+piece by piece using multiple smaller writes (create then append).
 
 IMPORTANT: Use timeouts for all commands. No single build or test command should
 run longer than 600 seconds. If a test takes too long, skip it and move on to

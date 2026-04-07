@@ -1,5 +1,4 @@
 use crate::battery::Paths;
-use crate::cli::Agent;
 use crate::translate::copy_dir_all;
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -63,9 +62,7 @@ impl Drop for TestArtifactGuard {
 // ── Public API ─────────────────────────────────────────────────────────
 
 /// Entry point: run tests for one battery or all batteries.
-pub fn run(repo_root: &Path, target: &str, mode: TestMode, agent: Agent) -> Result<TestOutcome> {
-    let paths = Paths::with_agent(repo_root, agent);
-
+pub fn run_test_corpus(paths: &Paths, target: &str, mode: TestMode) -> Result<TestOutcome> {
     let batteries = if target == "all" {
         discover_batteries(&paths.results_dir)?
     } else {
@@ -118,6 +115,234 @@ struct CheckRow {
     ok: bool,
 }
 
+// ── CRUST-bench testing ────────────────────────────────────────────────
+
+/// Per-project test result — strongly typed, not loose JSON.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct CrustTestResult {
+    tests_ok: usize,
+    tests_failed: usize,
+    build_ok: bool,
+}
+
+/// Aggregated CRUST results keyed by project name.
+#[derive(Debug, Serialize, Deserialize)]
+struct CrustBaseline(std::collections::BTreeMap<String, CrustTestResult>);
+
+/// A single regression found during --check.
+#[derive(Debug)]
+struct Regression {
+    project: String,
+    field: &'static str,
+    expected: String,
+    actual: String,
+}
+
+/// Pure function: compare baseline vs actual, return regressions.
+fn find_regressions(expected: &CrustBaseline, actual: &CrustBaseline) -> Vec<Regression> {
+    let mut regressions = Vec::new();
+    for (name, exp) in &expected.0 {
+        match actual.0.get(name) {
+            None => regressions.push(Regression {
+                project: name.clone(), field: "missing",
+                expected: "present".into(), actual: "not found".into(),
+            }),
+            Some(act) => {
+                if act.tests_ok < exp.tests_ok {
+                    regressions.push(Regression {
+                        project: name.clone(), field: "tests_ok",
+                        expected: exp.tests_ok.to_string(), actual: act.tests_ok.to_string(),
+                    });
+                }
+                if act.tests_failed > exp.tests_failed {
+                    regressions.push(Regression {
+                        project: name.clone(), field: "tests_failed",
+                        expected: exp.tests_failed.to_string(), actual: act.tests_failed.to_string(),
+                    });
+                }
+                if exp.build_ok && !act.build_ok {
+                    regressions.push(Regression {
+                        project: name.clone(), field: "build_ok",
+                        expected: "true".into(), actual: "false".into(),
+                    });
+                }
+            }
+        }
+    }
+    regressions
+}
+
+/// Run cargo test on a single CRUST project, return typed result.
+fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
+    // Clean up test artifacts
+    for artifact in [".vsync"] {
+        let p = proj_dir.join(artifact);
+        if p.exists() { let _ = std::fs::remove_dir_all(&p); }
+    }
+
+    let output = Command::new("timeout")
+        .args(["60", "cargo", "test"])
+        .current_dir(proj_dir)
+        .output()
+        .with_context(|| format!("running cargo test in {}", proj_dir.display()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let (tests_ok, tests_failed) = parse_cargo_test_results(&stdout);
+    let build_ok = !stderr.contains("error[") && !stderr.contains("could not compile")
+        && !stderr.contains("failed to run custom build command");
+
+    // If build failed or no tests ran, re-run with --verbose for full diagnostics
+    let (final_stdout, final_stderr) = if !build_ok || (tests_ok == 0 && tests_failed == 0) {
+        let verbose = Command::new("timeout")
+            .args(["60", "cargo", "test", "--verbose"])
+            .current_dir(proj_dir)
+            .output()
+            .ok();
+        if let Some(v) = verbose {
+            (String::from_utf8_lossy(&v.stdout).into_owned(),
+             String::from_utf8_lossy(&v.stderr).into_owned())
+        } else {
+            (stdout.into_owned(), stderr.into_owned())
+        }
+    } else {
+        (stdout.into_owned(), stderr.into_owned())
+    };
+
+    let logs_dir = proj_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    std::fs::write(logs_dir.join("test.log"), format!("{final_stdout}\n{final_stderr}"))?;
+
+    // Print diagnostic snippet when something went wrong
+    if !build_ok || tests_failed > 0 || (tests_ok == 0 && tests_failed == 0) {
+        let err_lines: Vec<&str> = final_stderr.lines()
+            .filter(|l| l.contains("error") || l.contains("FAILED") || l.contains("cannot find")
+                || l.contains("linking") || l.contains("Could not find") || l.contains("run custom build"))
+            .take(10)
+            .collect();
+        if !err_lines.is_empty() {
+            for line in &err_lines {
+                eprintln!("    │ {line}");
+            }
+        }
+    }
+
+    Ok(CrustTestResult { tests_ok, tests_failed, build_ok })
+}
+
+/// Parse `test result: ok. N passed; M failed; ...` lines from cargo test stdout.
+/// Deterministic regardless of output interleaving.
+fn parse_cargo_test_results(stdout: &str) -> (usize, usize) {
+    let re = Regex::new(r"test result: \S+\. (\d+) passed; (\d+) failed;").unwrap();
+    let (mut ok, mut failed) = (0usize, 0usize);
+    for caps in re.captures_iter(stdout) {
+        ok += caps[1].parse::<usize>().unwrap_or(0);
+        failed += caps[2].parse::<usize>().unwrap_or(0);
+    }
+    (ok, failed)
+}
+
+/// Load per-project result.json files into a baseline (for CI --check without re-running tests).
+fn load_stored_results(paths: &Paths) -> Result<CrustBaseline> {
+    let mut results = std::collections::BTreeMap::new();
+    if !paths.results_dir.is_dir() { return Ok(CrustBaseline(results)); }
+    for entry in std::fs::read_dir(&paths.results_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() { continue; }
+        let result_path = entry.path().join("result.json");
+        if result_path.exists() {
+            let data = std::fs::read_to_string(&result_path)?;
+            if let Ok(r) = serde_json::from_str::<CrustTestResult>(&data) {
+                results.insert(entry.file_name().to_string_lossy().into_owned(), r);
+            }
+        }
+    }
+    Ok(CrustBaseline(results))
+}
+
+pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], mode: TestMode) -> Result<TestOutcome> {
+    // Load stored result.json files as the baseline (single source of truth).
+    let stored = load_stored_results(paths)?;
+
+    let mut results = CrustBaseline(std::collections::BTreeMap::new());
+    let mut passed = 0usize;
+    let mut build_failed = 0usize;
+
+    for project in projects {
+        let name = project.name();
+        let proj_dir = paths.output_dir(name);
+        if !proj_dir.join("Cargo.toml").exists() { continue; }
+
+        let r = test_one_crust(&proj_dir)?;
+
+        if !r.build_ok {
+            build_failed += 1;
+            println!("  ❌ {name}: build failed");
+        } else if r.tests_failed > 0 {
+            println!("  ⚠️  {name}: {} ok, {} FAILED", r.tests_ok, r.tests_failed);
+        } else if r.tests_ok > 0 {
+            passed += 1;
+            println!("  ✅ {name}: {} ok", r.tests_ok);
+        } else {
+            println!("  ⚠️  {name}: no tests ran");
+        }
+
+        // --update: write result.json immediately
+        if matches!(mode, TestMode::Update) {
+            let json = serde_json::to_string_pretty(&r)?;
+            std::fs::write(proj_dir.join("result.json"), format!("{json}\n"))?;
+        }
+
+        results.0.insert(name.to_string(), r);
+    }
+
+    let total = results.0.len();
+    println!("\nCRUST: {passed}/{total} projects pass ({build_failed} build failures)");
+
+    match mode {
+        TestMode::Update => {
+            println!("📝 result.json written for {total} projects");
+            Ok(TestOutcome::Ok)
+        }
+        TestMode::Check => {
+            // If no tests ran (CI without translated code), nothing to regress against.
+            if results.0.is_empty() {
+                println!("✅ No translated projects found — nothing to check");
+                return Ok(TestOutcome::Passed);
+            }
+            let regressions = find_regressions(&stored, &results);
+            if regressions.is_empty() {
+                println!("✅ No regressions");
+                Ok(TestOutcome::Passed)
+            } else {
+                println!("\n❌ {} regression(s):", regressions.len());
+                for r in &regressions {
+                    println!("  {}: {} expected={} actual={}", r.project, r.field, r.expected, r.actual);
+                    // Dump test log for regression diagnosis
+                    let log_path = paths.output_dir(&r.project).join("logs/test.log");
+                    if let Ok(log) = std::fs::read_to_string(&log_path) {
+                        println!("  ┌── test.log for {} ──", r.project);
+                        for line in log.lines().take(200) {
+                            println!("  │ {line}");
+                        }
+                        let total_lines = log.lines().count();
+                        if total_lines > 200 {
+                            println!("  │ ... ({} more lines)", total_lines - 200);
+                        }
+                        println!("  └──");
+                    }
+                }
+                Ok(TestOutcome::Failed(vec![BatteryMismatch {
+                    battery: "CRUST".into(),
+                    diffs: regressions.iter().map(|r| format!("{}: {}", r.project, r.field)).collect(),
+                }]))
+            }
+        }
+        TestMode::Run => Ok(TestOutcome::Ok),
+    }
+}
+
 // ── Battery discovery ──────────────────────────────────────────────────
 
 fn discover_batteries(results_dir: &Path) -> Result<Vec<String>> {
@@ -168,7 +393,7 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
     // Generate workspace Cargo.toml for lib runners
     generate_workspace(&output_dir)?;
 
-    // Run MIT runtests
+    // Run MIT runtests — the source of truth for all test outcomes.
     let (summary, per_case) = run_runtests(paths, battery, mode)?;
 
     // Print summary line
@@ -353,6 +578,7 @@ fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary
     if !matches!(mode, TestMode::Check) {
         print!("{text}");
     }
+    let _ = std::fs::write(output_dir.join("test.log"), &text);
 
     let extract = |pattern: &str| -> usize {
         Regex::new(pattern)
@@ -364,45 +590,59 @@ fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary
     };
 
     let cases_discovered = extract(r"Test Cases Discovered:\s+(\d+)");
-    let cases_tested = extract(r"Test Cases Tested:\s+(\d+)");
-    let cases_failed = extract(r"Test Cases Failed:\s+(\d+)");
-    let cases_skipped = extract(r"Test Cases Skipped:\s+(\d+)");
     let vectors_passed = extract(r"Test Vectors Passed:\s+(\d+)");
     let vectors_failed = extract(r"Test Vectors Failed:\s+(\d+)");
     let vectors_skipped = extract(r"Test Vectors Skipped:\s+(\d+)");
 
-    let cases_passed = cases_discovered.saturating_sub(cases_failed + cases_skipped);
-
-    let fail_re = Regex::new(r"^- (\S+): Test failed")?;
+    // Parse ALL per-case outcomes from runtests output.
+    // Runtests reports every failure as: "- CASE_NAME: Build failed ..." or "- CASE_NAME: Test failed ..."
+    // and every executed case as: "Executing CASE_NAME"
+    let mut per_case: HashMap<String, serde_json::Value> = HashMap::new();
     let mut failed_cases: Vec<String> = Vec::new();
+
+    // 1. Parse "- NAME: Build failed ..." lines
+    let build_fail_re = Regex::new(r"^- (\S+): Build failed")?;
     for line in text.lines() {
-        if let Some(caps) = fail_re.captures(line) {
+        if let Some(caps) = build_fail_re.captures(line) {
             let name = caps[1].to_string();
-            if !failed_cases.contains(&name) {
-                failed_cases.push(name);
-            }
+            if !failed_cases.contains(&name) { failed_cases.push(name.clone()); }
+            per_case.insert(name.clone(), serde_json::json!({
+                "case": name, "battery": battery,
+                "vectors_failed": 1, "passed": false,
+                "error": "build failed",
+            }));
         }
     }
-    failed_cases.sort();
 
-    let exec_re = Regex::new(r"Executing (\S+)")?;
-    let mut per_case = HashMap::new();
-    for caps in exec_re.captures_iter(&text) {
-        let case = caps[1].to_string();
-        let vf = if failed_cases.contains(&case) { 1 } else { 0 };
-        per_case.insert(
-            case.clone(),
-            serde_json::json!({
-                "case": case,
-                "battery": battery,
-                "vectors_failed": vf,
-                "passed": vf == 0,
-            }),
-        );
+    // 2. Parse "- NAME: Test failed ..." lines
+    let test_fail_re = Regex::new(r"^- (\S+): Test failed")?;
+    for line in text.lines() {
+        if let Some(caps) = test_fail_re.captures(line) {
+            let name = caps[1].to_string();
+            if !failed_cases.contains(&name) { failed_cases.push(name.clone()); }
+            per_case.insert(name.clone(), serde_json::json!({
+                "case": name, "battery": battery,
+                "vectors_failed": 1, "passed": false,
+                "error": "test failed",
+            }));
+        }
     }
 
+    // 3. Parse "Executing NAME" lines — these passed (unless already marked failed)
+    let exec_re = Regex::new(r"Executing (\S+)")?;
+    for caps in exec_re.captures_iter(&text) {
+        let name = caps[1].to_string();
+        per_case.entry(name.clone()).or_insert_with(|| serde_json::json!({
+            "case": name, "battery": battery,
+            "vectors_failed": 0, "passed": true,
+        }));
+    }
+
+    failed_cases.sort();
+    let cases_passed = cases_discovered.saturating_sub(failed_cases.len());
+
     Ok((Summary {
-        cases_tested,
+        cases_tested: cases_discovered,
         cases_passed,
         vectors_passed,
         vectors_failed,

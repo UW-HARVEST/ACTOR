@@ -1,4 +1,4 @@
-use crate::cli::Agent;
+use crate::cli::{Agent, Dataset};
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::collections::HashMap;
@@ -42,6 +42,104 @@ pub struct Battery {
 }
 
 /// Discover all cases in a battery, resolving symlinks to group shared-source cases.
+/// List all battery names available in the corpus.
+pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
+    let public_tests = corpus_dir.join("Public-Tests");
+    anyhow::ensure!(public_tests.is_dir(), "Public-Tests not found: {}", public_tests.display());
+
+    let mut batteries: Vec<String> = std::fs::read_dir(&public_tests)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    batteries.sort();
+    Ok(batteries)
+}
+
+/// Quick check: does this battery contain shared-source groups (symlinked test_case)?
+pub fn has_shared_source_groups(corpus_dir: &Path, battery_name: &str) -> bool {
+    let dir = corpus_dir.join("Public-Tests").join(battery_name);
+    std::fs::read_dir(&dir).ok().map_or(false, |entries| {
+        entries.filter_map(|e| e.ok()).any(|e| e.path().join("test_case").is_symlink())
+    })
+}
+
+// ── CRUST-bench project (validated newtype) ────────────────────────────
+
+const CRUST_SKIP: &[&str] = &[
+    "Genetic_neural_network_for_simple_control", // C test >120s with -O2, https://github.com/anirudhkhatry/CRUST-bench/issues/40
+    "Holdem_Odds", // contradictory tests, https://github.com/anirudhkhatry/CRUST-bench/issues/37
+    "VaultSync", // test hardcodes /home/elhalili/... absolute path, only passes with leftover state
+    "bitset", // test uses bs.test() but C checks raw bits, https://github.com/anirudhkhatry/CRUST-bench/issues/41
+    "clog", // THIS_FILE hardcodes C filename, https://github.com/anirudhkhatry/CRUST-bench/issues/39
+];
+
+/// A validated CRUST project. Can only be constructed through `discover()` or
+/// `validated()`, which enforce the skip list and resolve paths.
+#[derive(Debug, Clone)]
+pub struct CrustProject {
+    name: String,
+    scaffold: PathBuf,
+    c_source: PathBuf,
+}
+
+impl CrustProject {
+    pub fn name(&self) -> &str { &self.name }
+    pub fn scaffold(&self) -> &Path { &self.scaffold }
+    pub fn c_source(&self) -> &Path { &self.c_source }
+
+    /// Discover all valid CRUST projects, applying skip list and optional limit.
+    pub fn discover(datasets_dir: &Path, limit: Option<usize>) -> Result<Vec<Self>> {
+        let rbench = datasets_dir.join("RBench");
+        anyhow::ensure!(rbench.is_dir(), "RBench not found: {}", rbench.display());
+
+        let mut names: Vec<String> = std::fs::read_dir(&rbench)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !CRUST_SKIP.contains(&n.as_str()))
+            .collect();
+        names.sort();
+        if let Some(n) = limit { names.truncate(n); }
+
+        names.into_iter()
+            .map(|name| Self::resolve(datasets_dir, name))
+            .collect()
+    }
+
+    /// Validate a single project name against the skip list and resolve paths.
+    pub fn validated(datasets_dir: &Path, name: &str) -> Result<Self> {
+        anyhow::ensure!(
+            !CRUST_SKIP.contains(&name),
+            "{name} is in the CRUST skip list"
+        );
+        Self::resolve(datasets_dir, name.to_string())
+    }
+
+    fn resolve(datasets_dir: &Path, name: String) -> Result<Self> {
+        let scaffold = datasets_dir.join("RBench").join(&name);
+        anyhow::ensure!(scaffold.is_dir(), "RBench scaffold not found: {}", scaffold.display());
+
+        let c_source = Self::find_cbench(datasets_dir, &name)
+            .with_context(|| format!("CBench source not found for {name}"))?;
+
+        Ok(Self { name, scaffold, c_source })
+    }
+
+    fn find_cbench(datasets_dir: &Path, project: &str) -> Option<PathBuf> {
+        let cbench = datasets_dir.join("CBench");
+        for candidate in [
+            project.to_string(),
+            project.replace('_', "-"),
+            project.strip_prefix("proj_").unwrap_or(project).replace('_', "-"),
+        ] {
+            let p = cbench.join(&candidate);
+            if p.is_dir() { return Some(p); }
+        }
+        None
+    }
+}
+
 pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> Result<Battery> {
     let input_dir = corpus_dir.join("Public-Tests").join(battery_name);
     anyhow::ensure!(input_dir.is_dir(), "Battery not found: {}", input_dir.display());
@@ -259,34 +357,31 @@ pub struct Paths {
     pub results_dir: PathBuf,
     pub prompts_dir: PathBuf,
     pub agent: Agent,
+    pub dataset: Dataset,
 }
 
 impl Paths {
-    pub fn new(repo_root: &Path) -> Self {
-        Self::with_agent(repo_root, Agent::Kiro)
-    }
-
-    pub fn with_agent(repo_root: &Path, agent: Agent) -> Self {
-        let (results_dir, prompts_dir) = match agent {
-            Agent::Kiro => (
-                repo_root.join("results/kiro"),
-                repo_root.join("scripts/prompts"),
+    pub fn new(repo_root: &Path, agent: Agent, dataset: Dataset) -> Self {
+        let agent_name = match agent {
+            Agent::Kiro => "kiro",
+            Agent::Claude => "claude",
+            Agent::C2rust => "c2rust",
+        };
+        let (corpus_dir, results_dir) = match dataset {
+            Dataset::TestCorpus => (
+                repo_root.join("test-corpus"),
+                repo_root.join("results/Test-Corpus").join(agent_name),
             ),
-            Agent::Claude => (
-                repo_root.join("results/claude"),
-                repo_root.join("scripts/prompts/claude"),
-            ),
-            Agent::C2rust => (
-                repo_root.join("results/c2rust"),
-                repo_root.join("scripts/prompts"), // unused
+            Dataset::Crust => (
+                repo_root.join("crust-bench/datasets"),
+                repo_root.join("results/CRUST").join(agent_name),
             ),
         };
-        Self {
-            corpus_dir: repo_root.join("test-corpus"),
-            results_dir,
-            prompts_dir,
-            agent,
-        }
+        let prompts_dir = match agent {
+            Agent::Claude => repo_root.join("scripts/prompts/claude"),
+            _ => repo_root.join("scripts/prompts"),
+        };
+        Self { corpus_dir, results_dir, prompts_dir, agent, dataset }
     }
 
     pub fn input_dir(&self, battery: &str) -> PathBuf {

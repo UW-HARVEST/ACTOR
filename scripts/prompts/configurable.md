@@ -2,6 +2,10 @@
 Translate the C code in c_src/ to Rust that produces **byte-identical output** for the same inputs.
 Write Cargo.toml and src/ files in the current directory (NOT in c_src/).
 
+You MUST translate ALL C source files — no stubs, no placeholders, no empty
+functions. Every .c file MUST have a complete Rust equivalent. The binary MUST
+produce the same stdout as the C binary for the same inputs.
+
 This project has **build-time configurability** via CMake cache variables.
 Look at c_src/CMakeLists.txt — it uses variables to select which source files
 to compile and which parameter headers to include at build time.
@@ -19,18 +23,17 @@ Your Cargo.toml must have both `[lib]` with `crate-type = ["cdylib"]` and
 Instead:
 1. Analyze the C project structure and create a plan (TODO list) breaking the
    translation into subtasks (e.g., core/shared code, each backend, entry points)
-2. For each subtask, invoke a subagent to do the translation by running:
-   ```
-   kiro-cli chat --no-interactive --trust-all-tools \
-     '<detailed prompt for this subtask>' \
-     < /dev/null
-   ```
-3. After each subagent completes, verify the work compiles before moving on
-4. Once all subtasks are done, wire up the feature gates and verify the full build
+2. The binary driver (main.rs) MUST be one of the subtasks — do not leave it for last.
+   Translate it fully, not as a stub.
+3. For each subtask, invoke a single subagent using the use_subagent tool with
+   agent_name "kiro_plain" and a detailed query for that subtask. Only invoke
+   one subagent at a time — wait for it to complete before starting the next.
+4. After each subagent completes, verify the work compiles before moving on
+5. Once all subtasks are done, wire up the feature gates and verify the full build
 
 Each subagent should work in the same directory and add to the existing code.
-Give each subagent a clear, focused prompt with the specific C files to translate
-and where to put the Rust output. Each subagent prompt MUST include:
+Give each subagent a clear, focused query with the specific C files to translate
+and where to put the Rust output. Each subagent query MUST include:
 - Which specific C source files to translate
 - Which Rust file(s) to write
 - Instructions to build and verify its own work compiles with the relevant features
