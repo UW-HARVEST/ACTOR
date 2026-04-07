@@ -343,6 +343,81 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
     }
 }
 
+/// Blind CRUST test: run LLM-generated tests, then swap in real tests and run again.
+pub fn run_blind_crust_test(
+    paths: &Paths,
+    projects: &[crate::battery::CrustProject],
+    mode: TestMode,
+) -> Result<TestOutcome> {
+    let mut llm_passed = 0usize;
+    let mut real_passed = 0usize;
+    let mut total = 0usize;
+
+    for project in projects {
+        let name = project.name();
+        let proj_dir = paths.output_dir(name);
+        if !proj_dir.join("Cargo.toml").exists() { continue; }
+        total += 1;
+
+        let bin_dir = proj_dir.join("src/bin");
+
+        // Phase 1: run with LLM-generated tests (whatever is in src/bin/)
+        let llm_result = test_one_crust(&proj_dir)?;
+        let llm_ok = llm_result.build_ok && llm_result.tests_ok > 0 && llm_result.tests_failed == 0;
+        if llm_ok { llm_passed += 1; }
+
+        // Save LLM tests aside
+        let llm_backup = proj_dir.join("src/bin_llm");
+        if bin_dir.is_dir() {
+            if llm_backup.exists() { std::fs::remove_dir_all(&llm_backup)?; }
+            crate::translate::copy_dir_all(&bin_dir, &llm_backup)?;
+        }
+
+        // Phase 2: swap in real tests from scaffold
+        let real_bin = project.scaffold().join("src/bin");
+        if real_bin.is_dir() {
+            if bin_dir.is_dir() { std::fs::remove_dir_all(&bin_dir)?; }
+            // Clean cargo cache so it recompiles with new test files
+            let _ = std::fs::remove_dir_all(proj_dir.join("target"));
+            crate::translate::copy_dir_all(&real_bin, &bin_dir)?;
+        }
+
+        let real_result = test_one_crust(&proj_dir)?;
+        let real_ok = real_result.build_ok && real_result.tests_ok > 0 && real_result.tests_failed == 0;
+        if real_ok { real_passed += 1; }
+
+        // Restore LLM tests
+        if llm_backup.is_dir() {
+            if bin_dir.is_dir() { std::fs::remove_dir_all(&bin_dir)?; }
+            let _ = std::fs::remove_dir_all(proj_dir.join("target"));
+            std::fs::rename(&llm_backup, &bin_dir)?;
+        }
+
+        // Report
+        let llm_icon = if llm_ok { "✅" } else { "❌" };
+        let real_icon = if real_ok { "✅" } else { "❌" };
+        println!("  {name}: LLM {llm_icon} ({}/{})  Real {real_icon} ({}/{})",
+            llm_result.tests_ok, llm_result.tests_ok + llm_result.tests_failed,
+            real_result.tests_ok, real_result.tests_ok + real_result.tests_failed);
+
+        if matches!(mode, TestMode::Update) {
+            let json = serde_json::json!({
+                "llm_tests_ok": llm_result.tests_ok,
+                "llm_tests_failed": llm_result.tests_failed,
+                "real_tests_ok": real_result.tests_ok,
+                "real_tests_failed": real_result.tests_failed,
+                "build_ok": real_result.build_ok,
+            });
+            std::fs::write(proj_dir.join("result.json"), serde_json::to_string_pretty(&json)? + "\n")?;
+        }
+    }
+
+    println!("\nCRUST-blind: {llm_passed}/{total} pass (LLM tests)");
+    println!("CRUST-blind: {real_passed}/{total} pass (real tests)");
+
+    Ok(TestOutcome::Ok)
+}
+
 // ── Battery discovery ──────────────────────────────────────────────────
 
 fn discover_batteries(results_dir: &Path) -> Result<Vec<String>> {

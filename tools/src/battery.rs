@@ -376,6 +376,10 @@ impl Paths {
                 repo_root.join("crust-bench/datasets"),
                 repo_root.join("results/CRUST").join(agent_name),
             ),
+            Dataset::BlindCrust => (
+                repo_root.join("crust-bench/datasets"),
+                repo_root.join("results/CRUST-blind").join(agent_name),
+            ),
         };
         let prompts_dir = match agent {
             Agent::Claude => repo_root.join("scripts/prompts/claude"),
