@@ -83,7 +83,7 @@ jobs:
 
       - name: Install system dependencies
         if: matrix.needs_openssl
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev cmake
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev cmake pkg-config
 
       - name: Set up Python
         uses: actions/setup-python@v5
