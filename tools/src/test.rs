@@ -303,6 +303,18 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
                 println!("\n❌ {} regression(s):", regressions.len());
                 for r in &regressions {
                     println!("  {}: {} expected={} actual={}", r.project, r.field, r.expected, r.actual);
+                    // Dump test log for regression diagnosis
+                    let log_path = paths.output_dir(&r.project).join("logs/test.log");
+                    if let Ok(log) = std::fs::read_to_string(&log_path) {
+                        println!("  ┌── test.log for {} ──", r.project);
+                        for line in log.lines().take(50) {
+                            println!("  │ {line}");
+                        }
+                        if log.lines().count() > 50 {
+                            println!("  │ ... ({} more lines)", log.lines().count() - 50);
+                        }
+                        println!("  └──");
+                    }
                 }
                 Ok(TestOutcome::Failed(vec![BatteryMismatch {
                     battery: "CRUST".into(),
