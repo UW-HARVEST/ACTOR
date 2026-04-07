@@ -56,6 +56,14 @@ pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
     Ok(batteries)
 }
 
+/// Quick check: does this battery contain shared-source groups (symlinked test_case)?
+pub fn has_shared_source_groups(corpus_dir: &Path, battery_name: &str) -> bool {
+    let dir = corpus_dir.join("Public-Tests").join(battery_name);
+    std::fs::read_dir(&dir).ok().map_or(false, |entries| {
+        entries.filter_map(|e| e.ok()).any(|e| e.path().join("test_case").is_symlink())
+    })
+}
+
 // ── CRUST-bench project (validated newtype) ────────────────────────────
 
 const CRUST_SKIP: &[&str] = &[

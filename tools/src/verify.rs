@@ -1,120 +1,130 @@
 use crate::battery::{self, Case, Paths};
 use crate::cargo_toml;
 use crate::cli::Agent;
-use crate::translate::{copy_dir_all, IsolatedWorkDir};
+use crate::translate::{copy_dir_all, IsolatedWorkDir, Semaphore};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
-pub fn run(repo_root: &Path, paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, _parallel: usize) -> Result<()> {
+pub fn run(repo_root: &Path, paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
+    let sem = Arc::new(Semaphore::new(parallel));
+    run_with_semaphore(repo_root, paths, battery_name, filter, force, &sem)
+}
+
+pub fn run_all(repo_root: &Path, paths: &Paths, batteries: &[String], force: bool, parallel: usize) -> Result<()> {
+    let sem = Arc::new(Semaphore::new(parallel));
+
+    let errors: Vec<anyhow::Error> = std::thread::scope(|s| {
+        let handles: Vec<_> = batteries.iter().map(|bat| {
+            let sem = sem.clone();
+            s.spawn(move || -> Result<()> {
+                run_with_semaphore(repo_root, paths, bat, None, force, &sem)
+            })
+        }).collect();
+
+        handles.into_iter().filter_map(|h| match h.join() {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e),
+            Err(_) => Some(anyhow::anyhow!("verify thread panicked")),
+        }).collect()
+    });
+
+    if let Some(first) = errors.into_iter().next() {
+        return Err(first);
+    }
+    Ok(())
+}
+
+fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, sem: &Arc<Semaphore>) -> Result<()> {
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
     let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))?;
 
-    let mut verified = 0;
-    let mut failed = 0;
-    let mut skipped = 0;
-    let mut total = 0;
-
-    // Count verifiable cases
+    // Split into independent (parallelizable) and shared-source (sequential)
+    let mut independent: Vec<&battery::IndependentCase> = Vec::new();
+    let mut shared: Vec<&battery::SharedSourceGroup> = Vec::new();
     for case in &battery.cases {
         match case {
-            Case::Independent(_) => total += 1,
-            Case::SharedSource(_) => total += 1, // only real case verified
+            Case::Independent(c) => independent.push(c),
+            Case::SharedSource(g) => shared.push(g),
+        }
+    }
+    let total = independent.len() + shared.len();
+    println!("=== Verifying {battery_name} ({total} cases) ===");
+
+    // ── Parallel: independent cases ────────────────────────────────────
+    let ind_results: Vec<(String, Option<bool>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = independent.iter().map(|c| {
+            s.spawn(|| {
+                let _permit = sem.acquire();
+                let case_dir = output_dir.join(&c.name);
+                if !case_dir.join("translated_rust/Cargo.toml").exists() {
+                    return (c.name.clone(), None);
+                }
+                if !force && case_dir.join("logs/verify.log").exists() {
+                    return (c.name.clone(), None); // skipped
+                }
+                let cmake_flags = get_cmake_flags(paths, battery_name, &c.name);
+                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths.agent)
+                    .unwrap_or(false);
+                (c.name.clone(), Some(ok))
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().expect("verify thread panicked")).collect()
+    });
+
+    let mut verified = 0usize;
+    let mut failed = 0usize;
+    let mut current = 0usize;
+    for (name, result) in &ind_results {
+        current += 1;
+        match result {
+            None => println!("[{current}/{total}] ⏭️  {name} (skipped)"),
+            Some(true) => { verified += 1; println!("[{current}/{total}] ✅ {name}"); }
+            Some(false) => { failed += 1; println!("[{current}/{total}] ❌ {name}"); }
         }
     }
 
-    println!("=== Verifying {battery_name} ({total} cases) ===");
+    // ── Sequential: shared-source groups ───────────────────────────────
+    for group in &shared {
+        current += 1;
+        let real_dir = output_dir.join(&group.real_case);
 
-    let mut current = 0;
-    for case in &battery.cases {
-        match case {
-            Case::Independent(c) => {
-                current += 1;
-                let case_dir = output_dir.join(&c.name);
-
-                if !case_dir.join("translated_rust/Cargo.toml").exists() {
-                    continue;
-                }
-
-                if !force && case_dir.join("logs/verify.log").exists() {
-                    println!("[{current}/{total}] ⏭️  {} (already verified)", c.name);
-                    skipped += 1;
-                    continue;
-                }
-
-                println!("[{current}/{total}] 🔬 {}", c.name);
-                let cmake_flags = get_cmake_flags(&paths, battery_name, &c.name);
-                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths.agent)?;
-
-                if ok {
-                    verified += 1;
-                    println!("[{current}/{total}] ✅ {} — verified", c.name);
-                } else {
-                    failed += 1;
-                    println!("[{current}/{total}] ❌ {} — verification incomplete", c.name);
-                }
-            }
-            Case::SharedSource(group) => {
-                current += 1;
-                let real_dir = output_dir.join(&group.real_case);
-
-                if !real_dir.join("translated_rust/Cargo.toml").exists() {
-                    continue;
-                }
-
-                if !force && real_dir.join("logs/verify.log").exists() {
-                    println!("[{current}/{total}] ⏭️  {} (already verified)", group.real_case);
-                    skipped += 1;
-                } else {
-                    println!("[{current}/{total}] 🔬 {} (shared-source, {} configs)", group.real_case, group.configs.len());
-                    let cmake_flags = get_cmake_flags(&paths, battery_name, &group.real_case);
-                    let configs_text = build_configs_text(&paths, battery_name, group);
-                    let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, paths.agent)?;
-
-                    if ok {
-                        verified += 1;
-                        println!("[{current}/{total}] ✅ {} — verified", group.real_case);
-                    } else {
-                        failed += 1;
-                        println!("[{current}/{total}] ❌ {} — verification incomplete", group.real_case);
-                    }
-                }
-
-                // Always propagate fixes to configs
-                println!("Re-propagating fixes from {} to {} configs...", group.real_case, group.configs.len());
-                let real_src = real_dir.join("translated_rust/src");
-                for cfg in &group.configs {
-                    let cfg_translated = output_dir.join(&cfg.name).join("translated_rust");
-                    if !cfg_translated.join("Cargo.toml").exists() {
-                        continue;
-                    }
-
-                    // Copy updated src
-                    let dst_src = cfg_translated.join("src");
-                    if dst_src.exists() {
-                        std::fs::remove_dir_all(&dst_src)?;
-                    }
-                    copy_dir_all(&real_src, &dst_src)?;
-
-                    // Strip for lib cases
-                    if cfg.is_lib {
-                        cargo_toml::strip_for_lib(&cfg_translated)?;
-                    }
-
-                    // Clean target so it rebuilds
-                    let target_dir = cfg_translated.join("target");
-                    if target_dir.exists() {
-                        std::fs::remove_dir_all(&target_dir)?;
-                    }
-                }
-                println!("Propagated to {} cases", group.configs.len());
-            }
+        if !real_dir.join("translated_rust/Cargo.toml").exists() {
+            continue;
         }
+
+        if !force && real_dir.join("logs/verify.log").exists() {
+            println!("[{current}/{total}] ⏭️  {} (already verified)", group.real_case);
+        } else {
+            println!("[{current}/{total}] 🔬 {} (shared-source, {} configs)", group.real_case, group.configs.len());
+            let cmake_flags = get_cmake_flags(paths, battery_name, &group.real_case);
+            let configs_text = build_configs_text(paths, battery_name, group);
+            let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, paths.agent)?;
+
+            if ok { verified += 1; println!("[{current}/{total}] ✅ {} — verified", group.real_case); }
+            else { failed += 1; println!("[{current}/{total}] ❌ {} — verification incomplete", group.real_case); }
+        }
+
+        // Always propagate fixes to configs
+        println!("Re-propagating fixes from {} to {} configs...", group.real_case, group.configs.len());
+        let real_src = real_dir.join("translated_rust/src");
+        for cfg in &group.configs {
+            let cfg_translated = output_dir.join(&cfg.name).join("translated_rust");
+            if !cfg_translated.join("Cargo.toml").exists() { continue; }
+            let dst_src = cfg_translated.join("src");
+            if dst_src.exists() { std::fs::remove_dir_all(&dst_src)?; }
+            copy_dir_all(&real_src, &dst_src)?;
+            if cfg.is_lib { cargo_toml::strip_for_lib(&cfg_translated)?; }
+            let target_dir = cfg_translated.join("target");
+            if target_dir.exists() { std::fs::remove_dir_all(&target_dir)?; }
+        }
+        println!("Propagated to {} cases", group.configs.len());
     }
 
     println!();
-    println!("Verified: {verified}, Failed: {failed}, Skipped: {skipped} (of {total})");
+    println!("Verified: {verified}, Failed: {failed} (of {total})");
     Ok(())
 }
 

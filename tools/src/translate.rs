@@ -9,17 +9,17 @@ use std::time::Instant;
 
 // ── Semaphore ──────────────────────────────────────────────────────────
 
-struct Semaphore {
+pub struct Semaphore {
     state: Mutex<usize>,
     cvar: Condvar,
     max: usize,
 }
 
 impl Semaphore {
-    fn new(max: usize) -> Self {
+    pub fn new(max: usize) -> Self {
         Self { state: Mutex::new(0), cvar: Condvar::new(), max }
     }
-    fn acquire(&self) -> SemaphoreGuard<'_> {
+    pub fn acquire(&self) -> SemaphoreGuard<'_> {
         let mut count = self.state.lock().unwrap();
         while *count >= self.max {
             count = self.cvar.wait(count).unwrap();
@@ -29,7 +29,7 @@ impl Semaphore {
     }
 }
 
-struct SemaphoreGuard<'a>(&'a Semaphore);
+pub struct SemaphoreGuard<'a>(&'a Semaphore);
 
 impl Drop for SemaphoreGuard<'_> {
     fn drop(&mut self) {

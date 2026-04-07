@@ -160,9 +160,50 @@ fn resolve_batteries(corpus_dir: &std::path::Path, target: &str) -> Result<Vec<S
 fn execute_translate(paths: &battery::Paths, plan: &TranslatePlan) -> Result<()> {
     match plan {
         TranslatePlan::TestCorpus { batteries, parallel } => {
-            for bat in batteries {
-                let (name, filter) = parse_target(bat, None);
-                translate::run_test_corpus(paths, &name, filter.as_deref(), *parallel)?;
+            if batteries.len() > 1 && *parallel > 1 {
+                // Split: shared-source batteries (P01-style, few real translations)
+                // get 1 dedicated thread each; independent batteries share the rest.
+                let (shared_bats, indie_bats): (Vec<&str>, Vec<&str>) = batteries.iter()
+                    .map(String::as_str)
+                    .partition(|b| battery::has_shared_source_groups(&paths.corpus_dir, b));
+
+                let indie_parallel = parallel.saturating_sub(shared_bats.len()).max(1);
+
+                let errors: Vec<anyhow::Error> = std::thread::scope(|s| {
+                    let mut handles = Vec::new();
+
+                    for bat in &shared_bats {
+                        handles.push(s.spawn(move || -> Result<()> {
+                            let (name, filter) = parse_target(bat, None);
+                            translate::run_test_corpus(paths, &name, filter.as_deref(), 1)
+                        }));
+                    }
+
+                    if !indie_bats.is_empty() {
+                        handles.push(s.spawn(|| -> Result<()> {
+                            for bat in &indie_bats {
+                                let (name, filter) = parse_target(bat, None);
+                                translate::run_test_corpus(paths, &name, filter.as_deref(), indie_parallel)?;
+                            }
+                            Ok(())
+                        }));
+                    }
+
+                    handles.into_iter().filter_map(|h| match h.join() {
+                        Ok(Ok(())) => None,
+                        Ok(Err(e)) => Some(e),
+                        Err(_) => Some(anyhow::anyhow!("translate thread panicked")),
+                    }).collect()
+                });
+
+                if let Some(first) = errors.into_iter().next() {
+                    return Err(first);
+                }
+            } else {
+                for bat in batteries {
+                    let (name, filter) = parse_target(bat, None);
+                    translate::run_test_corpus(paths, &name, filter.as_deref(), *parallel)?;
+                }
             }
         }
         TranslatePlan::Crust { projects, parallel } => {
@@ -175,9 +216,13 @@ fn execute_translate(paths: &battery::Paths, plan: &TranslatePlan) -> Result<()>
 fn execute_verify(repo_root: &std::path::Path, paths: &battery::Paths, plan: &VerifyPlan) -> Result<()> {
     match plan {
         VerifyPlan::TestCorpus { batteries, parallel, force } => {
-            for bat in batteries {
-                let (name, filter) = parse_target(bat, None);
-                verify::run(repo_root, paths, &name, filter.as_deref(), *force, *parallel)?;
+            if batteries.len() > 1 {
+                verify::run_all(repo_root, paths, batteries, *force, *parallel)?;
+            } else {
+                for bat in batteries {
+                    let (name, filter) = parse_target(bat, None);
+                    verify::run(repo_root, paths, &name, filter.as_deref(), *force, *parallel)?;
+                }
             }
         }
         VerifyPlan::Skip => {}

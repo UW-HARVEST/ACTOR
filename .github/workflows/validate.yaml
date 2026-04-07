@@ -5,7 +5,7 @@ on:
     branches: [main]
 
 jobs:
-  validate:
+  setup:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
@@ -19,8 +19,61 @@ jobs:
           git submodule update --init --depth=1 results test-corpus crust-bench
 
       - name: Unzip CRUST-bench datasets
+        run: cd crust-bench/datasets && unzip -q CRUST_bench.zip
+
+      - name: Set up Rust
         run: |
-          cd crust-bench/datasets && unzip -q CRUST_bench.zip
+          rustup toolchain install 1.94.0 --profile default
+          rustup toolchain install nightly --profile default
+          rustup default 1.94.0
+
+      - name: Build harvest-tools
+        run: cargo build --release --manifest-path tools/Cargo.toml
+
+      - name: Cache workspace
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .
+            !.git
+          key: workspace-${{ github.sha }}
+
+  validate:
+    needs: setup
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: CRUST kiro
+            guard: results/CRUST/kiro
+            cmd: ./tools/target/release/harvest-tools --agent kiro test CRUST --check
+            needs_openssl: true
+            needs_crust: true
+          - name: Test-Corpus kiro
+            guard: results/Test-Corpus/kiro
+            cmd: ./tools/target/release/harvest-tools --agent kiro test all --check
+            needs_openssl: false
+            needs_crust: false
+          - name: Test-Corpus c2rust
+            guard: results/Test-Corpus/c2rust
+            cmd: ./tools/target/release/harvest-tools --agent c2rust test all --check
+            needs_openssl: false
+            needs_crust: false
+          - name: Test-Corpus claude
+            guard: results/Test-Corpus/claude
+            cmd: ./tools/target/release/harvest-tools --agent claude test all --check
+            needs_openssl: false
+            needs_crust: false
+    name: ${{ matrix.name }}
+    steps:
+      - name: Restore workspace
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .
+            !.git
+          key: workspace-${{ github.sha }}
 
       - name: Set up Rust
         run: |
@@ -29,6 +82,7 @@ jobs:
           rustup default 1.94.0
 
       - name: Install system dependencies
+        if: matrix.needs_openssl
         run: sudo apt-get update && sudo apt-get install -y libssl-dev cmake
 
       - name: Set up Python
@@ -36,38 +90,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Build harvest-tools
-        run: cargo build --release --manifest-path tools/Cargo.toml
-
-      - name: Validate CRUST-bench translations (kiro)
+      - name: Validate
         env:
           CARGO_BUILD_JOBS: "2"
           OPENSSL_DIR: /usr
         run: |
-          if [ -d results/CRUST/kiro ]; then
-            ./tools/target/release/harvest-tools --agent kiro test CRUST --check
-          fi
-
-      - name: Validate c2rust translations
-        env:
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          if [ -d results/Test-Corpus/c2rust ]; then
-            ./tools/target/release/harvest-tools --agent c2rust test all --check
-          fi
-
-      - name: Validate kiro translations
-        env:
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          if [ -d results/Test-Corpus/kiro ]; then
-            ./tools/target/release/harvest-tools --agent kiro test all --check
-          fi
-
-      - name: Validate claude translations
-        env:
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          if [ -d results/Test-Corpus/claude ]; then
-            ./tools/target/release/harvest-tools --agent claude test all --check
+          if [ -d "${{ matrix.guard }}" ]; then
+            ${{ matrix.cmd }}
           fi

@@ -67,6 +67,9 @@ anything else.
 Add `libloading = "0.8"` to [dev-dependencies] in translated_rust/Cargo.toml.
 Do NOT modify anything in c_src/.
 
+IMPORTANT: If a file is too large to write in one tool call, build it up
+piece by piece using multiple smaller writes (create then append).
+
 IMPORTANT: Use timeouts for all commands. No single build or test command should
 run longer than 600 seconds. If a test takes too long, skip it and move on to
 the next function. Use `timeout 600 cargo test ...` or similar. Do not get stuck
