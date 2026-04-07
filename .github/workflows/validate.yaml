@@ -95,6 +95,20 @@ jobs:
           CARGO_BUILD_JOBS: "2"
           OPENSSL_DIR: /usr
         run: |
+          echo "::group::Environment diagnostics"
+          echo "Guard path: ${{ matrix.guard }}"
+          ls -la "${{ matrix.guard }}" 2>/dev/null | head -5 || echo "Guard path does not exist"
+          echo "pkg-config openssl:"
+          pkg-config --modversion openssl 2>&1 || echo "pkg-config not available"
+          echo "openssl version:"
+          openssl version 2>&1 || echo "openssl not found"
+          echo "VaultSync .vsync check:"
+          ls -la results/CRUST/kiro/VaultSync/.vsync 2>/dev/null && echo "WARNING: .vsync exists!" || echo ".vsync not present (good)"
+          echo "c_blind_rsa result.json:"
+          cat results/CRUST/kiro/c_blind_rsa_signatures/result.json 2>/dev/null || echo "not found"
+          echo "VaultSync result.json:"
+          cat results/CRUST/kiro/VaultSync/result.json 2>/dev/null || echo "not found"
+          echo "::endgroup::"
           if [ -d "${{ matrix.guard }}" ]; then
             ${{ matrix.cmd }}
           fi
