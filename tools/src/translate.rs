@@ -756,13 +756,10 @@ fn verify_one_crust_blind_inner(paths: &Paths, project: &battery::CrustProject, 
     invoke_agent(paths.agent, prompt, &log_path, &work)?;
     let elapsed = start.elapsed().as_secs();
 
-    // Copy back only src/bin/ (the LLM-generated tests)
-    let work_bin = work.join("src/bin");
-    if work_bin.is_dir() {
-        std::fs::create_dir_all(&bin_dir)?;
-        copy_dir_all(&work_bin, &bin_dir)?;
-    }
+    // Copy back all agent changes (src/, Cargo.toml — but not target/c_src/logs)
+    copy_dir_filtered(&work, &out, &["target", "c_src", "logs"])?;
 
+    let bin_dir = out.join("src/bin");
     let success = bin_dir.is_dir() && std::fs::read_dir(&bin_dir)?.next().is_some();
     Ok(CaseResult { name: project.name().into(), elapsed_secs: elapsed, success, error: None, skipped: false })
 }
