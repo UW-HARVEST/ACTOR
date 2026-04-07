@@ -233,11 +233,17 @@ fn execute_verify(repo_root: &std::path::Path, paths: &battery::Paths, plan: &Ve
 fn execute_test(paths: &battery::Paths, plan: &TestPlan) -> Result<test::TestOutcome> {
     match plan {
         TestPlan::TestCorpus { batteries, mode } => {
+            let mut all_mismatches = Vec::new();
             for bat in batteries {
-                test::run_test_corpus(paths, bat, *mode)?;
+                if let test::TestOutcome::Failed(m) = test::run_test_corpus(paths, bat, *mode)? {
+                    all_mismatches.extend(m);
+                }
             }
-            // TODO: aggregate outcomes properly
-            Ok(test::TestOutcome::Ok)
+            if all_mismatches.is_empty() {
+                Ok(test::TestOutcome::Passed)
+            } else {
+                Ok(test::TestOutcome::Failed(all_mismatches))
+            }
         }
         TestPlan::Crust { projects, mode } => {
             test::run_crust_test(paths, projects, *mode)
