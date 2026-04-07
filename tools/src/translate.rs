@@ -669,7 +669,7 @@ fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject, mod
 
 // ── Blind CRUST verify: agent generates tests ──────────────────────────
 
-pub fn verify_crust_blind(paths: &Paths, projects: &[battery::CrustProject], parallel: usize) -> Result<()> {
+pub fn verify_crust_blind(paths: &Paths, projects: &[battery::CrustProject], parallel: usize, force: bool) -> Result<()> {
     preflight_check(paths.agent)?;
 
     let prompt = std::fs::read_to_string(paths.prompts_dir.join("crust_verify.md"))
@@ -684,7 +684,7 @@ pub fn verify_crust_blind(paths: &Paths, projects: &[battery::CrustProject], par
             let sem = &sem;
             s.spawn(move || {
                 let _permit = sem.acquire();
-                verify_one_crust_blind(paths, p, prompt)
+                verify_one_crust_blind(paths, p, prompt, force)
             })
         }).collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -711,8 +711,8 @@ pub fn verify_crust_blind(paths: &Paths, projects: &[battery::CrustProject], par
     Ok(())
 }
 
-fn verify_one_crust_blind(paths: &Paths, project: &battery::CrustProject, prompt: &str) -> CaseResult {
-    match verify_one_crust_blind_inner(paths, project, prompt) {
+fn verify_one_crust_blind(paths: &Paths, project: &battery::CrustProject, prompt: &str, force: bool) -> CaseResult {
+    match verify_one_crust_blind_inner(paths, project, prompt, force) {
         Ok(r) => r,
         Err(e) => CaseResult {
             name: project.name().to_string(),
@@ -724,16 +724,22 @@ fn verify_one_crust_blind(paths: &Paths, project: &battery::CrustProject, prompt
     }
 }
 
-fn verify_one_crust_blind_inner(paths: &Paths, project: &battery::CrustProject, prompt: &str) -> Result<CaseResult> {
+fn verify_one_crust_blind_inner(paths: &Paths, project: &battery::CrustProject, prompt: &str, force: bool) -> Result<CaseResult> {
     let out = paths.output_dir(project.name());
 
     anyhow::ensure!(out.join("Cargo.toml").exists(), "translation not found for {}", project.name());
 
-    // Skip if LLM-generated tests already exist
+    // Skip if LLM-generated tests already exist (unless --force)
     let bin_dir = out.join("src/bin");
-    if bin_dir.is_dir() && std::fs::read_dir(&bin_dir)?.next().is_some() {
+    if !force && bin_dir.is_dir() && std::fs::read_dir(&bin_dir)?.next().is_some() {
         return Ok(CaseResult { name: project.name().into(), elapsed_secs: 0, success: true, error: None, skipped: true });
     }
+
+    // Clean old LLM tests if re-running
+    if bin_dir.is_dir() {
+        std::fs::remove_dir_all(&bin_dir)?;
+    }
+    let _ = std::fs::remove_dir_all(out.join("target"));
 
     // Set up temp workspace with the translated code + C source
     let tmp = tempfile::Builder::new()

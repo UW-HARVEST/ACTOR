@@ -142,6 +142,7 @@ pub enum VerifyPlan {
     BlindCrust {
         projects: Vec<super::battery::CrustProject>,
         parallel: usize,
+        force: bool,
     },
     Skip,
 }

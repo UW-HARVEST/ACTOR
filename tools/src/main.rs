@@ -131,7 +131,7 @@ fn make_verify_plan(
         Dataset::Crust => Ok(VerifyPlan::Skip),
         Dataset::BlindCrust => {
             let projects = resolve_crust_projects(&paths.corpus_dir, target, None)?;
-            Ok(VerifyPlan::BlindCrust { projects, parallel })
+            Ok(VerifyPlan::BlindCrust { projects, parallel, force })
         }
     }
 }
@@ -244,8 +244,8 @@ fn execute_verify(repo_root: &std::path::Path, paths: &battery::Paths, plan: &Ve
                 }
             }
         }
-        VerifyPlan::BlindCrust { projects, parallel } => {
-            translate::verify_crust_blind(paths, projects, *parallel)?;
+        VerifyPlan::BlindCrust { projects, parallel, force } => {
+            translate::verify_crust_blind(paths, projects, *parallel, *force)?;
         }
         VerifyPlan::Skip => {}
     }
