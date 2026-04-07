@@ -180,10 +180,8 @@ fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
         if p.exists() { let _ = std::fs::remove_dir_all(&p); }
     }
 
-    let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
     let output = Command::new("timeout")
         .args(["60", "cargo", "test"])
-        .env("OPENSSL_DIR", &openssl_dir)
         .current_dir(proj_dir)
         .output()
         .with_context(|| format!("running cargo test in {}", proj_dir.display()))?;
@@ -199,7 +197,6 @@ fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
     let (final_stdout, final_stderr) = if !build_ok || (tests_ok == 0 && tests_failed == 0) {
         let verbose = Command::new("timeout")
             .args(["60", "cargo", "test", "--verbose"])
-            .env("OPENSSL_DIR", &openssl_dir)
             .current_dir(proj_dir)
             .output()
             .ok();

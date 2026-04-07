@@ -93,7 +93,6 @@ jobs:
       - name: Validate
         env:
           CARGO_BUILD_JOBS: "2"
-          OPENSSL_DIR: /usr
         run: |
           echo "::group::Environment diagnostics"
           echo "Guard path: ${{ matrix.guard }}"
