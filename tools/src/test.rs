@@ -195,8 +195,7 @@ fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
     std::fs::create_dir_all(&logs_dir)?;
     std::fs::write(logs_dir.join("test.log"), format!("{stdout}\n{stderr}"))?;
 
-    let tests_ok = stdout.matches("... ok").count();
-    let tests_failed = stdout.matches("... FAILED").count();
+    let (tests_ok, tests_failed) = parse_cargo_test_results(&stdout);
     let build_ok = !stderr.contains("error[") && !stderr.contains("could not compile");
 
     // Print diagnostic snippet when something went wrong
@@ -214,6 +213,18 @@ fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
     }
 
     Ok(CrustTestResult { tests_ok, tests_failed, build_ok })
+}
+
+/// Parse `test result: ok. N passed; M failed; ...` lines from cargo test stdout.
+/// Deterministic regardless of output interleaving.
+fn parse_cargo_test_results(stdout: &str) -> (usize, usize) {
+    let re = Regex::new(r"test result: \S+\. (\d+) passed; (\d+) failed;").unwrap();
+    let (mut ok, mut failed) = (0usize, 0usize);
+    for caps in re.captures_iter(stdout) {
+        ok += caps[1].parse::<usize>().unwrap_or(0);
+        failed += caps[2].parse::<usize>().unwrap_or(0);
+    }
+    (ok, failed)
 }
 
 /// Load per-project result.json files into a baseline (for CI --check without re-running tests).
