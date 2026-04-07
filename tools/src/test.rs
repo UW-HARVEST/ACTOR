@@ -191,19 +191,38 @@ fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
+    let (tests_ok, tests_failed) = parse_cargo_test_results(&stdout);
+    let build_ok = !stderr.contains("error[") && !stderr.contains("could not compile")
+        && !stderr.contains("failed to run custom build command");
+
+    // If build failed or no tests ran, re-run with --verbose for full diagnostics
+    let (final_stdout, final_stderr) = if !build_ok || (tests_ok == 0 && tests_failed == 0) {
+        let verbose = Command::new("timeout")
+            .args(["60", "cargo", "test", "--verbose"])
+            .env("OPENSSL_DIR", &openssl_dir)
+            .current_dir(proj_dir)
+            .output()
+            .ok();
+        if let Some(v) = verbose {
+            (String::from_utf8_lossy(&v.stdout).into_owned(),
+             String::from_utf8_lossy(&v.stderr).into_owned())
+        } else {
+            (stdout.into_owned(), stderr.into_owned())
+        }
+    } else {
+        (stdout.into_owned(), stderr.into_owned())
+    };
+
     let logs_dir = proj_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
-    std::fs::write(logs_dir.join("test.log"), format!("{stdout}\n{stderr}"))?;
-
-    let (tests_ok, tests_failed) = parse_cargo_test_results(&stdout);
-    let build_ok = !stderr.contains("error[") && !stderr.contains("could not compile");
+    std::fs::write(logs_dir.join("test.log"), format!("{final_stdout}\n{final_stderr}"))?;
 
     // Print diagnostic snippet when something went wrong
     if !build_ok || tests_failed > 0 || (tests_ok == 0 && tests_failed == 0) {
-        // Show last few error lines from stderr
-        let err_lines: Vec<&str> = stderr.lines()
-            .filter(|l| l.contains("error") || l.contains("FAILED") || l.contains("cannot find") || l.contains("linking"))
-            .take(5)
+        let err_lines: Vec<&str> = final_stderr.lines()
+            .filter(|l| l.contains("error") || l.contains("FAILED") || l.contains("cannot find")
+                || l.contains("linking") || l.contains("Could not find") || l.contains("run custom build"))
+            .take(10)
             .collect();
         if !err_lines.is_empty() {
             for line in &err_lines {
