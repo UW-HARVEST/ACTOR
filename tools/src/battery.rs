@@ -71,7 +71,6 @@ const CRUST_SKIP: &[&str] = &[
     "Holdem_Odds", // contradictory tests, https://github.com/anirudhkhatry/CRUST-bench/issues/37
     "VaultSync", // test hardcodes /home/elhalili/... absolute path, only passes with leftover state
     "bitset", // test uses bs.test() but C checks raw bits, https://github.com/anirudhkhatry/CRUST-bench/issues/41
-    "c_blind_rsa_signatures", // openssl-sys build script fails on Ubuntu 24.04 (OpenSSL 3.x)
     "clog", // THIS_FILE hardcodes C filename, https://github.com/anirudhkhatry/CRUST-bench/issues/39
 ];
 
