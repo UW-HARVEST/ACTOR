@@ -366,6 +366,10 @@ pub fn run_blind_crust_test(
         let llm_ok = llm_result.build_ok && llm_result.tests_ok > 0 && llm_result.tests_failed == 0;
         if llm_ok { llm_passed += 1; }
 
+        // Preserve LLM test log
+        let logs_dir = proj_dir.join("logs");
+        let _ = std::fs::rename(logs_dir.join("test.log"), logs_dir.join("test_llm.log"));
+
         // Save LLM tests aside
         let llm_backup = proj_dir.join("src/bin_llm");
         if bin_dir.is_dir() {
@@ -377,7 +381,6 @@ pub fn run_blind_crust_test(
         let real_bin = project.scaffold().join("src/bin");
         if real_bin.is_dir() {
             if bin_dir.is_dir() { std::fs::remove_dir_all(&bin_dir)?; }
-            // Clean cargo cache so it recompiles with new test files
             let _ = std::fs::remove_dir_all(proj_dir.join("target"));
             crate::translate::copy_dir_all(&real_bin, &bin_dir)?;
         }
@@ -385,6 +388,9 @@ pub fn run_blind_crust_test(
         let real_result = test_one_crust(&proj_dir)?;
         let real_ok = real_result.build_ok && real_result.tests_ok > 0 && real_result.tests_failed == 0;
         if real_ok { real_passed += 1; }
+
+        // Preserve real test log
+        let _ = std::fs::rename(logs_dir.join("test.log"), logs_dir.join("test_real.log"));
 
         // Restore LLM tests
         if llm_backup.is_dir() {
