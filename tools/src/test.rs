@@ -349,7 +349,7 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
             for name in results.0.keys() {
                 let proj_dir = paths.output_dir(name);
                 let tlog = proj_dir.join("logs/translation.log");
-                for d in check_enrichment(&proj_dir.join("result.json"), &proj_dir.join("src"), &[("agent", &tlog)]) {
+                for d in check_enrichment(&proj_dir.join("result.json"), &proj_dir.join("src"), &[("agent", &tlog)], paths.agent) {
                     enrich_diffs.push(format!("{name}: {d}"));
                 }
             }
@@ -517,7 +517,7 @@ pub fn run_blind_crust_test(
                 let src = paths.translate_dir(name).join("src");
                 let tlog = paths.translate_dir(name).join("logs/translation.log");
                 let vlog = paths.verify_dir(name).join("logs/verify.log");
-                for d in check_enrichment(&rj, &src, &[("translate", &tlog), ("verify", &vlog)]) {
+                for d in check_enrichment(&rj, &src, &[("translate", &tlog), ("verify", &vlog)], paths.agent) {
                     regressions.push(format!("{name}: {d}"));
                 }
             }
@@ -633,6 +633,7 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
                     &case_dir.join("result.json"),
                     &case_dir.join("translated_rust/src"),
                     &[("translate", &tlog), ("verify", &vlog)],
+                    paths.agent,
                 ) {
                     diffs.push(format!("{case_name}: {d}"));
                 }
@@ -938,25 +939,32 @@ fn diff_summaries(expected: &Summary, actual: &Summary) -> Vec<String> {
 
 /// Compare stored credits + unsafe in result.json against live extraction.
 /// Returns a list of mismatch descriptions (empty = all good).
-fn check_enrichment(result_json: &Path, src_dir: &Path, log_paths: &[(&str, &Path)]) -> Vec<String> {
+fn check_enrichment(
+    result_json: &Path,
+    src_dir: &Path,
+    log_paths: &[(&str, &Path)],
+    agent: crate::cli::Agent,
+) -> Vec<String> {
     let mut diffs = Vec::new();
     let Ok(data) = std::fs::read_to_string(result_json) else { return diffs };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else { return diffs };
 
-    // Check unsafe
+    // All agents require unsafe counts
     let live = crate::battery::count_unsafe(src_dir);
-    if let Some(stored) = json.get("unsafe") {
-        let sb = stored.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let sf = stored.get("fns").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let si = stored.get("impls").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        if sb != live.blocks { diffs.push(format!("unsafe.blocks expected={sb} actual={}", live.blocks)); }
-        if sf != live.fns { diffs.push(format!("unsafe.fns expected={sf} actual={}", live.fns)); }
-        if si != live.impls { diffs.push(format!("unsafe.impls expected={si} actual={}", live.impls)); }
-    } else {
-        diffs.push("missing unsafe field".into());
+    match json.get("unsafe") {
+        Some(stored) => {
+            let sb = stored.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let sf = stored.get("fns").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let si = stored.get("impls").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            if sb != live.blocks { diffs.push(format!("unsafe.blocks expected={sb} actual={}", live.blocks)); }
+            if sf != live.fns { diffs.push(format!("unsafe.fns expected={sf} actual={}", live.fns)); }
+            if si != live.impls { diffs.push(format!("unsafe.impls expected={si} actual={}", live.impls)); }
+        }
+        None => diffs.push("missing unsafe field".into()),
     }
 
-    // Check credits
+    // Only kiro has credits
+    let require_credits = matches!(agent, crate::cli::Agent::Kiro);
     for &(key, log) in log_paths {
         let live_meta = crate::battery::extract_agent_meta(log);
         match (json.get(key), live_meta) {
@@ -970,8 +978,8 @@ fn check_enrichment(result_json: &Path, src_dir: &Path, log_paths: &[(&str, &Pat
                     diffs.push(format!("{key}.wall_secs expected={sw} actual={}", live.wall_secs));
                 }
             }
-            (None, Some(_)) => diffs.push(format!("missing {key} field")),
-            _ => {} // both None is fine (no log = no credits)
+            (None, Some(_)) if require_credits => diffs.push(format!("missing {key} field")),
+            _ => {}
         }
     }
     diffs
