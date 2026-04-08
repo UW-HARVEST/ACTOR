@@ -14,13 +14,15 @@ pub enum Dataset {
     TestCorpus,
     /// CRUST-bench (cargo test).
     Crust,
+    /// CRUST-bench blind mode (no ground-truth tests visible to agents).
+    BlindCrust,
 }
 
 impl Dataset {
     /// Auto-detect from target name: "CRUST/<project>" or "CRUST" → Crust, else TestCorpus.
-    pub fn detect(target: &str) -> Self {
+    pub fn detect(target: &str, blind: bool) -> Self {
         if target.eq_ignore_ascii_case("crust") || target.starts_with("CRUST/") {
-            Self::Crust
+            if blind { Self::BlindCrust } else { Self::Crust }
         } else {
             Self::TestCorpus
         }
@@ -61,6 +63,9 @@ pub enum Command {
         /// Max number of cases to process
         #[arg(long)]
         limit: Option<usize>,
+        /// CRUST blind mode: agents never see ground-truth tests
+        #[arg(long)]
+        blind: bool,
     },
     /// Translate C to Rust
     Translate {
@@ -72,6 +77,9 @@ pub enum Command {
         /// Max number of cases to process
         #[arg(long)]
         limit: Option<usize>,
+        /// CRUST blind mode: agent does not see ground-truth tests
+        #[arg(long)]
+        blind: bool,
     },
     /// C-as-oracle verification
     Verify {
@@ -83,6 +91,9 @@ pub enum Command {
         force: bool,
         #[arg(long, default_value_t = 1)]
         parallel: usize,
+        /// CRUST blind mode: agent generates tests without seeing ground truth
+        #[arg(long)]
+        blind: bool,
     },
     /// Run MIT runtests
     Test {
@@ -93,6 +104,9 @@ pub enum Command {
         /// CI mode: compare against stored summary.json, exit 1 on mismatch
         #[arg(long, conflicts_with = "update")]
         check: bool,
+        /// CRUST blind mode: run LLM tests then swap in real tests
+        #[arg(long)]
+        blind: bool,
     },
 }
 
@@ -110,12 +124,23 @@ pub enum TranslatePlan {
         projects: Vec<super::battery::CrustProject>,
         parallel: usize,
     },
+    /// Blind: scaffold copied WITHOUT src/bin/ (agent never sees tests).
+    BlindCrust {
+        projects: Vec<super::battery::CrustProject>,
+        parallel: usize,
+    },
 }
 
-/// Plan for verification. CRUST has no verify step.
+/// Plan for verification.
 pub enum VerifyPlan {
     TestCorpus {
         batteries: Vec<String>,
+        parallel: usize,
+        force: bool,
+    },
+    /// Blind CRUST: agent writes src/bin/test_*.rs from C+Rust (no ground truth).
+    BlindCrust {
+        projects: Vec<super::battery::CrustProject>,
         parallel: usize,
         force: bool,
     },
@@ -129,6 +154,11 @@ pub enum TestPlan {
         mode: super::test::TestMode,
     },
     Crust {
+        projects: Vec<super::battery::CrustProject>,
+        mode: super::test::TestMode,
+    },
+    /// Blind: run LLM-generated tests, then swap in real tests and run again.
+    BlindCrust {
         projects: Vec<super::battery::CrustProject>,
         mode: super::test::TestMode,
     },

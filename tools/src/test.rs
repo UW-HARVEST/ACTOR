@@ -261,6 +261,32 @@ fn load_stored_results(paths: &Paths) -> Result<CrustBaseline> {
     Ok(CrustBaseline(results))
 }
 
+/// Stored blind CRUST result with both LLM and real test fields.
+#[derive(Debug, Deserialize)]
+struct BlindCrustStored {
+    #[serde(default)]
+    real_tests_ok: usize,
+    #[serde(default)]
+    real_tests_failed: usize,
+}
+
+fn load_blind_stored_results(paths: &Paths) -> Result<std::collections::BTreeMap<String, BlindCrustStored>> {
+    let mut map = std::collections::BTreeMap::new();
+    if !paths.results_dir.is_dir() { return Ok(map); }
+    for entry in std::fs::read_dir(&paths.results_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() { continue; }
+        let rj = entry.path().join("result.json");
+        if rj.exists() {
+            let data = std::fs::read_to_string(&rj)?;
+            if let Ok(r) = serde_json::from_str::<BlindCrustStored>(&data) {
+                map.insert(entry.file_name().to_string_lossy().into_owned(), r);
+            }
+        }
+    }
+    Ok(map)
+}
+
 pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], mode: TestMode) -> Result<TestOutcome> {
     // Load stored result.json files as the baseline (single source of truth).
     let stored = load_stored_results(paths)?;
@@ -340,6 +366,123 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
             }
         }
         TestMode::Run => Ok(TestOutcome::Ok),
+    }
+}
+
+/// Blind CRUST test: run LLM-generated tests, then swap in real tests and run again.
+pub fn run_blind_crust_test(
+    paths: &Paths,
+    projects: &[crate::battery::CrustProject],
+    mode: TestMode,
+) -> Result<TestOutcome> {
+    let mut llm_passed = 0usize;
+    let mut real_passed = 0usize;
+    let mut total = 0usize;
+    let mut results: Vec<(String, CrustTestResult, CrustTestResult)> = Vec::new();
+
+    let check_only = matches!(mode, TestMode::Check);
+
+    for project in projects {
+        let name = project.name();
+        let proj_dir = paths.output_dir(name);
+        if !proj_dir.join("Cargo.toml").exists() { continue; }
+        total += 1;
+
+        let bin_dir = proj_dir.join("src/bin");
+
+        // Phase 1: run with LLM-generated tests (skip in --check for speed)
+        let (llm_result, llm_ok) = if check_only {
+            (CrustTestResult { tests_ok: 0, tests_failed: 0, build_ok: true }, false)
+        } else {
+            let r = test_one_crust(&proj_dir)?;
+            let ok = r.build_ok && r.tests_ok > 0 && r.tests_failed == 0;
+            if ok { llm_passed += 1; }
+            // Preserve LLM test log
+            let logs_dir = proj_dir.join("logs");
+            let _ = std::fs::rename(logs_dir.join("test.log"), logs_dir.join("test_llm.log"));
+            (r, ok)
+        };
+
+        // Save LLM tests aside
+        let llm_backup = proj_dir.join("src/bin_llm");
+        if !check_only && bin_dir.is_dir() {
+            if llm_backup.exists() { std::fs::remove_dir_all(&llm_backup)?; }
+            crate::translate::copy_dir_all(&bin_dir, &llm_backup)?;
+        }
+
+        // Phase 2: swap in real tests from scaffold
+        let real_bin = project.scaffold().join("src/bin");
+        if real_bin.is_dir() {
+            if bin_dir.is_dir() { std::fs::remove_dir_all(&bin_dir)?; }
+            let _ = std::fs::remove_dir_all(proj_dir.join("target"));
+            crate::translate::copy_dir_all(&real_bin, &bin_dir)?;
+        }
+
+        let real_result = test_one_crust(&proj_dir)?;
+        let real_ok = real_result.build_ok && real_result.tests_ok > 0 && real_result.tests_failed == 0;
+        if real_ok { real_passed += 1; }
+
+        // Preserve real test log
+        let logs_dir = proj_dir.join("logs");
+        let _ = std::fs::rename(logs_dir.join("test.log"), logs_dir.join("test_real.log"));
+
+        // Restore LLM tests (skip in --check, we didn't back them up)
+        if !check_only && llm_backup.is_dir() {
+            if bin_dir.is_dir() { std::fs::remove_dir_all(&bin_dir)?; }
+            let _ = std::fs::remove_dir_all(proj_dir.join("target"));
+            std::fs::rename(&llm_backup, &bin_dir)?;
+        }
+
+        // Report
+        let llm_icon = if llm_ok { "✅" } else { "❌" };
+        let real_icon = if real_ok { "✅" } else { "❌" };
+        println!("  {name}: LLM {llm_icon} ({}/{})  Real {real_icon} ({}/{})",
+            llm_result.tests_ok, llm_result.tests_ok + llm_result.tests_failed,
+            real_result.tests_ok, real_result.tests_ok + real_result.tests_failed);
+
+        results.push((name.to_string(), real_result.clone(), llm_result.clone()));
+
+        if matches!(mode, TestMode::Update) {
+            let json = serde_json::json!({
+                "llm_tests_ok": llm_result.tests_ok,
+                "llm_tests_failed": llm_result.tests_failed,
+                "real_tests_ok": real_result.tests_ok,
+                "real_tests_failed": real_result.tests_failed,
+                "build_ok": real_result.build_ok,
+            });
+            std::fs::write(proj_dir.join("result.json"), serde_json::to_string_pretty(&json)? + "\n")?;
+        }
+    }
+
+    println!("\nCRUST-blind: {llm_passed}/{total} pass (LLM tests)");
+    println!("CRUST-blind: {real_passed}/{total} pass (real tests)");
+
+    match mode {
+        TestMode::Check => {
+            // Load stored result.json and compare real_tests fields
+            let stored = load_blind_stored_results(paths)?;
+            let mut regressions = Vec::new();
+            for (name, actual_real, actual_llm) in results.iter() {
+                if let Some(stored_r) = stored.get(name.as_str()) {
+                    if actual_real.tests_ok < stored_r.real_tests_ok {
+                        regressions.push(format!("{name}: real_tests_ok expected={} actual={}", stored_r.real_tests_ok, actual_real.tests_ok));
+                    }
+                    if actual_real.tests_failed > stored_r.real_tests_failed {
+                        regressions.push(format!("{name}: real_tests_failed expected={} actual={}", stored_r.real_tests_failed, actual_real.tests_failed));
+                    }
+                }
+            }
+            if regressions.is_empty() {
+                println!("✅ No regressions");
+                Ok(TestOutcome::Passed)
+            } else {
+                Ok(TestOutcome::Failed(vec![BatteryMismatch {
+                    battery: "CRUST-blind".into(),
+                    diffs: regressions,
+                }]))
+            }
+        }
+        _ => Ok(TestOutcome::Ok),
     }
 }
 

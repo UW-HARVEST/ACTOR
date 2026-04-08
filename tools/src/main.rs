@@ -20,8 +20,9 @@ fn main() -> Result<()> {
             include_regex,
             parallel,
             limit,
+            blind,
         } => {
-            let dataset = Dataset::detect(target);
+            let dataset = Dataset::detect(target, blind);
             let paths = battery::Paths::new(&repo_root, agent, dataset);
             let inner = Dataset::strip_prefix(target);
 
@@ -42,8 +43,9 @@ fn main() -> Result<()> {
             include_regex,
             parallel,
             limit,
+            blind,
         } => {
-            let dataset = Dataset::detect(target);
+            let dataset = Dataset::detect(target, blind);
             let paths = battery::Paths::new(&repo_root, agent, dataset);
             let inner = Dataset::strip_prefix(target);
 
@@ -55,8 +57,9 @@ fn main() -> Result<()> {
             include_regex,
             force,
             parallel,
+            blind,
         } => {
-            let dataset = Dataset::detect(target);
+            let dataset = Dataset::detect(target, blind);
             let paths = battery::Paths::new(&repo_root, agent, dataset);
             let inner = Dataset::strip_prefix(target);
 
@@ -67,8 +70,9 @@ fn main() -> Result<()> {
             ref target,
             update,
             check,
+            blind,
         } => {
-            let dataset = Dataset::detect(target);
+            let dataset = Dataset::detect(target, blind);
             let paths = battery::Paths::new(&repo_root, agent, dataset);
             let inner = Dataset::strip_prefix(target);
             let mode = if update {
@@ -96,7 +100,7 @@ fn main() -> Result<()> {
 // ── Plan constructors ──────────────────────────────────────────────────
 
 fn make_translate_plan(
-    paths: &battery::Paths, target: &str, include_regex: Option<&str>,
+    paths: &battery::Paths, target: &str, _include_regex: Option<&str>,
     parallel: usize, limit: Option<usize>,
 ) -> Result<TranslatePlan> {
     match paths.dataset {
@@ -105,12 +109,12 @@ fn make_translate_plan(
             Ok(TranslatePlan::TestCorpus { batteries, parallel })
         }
         Dataset::Crust => {
-            let projects = if target.eq_ignore_ascii_case("crust") || target == "all" {
-                battery::CrustProject::discover(&paths.corpus_dir, limit)?
-            } else {
-                vec![battery::CrustProject::validated(&paths.corpus_dir, target)?]
-            };
+            let projects = resolve_crust_projects(&paths.corpus_dir, target, limit)?;
             Ok(TranslatePlan::Crust { projects, parallel })
+        }
+        Dataset::BlindCrust => {
+            let projects = resolve_crust_projects(&paths.corpus_dir, target, limit)?;
+            Ok(TranslatePlan::BlindCrust { projects, parallel })
         }
     }
 }
@@ -125,6 +129,10 @@ fn make_verify_plan(
             Ok(VerifyPlan::TestCorpus { batteries, parallel, force })
         }
         Dataset::Crust => Ok(VerifyPlan::Skip),
+        Dataset::BlindCrust => {
+            let projects = resolve_crust_projects(&paths.corpus_dir, target, None)?;
+            Ok(VerifyPlan::BlindCrust { projects, parallel, force })
+        }
     }
 }
 
@@ -137,12 +145,12 @@ fn make_test_plan(
             Ok(TestPlan::TestCorpus { batteries, mode })
         }
         Dataset::Crust => {
-            let projects = if target.eq_ignore_ascii_case("crust") || target == "all" {
-                battery::CrustProject::discover(&paths.corpus_dir, None)?
-            } else {
-                vec![battery::CrustProject::validated(&paths.corpus_dir, target)?]
-            };
+            let projects = resolve_crust_projects(&paths.corpus_dir, target, None)?;
             Ok(TestPlan::Crust { projects, mode })
+        }
+        Dataset::BlindCrust => {
+            let projects = resolve_crust_projects(&paths.corpus_dir, target, None)?;
+            Ok(TestPlan::BlindCrust { projects, mode })
         }
     }
 }
@@ -155,14 +163,22 @@ fn resolve_batteries(corpus_dir: &std::path::Path, target: &str) -> Result<Vec<S
     }
 }
 
+fn resolve_crust_projects(
+    corpus_dir: &std::path::Path, target: &str, limit: Option<usize>,
+) -> Result<Vec<battery::CrustProject>> {
+    if target.eq_ignore_ascii_case("crust") || target == "all" {
+        battery::CrustProject::discover(corpus_dir, limit)
+    } else {
+        Ok(vec![battery::CrustProject::validated(corpus_dir, target)?])
+    }
+}
+
 // ── Plan executors ─────────────────────────────────────────────────────
 
 fn execute_translate(paths: &battery::Paths, plan: &TranslatePlan) -> Result<()> {
     match plan {
         TranslatePlan::TestCorpus { batteries, parallel } => {
             if batteries.len() > 1 && *parallel > 1 {
-                // Split: shared-source batteries (P01-style, few real translations)
-                // get 1 dedicated thread each; independent batteries share the rest.
                 let (shared_bats, indie_bats): (Vec<&str>, Vec<&str>) = batteries.iter()
                     .map(String::as_str)
                     .partition(|b| battery::has_shared_source_groups(&paths.corpus_dir, b));
@@ -209,6 +225,9 @@ fn execute_translate(paths: &battery::Paths, plan: &TranslatePlan) -> Result<()>
         TranslatePlan::Crust { projects, parallel } => {
             translate::run_crust(paths, projects, *parallel)?;
         }
+        TranslatePlan::BlindCrust { projects, parallel } => {
+            translate::run_crust_blind(paths, projects, *parallel)?;
+        }
     }
     Ok(())
 }
@@ -224,6 +243,9 @@ fn execute_verify(repo_root: &std::path::Path, paths: &battery::Paths, plan: &Ve
                     verify::run(repo_root, paths, &name, filter.as_deref(), *force, *parallel)?;
                 }
             }
+        }
+        VerifyPlan::BlindCrust { projects, parallel, force } => {
+            translate::verify_crust_blind(paths, projects, *parallel, *force)?;
         }
         VerifyPlan::Skip => {}
     }
@@ -247,6 +269,9 @@ fn execute_test(paths: &battery::Paths, plan: &TestPlan) -> Result<test::TestOut
         }
         TestPlan::Crust { projects, mode } => {
             test::run_crust_test(paths, projects, *mode)
+        }
+        TestPlan::BlindCrust { projects, mode } => {
+            test::run_blind_crust_test(paths, projects, *mode)
         }
     }
 }

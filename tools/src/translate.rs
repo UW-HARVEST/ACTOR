@@ -483,17 +483,129 @@ fn count_cases(battery: &battery::Battery) -> usize {
 
 // ── CRUST-bench translation ────────────────────────────────────────────
 
+/// Whether the scaffold includes ground-truth test files.
+enum ScaffoldMode {
+    /// Standard: copy everything including src/bin/ (agent sees tests).
+    Standard,
+    /// Blind: strip src/bin/ after copy (agent never sees tests).
+    Blind,
+}
+
+/// Prepare a CRUST workspace: copy scaffold, move interfaces, copy C source.
+/// Returns (tempdir, work_path, log_path).
+fn prepare_crust_workspace(
+    paths: &Paths,
+    project: &battery::CrustProject,
+    mode: &ScaffoldMode,
+    log_name: &str,
+) -> Result<(tempfile::TempDir, PathBuf, PathBuf)> {
+    let out = paths.output_dir(project.name());
+    let logs_dir = out.join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    let log_path = logs_dir.join(log_name);
+
+    let tmp = tempfile::Builder::new()
+        .prefix("harvest-crust-")
+        .tempdir()
+        .context("creating temp dir for CRUST")?;
+    let work = tmp.path().join("project");
+
+    copy_dir_all(project.scaffold(), &work)?;
+
+    // Blind mode: remove test files so agent never sees them
+    if matches!(mode, ScaffoldMode::Blind) {
+        let bin_dir = work.join("src/bin");
+        if bin_dir.is_dir() {
+            std::fs::remove_dir_all(&bin_dir)?;
+        }
+    }
+
+    // Move interfaces/*.rs → src/ (matches CRUST-bench's format_into_compilable_rust)
+    // Skip main.rs — it conflicts with Cargo's binary crate detection
+    let interfaces = work.join("src/interfaces");
+    if interfaces.is_dir() {
+        let src = work.join("src");
+        for entry in std::fs::read_dir(&interfaces)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == "main.rs" { continue; }
+            if entry.path().extension().map_or(false, |e| e == "rs") {
+                std::fs::rename(entry.path(), src.join(&name))?;
+            }
+        }
+        if std::fs::read_dir(&interfaces)?.next().is_none() {
+            std::fs::remove_dir(&interfaces)?;
+        }
+    }
+
+    let c_dst = work.join("c_src");
+    std::fs::create_dir_all(&c_dst)?;
+    copy_dir_all(project.c_source(), &c_dst)?;
+
+    Ok((tmp, work, log_path))
+}
+
+/// Invoke the agent in a working directory with a prompt.
+fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Result<()> {
+    match agent {
+        Agent::Kiro => {
+            Command::new("bash")
+                .arg("-lc")
+                .arg(r#"set -o pipefail; timeout 1800 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
+                .arg("--")
+                .arg(prompt)
+                .arg(log_path)
+                .current_dir(work)
+                .status()
+                .context("invoking kiro-cli for CRUST")?;
+        }
+        Agent::Claude => {
+            Command::new("bash")
+                .arg("-lc")
+                .arg(r#"set -o pipefail; timeout 10800 claude -p "$1" --allowedTools 'Bash(*)' 'Write' 'Edit' --max-turns 50 --verbose --output-format stream-json < /dev/null 2>&1 | tee "$2""#)
+                .arg("--")
+                .arg(prompt)
+                .arg(log_path)
+                .current_dir(work)
+                .status()
+                .context("invoking claude for CRUST")?;
+        }
+        Agent::C2rust => anyhow::bail!("c2rust not supported for CRUST-bench"),
+    }
+    Ok(())
+}
+
 pub fn run_crust(paths: &Paths, projects: &[battery::CrustProject], parallel: usize) -> Result<()> {
+    run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Standard, "crust.md")
+}
+
+pub fn run_crust_blind(paths: &Paths, projects: &[battery::CrustProject], parallel: usize) -> Result<()> {
+    run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Blind, "crust_blind.md")
+}
+
+fn run_crust_with_mode(
+    paths: &Paths,
+    projects: &[battery::CrustProject],
+    parallel: usize,
+    mode: ScaffoldMode,
+    prompt_file: &str,
+) -> Result<()> {
     preflight_check(paths.agent)?;
 
     let total = projects.len();
     let sem = Semaphore::new(parallel);
+    // Read prompt once, share across threads
+    let prompt = std::fs::read_to_string(paths.prompts_dir.join(prompt_file))
+        .with_context(|| format!("reading {prompt_file}"))?;
 
     let results: Vec<CaseResult> = std::thread::scope(|s| {
         let handles: Vec<_> = projects.iter().map(|p| {
-            s.spawn(|| {
+            let prompt = &prompt;
+            let mode = &mode;
+            let sem = &sem;
+            s.spawn(move || {
                 let _permit = sem.acquire();
-                translate_one_crust(paths, p)
+                translate_one_crust(paths, p, mode, prompt)
             })
         }).collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -520,8 +632,8 @@ pub fn run_crust(paths: &Paths, projects: &[battery::CrustProject], parallel: us
     Ok(())
 }
 
-fn translate_one_crust(paths: &Paths, project: &battery::CrustProject) -> CaseResult {
-    match translate_one_crust_inner(paths, project) {
+fn translate_one_crust(paths: &Paths, project: &battery::CrustProject, mode: &ScaffoldMode, prompt: &str) -> CaseResult {
+    match translate_one_crust_inner(paths, project, mode, prompt) {
         Ok(r) => r,
         Err(e) => CaseResult {
             name: project.name().to_string(),
@@ -533,85 +645,122 @@ fn translate_one_crust(paths: &Paths, project: &battery::CrustProject) -> CaseRe
     }
 }
 
-fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject) -> Result<CaseResult> {
+fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject, mode: &ScaffoldMode, prompt: &str) -> Result<CaseResult> {
     let out = paths.output_dir(project.name());
 
     if out.join("Cargo.toml").exists() {
         return Ok(CaseResult { name: project.name().into(), elapsed_secs: 0, success: true, error: None, skipped: true });
     }
 
-    let logs_dir = out.join("logs");
-    std::fs::create_dir_all(&logs_dir)?;
-    let log_path = logs_dir.join("translation.log");
-
-    let tmp = tempfile::Builder::new()
-        .prefix("harvest-crust-")
-        .tempdir()
-        .context("creating temp dir for CRUST")?;
-    let work = tmp.path().join("project");
-
-    let prompt = std::fs::read_to_string(paths.prompts_dir.join("crust.md"))
-        .context("reading crust.md prompt")?;
-
-    copy_dir_all(project.scaffold(), &work)?;
-    // Move interfaces/*.rs → src/ (matches CRUST-bench's format_into_compilable_rust)
-    // Skip main.rs — it conflicts with Cargo's binary crate detection
-    let interfaces = work.join("src/interfaces");
-    if interfaces.is_dir() {
-        let src = work.join("src");
-        for entry in std::fs::read_dir(&interfaces)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if name == "main.rs" { continue; }
-            if entry.path().extension().map_or(false, |e| e == "rs") {
-                std::fs::rename(entry.path(), src.join(&name))?;
-            }
-        }
-        // Don't remove interfaces/ if main.rs remains
-        if std::fs::read_dir(&interfaces)?.next().is_none() {
-            std::fs::remove_dir(&interfaces)?;
-        }
-    }
-    let c_dst = work.join("c_src");
-    std::fs::create_dir_all(&c_dst)?;
-    copy_dir_all(project.c_source(), &c_dst)?;
+    let (_tmp, work, log_path) = prepare_crust_workspace(paths, project, mode, "translation.log")?;
 
     let start = Instant::now();
-
-    match paths.agent {
-        Agent::Kiro => {
-            let _status = Command::new("bash")
-                .arg("-lc")
-                .arg(r#"set -o pipefail; timeout 1800 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
-                .arg("--")
-                .arg(&prompt)
-                .arg(&log_path)
-                .current_dir(&work)
-                .status()
-                .context("invoking kiro-cli for CRUST")?;
-        }
-        Agent::Claude => {
-            let _status = Command::new("bash")
-                .arg("-lc")
-                .arg(r#"set -o pipefail; timeout 10800 claude -p "$1" --allowedTools 'Bash(*)' 'Write' 'Edit' --max-turns 50 --verbose --output-format stream-json < /dev/null 2>&1 | tee "$2""#)
-                .arg("--")
-                .arg(&prompt)
-                .arg(&log_path)
-                .current_dir(&work)
-                .status()
-                .context("invoking claude for CRUST")?;
-        }
-        Agent::C2rust => anyhow::bail!("c2rust not supported for CRUST-bench"),
-    }
-
+    invoke_agent(paths.agent, prompt, &log_path, &work)?;
     let elapsed = start.elapsed().as_secs();
 
     // Copy back code from temp, preserving logs dir
     copy_dir_filtered(&work, &out, &["target", "c_src"])?;
-    copy_dir_all(&c_dst, &out.join("c_src"))?;
+    copy_dir_all(&work.join("c_src"), &out.join("c_src"))?;
 
     let success = out.join("Cargo.toml").exists();
     write_translation_metrics(&out, paths.agent, elapsed, success);
+    Ok(CaseResult { name: project.name().into(), elapsed_secs: elapsed, success, error: None, skipped: false })
+}
+
+// ── Blind CRUST verify: agent generates tests ──────────────────────────
+
+pub fn verify_crust_blind(paths: &Paths, projects: &[battery::CrustProject], parallel: usize, force: bool) -> Result<()> {
+    preflight_check(paths.agent)?;
+
+    let prompt = std::fs::read_to_string(paths.prompts_dir.join("crust_verify.md"))
+        .context("reading crust_verify.md")?;
+
+    let total = projects.len();
+    let sem = Semaphore::new(parallel);
+
+    let results: Vec<CaseResult> = std::thread::scope(|s| {
+        let handles: Vec<_> = projects.iter().map(|p| {
+            let prompt = &prompt;
+            let sem = &sem;
+            s.spawn(move || {
+                let _permit = sem.acquire();
+                verify_one_crust_blind(paths, p, prompt, force)
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut verified = 0usize;
+    let mut failed = 0usize;
+    for (i, r) in results.iter().enumerate() {
+        let n = i + 1;
+        if r.skipped {
+            verified += 1;
+            println!("[{n}/{total}] ⏭️  {} (already has tests)", r.name);
+        } else if r.success {
+            verified += 1;
+            println!("[{n}/{total}] ✅ {} ({}s)", r.name, r.elapsed_secs);
+        } else {
+            failed += 1;
+            let err = r.error.as_deref().unwrap_or("unknown");
+            println!("[{n}/{total}] ❌ {} — {err} ({}s)", r.name, r.elapsed_secs);
+        }
+    }
+
+    println!("\nDone: {verified}/{total} verified, {failed} failed");
+    Ok(())
+}
+
+fn verify_one_crust_blind(paths: &Paths, project: &battery::CrustProject, prompt: &str, force: bool) -> CaseResult {
+    match verify_one_crust_blind_inner(paths, project, prompt, force) {
+        Ok(r) => r,
+        Err(e) => CaseResult {
+            name: project.name().to_string(),
+            elapsed_secs: 0,
+            success: false,
+            error: Some(e.to_string()),
+            skipped: false,
+        },
+    }
+}
+
+fn verify_one_crust_blind_inner(paths: &Paths, project: &battery::CrustProject, prompt: &str, force: bool) -> Result<CaseResult> {
+    let out = paths.output_dir(project.name());
+
+    anyhow::ensure!(out.join("Cargo.toml").exists(), "translation not found for {}", project.name());
+
+    // Skip if LLM-generated tests already exist (unless --force)
+    let bin_dir = out.join("src/bin");
+    if !force && bin_dir.is_dir() && std::fs::read_dir(&bin_dir)?.next().is_some() {
+        return Ok(CaseResult { name: project.name().into(), elapsed_secs: 0, success: true, error: None, skipped: true });
+    }
+
+    // Clean old LLM tests if re-running
+    if bin_dir.is_dir() {
+        std::fs::remove_dir_all(&bin_dir)?;
+    }
+    let _ = std::fs::remove_dir_all(out.join("target"));
+
+    // Set up temp workspace with the translated code + C source
+    let tmp = tempfile::Builder::new()
+        .prefix("harvest-crust-verify-")
+        .tempdir()
+        .context("creating temp dir for CRUST verify")?;
+    let work = tmp.path().join("project");
+    copy_dir_filtered(&out, &work, &["target", "logs"])?;
+
+    let log_path = out.join("logs/verify.log");
+    std::fs::create_dir_all(out.join("logs"))?;
+
+    let start = Instant::now();
+    invoke_agent(paths.agent, prompt, &log_path, &work)?;
+    let elapsed = start.elapsed().as_secs();
+
+    // Copy back all agent changes (src/, Cargo.toml — but not target/c_src/logs)
+    copy_dir_filtered(&work, &out, &["target", "c_src", "logs"])?;
+
+    let bin_dir = out.join("src/bin");
+    let success = bin_dir.is_dir() && std::fs::read_dir(&bin_dir)?.next().is_some();
     Ok(CaseResult { name: project.name().into(), elapsed_secs: elapsed, success, error: None, skipped: false })
 }
 
