@@ -380,6 +380,8 @@ pub fn run_blind_crust_test(
     let mut total = 0usize;
     let mut results: Vec<(String, CrustTestResult, CrustTestResult)> = Vec::new();
 
+    let check_only = matches!(mode, TestMode::Check);
+
     for project in projects {
         let name = project.name();
         let proj_dir = paths.output_dir(name);
@@ -388,18 +390,22 @@ pub fn run_blind_crust_test(
 
         let bin_dir = proj_dir.join("src/bin");
 
-        // Phase 1: run with LLM-generated tests (whatever is in src/bin/)
-        let llm_result = test_one_crust(&proj_dir)?;
-        let llm_ok = llm_result.build_ok && llm_result.tests_ok > 0 && llm_result.tests_failed == 0;
-        if llm_ok { llm_passed += 1; }
-
-        // Preserve LLM test log
-        let logs_dir = proj_dir.join("logs");
-        let _ = std::fs::rename(logs_dir.join("test.log"), logs_dir.join("test_llm.log"));
+        // Phase 1: run with LLM-generated tests (skip in --check for speed)
+        let (llm_result, llm_ok) = if check_only {
+            (CrustTestResult { tests_ok: 0, tests_failed: 0, build_ok: true }, false)
+        } else {
+            let r = test_one_crust(&proj_dir)?;
+            let ok = r.build_ok && r.tests_ok > 0 && r.tests_failed == 0;
+            if ok { llm_passed += 1; }
+            // Preserve LLM test log
+            let logs_dir = proj_dir.join("logs");
+            let _ = std::fs::rename(logs_dir.join("test.log"), logs_dir.join("test_llm.log"));
+            (r, ok)
+        };
 
         // Save LLM tests aside
         let llm_backup = proj_dir.join("src/bin_llm");
-        if bin_dir.is_dir() {
+        if !check_only && bin_dir.is_dir() {
             if llm_backup.exists() { std::fs::remove_dir_all(&llm_backup)?; }
             crate::translate::copy_dir_all(&bin_dir, &llm_backup)?;
         }
@@ -417,10 +423,11 @@ pub fn run_blind_crust_test(
         if real_ok { real_passed += 1; }
 
         // Preserve real test log
+        let logs_dir = proj_dir.join("logs");
         let _ = std::fs::rename(logs_dir.join("test.log"), logs_dir.join("test_real.log"));
 
-        // Restore LLM tests
-        if llm_backup.is_dir() {
+        // Restore LLM tests (skip in --check, we didn't back them up)
+        if !check_only && llm_backup.is_dir() {
             if bin_dir.is_dir() { std::fs::remove_dir_all(&bin_dir)?; }
             let _ = std::fs::remove_dir_all(proj_dir.join("target"));
             std::fs::rename(&llm_backup, &bin_dir)?;
