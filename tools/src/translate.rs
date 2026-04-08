@@ -511,11 +511,18 @@ fn prepare_crust_workspace(
 
     copy_dir_all(project.scaffold(), &work)?;
 
-    // Blind mode: remove test files so agent never sees them
+    // Blind mode: remove test files and test metadata so agent never sees them
     if matches!(mode, ScaffoldMode::Blind) {
         let bin_dir = work.join("src/bin");
         if bin_dir.is_dir() {
             std::fs::remove_dir_all(&bin_dir)?;
+        }
+        // Strip [[test]] entries from Cargo.toml — they reference the hidden test files
+        let cargo_path = work.join("Cargo.toml");
+        if cargo_path.exists() {
+            let content = std::fs::read_to_string(&cargo_path)?;
+            let stripped = strip_test_entries(&content);
+            std::fs::write(&cargo_path, stripped)?;
         }
     }
 
@@ -774,6 +781,28 @@ fn verify_one_crust_blind_inner(paths: &Paths, project: &battery::CrustProject, 
 }
 
 // ── Utilities ──────────────────────────────────────────────────────────
+
+/// Strip `[[test]]` sections from a Cargo.toml string.
+/// Each section starts with `[[test]]` and ends at the next `[[` or `[` header or EOF.
+fn strip_test_entries(content: &str) -> String {
+    let mut out = String::new();
+    let mut skip = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[[test]]" {
+            skip = true;
+            continue;
+        }
+        if skip && (trimmed.starts_with("[[") || trimmed.starts_with('[') && !trimmed.starts_with("[[")) {
+            skip = false;
+        }
+        if !skip {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
 
 pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
