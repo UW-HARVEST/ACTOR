@@ -376,6 +376,106 @@ macro_rules! impl_dir_newtype {
 impl_dir_newtype!(TranslateDir);
 impl_dir_newtype!(VerifyDir);
 
+/// LLM API credits consumed by a single agent invocation.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct Credits(pub f64);
+
+/// Metadata extracted from an agent run log (kiro-cli / claude).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct AgentRunMeta {
+    pub credits: Credits,
+    pub wall_secs: u64,
+}
+
+/// Parse the last `▸ Credits: X.XX • Time: Xm Xs` line from an agent log.
+pub fn extract_agent_meta(log_path: &Path) -> Option<AgentRunMeta> {
+    let data = std::fs::read_to_string(log_path).ok()?;
+    let re = Regex::new(r"Credits:\s*([0-9.]+).*?Time:\s*(.+)").ok()?;
+    let caps = re.captures_iter(&data).last()?;
+    let credits = Credits(caps[1].parse().ok()?);
+    let wall_secs = parse_duration(&caps[2]);
+    Some(AgentRunMeta { credits, wall_secs })
+}
+
+fn parse_duration(s: &str) -> u64 {
+    let mut secs = 0u64;
+    for part in s.split_whitespace() {
+        if let Some(m) = part.strip_suffix('m') {
+            secs += m.parse::<u64>().unwrap_or(0) * 60;
+        } else if let Some(s_val) = part.strip_suffix('s') {
+            secs += s_val.parse::<u64>().unwrap_or(0);
+        }
+    }
+    secs
+}
+
+/// Unsafe usage counts extracted via AST (`syn`).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct UnsafeCounts {
+    /// `unsafe { ... }` blocks
+    pub blocks: usize,
+    /// `unsafe fn` declarations
+    pub fns: usize,
+    /// `unsafe impl` blocks
+    pub impls: usize,
+}
+
+impl UnsafeCounts {
+    pub fn total(&self) -> usize { self.blocks + self.fns + self.impls }
+}
+
+/// Count unsafe constructs in `*.rs` files under `src_dir`, excluding `bin/` and `tests/`.
+pub fn count_unsafe(src_dir: &Path) -> UnsafeCounts {
+    let mut counts = UnsafeCounts::default();
+    let Ok(entries) = std::fs::read_dir(src_dir) else { return counts };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name();
+            if name == "bin" || name == "tests" { continue; }
+            let sub = count_unsafe(&path);
+            counts.blocks += sub.blocks;
+            counts.fns += sub.fns;
+            counts.impls += sub.impls;
+        } else if path.extension().is_some_and(|x| x == "rs") {
+            let Ok(src) = std::fs::read_to_string(&path) else { continue };
+            let Ok(file) = syn::parse_file(&src) else { continue };
+            let mut v = UnsafeVisitor::default();
+            syn::visit::visit_file(&mut v, &file);
+            counts.blocks += v.blocks;
+            counts.fns += v.fns;
+            counts.impls += v.impls;
+        }
+    }
+    counts
+}
+
+#[derive(Default)]
+struct UnsafeVisitor {
+    blocks: usize,
+    fns: usize,
+    impls: usize,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for UnsafeVisitor {
+    fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
+        self.blocks += 1;
+        syn::visit::visit_expr_unsafe(self, node);
+    }
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if node.sig.unsafety.is_some() { self.fns += 1; }
+        syn::visit::visit_item_fn(self, node);
+    }
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if node.sig.unsafety.is_some() { self.fns += 1; }
+        syn::visit::visit_impl_item_fn(self, node);
+    }
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if node.unsafety.is_some() { self.impls += 1; }
+        syn::visit::visit_item_impl(self, node);
+    }
+}
+
 pub struct Paths {
     pub corpus_dir: PathBuf,
     pub results_dir: PathBuf,

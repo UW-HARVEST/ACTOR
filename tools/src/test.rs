@@ -318,8 +318,12 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
 
         // --update: write result.json immediately
         if matches!(mode, TestMode::Update) {
-            let json = serde_json::to_string_pretty(&r)?;
-            std::fs::write(proj_dir.join("result.json"), format!("{json}\n"))?;
+            let mut json = serde_json::to_value(&r)?;
+            if let Some(m) = crate::battery::extract_agent_meta(&proj_dir.join("logs/translation.log")) {
+                json["agent"] = serde_json::to_value(&m).unwrap();
+            }
+            json["unsafe"] = serde_json::to_value(&crate::battery::count_unsafe(&proj_dir.join("src"))).unwrap();
+            std::fs::write(proj_dir.join("result.json"), serde_json::to_string_pretty(&json)? + "\n")?;
         }
 
         results.0.insert(name.to_string(), r);
@@ -340,11 +344,21 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
                 return Ok(TestOutcome::Passed);
             }
             let regressions = find_regressions(&stored, &results);
-            if regressions.is_empty() {
+            // Check credits + unsafe
+            let mut enrich_diffs = Vec::new();
+            for name in results.0.keys() {
+                let proj_dir = paths.output_dir(name);
+                let tlog = proj_dir.join("logs/translation.log");
+                for d in check_enrichment(&proj_dir.join("result.json"), &proj_dir.join("src"), &[("agent", &tlog)], paths.agent) {
+                    enrich_diffs.push(format!("{name}: {d}"));
+                }
+            }
+            if regressions.is_empty() && enrich_diffs.is_empty() {
                 println!("✅ No regressions");
                 Ok(TestOutcome::Passed)
             } else {
-                println!("\n❌ {} regression(s):", regressions.len());
+                let total = regressions.len() + enrich_diffs.len();
+                println!("\n❌ {} regression(s):", total);
                 for r in &regressions {
                     println!("  {}: {} expected={} actual={}", r.project, r.field, r.expected, r.actual);
                     // Dump test log for regression diagnosis
@@ -361,9 +375,12 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
                         println!("  └──");
                     }
                 }
+                for d in &enrich_diffs { println!("  {d}"); }
+                let mut all_diffs: Vec<String> = regressions.iter().map(|r| format!("{}: {}", r.project, r.field)).collect();
+                all_diffs.extend(enrich_diffs);
                 Ok(TestOutcome::Failed(vec![BatteryMismatch {
                     battery: "CRUST".into(),
-                    diffs: regressions.iter().map(|r| format!("{}: {}", r.project, r.field)).collect(),
+                    diffs: all_diffs,
                 }]))
             }
         }
@@ -454,13 +471,26 @@ pub fn run_blind_crust_test(
         results.push((name.to_string(), real_result.clone(), llm_result.clone()));
 
         if matches!(mode, TestMode::Update) {
-            let json = serde_json::json!({
+            let translate_meta = crate::battery::extract_agent_meta(
+                &paths.translate_dir(name).join("logs/translation.log"),
+            );
+            let verify_meta = crate::battery::extract_agent_meta(
+                &proj_dir.join("logs/verify.log"),
+            );
+            let mut json = serde_json::json!({
                 "llm_tests_ok": llm_result.tests_ok,
                 "llm_tests_failed": llm_result.tests_failed,
                 "real_tests_ok": real_result.tests_ok,
                 "real_tests_failed": real_result.tests_failed,
                 "build_ok": real_result.build_ok,
+                "unsafe": crate::battery::count_unsafe(&paths.translate_dir(name).join("src")),
             });
+            if let Some(m) = translate_meta {
+                json["translate"] = serde_json::to_value(&m).unwrap();
+            }
+            if let Some(m) = verify_meta {
+                json["verify"] = serde_json::to_value(&m).unwrap();
+            }
             std::fs::write(proj_dir.join("result.json"), serde_json::to_string_pretty(&json)? + "\n")?;
         }
     }
@@ -481,6 +511,14 @@ pub fn run_blind_crust_test(
                     if actual_real.tests_failed != stored_r.real_tests_failed {
                         regressions.push(format!("{name}: real_tests_failed expected={} actual={}", stored_r.real_tests_failed, actual_real.tests_failed));
                     }
+                }
+                // Check credits + unsafe
+                let rj = paths.verify_dir(name).join("result.json");
+                let src = paths.translate_dir(name).join("src");
+                let tlog = paths.translate_dir(name).join("logs/translation.log");
+                let vlog = paths.verify_dir(name).join("logs/verify.log");
+                for d in check_enrichment(&rj, &src, &[("translate", &tlog), ("verify", &vlog)], paths.agent) {
+                    regressions.push(format!("{name}: {d}"));
                 }
             }
             if regressions.is_empty() {
@@ -585,7 +623,21 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
         }
         TestMode::Check => {
             let expected = load_summary(&output_dir);
-            let diffs = diff_summaries(&expected, &summary);
+            let mut diffs = diff_summaries(&expected, &summary);
+            // Check credits + unsafe per case
+            for case_name in per_case.keys() {
+                let case_dir = output_dir.join(case_name);
+                let tlog = case_dir.join("logs/translation.log");
+                let vlog = case_dir.join("logs/verify.log");
+                for d in check_enrichment(
+                    &case_dir.join("result.json"),
+                    &case_dir.join("translated_rust/src"),
+                    &[("translate", &tlog), ("verify", &vlog)],
+                    paths.agent,
+                ) {
+                    diffs.push(format!("{case_name}: {d}"));
+                }
+            }
             let ok = diffs.is_empty();
             check_rows.push(CheckRow {
                 battery: battery.to_string(),
@@ -830,7 +882,18 @@ fn write_results(
     for (case_name, data) in per_case {
         let case_dir = output_dir.join(case_name);
         if case_dir.is_dir() {
-            let json = serde_json::to_string_pretty(data)?;
+            let mut val = data.clone();
+            for log in ["logs/translation.log", "logs/verify.log"] {
+                let log_path = case_dir.join(log);
+                if let Some(m) = crate::battery::extract_agent_meta(&log_path) {
+                    let key = if log.contains("translation") { "translate" } else { "verify" };
+                    val[key] = serde_json::to_value(&m).unwrap();
+                }
+            }
+            val["unsafe"] = serde_json::to_value(
+                &crate::battery::count_unsafe(&case_dir.join("translated_rust/src")),
+            ).unwrap();
+            let json = serde_json::to_string_pretty(&val)?;
             std::fs::write(case_dir.join("result.json"), format!("{json}\n"))?;
         }
     }
@@ -871,6 +934,127 @@ fn diff_summaries(expected: &Summary, actual: &Summary) -> Vec<String> {
     diffs
 }
 
+
+// ── Enrich: backfill result.json with credits + unsafe (no test runs) ──
+
+/// Compare stored credits + unsafe in result.json against live extraction.
+/// Returns a list of mismatch descriptions (empty = all good).
+fn check_enrichment(
+    result_json: &Path,
+    src_dir: &Path,
+    log_paths: &[(&str, &Path)],
+    agent: crate::cli::Agent,
+) -> Vec<String> {
+    let mut diffs = Vec::new();
+    let Ok(data) = std::fs::read_to_string(result_json) else { return diffs };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else { return diffs };
+
+    // All agents require unsafe counts
+    let live = crate::battery::count_unsafe(src_dir);
+    match json.get("unsafe") {
+        Some(stored) => {
+            let sb = stored.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let sf = stored.get("fns").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let si = stored.get("impls").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            if sb != live.blocks { diffs.push(format!("unsafe.blocks expected={sb} actual={}", live.blocks)); }
+            if sf != live.fns { diffs.push(format!("unsafe.fns expected={sf} actual={}", live.fns)); }
+            if si != live.impls { diffs.push(format!("unsafe.impls expected={si} actual={}", live.impls)); }
+        }
+        None => diffs.push("missing unsafe field".into()),
+    }
+
+    // Only kiro has credits
+    let require_credits = matches!(agent, crate::cli::Agent::Kiro);
+    for &(key, log) in log_paths {
+        let live_meta = crate::battery::extract_agent_meta(log);
+        match (json.get(key), live_meta) {
+            (Some(stored), Some(live)) => {
+                let sc = stored.get("credits").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let sw = stored.get("wall_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+                if (sc - live.credits.0).abs() > 0.001 {
+                    diffs.push(format!("{key}.credits expected={sc} actual={}", live.credits.0));
+                }
+                if sw != live.wall_secs {
+                    diffs.push(format!("{key}.wall_secs expected={sw} actual={}", live.wall_secs));
+                }
+            }
+            (None, Some(_)) if require_credits => diffs.push(format!("missing {key} field")),
+            _ => {}
+        }
+    }
+    diffs
+}
+
+pub fn enrich_blind_crust(paths: &Paths, projects: &[crate::battery::CrustProject]) -> Result<()> {
+    let mut enriched = 0usize;
+    for project in projects {
+        let name = project.name();
+        let rj = paths.verify_dir(name).join("result.json");
+        if !rj.exists() { continue; }
+        let mut json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&rj)?)?;
+
+        if let Some(m) = crate::battery::extract_agent_meta(&paths.translate_dir(name).join("logs/translation.log")) {
+            json["translate"] = serde_json::to_value(&m)?;
+        }
+        if let Some(m) = crate::battery::extract_agent_meta(&paths.verify_dir(name).join("logs/verify.log")) {
+            json["verify"] = serde_json::to_value(&m)?;
+        }
+        json["unsafe"] = serde_json::to_value(&crate::battery::count_unsafe(&paths.translate_dir(name).join("src")))?;
+
+        std::fs::write(&rj, serde_json::to_string_pretty(&json)? + "\n")?;
+        enriched += 1;
+    }
+    println!("✅ Enriched {enriched} CRUST-blind result.json files");
+    Ok(())
+}
+
+pub fn enrich_crust(paths: &Paths, projects: &[crate::battery::CrustProject]) -> Result<()> {
+    let mut enriched = 0usize;
+    for project in projects {
+        let name = project.name();
+        let proj_dir = paths.output_dir(name);
+        let rj = proj_dir.join("result.json");
+        if !rj.exists() { continue; }
+        let mut json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&rj)?)?;
+
+        if let Some(m) = crate::battery::extract_agent_meta(&proj_dir.join("logs/translation.log")) {
+            json["agent"] = serde_json::to_value(&m)?;
+        }
+        json["unsafe"] = serde_json::to_value(&crate::battery::count_unsafe(&proj_dir.join("src")))?;
+
+        std::fs::write(&rj, serde_json::to_string_pretty(&json)? + "\n")?;
+        enriched += 1;
+    }
+    println!("✅ Enriched {enriched} CRUST result.json files");
+    Ok(())
+}
+
+pub fn enrich_test_corpus(paths: &Paths, battery: &str) -> Result<()> {
+    let output_dir = paths.results_dir.join(battery);
+    if !output_dir.is_dir() { return Ok(()); }
+    let mut enriched = 0usize;
+    for entry in std::fs::read_dir(&output_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() { continue; }
+        let case_dir = entry.path();
+        let rj = case_dir.join("result.json");
+        if !rj.exists() { continue; }
+        let mut json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&rj)?)?;
+
+        for log in ["logs/translation.log", "logs/verify.log"] {
+            if let Some(m) = crate::battery::extract_agent_meta(&case_dir.join(log)) {
+                let key = if log.contains("translation") { "translate" } else { "verify" };
+                json[key] = serde_json::to_value(&m)?;
+            }
+        }
+        json["unsafe"] = serde_json::to_value(&crate::battery::count_unsafe(&case_dir.join("translated_rust/src")))?;
+
+        std::fs::write(&rj, serde_json::to_string_pretty(&json)? + "\n")?;
+        enriched += 1;
+    }
+    println!("✅ Enriched {enriched} {battery} result.json files");
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;

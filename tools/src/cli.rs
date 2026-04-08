@@ -108,6 +108,12 @@ pub enum Command {
         #[arg(long)]
         blind: bool,
     },
+    /// Backfill result.json with credits + unsafe counts (no tests, no LLM calls)
+    Enrich {
+        target: String,
+        #[arg(long)]
+        blind: bool,
+    },
 }
 
 // ── Type-safe execution plans ──────────────────────────────────────────
