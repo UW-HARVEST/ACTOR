@@ -261,6 +261,32 @@ fn load_stored_results(paths: &Paths) -> Result<CrustBaseline> {
     Ok(CrustBaseline(results))
 }
 
+/// Stored blind CRUST result with both LLM and real test fields.
+#[derive(Debug, Deserialize)]
+struct BlindCrustStored {
+    #[serde(default)]
+    real_tests_ok: usize,
+    #[serde(default)]
+    real_tests_failed: usize,
+}
+
+fn load_blind_stored_results(paths: &Paths) -> Result<std::collections::BTreeMap<String, BlindCrustStored>> {
+    let mut map = std::collections::BTreeMap::new();
+    if !paths.results_dir.is_dir() { return Ok(map); }
+    for entry in std::fs::read_dir(&paths.results_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() { continue; }
+        let rj = entry.path().join("result.json");
+        if rj.exists() {
+            let data = std::fs::read_to_string(&rj)?;
+            if let Ok(r) = serde_json::from_str::<BlindCrustStored>(&data) {
+                map.insert(entry.file_name().to_string_lossy().into_owned(), r);
+            }
+        }
+    }
+    Ok(map)
+}
+
 pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], mode: TestMode) -> Result<TestOutcome> {
     // Load stored result.json files as the baseline (single source of truth).
     let stored = load_stored_results(paths)?;
@@ -352,6 +378,7 @@ pub fn run_blind_crust_test(
     let mut llm_passed = 0usize;
     let mut real_passed = 0usize;
     let mut total = 0usize;
+    let mut results: Vec<(String, CrustTestResult, CrustTestResult)> = Vec::new();
 
     for project in projects {
         let name = project.name();
@@ -406,6 +433,8 @@ pub fn run_blind_crust_test(
             llm_result.tests_ok, llm_result.tests_ok + llm_result.tests_failed,
             real_result.tests_ok, real_result.tests_ok + real_result.tests_failed);
 
+        results.push((name.to_string(), real_result.clone(), llm_result.clone()));
+
         if matches!(mode, TestMode::Update) {
             let json = serde_json::json!({
                 "llm_tests_ok": llm_result.tests_ok,
@@ -421,7 +450,33 @@ pub fn run_blind_crust_test(
     println!("\nCRUST-blind: {llm_passed}/{total} pass (LLM tests)");
     println!("CRUST-blind: {real_passed}/{total} pass (real tests)");
 
-    Ok(TestOutcome::Ok)
+    match mode {
+        TestMode::Check => {
+            // Load stored result.json and compare real_tests fields
+            let stored = load_blind_stored_results(paths)?;
+            let mut regressions = Vec::new();
+            for (name, actual_real, actual_llm) in results.iter() {
+                if let Some(stored_r) = stored.get(name.as_str()) {
+                    if actual_real.tests_ok < stored_r.real_tests_ok {
+                        regressions.push(format!("{name}: real_tests_ok expected={} actual={}", stored_r.real_tests_ok, actual_real.tests_ok));
+                    }
+                    if actual_real.tests_failed > stored_r.real_tests_failed {
+                        regressions.push(format!("{name}: real_tests_failed expected={} actual={}", stored_r.real_tests_failed, actual_real.tests_failed));
+                    }
+                }
+            }
+            if regressions.is_empty() {
+                println!("✅ No regressions");
+                Ok(TestOutcome::Passed)
+            } else {
+                Ok(TestOutcome::Failed(vec![BatteryMismatch {
+                    battery: "CRUST-blind".into(),
+                    diffs: regressions,
+                }]))
+            }
+        }
+        _ => Ok(TestOutcome::Ok),
+    }
 }
 
 // ── Battery discovery ──────────────────────────────────────────────────
