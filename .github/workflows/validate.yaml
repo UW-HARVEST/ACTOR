@@ -50,6 +50,11 @@ jobs:
             cmd: ./tools/target/release/harvest-tools --agent kiro test CRUST --check
             needs_openssl: true
             needs_crust: true
+          - name: CRUST-blind kiro
+            guard: results/CRUST-blind/kiro
+            cmd: ./tools/target/release/harvest-tools --agent kiro test CRUST --blind --check
+            needs_openssl: true
+            needs_crust: true
           - name: Test-Corpus kiro
             guard: results/Test-Corpus/kiro
             cmd: ./tools/target/release/harvest-tools --agent kiro test all --check
