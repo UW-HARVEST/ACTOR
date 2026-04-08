@@ -410,12 +410,17 @@ pub fn run_blind_crust_test(
             crate::translate::copy_dir_all(&bin_dir, &llm_backup)?;
         }
 
-        // Phase 2: swap in real tests from scaffold
+        // Phase 2: swap in real tests from scaffold (src/bin + Cargo.toml)
+        let cargo_toml = proj_dir.join("Cargo.toml");
+        let cargo_backup = proj_dir.join("Cargo.toml.llm");
         let real_bin = project.scaffold().join("src/bin");
         if real_bin.is_dir() {
             if bin_dir.is_dir() { std::fs::remove_dir_all(&bin_dir)?; }
             let _ = std::fs::remove_dir_all(proj_dir.join("target"));
             crate::translate::copy_dir_all(&real_bin, &bin_dir)?;
+            // Swap Cargo.toml so [[test]] entries match the real test files
+            std::fs::rename(&cargo_toml, &cargo_backup)?;
+            std::fs::copy(project.scaffold().join("Cargo.toml"), &cargo_toml)?;
         }
 
         let real_result = test_one_crust(proj_dir.as_ref())?;
@@ -426,7 +431,11 @@ pub fn run_blind_crust_test(
         let logs_dir = proj_dir.join("logs");
         let _ = std::fs::rename(logs_dir.join("test.log"), logs_dir.join("test_real.log"));
 
-        // Restore LLM tests (skip in --check, we didn't back them up)
+        // Restore verify's Cargo.toml and LLM tests
+        if cargo_backup.exists() {
+            let _ = std::fs::remove_file(&cargo_toml);
+            std::fs::rename(&cargo_backup, &cargo_toml)?;
+        }
         if !check_only && llm_backup.is_dir() {
             if bin_dir.is_dir() { std::fs::remove_dir_all(&bin_dir)?; }
             let _ = std::fs::remove_dir_all(proj_dir.join("target"));
