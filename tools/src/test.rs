@@ -276,7 +276,7 @@ fn load_blind_stored_results(paths: &Paths) -> Result<std::collections::BTreeMap
     for entry in std::fs::read_dir(&paths.results_dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() { continue; }
-        let rj = entry.path().join("result.json");
+        let rj = entry.path().join("verify/result.json");
         if rj.exists() {
             let data = std::fs::read_to_string(&rj)?;
             if let Ok(r) = serde_json::from_str::<BlindCrustStored>(&data) {
@@ -384,7 +384,7 @@ pub fn run_blind_crust_test(
 
     for project in projects {
         let name = project.name();
-        let proj_dir = paths.output_dir(name);
+        let proj_dir = paths.verify_dir(name);
         if !proj_dir.join("Cargo.toml").exists() { continue; }
         total += 1;
 
@@ -394,7 +394,7 @@ pub fn run_blind_crust_test(
         let (llm_result, llm_ok) = if check_only {
             (CrustTestResult { tests_ok: 0, tests_failed: 0, build_ok: true }, false)
         } else {
-            let r = test_one_crust(&proj_dir)?;
+            let r = test_one_crust(proj_dir.as_ref())?;
             let ok = r.build_ok && r.tests_ok > 0 && r.tests_failed == 0;
             if ok { llm_passed += 1; }
             // Preserve LLM test log
@@ -418,7 +418,7 @@ pub fn run_blind_crust_test(
             crate::translate::copy_dir_all(&real_bin, &bin_dir)?;
         }
 
-        let real_result = test_one_crust(&proj_dir)?;
+        let real_result = test_one_crust(proj_dir.as_ref())?;
         let real_ok = real_result.build_ok && real_result.tests_ok > 0 && real_result.tests_failed == 0;
         if real_ok { real_passed += 1; }
 
@@ -844,4 +844,35 @@ fn diff_summaries(expected: &Summary, actual: &Summary) -> Vec<String> {
         diffs.push(format!("no longer failing: {}", removed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
     }
     diffs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn load_blind_stored_results_reads_from_verify_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let results_dir = tmp.path().join("results/CRUST-blind/kiro");
+
+        // Create project with verify/result.json
+        let proj = results_dir.join("vec/verify");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("result.json"), r#"{"real_tests_ok": 22, "real_tests_failed": 0}"#).unwrap();
+
+        // Create another project — result.json at root (old layout) should be ignored
+        let proj2 = results_dir.join("hamta");
+        fs::create_dir_all(&proj2).unwrap();
+        fs::write(proj2.join("result.json"), r#"{"real_tests_ok": 99, "real_tests_failed": 1}"#).unwrap();
+
+        let paths = crate::battery::Paths::new(
+            tmp.path(), crate::cli::Agent::Kiro, crate::cli::Dataset::BlindCrust,
+        );
+
+        let stored = load_blind_stored_results(&paths).unwrap();
+        assert_eq!(stored.len(), 1, "only verify/ layout should be found");
+        assert_eq!(stored["vec"].real_tests_ok, 22);
+        assert_eq!(stored["vec"].real_tests_failed, 0);
+    }
 }

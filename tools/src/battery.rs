@@ -352,6 +352,30 @@ pub fn all_case_names(battery: &Battery) -> Vec<String> {
 }
 
 /// Paths helper.
+/// Immutable translation output directory. Created once by translate, never modified after.
+#[derive(Debug, Clone)]
+pub struct TranslateDir(PathBuf);
+
+/// Mutable verify workspace. Can be wiped and recreated from a [`TranslateDir`].
+#[derive(Debug, Clone)]
+pub struct VerifyDir(PathBuf);
+
+macro_rules! impl_dir_newtype {
+    ($T:ty) => {
+        impl $T {
+            pub fn join(&self, path: impl AsRef<Path>) -> PathBuf { self.0.join(path) }
+            pub fn exists(&self) -> bool { self.0.exists() }
+            pub fn is_dir(&self) -> bool { self.0.is_dir() }
+        }
+        impl AsRef<Path> for $T {
+            fn as_ref(&self) -> &Path { &self.0 }
+        }
+    };
+}
+
+impl_dir_newtype!(TranslateDir);
+impl_dir_newtype!(VerifyDir);
+
 pub struct Paths {
     pub corpus_dir: PathBuf,
     pub results_dir: PathBuf,
@@ -392,8 +416,18 @@ impl Paths {
         self.corpus_dir.join("Public-Tests").join(battery)
     }
 
-    pub fn output_dir(&self, battery: &str) -> PathBuf {
-        self.results_dir.join(battery)
+    pub fn output_dir(&self, name: &str) -> PathBuf {
+        self.results_dir.join(name)
+    }
+
+    /// Blind CRUST: immutable translation output.
+    pub fn translate_dir(&self, name: &str) -> TranslateDir {
+        TranslateDir(self.results_dir.join(name).join("translate"))
+    }
+
+    /// Blind CRUST: mutable verify workspace (tests + possible src fixes).
+    pub fn verify_dir(&self, name: &str) -> VerifyDir {
+        VerifyDir(self.results_dir.join(name).join("verify"))
     }
 
     pub fn case_dir(&self, battery: &str, case: &str) -> PathBuf {
@@ -528,5 +562,45 @@ mod tests {
         } else {
             panic!("expected Independent");
         }
+    }
+
+    #[test]
+    fn translate_and_verify_dirs_are_distinct_newtypes() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("crust-bench/datasets")).unwrap();
+        fs::create_dir_all(tmp.path().join("results/CRUST-blind/kiro")).unwrap();
+        fs::create_dir_all(tmp.path().join("scripts/prompts")).unwrap();
+
+        let paths = Paths::new(tmp.path(), crate::cli::Agent::Kiro, crate::cli::Dataset::BlindCrust);
+
+        let t = paths.translate_dir("vec");
+        let v = paths.verify_dir("vec");
+
+        assert_ne!(t.as_ref(), v.as_ref());
+        assert!(t.as_ref().ends_with("vec/translate"));
+        assert!(v.as_ref().ends_with("vec/verify"));
+        assert_eq!(t.as_ref().parent(), v.as_ref().parent());
+    }
+
+    #[test]
+    fn verify_wipe_preserves_translate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("myproj");
+        let translate = project.join("translate");
+        let verify = project.join("verify");
+
+        fs::create_dir_all(translate.join("src")).unwrap();
+        fs::write(translate.join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
+        fs::write(translate.join("src/lib.rs"), "pub fn f() {}").unwrap();
+
+        fs::create_dir_all(verify.join("src/bin")).unwrap();
+        fs::write(verify.join("src/bin/test_f.rs"), "#[test] fn t() {}").unwrap();
+
+        // Wipe verify (simulates --force)
+        fs::remove_dir_all(&verify).unwrap();
+
+        // Translate is untouched
+        assert!(translate.join("Cargo.toml").exists());
+        assert_eq!(fs::read_to_string(translate.join("src/lib.rs")).unwrap(), "pub fn f() {}");
     }
 }

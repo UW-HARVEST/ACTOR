@@ -497,12 +497,11 @@ fn prepare_crust_workspace(
     paths: &Paths,
     project: &battery::CrustProject,
     mode: &ScaffoldMode,
+    log_dir: &Path,
     log_name: &str,
 ) -> Result<(tempfile::TempDir, PathBuf, PathBuf)> {
-    let out = paths.output_dir(project.name());
-    let logs_dir = out.join("logs");
-    std::fs::create_dir_all(&logs_dir)?;
-    let log_path = logs_dir.join(log_name);
+    std::fs::create_dir_all(log_dir)?;
+    let log_path = log_dir.join(log_name);
 
     let tmp = tempfile::Builder::new()
         .prefix("harvest-crust-")
@@ -646,13 +645,18 @@ fn translate_one_crust(paths: &Paths, project: &battery::CrustProject, mode: &Sc
 }
 
 fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject, mode: &ScaffoldMode, prompt: &str) -> Result<CaseResult> {
-    let out = paths.output_dir(project.name());
+    let is_blind = matches!(mode, ScaffoldMode::Blind);
+    let out: PathBuf = if is_blind {
+        paths.translate_dir(project.name()).as_ref().to_owned()
+    } else {
+        paths.output_dir(project.name())
+    };
 
     if out.join("Cargo.toml").exists() {
         return Ok(CaseResult { name: project.name().into(), elapsed_secs: 0, success: true, error: None, skipped: true });
     }
 
-    let (_tmp, work, log_path) = prepare_crust_workspace(paths, project, mode, "translation.log")?;
+    let (_tmp, work, log_path) = prepare_crust_workspace(paths, project, mode, &out.join("logs"), "translation.log")?;
 
     let start = Instant::now();
     invoke_agent(paths.agent, prompt, &log_path, &work)?;
@@ -725,41 +729,46 @@ fn verify_one_crust_blind(paths: &Paths, project: &battery::CrustProject, prompt
 }
 
 fn verify_one_crust_blind_inner(paths: &Paths, project: &battery::CrustProject, prompt: &str, force: bool) -> Result<CaseResult> {
-    let out = paths.output_dir(project.name());
+    let translate = paths.translate_dir(project.name());
+    let verify = paths.verify_dir(project.name());
 
-    anyhow::ensure!(out.join("Cargo.toml").exists(), "translation not found for {}", project.name());
+    anyhow::ensure!(translate.join("Cargo.toml").exists(), "translation not found for {}", project.name());
 
     // Skip if LLM-generated tests already exist (unless --force)
-    let bin_dir = out.join("src/bin");
+    let bin_dir = verify.join("src/bin");
     if !force && bin_dir.is_dir() && std::fs::read_dir(&bin_dir)?.next().is_some() {
         return Ok(CaseResult { name: project.name().into(), elapsed_secs: 0, success: true, error: None, skipped: true });
     }
 
-    // Clean old LLM tests if re-running
-    if bin_dir.is_dir() {
-        std::fs::remove_dir_all(&bin_dir)?;
+    // Wipe old verify dir — always start fresh from translation
+    if verify.is_dir() {
+        std::fs::remove_dir_all(&verify)?;
     }
-    let _ = std::fs::remove_dir_all(out.join("target"));
 
-    // Set up temp workspace with the translated code + C source
+    // Set up temp workspace from the immutable translation
     let tmp = tempfile::Builder::new()
         .prefix("harvest-crust-verify-")
         .tempdir()
         .context("creating temp dir for CRUST verify")?;
     let work = tmp.path().join("project");
-    copy_dir_filtered(&out, &work, &["target", "logs"])?;
+    copy_dir_filtered(translate.as_ref(), &work, &["target", "logs"])?;
 
-    let log_path = out.join("logs/verify.log");
-    std::fs::create_dir_all(out.join("logs"))?;
+    let logs_dir = verify.join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    let log_path = logs_dir.join("verify.log");
 
     let start = Instant::now();
     invoke_agent(paths.agent, prompt, &log_path, &work)?;
     let elapsed = start.elapsed().as_secs();
 
-    // Copy back all agent changes (src/, Cargo.toml — but not target/c_src/logs)
-    copy_dir_filtered(&work, &out, &["target", "c_src", "logs"])?;
+    // Copy agent output to verify/ (not back to translate/)
+    copy_dir_filtered(&work, verify.as_ref(), &["target", "c_src", "logs"])?;
+    // Ensure c_src is available in verify/ for test compilation
+    if translate.join("c_src").is_dir() {
+        copy_dir_all(&translate.join("c_src"), &verify.join("c_src"))?;
+    }
 
-    let bin_dir = out.join("src/bin");
+    let bin_dir = verify.join("src/bin");
     let success = bin_dir.is_dir() && std::fs::read_dir(&bin_dir)?.next().is_some();
     Ok(CaseResult { name: project.name().into(), elapsed_secs: elapsed, success, error: None, skipped: false })
 }
