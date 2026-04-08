@@ -268,6 +268,8 @@ struct BlindCrustStored {
     real_tests_ok: usize,
     #[serde(default)]
     real_tests_failed: usize,
+    #[serde(default)]
+    flaky: bool,
 }
 
 fn load_blind_stored_results(paths: &Paths) -> Result<std::collections::BTreeMap<String, BlindCrustStored>> {
@@ -471,12 +473,12 @@ pub fn run_blind_crust_test(
             // Load stored result.json and compare real_tests fields
             let stored = load_blind_stored_results(paths)?;
             let mut regressions = Vec::new();
-            for (name, actual_real, actual_llm) in results.iter() {
+            for (name, actual_real, _actual_llm) in results.iter() {
                 if let Some(stored_r) = stored.get(name.as_str()) {
-                    if actual_real.tests_ok < stored_r.real_tests_ok {
+                    if actual_real.tests_ok != stored_r.real_tests_ok {
                         regressions.push(format!("{name}: real_tests_ok expected={} actual={}", stored_r.real_tests_ok, actual_real.tests_ok));
                     }
-                    if actual_real.tests_failed > stored_r.real_tests_failed {
+                    if actual_real.tests_failed != stored_r.real_tests_failed {
                         regressions.push(format!("{name}: real_tests_failed expected={} actual={}", stored_r.real_tests_failed, actual_real.tests_failed));
                     }
                 }
@@ -485,6 +487,20 @@ pub fn run_blind_crust_test(
                 println!("✅ No regressions");
                 Ok(TestOutcome::Passed)
             } else {
+                println!("\n❌ {} regression(s):", regressions.len());
+                for r in &regressions {
+                    println!("  {r}");
+                    // Extract project name and dump test_real.log
+                    let proj = r.split(':').next().unwrap_or("");
+                    let log_path = paths.verify_dir(proj).join("logs/test_real.log");
+                    if let Ok(log) = std::fs::read_to_string(&log_path) {
+                        println!("  ┌── test_real.log for {proj} ──");
+                        for line in log.lines().rev().take(50).collect::<Vec<_>>().into_iter().rev() {
+                            println!("  │ {line}");
+                        }
+                        println!("  └──");
+                    }
+                }
                 Ok(TestOutcome::Failed(vec![BatteryMismatch {
                     battery: "CRUST-blind".into(),
                     diffs: regressions,
