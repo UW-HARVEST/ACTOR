@@ -174,14 +174,14 @@ fn find_regressions(expected: &CrustBaseline, actual: &CrustBaseline) -> Vec<Reg
 
 /// Run cargo test on a single CRUST project, return typed result.
 fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
-    // Clean up test artifacts
-    for artifact in [".vsync"] {
+    // Clean up test artifacts and shared temp dirs (some CRUST tests use ./tmp)
+    for artifact in [".vsync", "tmp"] {
         let p = proj_dir.join(artifact);
         if p.exists() { let _ = std::fs::remove_dir_all(&p); }
     }
 
     let output = Command::new("timeout")
-        .args(["60", "cargo", "test"])
+        .args(["60", "cargo", "test", "--", "--test-threads=1"])
         .current_dir(proj_dir)
         .output()
         .with_context(|| format!("running cargo test in {}", proj_dir.display()))?;
