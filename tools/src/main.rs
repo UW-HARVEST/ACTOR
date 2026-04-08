@@ -93,6 +93,26 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Enrich { ref target, blind } => {
+            let dataset = Dataset::detect(target, blind);
+            let paths = battery::Paths::new(&repo_root, agent, dataset);
+            let inner = Dataset::strip_prefix(target);
+            match dataset {
+                Dataset::BlindCrust => {
+                    let projects = resolve_crust_projects(&paths.corpus_dir, inner, None)?;
+                    test::enrich_blind_crust(&paths, &projects)?;
+                }
+                Dataset::Crust => {
+                    let projects = resolve_crust_projects(&paths.corpus_dir, inner, None)?;
+                    test::enrich_crust(&paths, &projects)?;
+                }
+                Dataset::TestCorpus => {
+                    for bat in resolve_batteries(&paths.corpus_dir, inner)? {
+                        test::enrich_test_corpus(&paths, &bat)?;
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
