@@ -1,5 +1,4 @@
 use crate::battery::{self, Case, Paths};
-use crate::cargo_toml;
 use crate::cli::Agent;
 use crate::translate::{copy_dir_all, IsolatedWorkDir, Semaphore};
 use anyhow::{Context, Result};
@@ -109,16 +108,8 @@ fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filte
 
         // Always propagate fixes to configs
         println!("Re-propagating fixes from {} to {} configs...", group.real_case, group.configs.len());
-        let real_src = real_dir.join("translated_rust/src");
         for cfg in &group.configs {
-            let cfg_translated = output_dir.join(&cfg.name).join("translated_rust");
-            if !cfg_translated.join("Cargo.toml").exists() { continue; }
-            let dst_src = cfg_translated.join("src");
-            if dst_src.exists() { std::fs::remove_dir_all(&dst_src)?; }
-            copy_dir_all(&real_src, &dst_src)?;
-            if cfg.is_lib { cargo_toml::strip_for_lib(&cfg_translated)?; }
-            let target_dir = cfg_translated.join("target");
-            if target_dir.exists() { std::fs::remove_dir_all(&target_dir)?; }
+            crate::translate::propagate_config(paths, battery_name, &group.real_case, cfg)?;
         }
         println!("Propagated to {} cases", group.configs.len());
     }
