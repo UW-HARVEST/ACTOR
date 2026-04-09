@@ -229,6 +229,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "proc-macro2",
  "regex",
  "serde",
  "serde_json",

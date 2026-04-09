@@ -418,6 +418,8 @@ pub struct UnsafeCounts {
     pub fns: usize,
     /// `unsafe impl` blocks
     pub impls: usize,
+    /// Total lines inside unsafe blocks/fns/impls
+    pub lines: usize,
 }
 
 impl UnsafeCounts {
@@ -437,6 +439,7 @@ pub fn count_unsafe(src_dir: &Path) -> UnsafeCounts {
             counts.blocks += sub.blocks;
             counts.fns += sub.fns;
             counts.impls += sub.impls;
+            counts.lines += sub.lines;
         } else if path.extension().is_some_and(|x| x == "rs") {
             let Ok(src) = std::fs::read_to_string(&path) else { continue };
             let Ok(file) = syn::parse_file(&src) else { continue };
@@ -445,6 +448,7 @@ pub fn count_unsafe(src_dir: &Path) -> UnsafeCounts {
             counts.blocks += v.blocks;
             counts.fns += v.fns;
             counts.impls += v.impls;
+            counts.lines += v.lines;
         }
     }
     counts
@@ -455,23 +459,44 @@ struct UnsafeVisitor {
     blocks: usize,
     fns: usize,
     impls: usize,
+    lines: usize,
+}
+
+fn span_lines(open: proc_macro2::Span, close: proc_macro2::Span) -> usize {
+    let start = open.start().line;
+    let end = close.end().line;
+    if end >= start { end - start + 1 } else { 1 }
 }
 
 impl<'ast> syn::visit::Visit<'ast> for UnsafeVisitor {
     fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
         self.blocks += 1;
+        let b = node.block.brace_token;
+        self.lines += span_lines(b.span.open(), b.span.close());
         syn::visit::visit_expr_unsafe(self, node);
     }
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if node.sig.unsafety.is_some() { self.fns += 1; }
+        if node.sig.unsafety.is_some() {
+            self.fns += 1;
+            let b = node.block.brace_token;
+            self.lines += span_lines(b.span.open(), b.span.close());
+        }
         syn::visit::visit_item_fn(self, node);
     }
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if node.sig.unsafety.is_some() { self.fns += 1; }
+        if node.sig.unsafety.is_some() {
+            self.fns += 1;
+            let b = node.block.brace_token;
+            self.lines += span_lines(b.span.open(), b.span.close());
+        }
         syn::visit::visit_impl_item_fn(self, node);
     }
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        if node.unsafety.is_some() { self.impls += 1; }
+        if node.unsafety.is_some() {
+            self.impls += 1;
+            let b = node.brace_token;
+            self.lines += span_lines(b.span.open(), b.span.close());
+        }
         syn::visit::visit_item_impl(self, node);
     }
 }
