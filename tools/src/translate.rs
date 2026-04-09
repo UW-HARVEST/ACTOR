@@ -388,7 +388,7 @@ fn post_process_independent(paths: &Paths, battery: &str, name: &str, is_lib: bo
     Ok(())
 }
 
-fn propagate_config(
+pub fn propagate_config(
     paths: &Paths,
     battery: &str,
     real_case: &str,
