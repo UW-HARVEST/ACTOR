@@ -959,6 +959,8 @@ fn check_enrichment(
             if sb != live.blocks { diffs.push(format!("unsafe.blocks expected={sb} actual={}", live.blocks)); }
             if sf != live.fns { diffs.push(format!("unsafe.fns expected={sf} actual={}", live.fns)); }
             if si != live.impls { diffs.push(format!("unsafe.impls expected={si} actual={}", live.impls)); }
+            let sl = stored.get("lines").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            if sl != live.lines { diffs.push(format!("unsafe.lines expected={sl} actual={}", live.lines)); }
         }
         None => diffs.push("missing unsafe field".into()),
     }
