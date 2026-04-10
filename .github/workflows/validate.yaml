@@ -70,6 +70,16 @@ jobs:
             cmd: ./tools/target/release/harvest-tools --agent claude test all --check
             needs_openssl: false
             needs_crust: false
+          - name: Test-Corpus kiro-translate
+            guard: results/Test-Corpus/kiro-translate
+            cmd: ./tools/target/release/harvest-tools --agent kiro-translate test all --check
+            needs_openssl: false
+            needs_crust: false
+          - name: CRUST-blind kiro-translate
+            guard: results/CRUST-blind/kiro-translate
+            cmd: ./tools/target/release/harvest-tools --agent kiro-translate test CRUST --blind --check
+            needs_openssl: true
+            needs_crust: true
     name: ${{ matrix.name }}
     steps:
       - name: Restore workspace

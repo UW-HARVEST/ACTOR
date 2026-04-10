@@ -159,7 +159,7 @@ fn translate_one_independent(
     let prompt_text = match paths.agent {
         Agent::C2rust => String::new(),
         Agent::Claude => std::fs::read_to_string(paths.prompts_dir.join("translate.md")).unwrap_or_default(),
-        Agent::Kiro => {
+        Agent::Kiro | Agent::KiroTranslate => {
             let f = if case.is_lib { "library.md" } else { "executable.md" };
             std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default()
         }
@@ -196,7 +196,7 @@ fn translate_one_shared(
     let prompt_text = match paths.agent {
         Agent::C2rust => String::new(),
         Agent::Claude => std::fs::read_to_string(paths.prompts_dir.join("translate.md")).unwrap_or_default(),
-        Agent::Kiro => std::fs::read_to_string(paths.prompts_dir.join("configurable.md")).unwrap_or_default(),
+        Agent::Kiro | Agent::KiroTranslate => std::fs::read_to_string(paths.prompts_dir.join("configurable.md")).unwrap_or_default(),
     };
 
     println!("Translating: {} (shared-source, {} configs)", group.real_case, group.configs.len());
@@ -224,7 +224,7 @@ fn translate_one_shared(
 
 fn preflight_check(agent: Agent) -> Result<()> {
     let (cmd, version_args): (&str, &[&str]) = match agent {
-        Agent::Kiro => ("kiro-cli", &["--version"]),
+        Agent::Kiro | Agent::KiroTranslate => ("kiro-cli", &["--version"]),
         Agent::Claude => ("claude", &["--version"]),
         Agent::C2rust => ("c2rust", &["--version"]),
     };
@@ -287,7 +287,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
     let (work_dir, _tmp_guard) = match paths.agent {
-        Agent::Kiro | Agent::Claude | Agent::C2rust => {
+        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::C2rust => {
             let tmp = tempfile::Builder::new()
                 .prefix("harvest-translate-")
                 .tempdir()
@@ -322,7 +322,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
     };
 
     match paths.agent {
-        Agent::Kiro => {
+        Agent::Kiro | Agent::KiroTranslate => {
             let _status = Command::new("bash")
                 .arg("-lc")
                 .arg(r#"set -o pipefail; timeout 5400 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
@@ -554,7 +554,7 @@ fn prepare_crust_workspace(
 /// Invoke the agent in a working directory with a prompt.
 fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Result<()> {
     match agent {
-        Agent::Kiro => {
+        Agent::Kiro | Agent::KiroTranslate => {
             Command::new("bash")
                 .arg("-lc")
                 .arg(r#"set -o pipefail; timeout 1800 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
