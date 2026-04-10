@@ -966,7 +966,7 @@ fn check_enrichment(
     }
 
     // Only kiro has credits
-    let require_credits = matches!(agent, crate::cli::Agent::Kiro);
+    let require_credits = matches!(agent, crate::cli::Agent::Kiro | crate::cli::Agent::KiroTranslate);
     for &(key, log) in log_paths {
         let live_meta = crate::battery::extract_agent_meta(log);
         match (json.get(key), live_meta) {

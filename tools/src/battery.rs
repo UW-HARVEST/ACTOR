@@ -513,6 +513,7 @@ impl Paths {
     pub fn new(repo_root: &Path, agent: Agent, dataset: Dataset) -> Self {
         let agent_name = match agent {
             Agent::Kiro => "kiro",
+            Agent::KiroTranslate => "kiro-translate",
             Agent::Claude => "claude",
             Agent::C2rust => "c2rust",
         };

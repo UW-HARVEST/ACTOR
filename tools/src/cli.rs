@@ -3,6 +3,7 @@ use clap::Parser;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Agent {
     Kiro,
+    KiroTranslate,
     Claude,
     C2rust,
 }
@@ -110,6 +111,12 @@ pub enum Command {
     },
     /// Backfill result.json with credits + unsafe counts (no tests, no LLM calls)
     Enrich {
+        target: String,
+        #[arg(long)]
+        blind: bool,
+    },
+    /// Populate kiro-translate results from kiro's pre-verify artifacts
+    Populate {
         target: String,
         #[arg(long)]
         blind: bool,

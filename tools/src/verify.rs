@@ -151,7 +151,7 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
         .replace("ALL_CONFIGURATIONS", configs_text);
 
     match agent {
-        Agent::Kiro => {
+        Agent::Kiro | Agent::KiroTranslate => {
             let _status = Command::new("bash")
                 .arg("-lc")
                 .arg(r#"timeout 2700 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
