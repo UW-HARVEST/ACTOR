@@ -1170,11 +1170,12 @@ fn laertes_preprocess(work_dir: &Path) -> Result<()> {
 
 /// Restore modern-toolchain compatibility after Laertes rewrites.
 fn laertes_postprocess(work_dir: &Path) -> Result<()> {
+    let libc_internal = regex::Regex::new(r"libc::(?:[a-z_0-9]+::)+([a-z_0-9]+)").unwrap();
     for path in walkdir(work_dir)? {
         if path.extension().map_or(true, |e| e != "rs") { continue; }
         let src = std::fs::read_to_string(&path)?;
         let mut out = src.replace("extern crate libc;\n", "");
-        out = out.replace("libc::unix::", "libc::");
+        out = libc_internal.replace_all(&out, "libc::$1").into_owned();
         if out != src { std::fs::write(&path, out)?; }
     }
 
