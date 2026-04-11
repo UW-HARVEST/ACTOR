@@ -6,6 +6,7 @@ pub enum Agent {
     KiroTranslate,
     Claude,
     C2rust,
+    Laertes,
 }
 
 /// Which benchmark dataset to use.
