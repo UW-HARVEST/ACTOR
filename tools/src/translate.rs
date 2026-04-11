@@ -156,8 +156,26 @@ fn translate_one_independent(
         return CaseResult { name: case.name.clone(), elapsed_secs: 0, success: true, error: None, skipped: true };
     }
 
+    if paths.agent == Agent::Laertes {
+        let start = Instant::now();
+        match laertes_translate_case(paths, battery_name, &case.name) {
+            Ok(()) => {
+                let elapsed = start.elapsed().as_secs();
+                write_translation_metrics(&output_dir.join(&case.name), paths.agent, elapsed, true);
+                let _ = post_process_independent(paths, battery_name, &case.name, case.is_lib);
+                let _ = save_original(output_dir, &case.name);
+                return CaseResult { name: case.name.clone(), elapsed_secs: elapsed, success: true, error: None, skipped: false };
+            }
+            Err(e) => {
+                let elapsed = start.elapsed().as_secs();
+                write_translation_metrics(&output_dir.join(&case.name), paths.agent, elapsed, false);
+                return CaseResult { name: case.name.clone(), elapsed_secs: elapsed, success: false, error: Some(e.to_string()), skipped: false };
+            }
+        }
+    }
+
     let prompt_text = match paths.agent {
-        Agent::C2rust => String::new(),
+        Agent::C2rust | Agent::Laertes => String::new(),
         Agent::Claude => std::fs::read_to_string(paths.prompts_dir.join("translate.md")).unwrap_or_default(),
         Agent::Kiro | Agent::KiroTranslate => {
             let f = if case.is_lib { "library.md" } else { "executable.md" };
@@ -193,8 +211,29 @@ fn translate_one_shared(
         return CaseResult { name: group.real_case.clone(), elapsed_secs: 0, success: true, error: None, skipped: true };
     }
 
+    if paths.agent == Agent::Laertes {
+        let start = Instant::now();
+        match laertes_translate_case(paths, battery_name, &group.real_case) {
+            Ok(()) => {
+                let elapsed = start.elapsed().as_secs();
+                write_translation_metrics(&real_dir, paths.agent, elapsed, true);
+                if let Ok(mut cargo) = CargoToml::open(&real_dir.join("translated_rust/Cargo.toml")) {
+                    cargo.add_workspace();
+                    let _ = cargo.save();
+                }
+                let _ = save_original(output_dir, &group.real_case);
+                return CaseResult { name: group.real_case.clone(), elapsed_secs: elapsed, success: true, error: None, skipped: false };
+            }
+            Err(e) => {
+                let elapsed = start.elapsed().as_secs();
+                write_translation_metrics(&real_dir, paths.agent, elapsed, false);
+                return CaseResult { name: group.real_case.clone(), elapsed_secs: elapsed, success: false, error: Some(e.to_string()), skipped: false };
+            }
+        }
+    }
+
     let prompt_text = match paths.agent {
-        Agent::C2rust => String::new(),
+        Agent::C2rust | Agent::Laertes => String::new(),
         Agent::Claude => std::fs::read_to_string(paths.prompts_dir.join("translate.md")).unwrap_or_default(),
         Agent::Kiro | Agent::KiroTranslate => std::fs::read_to_string(paths.prompts_dir.join("configurable.md")).unwrap_or_default(),
     };
@@ -227,6 +266,7 @@ fn preflight_check(agent: Agent) -> Result<()> {
         Agent::Kiro | Agent::KiroTranslate => ("kiro-cli", &["--version"]),
         Agent::Claude => ("claude", &["--version"]),
         Agent::C2rust => ("c2rust", &["--version"]),
+        Agent::Laertes => ("docker", &["--version"]),
     };
 
     let output = Command::new("bash")
@@ -287,7 +327,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
     let (work_dir, _tmp_guard) = match paths.agent {
-        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::C2rust => {
+        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::C2rust | Agent::Laertes => {
             let tmp = tempfile::Builder::new()
                 .prefix("harvest-translate-")
                 .tempdir()
@@ -349,6 +389,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
         Agent::C2rust => {
             c2rust_translate(&work_dir, &log_path)?;
         }
+        Agent::Laertes => unreachable!("laertes uses laertes_translate_case"),
     };
 
     if !work_dir.join("Cargo.toml").exists() {
@@ -576,7 +617,7 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
                 .status()
                 .context("invoking claude for CRUST")?;
         }
-        Agent::C2rust => anyhow::bail!("c2rust not supported for CRUST-bench"),
+        Agent::C2rust | Agent::Laertes => anyhow::bail!("c2rust/laertes not supported for CRUST-bench"),
     }
     Ok(())
 }
@@ -993,6 +1034,162 @@ fn c2rust_translate(work_dir: &Path, log_path: &Path) -> Result<()> {
     log.write_all(&build_out.stderr)?;
     writeln!(log, "\nc2rust translation {}", if build_out.status.success() { "succeeded" } else { "FAILED to compile" })?;
 
+    Ok(())
+}
+
+// ── Laertes (c2rust → resolve-imports → resolve-lifetimes) ─────────────
+
+const LAERTES_DOCKER_IMAGE: &str = "laertes-ready";
+
+/// Shell script executed inside the Laertes Docker container.
+/// Expects the project mounted at /mnt/project with read-write access.
+const LAERTES_DOCKER_SCRIPT: &str = r#"
+set -e
+export PATH=$HOME/.cargo/bin:$PATH
+export LD_LIBRARY_PATH=$HOME/.rustup/toolchains/nightly-2020-10-15-x86_64-unknown-linux-gnu/lib
+export RUST_LOG=off
+cd $HOME/lab/laertes
+
+rm -rf rewrite-workspace/project rewrite-invocations/project
+cp -r /mnt/project rewrite-workspace/project
+echo "$HOME/lab/laertes/rewrite-workspace/project/lib.rs" > rewrite-invocations/project
+
+echo "=== resolve-imports ==="
+target/release/resolve-imports $(cat rewrite-invocations/project) 2>&1
+
+echo "=== resolve-lifetimes ==="
+timeout 120 target/release/resolve-lifetimes -f $(cat rewrite-invocations/project) 2>&1 \
+    || echo "resolve-lifetimes failed or timed out, continuing with RI-only output"
+
+echo "=== resolve-imports (cleanup) ==="
+target/release/resolve-imports $(cat rewrite-invocations/project) 2>&1
+
+# Copy rewritten sources back (only .rs files, preserve mount structure)
+find rewrite-workspace/project -name '*.rs' | while read -r f; do
+    rel="${f#rewrite-workspace/project/}"
+    mkdir -p "/mnt/project/$(dirname "$rel")"
+    cp "$f" "/mnt/project/$rel"
+done
+"#;
+
+fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()> {
+    use std::io::Write;
+
+    // Locate c2rust source (sibling directory under results/Test-Corpus/)
+    let c2rust_original = paths.results_dir
+        .parent().context("no parent for results_dir")?
+        .join("c2rust").join(battery).join(name).join("translated_rust_original");
+    anyhow::ensure!(c2rust_original.is_dir(),
+        "c2rust translated_rust_original not found: {}", c2rust_original.display());
+
+    let case_dir = paths.case_dir(battery, name);
+    if case_dir.exists() { std::fs::remove_dir_all(&case_dir)?; }
+    let logs_dir = case_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    let log_path = logs_dir.join("translation.log");
+    let translated = case_dir.join("translated_rust");
+
+    // Copy c2rust output (skip target/ and Cargo.lock)
+    copy_dir_filtered(&c2rust_original, &translated, &["target"])?;
+
+    let mut log = std::fs::File::create(&log_path)?;
+    writeln!(log, "source: {}", c2rust_original.display())?;
+
+    // Pre-process for nightly-2020-10-15
+    writeln!(log, "\n=== Laertes pre-process ===")?;
+    laertes_preprocess(&translated)?;
+    writeln!(log, "done")?;
+
+    // Run Laertes in Docker
+    writeln!(log, "\n=== Laertes Docker ===")?;
+    let mount = format!("{}:/mnt/project", translated.display());
+    let docker_out = Command::new("docker")
+        .args(["run", "--rm", "-v", &mount, LAERTES_DOCKER_IMAGE, "bash", "-c", LAERTES_DOCKER_SCRIPT])
+        .output()
+        .context("running laertes docker container")?;
+    log.write_all(&docker_out.stdout)?;
+    log.write_all(&docker_out.stderr)?;
+
+    // Post-process for modern toolchain
+    writeln!(log, "\n=== Laertes post-process ===")?;
+    laertes_postprocess(&translated)?;
+
+    // Verify it compiles
+    let build = Command::new("cargo")
+        .args(["+nightly", "build", "--release"])
+        .env("RUSTFLAGS", "-Awarnings")
+        .current_dir(&translated)
+        .output()
+        .context("cargo build after laertes")?;
+    log.write_all(&build.stdout)?;
+    log.write_all(&build.stderr)?;
+    let ok = build.status.success();
+    writeln!(log, "\nlaertes translation {}", if ok { "succeeded" } else { "FAILED to compile (non-fatal)" })?;
+
+    Ok(())
+}
+
+/// Adapt c2rust output for Laertes' nightly-2020-10-15 toolchain.
+fn laertes_preprocess(work_dir: &Path) -> Result<()> {
+    for path in walkdir(work_dir)? {
+        if path.extension().map_or(true, |e| e != "rs") { continue; }
+        let mut src = std::fs::read_to_string(&path)?;
+        let changed = src.contains("::core::ffi::") || src.contains("::core::ptr") || src.contains("::core::mem");
+        if !changed && !path.ends_with("lib.rs") { continue; }
+
+        src = src.replace("::core::ffi::", "libc::");
+        src = src.replace("::core::ptr", "std::ptr");
+        src = src.replace("::core::mem", "std::mem");
+
+        if src.contains("libc::") && !src.contains("extern crate libc") {
+            src.insert_str(0, "extern crate libc;\n");
+        }
+        std::fs::write(&path, src)?;
+    }
+
+    // Fix entry point features
+    let lib_rs = work_dir.join("lib.rs");
+    if lib_rs.exists() {
+        let mut src = std::fs::read_to_string(&lib_rs)?;
+        if !src.contains("rustc_private") {
+            src.insert_str(0, "#![feature(rustc_private)]\n");
+        }
+        std::fs::write(&lib_rs, src)?;
+    }
+
+    // Cargo.toml: edition 2018, pin libc for old resolver
+    let cargo = work_dir.join("Cargo.toml");
+    if cargo.exists() {
+        let mut s = std::fs::read_to_string(&cargo)?;
+        s = s.replace("edition = \"2021\"", "edition = \"2018\"");
+        s = s.replace("libc = \"0.2\"", "libc = \"=0.2.126\"");
+        std::fs::write(&cargo, s)?;
+    }
+    Ok(())
+}
+
+/// Restore modern-toolchain compatibility after Laertes rewrites.
+fn laertes_postprocess(work_dir: &Path) -> Result<()> {
+    for path in walkdir(work_dir)? {
+        if path.extension().map_or(true, |e| e != "rs") { continue; }
+        let src = std::fs::read_to_string(&path)?;
+        if !src.contains("extern crate libc;\n") { continue; }
+        std::fs::write(&path, src.replace("extern crate libc;\n", ""))?;
+    }
+
+    let lib_rs = work_dir.join("lib.rs");
+    if lib_rs.exists() {
+        let src = std::fs::read_to_string(&lib_rs)?;
+        std::fs::write(&lib_rs, src.replace("#![feature(rustc_private)]\n", ""))?;
+    }
+
+    let cargo = work_dir.join("Cargo.toml");
+    if cargo.exists() {
+        let mut s = std::fs::read_to_string(&cargo)?;
+        s = s.replace("edition = \"2018\"", "edition = \"2021\"");
+        s = s.replace("libc = \"=0.2.126\"", "libc = \"0.2\"");
+        std::fs::write(&cargo, s)?;
+    }
     Ok(())
 }
 

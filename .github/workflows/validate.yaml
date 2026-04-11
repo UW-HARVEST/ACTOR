@@ -80,6 +80,11 @@ jobs:
             cmd: ./tools/target/release/harvest-tools --agent kiro-translate test CRUST --blind --check
             needs_openssl: true
             needs_crust: true
+          - name: Test-Corpus laertes
+            guard: results/Test-Corpus/laertes
+            cmd: ./tools/target/release/harvest-tools --agent laertes test all --check
+            needs_openssl: false
+            needs_crust: false
     name: ${{ matrix.name }}
     steps:
       - name: Restore workspace

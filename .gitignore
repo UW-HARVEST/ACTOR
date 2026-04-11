@@ -2,3 +2,5 @@
 /target/
 .vscode/
 /results-claude/
+translating-c-to-rust.tgz
+Dockerfile.laertes

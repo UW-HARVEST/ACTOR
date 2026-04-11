@@ -516,6 +516,7 @@ impl Paths {
             Agent::KiroTranslate => "kiro-translate",
             Agent::Claude => "claude",
             Agent::C2rust => "c2rust",
+            Agent::Laertes => "laertes",
         };
         let (corpus_dir, results_dir) = match dataset {
             Dataset::TestCorpus => (
