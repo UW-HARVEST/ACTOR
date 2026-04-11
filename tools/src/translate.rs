@@ -1173,8 +1173,9 @@ fn laertes_postprocess(work_dir: &Path) -> Result<()> {
     for path in walkdir(work_dir)? {
         if path.extension().map_or(true, |e| e != "rs") { continue; }
         let src = std::fs::read_to_string(&path)?;
-        if !src.contains("extern crate libc;\n") { continue; }
-        std::fs::write(&path, src.replace("extern crate libc;\n", ""))?;
+        let mut out = src.replace("extern crate libc;\n", "");
+        out = out.replace("libc::unix::", "libc::");
+        if out != src { std::fs::write(&path, out)?; }
     }
 
     let lib_rs = work_dir.join("lib.rs");
