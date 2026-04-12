@@ -323,6 +323,7 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
                 json["agent"] = serde_json::to_value(&m).unwrap();
             }
             json["unsafe"] = serde_json::to_value(&crate::battery::count_unsafe(&proj_dir.join("src"))).unwrap();
+            json["loc"] = serde_json::to_value(&crate::battery::count_loc(&proj_dir.join("src"))).unwrap();
             std::fs::write(proj_dir.join("result.json"), serde_json::to_string_pretty(&json)? + "\n")?;
         }
 
@@ -484,6 +485,7 @@ pub fn run_blind_crust_test(
                 "real_tests_failed": real_result.tests_failed,
                 "build_ok": real_result.build_ok,
                 "unsafe": crate::battery::count_unsafe(&paths.translate_dir(name).join("src")),
+                "loc": crate::battery::count_loc(&paths.translate_dir(name).join("src")),
             });
             if let Some(m) = translate_meta {
                 json["translate"] = serde_json::to_value(&m).unwrap();
@@ -893,6 +895,9 @@ fn write_results(
             val["unsafe"] = serde_json::to_value(
                 &crate::battery::count_unsafe(&case_dir.join("translated_rust/src")),
             ).unwrap();
+            val["loc"] = serde_json::to_value(
+                &crate::battery::count_loc(&case_dir.join("translated_rust/src")),
+            ).unwrap();
             let json = serde_json::to_string_pretty(&val)?;
             std::fs::write(case_dir.join("result.json"), format!("{json}\n"))?;
         }
@@ -965,6 +970,16 @@ fn check_enrichment(
         None => diffs.push("missing unsafe field".into()),
     }
 
+    // LOC counts
+    let live_loc = crate::battery::count_loc(src_dir);
+    match json.get("loc") {
+        Some(stored) => {
+            let sc = stored.get("code").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            if sc != live_loc.code { diffs.push(format!("loc.code expected={sc} actual={}", live_loc.code)); }
+        }
+        None => diffs.push("missing loc field".into()),
+    }
+
     // Only kiro has credits
     let require_credits = matches!(agent, crate::cli::Agent::Kiro | crate::cli::Agent::KiroTranslate);
     for &(key, log) in log_paths {
@@ -1002,6 +1017,7 @@ pub fn enrich_blind_crust(paths: &Paths, projects: &[crate::battery::CrustProjec
             json["verify"] = serde_json::to_value(&m)?;
         }
         json["unsafe"] = serde_json::to_value(&crate::battery::count_unsafe(&paths.translate_dir(name).join("src")))?;
+        json["loc"] = serde_json::to_value(&crate::battery::count_loc(&paths.translate_dir(name).join("src")))?;
 
         std::fs::write(&rj, serde_json::to_string_pretty(&json)? + "\n")?;
         enriched += 1;
@@ -1023,6 +1039,7 @@ pub fn enrich_crust(paths: &Paths, projects: &[crate::battery::CrustProject]) ->
             json["agent"] = serde_json::to_value(&m)?;
         }
         json["unsafe"] = serde_json::to_value(&crate::battery::count_unsafe(&proj_dir.join("src")))?;
+        json["loc"] = serde_json::to_value(&crate::battery::count_loc(&proj_dir.join("src")))?;
 
         std::fs::write(&rj, serde_json::to_string_pretty(&json)? + "\n")?;
         enriched += 1;
@@ -1050,6 +1067,7 @@ pub fn enrich_test_corpus(paths: &Paths, battery: &str) -> Result<()> {
             }
         }
         json["unsafe"] = serde_json::to_value(&crate::battery::count_unsafe(&case_dir.join("translated_rust/src")))?;
+        json["loc"] = serde_json::to_value(&crate::battery::count_loc(&case_dir.join("translated_rust/src")))?;
 
         std::fs::write(&rj, serde_json::to_string_pretty(&json)? + "\n")?;
         enriched += 1;
