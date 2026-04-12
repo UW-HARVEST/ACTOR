@@ -454,6 +454,34 @@ pub fn count_unsafe(src_dir: &Path) -> UnsafeCounts {
     counts
 }
 
+/// Lines-of-code counts for translated Rust source.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct LocCounts {
+    /// Total non-blank, non-comment lines in `*.rs` files.
+    pub code: usize,
+}
+
+/// Count lines of code in `*.rs` files under `src_dir`, excluding `bin/` and `tests/`.
+/// Counts non-blank lines that aren't pure `//` comments.
+pub fn count_loc(src_dir: &Path) -> LocCounts {
+    let mut counts = LocCounts::default();
+    let Ok(entries) = std::fs::read_dir(src_dir) else { return counts };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name();
+            if name == "bin" || name == "tests" { continue; }
+            counts.code += count_loc(&path).code;
+        } else if path.extension().is_some_and(|x| x == "rs") {
+            let Ok(src) = std::fs::read_to_string(&path) else { continue };
+            counts.code += src.lines()
+                .filter(|l| { let t = l.trim(); !t.is_empty() && !t.starts_with("//") })
+                .count();
+        }
+    }
+    counts
+}
+
 #[derive(Default)]
 struct UnsafeVisitor {
     blocks: usize,
