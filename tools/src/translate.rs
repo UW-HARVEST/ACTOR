@@ -156,48 +156,10 @@ fn translate_one_independent(
         return CaseResult { name: case.name.clone(), elapsed_secs: 0, success: true, error: None, skipped: true };
     }
 
-    if paths.agent == Agent::Laertes {
-        let start = Instant::now();
-        match laertes_translate_case(paths, battery_name, &case.name) {
-            Ok(()) => {
-                let elapsed = start.elapsed().as_secs();
-                write_translation_metrics(&output_dir.join(&case.name), paths.agent, elapsed, true);
-                let _ = post_process_independent(paths, battery_name, &case.name, case.is_lib);
-                let _ = save_original(output_dir, &case.name);
-                return CaseResult { name: case.name.clone(), elapsed_secs: elapsed, success: true, error: None, skipped: false };
-            }
-            Err(e) => {
-                let elapsed = start.elapsed().as_secs();
-                write_translation_metrics(&output_dir.join(&case.name), paths.agent, elapsed, false);
-                return CaseResult { name: case.name.clone(), elapsed_secs: elapsed, success: false, error: Some(e.to_string()), skipped: false };
-            }
-        }
-    }
-
-    let prompt_text = match paths.agent {
-        Agent::C2rust | Agent::Laertes => String::new(),
-        Agent::Claude => std::fs::read_to_string(paths.prompts_dir.join("translate.md")).unwrap_or_default(),
-        Agent::Kiro | Agent::KiroTranslate => {
-            let f = if case.is_lib { "library.md" } else { "executable.md" };
-            std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default()
-        }
-    };
-
-    let start = Instant::now();
-    match translate_case(paths, battery_name, &case.name, &prompt_text) {
-        Ok(()) => {
-            let elapsed = start.elapsed().as_secs();
-            write_translation_metrics(&output_dir.join(&case.name), paths.agent, elapsed, true);
-            let _ = post_process_independent(paths, battery_name, &case.name, case.is_lib);
-            let _ = save_original(output_dir, &case.name);
-            CaseResult { name: case.name.clone(), elapsed_secs: elapsed, success: true, error: None, skipped: false }
-        }
-        Err(e) => {
-            let elapsed = start.elapsed().as_secs();
-            write_translation_metrics(&output_dir.join(&case.name), paths.agent, elapsed, false);
-            CaseResult { name: case.name.clone(), elapsed_secs: elapsed, success: false, error: Some(e.to_string()), skipped: false }
-        }
-    }
+    run_and_record(&case.name, &output_dir.join(&case.name), paths.agent, output_dir,
+        || dispatch_translate(paths, battery_name, &case.name, case.is_lib),
+        || post_process_independent(paths, battery_name, &case.name, case.is_lib),
+    )
 }
 
 fn translate_one_shared(
@@ -211,50 +173,75 @@ fn translate_one_shared(
         return CaseResult { name: group.real_case.clone(), elapsed_secs: 0, success: true, error: None, skipped: true };
     }
 
-    if paths.agent == Agent::Laertes {
-        let start = Instant::now();
-        match laertes_translate_case(paths, battery_name, &group.real_case) {
-            Ok(()) => {
-                let elapsed = start.elapsed().as_secs();
-                write_translation_metrics(&real_dir, paths.agent, elapsed, true);
-                if let Ok(mut cargo) = CargoToml::open(&real_dir.join("translated_rust/Cargo.toml")) {
-                    cargo.add_workspace();
-                    let _ = cargo.save();
-                }
-                let _ = save_original(output_dir, &group.real_case);
-                return CaseResult { name: group.real_case.clone(), elapsed_secs: elapsed, success: true, error: None, skipped: false };
-            }
-            Err(e) => {
-                let elapsed = start.elapsed().as_secs();
-                write_translation_metrics(&real_dir, paths.agent, elapsed, false);
-                return CaseResult { name: group.real_case.clone(), elapsed_secs: elapsed, success: false, error: Some(e.to_string()), skipped: false };
-            }
-        }
-    }
-
-    let prompt_text = match paths.agent {
-        Agent::C2rust | Agent::Laertes => String::new(),
-        Agent::Claude => std::fs::read_to_string(paths.prompts_dir.join("translate.md")).unwrap_or_default(),
-        Agent::Kiro | Agent::KiroTranslate => std::fs::read_to_string(paths.prompts_dir.join("configurable.md")).unwrap_or_default(),
-    };
-
     println!("Translating: {} (shared-source, {} configs)", group.real_case, group.configs.len());
-    let start = Instant::now();
-    match translate_case(paths, battery_name, &group.real_case, &prompt_text) {
-        Ok(()) => {
-            let elapsed = start.elapsed().as_secs();
-            write_translation_metrics(&real_dir, paths.agent, elapsed, true);
+    run_and_record(&group.real_case, &real_dir, paths.agent, output_dir,
+        || dispatch_translate_shared(paths, battery_name, &group.real_case),
+        || {
             if let Ok(mut cargo) = CargoToml::open(&real_dir.join("translated_rust/Cargo.toml")) {
                 cargo.add_workspace();
                 let _ = cargo.save();
             }
-            let _ = save_original(output_dir, &group.real_case);
-            CaseResult { name: group.real_case.clone(), elapsed_secs: elapsed, success: true, error: None, skipped: false }
+            Ok(())
+        },
+    )
+}
+
+// ── DRY dispatch helpers ───────────────────────────────────────────────
+
+fn run_and_record(
+    name: &str,
+    case_dir: &Path,
+    agent: Agent,
+    output_dir: &Path,
+    translate_fn: impl FnOnce() -> Result<()>,
+    post_process_fn: impl FnOnce() -> Result<()>,
+) -> CaseResult {
+    let start = Instant::now();
+    match translate_fn() {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            write_translation_metrics(case_dir, agent, elapsed, true);
+            let _ = post_process_fn();
+            let _ = save_original(output_dir, name);
+            CaseResult { name: name.to_owned(), elapsed_secs: elapsed, success: true, error: None, skipped: false }
         }
         Err(e) => {
             let elapsed = start.elapsed().as_secs();
-            write_translation_metrics(&real_dir, paths.agent, elapsed, false);
-            CaseResult { name: group.real_case.clone(), elapsed_secs: elapsed, success: false, error: Some(e.to_string()), skipped: false }
+            write_translation_metrics(case_dir, agent, elapsed, false);
+            CaseResult { name: name.to_owned(), elapsed_secs: elapsed, success: false, error: Some(e.to_string()), skipped: false }
+        }
+    }
+}
+
+fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) -> Result<()> {
+    match paths.agent {
+        Agent::Laertes => laertes_translate_case(paths, battery, name),
+        Agent::Kimi => kimi_translate_case(paths, battery, name, is_lib),
+        agent => {
+            let prompt = match agent {
+                Agent::Kiro | Agent::KiroTranslate => {
+                    let f = if is_lib { "library.md" } else { "executable.md" };
+                    std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default()
+                }
+                Agent::Claude => std::fs::read_to_string(paths.prompts_dir.join("translate.md")).unwrap_or_default(),
+                _ => String::new(),
+            };
+            translate_case(paths, battery, name, &prompt)
+        }
+    }
+}
+
+fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result<()> {
+    match paths.agent {
+        Agent::Laertes => laertes_translate_case(paths, battery, name),
+        Agent::Kimi => kimi_translate_case(paths, battery, name, true),
+        agent => {
+            let prompt = match agent {
+                Agent::Kiro | Agent::KiroTranslate => std::fs::read_to_string(paths.prompts_dir.join("configurable.md")).unwrap_or_default(),
+                Agent::Claude => std::fs::read_to_string(paths.prompts_dir.join("translate.md")).unwrap_or_default(),
+                _ => String::new(),
+            };
+            translate_case(paths, battery, name, &prompt)
         }
     }
 }
@@ -267,6 +254,7 @@ fn preflight_check(agent: Agent) -> Result<()> {
         Agent::Claude => ("claude", &["--version"]),
         Agent::C2rust => ("c2rust", &["--version"]),
         Agent::Laertes => ("docker", &["--version"]),
+        Agent::Kimi => ("aws", &["sts", "get-caller-identity"]),
     };
 
     let output = Command::new("bash")
@@ -327,7 +315,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
     let (work_dir, _tmp_guard) = match paths.agent {
-        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::C2rust | Agent::Laertes => {
+        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::C2rust | Agent::Laertes | Agent::Kimi => {
             let tmp = tempfile::Builder::new()
                 .prefix("harvest-translate-")
                 .tempdir()
@@ -390,6 +378,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
             c2rust_translate(&work_dir, &log_path)?;
         }
         Agent::Laertes => unreachable!("laertes uses laertes_translate_case"),
+        Agent::Kimi => unreachable!("kimi uses kimi_translate_case"),
     };
 
     if !work_dir.join("Cargo.toml").exists() {
@@ -617,7 +606,7 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
                 .status()
                 .context("invoking claude for CRUST")?;
         }
-        Agent::C2rust | Agent::Laertes => anyhow::bail!("c2rust/laertes not supported for CRUST-bench"),
+        Agent::C2rust | Agent::Laertes | Agent::Kimi => anyhow::bail!("c2rust/laertes/kimi not supported for CRUST-bench"),
     }
     Ok(())
 }
@@ -1034,6 +1023,239 @@ fn c2rust_translate(work_dir: &Path, log_path: &Path) -> Result<()> {
     log.write_all(&build_out.stderr)?;
     writeln!(log, "\nc2rust translation {}", if build_out.status.success() { "succeeded" } else { "FAILED to compile" })?;
 
+    Ok(())
+}
+
+// ── Kimi one-shot LLM translation (harvest methodology) ───────────────
+
+const BEDROCK_MODEL_ID: &str = "moonshotai.kimi-k2.5";
+const BEDROCK_REGION: &str = "us-east-1";
+const BEDROCK_MAX_TOKENS: u32 = 16384;
+
+/// System prompt for library projects (from harvest repo, verbatim).
+const HARVEST_PROMPT_LIBRARY: &str = r#"You are a code translation tool. You translate provided C projects into a Rust projects including Cargo manifest. You translate functions, methods, structs, and modules but not comments. Do not include or write any new comments. You preserve external interfaces but internally use cannonical and safe Rust as much as possible. For example, given the following prompt:
+
+```
+Please translate the following C project into a Rust project including Cargo manifest:
+
+{ "files": [
+{
+  "path": "src/lib.c",
+  "contents": "int a_lib_function(const char* input) {\n  return strlen(input);\n}"
+},
+{
+  "path": "include/lib.h",
+  "contents": "int a_lib_function(const char* input);\n}"
+},
+{
+  "path": "CMakeLists.txt",
+  "contents": "cmake_minimum_required(VERSION 3.10)\nproject(noop)\nadd_library(mylibname\n    src/lib.c)",
+}
+]
+}
+
+return as JSON
+```
+
+You should return:
+
+```
+{ "files": [
+{
+  "path": "src/lib.rs",
+  "contents": "use std::ffi::{CStr, c_char};\nuse std::os::raw::c_int;\n\n#[unsafe(no_mangle)]\npub extern \"C\" fn a_lib_function(input: *const c_char) -> c_int {\n    let c_str = unsafe {\n        CStr::from_ptr(input)\n    };\n    c_str.to_bytes().len() as c_int\n}"
+},
+{
+  "path": "Cargo.toml",
+  "contents": "[package]\nname = \"noop\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n"
+}
+]
+}
+```"#;
+
+/// System prompt for executable projects (from harvest repo, verbatim).
+const HARVEST_PROMPT_EXECUTABLE: &str = r#"You are a code translation tool. You translate provided C projects into a Rust projects including Cargo manifest. You translate functions, methods, structs, and modules but not comments. Do not include or write any new comments. You preserve external interfaces but internally use cannonical and safe Rust as much as possible. When asked to generate a structured JSON response, you always respond with valid JSON only: never any preceeding markdown block formatting, and you take extreme care for the JSON to be valid. For example, given the following prompt:
+
+```
+Please translate the following C project into a Rust project including Cargo manifest:
+
+{ "files": [
+{
+  "path": "src/main.c",
+  "contents": "int main() {\n  return 0;\n}"
+},
+{
+  "path": "CMakeLists.txt",
+  "contents": "cmake_minimum_required(VERSION 3.10)\nproject(noop)\nadd_executable(driver\n    src/main.c)",
+}
+]
+}
+
+return as JSON
+```
+
+You should return:
+
+```
+{ "files": [
+{
+  "path": "src/main.rs",
+  "contents": "fn main() {\n\n}",
+},
+{
+  "path": "Cargo.toml",
+  "contents": "[package]\nname = \"noop\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n"
+}
+]
+}
+```"#;
+
+fn kimi_translate_case(paths: &Paths, battery: &str, name: &str, is_lib_hint: bool) -> Result<()> {
+    let case_dir = paths.case_dir(battery, name);
+    if case_dir.exists() { std::fs::remove_dir_all(&case_dir)?; }
+
+    let logs_dir = case_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    let log_path = logs_dir.join("translation.log");
+
+    let input_test_case = paths.input_dir(battery).join(name).join("test_case");
+    let translated = case_dir.join("translated_rust");
+    std::fs::create_dir_all(&translated)?;
+
+    // Copy c_src for the test harness
+    let c_src = translated.join("c_src");
+    std::fs::create_dir_all(&c_src)?;
+    copy_dir_all(&input_test_case, &c_src)?;
+
+    // Collect C files and detect project kind
+    let files_json = collect_c_files_json(&input_test_case)?;
+    let is_lib = detect_is_library(&input_test_case).unwrap_or(is_lib_hint);
+    let system_prompt = if is_lib { HARVEST_PROMPT_LIBRARY } else { HARVEST_PROMPT_EXECUTABLE };
+
+    let user_msg = format!(
+        "Please translate the following C project into a Rust project including Cargo manifest:\n\n{files_json}\n\nreturn as JSON"
+    );
+
+    // Call Bedrock and write output files
+    let response = bedrock_converse(system_prompt, &user_msg, &log_path)?;
+    write_llm_files(&response, &translated)?;
+
+    if !translated.join("Cargo.toml").exists() {
+        anyhow::bail!("no Cargo.toml in LLM response");
+    }
+    Ok(())
+}
+
+/// Collect all files under `dir` as a JSON object: `{"files": [{"path": "...", "contents": "..."}]}`.
+fn collect_c_files_json(dir: &Path) -> Result<String> {
+    #[derive(serde::Serialize)]
+    struct FileEntry { path: String, contents: String }
+    #[derive(serde::Serialize)]
+    struct FilesPayload { files: Vec<FileEntry> }
+
+    let mut files = Vec::new();
+    for path in walkdir(dir)? {
+        let rel = path.strip_prefix(dir)?.to_string_lossy().to_string();
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| String::from("<binary file>"));
+        files.push(FileEntry { path: rel, contents });
+    }
+    Ok(serde_json::to_string(&FilesPayload { files })?)
+}
+
+/// Detect whether a project is a library by reading CMakeLists.txt.
+fn detect_is_library(dir: &Path) -> Option<bool> {
+    let cmake = std::fs::read_to_string(dir.join("CMakeLists.txt")).ok()?;
+    if cmake.lines().any(|l| l.trim_start().starts_with("add_library(")) {
+        Some(true)
+    } else if cmake.lines().any(|l| l.trim_start().starts_with("add_executable(")) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Call AWS Bedrock Converse API and return the assistant's text response.
+fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) -> Result<String> {
+    let request = serde_json::json!({
+        "modelId": BEDROCK_MODEL_ID,
+        "system": [{"text": system_prompt}],
+        "messages": [{"role": "user", "content": [{"text": user_message}]}],
+        "inferenceConfig": {"maxTokens": BEDROCK_MAX_TOKENS, "temperature": 0.0}
+    });
+
+    let request_file = log_path.with_extension("request.json");
+    std::fs::write(&request_file, serde_json::to_string_pretty(&request)?)?;
+
+    let output = Command::new("aws")
+        .args(["bedrock-runtime", "converse",
+            "--region", BEDROCK_REGION,
+            "--cli-read-timeout", "300",
+            "--cli-input-json", &format!("file://{}", request_file.display()),
+            "--query", "output.message.content[0].text",
+            "--output", "text",
+        ])
+        .output()
+        .context("failed to invoke aws bedrock-runtime converse")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // Log everything
+    let log_content = format!(
+        "=== BEDROCK REQUEST ===\nModel: {BEDROCK_MODEL_ID}\nRegion: {BEDROCK_REGION}\n\n\
+         === SYSTEM PROMPT ===\n{system_prompt}\n\n\
+         === USER MESSAGE (first 2000 chars) ===\n{}\n\n\
+         === RESPONSE ===\n{stdout}\n\n\
+         === STDERR ===\n{stderr}",
+        &user_message[..user_message.len().min(2000)]
+    );
+    let _ = std::fs::write(log_path, &log_content);
+
+    if !output.status.success() {
+        anyhow::bail!("bedrock converse failed: {stderr}");
+    }
+
+    Ok(stdout.trim().to_string())
+}
+
+/// Parse a JSON response `{"files": [{"path": "...", "contents": "..."}]}` and write files.
+fn write_llm_files(json_response: &str, output_dir: &Path) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct FileEntry { path: String, contents: String }
+    #[derive(serde::Deserialize)]
+    struct FilesPayload { files: Vec<FileEntry> }
+
+    // Try to extract JSON from markdown code blocks if present
+    let json_str = if let Some(start) = json_response.find('{') {
+        let from_brace = &json_response[start..];
+        // Find the matching closing brace
+        let mut depth = 0;
+        let mut end = from_brace.len();
+        for (i, c) in from_brace.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => { depth -= 1; if depth == 0 { end = i + 1; break; } }
+                _ => {}
+            }
+        }
+        &from_brace[..end]
+    } else {
+        json_response
+    };
+
+    let payload: FilesPayload = serde_json::from_str(json_str)
+        .with_context(|| format!("failed to parse LLM JSON response: {}", &json_str[..json_str.len().min(500)]))?;
+
+    for file in &payload.files {
+        let dest = output_dir.join(&file.path);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, &file.contents)?;
+    }
+
+    println!("    LLM produced {} files", payload.files.len());
     Ok(())
 }
 
