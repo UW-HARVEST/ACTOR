@@ -90,6 +90,11 @@ jobs:
             cmd: ./tools/target/release/harvest-tools --agent kimi test all --check
             needs_openssl: false
             needs_crust: false
+          - name: Test-Corpus gpt-5.4
+            guard: results/Test-Corpus/gpt-5.4
+            cmd: ./tools/target/release/harvest-tools --agent oneshot --model openai/gpt-5.4 test all --check
+            needs_openssl: false
+            needs_crust: false
     name: ${{ matrix.name }}
     steps:
       - name: Restore workspace

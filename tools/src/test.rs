@@ -1096,7 +1096,7 @@ mod tests {
         fs::write(proj2.join("result.json"), r#"{"real_tests_ok": 99, "real_tests_failed": 1}"#).unwrap();
 
         let paths = crate::battery::Paths::new(
-            tmp.path(), crate::cli::Agent::Kiro, crate::cli::Dataset::BlindCrust,
+            tmp.path(), crate::cli::Agent::Kiro, crate::cli::Dataset::BlindCrust, None,
         );
 
         let stored = load_blind_stored_results(&paths).unwrap();

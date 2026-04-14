@@ -535,17 +535,21 @@ pub struct Paths {
     pub prompts_dir: PathBuf,
     pub agent: Agent,
     pub dataset: Dataset,
+    pub model: Option<String>,
 }
 
 impl Paths {
-    pub fn new(repo_root: &Path, agent: Agent, dataset: Dataset) -> Self {
-        let agent_name = match agent {
+    pub fn new(repo_root: &Path, agent: Agent, dataset: Dataset, model: Option<&str>) -> Self {
+        let agent_name: &str = match agent {
             Agent::Kiro => "kiro",
             Agent::KiroTranslate => "kiro-translate",
             Agent::Claude => "claude",
             Agent::C2rust => "c2rust",
             Agent::Laertes => "laertes",
             Agent::Kimi => "kimi",
+            Agent::Oneshot => model
+                .and_then(|m| m.rsplit('/').next())
+                .expect("--model required for --agent oneshot"),
         };
         let (corpus_dir, results_dir) = match dataset {
             Dataset::TestCorpus => (
@@ -565,7 +569,7 @@ impl Paths {
             Agent::Claude => repo_root.join("scripts/prompts/claude"),
             _ => repo_root.join("scripts/prompts"),
         };
-        Self { corpus_dir, results_dir, prompts_dir, agent, dataset }
+        Self { corpus_dir, results_dir, prompts_dir, agent, dataset, model: model.map(String::from) }
     }
 
     pub fn input_dir(&self, battery: &str) -> PathBuf {
@@ -727,7 +731,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("results/CRUST-blind/kiro")).unwrap();
         fs::create_dir_all(tmp.path().join("scripts/prompts")).unwrap();
 
-        let paths = Paths::new(tmp.path(), crate::cli::Agent::Kiro, crate::cli::Dataset::BlindCrust);
+        let paths = Paths::new(tmp.path(), crate::cli::Agent::Kiro, crate::cli::Dataset::BlindCrust, None);
 
         let t = paths.translate_dir("vec");
         let v = paths.verify_dir("vec");
