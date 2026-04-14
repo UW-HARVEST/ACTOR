@@ -8,6 +8,7 @@ pub enum Agent {
     C2rust,
     Laertes,
     Kimi,
+    Oneshot,
 }
 
 /// Which benchmark dataset to use.
@@ -43,6 +44,10 @@ pub struct Cli {
     /// Which LLM agent to use for translation
     #[arg(long, value_enum, default_value_t = Agent::Kiro)]
     pub agent: Agent,
+
+    /// OpenRouter model ID (required with --agent oneshot), e.g. "openai/gpt-5.4"
+    #[arg(long)]
+    pub model: Option<String>,
 
     #[command(subcommand)]
     pub command: Command,

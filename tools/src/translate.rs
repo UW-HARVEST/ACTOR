@@ -217,6 +217,7 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
     match paths.agent {
         Agent::Laertes => laertes_translate_case(paths, battery, name),
         Agent::Kimi => kimi_translate_case(paths, battery, name, is_lib),
+        Agent::Oneshot => oneshot_translate_case(paths, battery, name, is_lib),
         agent => {
             let prompt = match agent {
                 Agent::Kiro | Agent::KiroTranslate => {
@@ -235,6 +236,7 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
     match paths.agent {
         Agent::Laertes => laertes_translate_case(paths, battery, name),
         Agent::Kimi => kimi_translate_case(paths, battery, name, true),
+        Agent::Oneshot => oneshot_translate_case(paths, battery, name, true),
         agent => {
             let prompt = match agent {
                 Agent::Kiro | Agent::KiroTranslate => std::fs::read_to_string(paths.prompts_dir.join("configurable.md")).unwrap_or_default(),
@@ -255,6 +257,7 @@ fn preflight_check(agent: Agent) -> Result<()> {
         Agent::C2rust => ("c2rust", &["--version"]),
         Agent::Laertes => ("docker", &["--version"]),
         Agent::Kimi => ("aws", &["sts", "get-caller-identity"]),
+        Agent::Oneshot => ("curl", &["--version"]),
     };
 
     let output = Command::new("bash")
@@ -315,7 +318,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
     let (work_dir, _tmp_guard) = match paths.agent {
-        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::C2rust | Agent::Laertes | Agent::Kimi => {
+        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot => {
             let tmp = tempfile::Builder::new()
                 .prefix("harvest-translate-")
                 .tempdir()
@@ -379,6 +382,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
         }
         Agent::Laertes => unreachable!("laertes uses laertes_translate_case"),
         Agent::Kimi => unreachable!("kimi uses kimi_translate_case"),
+        Agent::Oneshot => unreachable!("oneshot uses oneshot_translate_case"),
     };
 
     if !work_dir.join("Cargo.toml").exists() {
@@ -606,7 +610,7 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
                 .status()
                 .context("invoking claude for CRUST")?;
         }
-        Agent::C2rust | Agent::Laertes | Agent::Kimi => anyhow::bail!("c2rust/laertes/kimi not supported for CRUST-bench"),
+        Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot => anyhow::bail!("c2rust/laertes/kimi/oneshot not supported for CRUST-bench"),
     }
     Ok(())
 }
@@ -1028,6 +1032,12 @@ fn c2rust_translate(work_dir: &Path, log_path: &Path) -> Result<()> {
 
 // ── Kimi one-shot LLM translation (harvest methodology) ───────────────
 
+struct LlmResponse {
+    content: String,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
 const BEDROCK_MODEL_ID: &str = "moonshotai.kimi-k2.5";
 const BEDROCK_REGION: &str = "us-east-1";
 const BEDROCK_MAX_TOKENS: u32 = 16384;
@@ -1111,6 +1121,24 @@ You should return:
 ```"#;
 
 fn kimi_translate_case(paths: &Paths, battery: &str, name: &str, is_lib_hint: bool) -> Result<()> {
+    oneshot_llm_translate(paths, battery, name, is_lib_hint, None, bedrock_converse)
+}
+
+fn oneshot_translate_case(paths: &Paths, battery: &str, name: &str, is_lib_hint: bool) -> Result<()> {
+    let model = paths.model.as_deref().expect("--model required for oneshot");
+    oneshot_llm_translate(paths, battery, name, is_lib_hint, Some(model), |sys, usr, log| {
+        openrouter_converse(model, sys, usr, log)
+    })
+}
+
+fn oneshot_llm_translate(
+    paths: &Paths,
+    battery: &str,
+    name: &str,
+    is_lib_hint: bool,
+    model: Option<&str>,
+    invoke_llm: impl FnOnce(&str, &str, &Path) -> Result<LlmResponse>,
+) -> Result<()> {
     let case_dir = paths.case_dir(battery, name);
     if case_dir.exists() { std::fs::remove_dir_all(&case_dir)?; }
 
@@ -1136,9 +1164,19 @@ fn kimi_translate_case(paths: &Paths, battery: &str, name: &str, is_lib_hint: bo
         "Please translate the following C project into a Rust project including Cargo manifest:\n\n{files_json}\n\nreturn as JSON"
     );
 
-    // Call Bedrock and write output files
-    let response = bedrock_converse(system_prompt, &user_msg, &log_path)?;
-    write_llm_files(&response, &translated)?;
+    // Call LLM backend and write output files
+    let resp = invoke_llm(system_prompt, &user_msg, &log_path)?;
+
+    // Write usage metadata
+    let mut usage = serde_json::json!({
+        "input_tokens": resp.input_tokens,
+        "output_tokens": resp.output_tokens,
+    });
+    if let Some(m) = model { usage["model"] = serde_json::json!(m); }
+    let _ = std::fs::write(logs_dir.join("usage.json"),
+        serde_json::to_string_pretty(&usage).unwrap_or_default() + "\n");
+
+    write_llm_files(&resp.content, &translated)?;
 
     if !translated.join("Cargo.toml").exists() {
         anyhow::bail!("no Cargo.toml in LLM response");
@@ -1176,7 +1214,7 @@ fn detect_is_library(dir: &Path) -> Option<bool> {
 }
 
 /// Call AWS Bedrock Converse API and return the assistant's text response.
-fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) -> Result<String> {
+fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) -> Result<LlmResponse> {
     let request = serde_json::json!({
         "modelId": BEDROCK_MODEL_ID,
         "system": [{"text": system_prompt}],
@@ -1192,8 +1230,6 @@ fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) ->
             "--region", BEDROCK_REGION,
             "--cli-read-timeout", "300",
             "--cli-input-json", &format!("file://{}", request_file.display()),
-            "--query", "output.message.content[0].text",
-            "--output", "text",
         ])
         .output()
         .context("failed to invoke aws bedrock-runtime converse")?;
@@ -1201,12 +1237,15 @@ fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) ->
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    // Log everything
+    // Save full raw response
+    let response_file = log_path.parent().unwrap().join("translation.response.json");
+    let _ = std::fs::write(&response_file, &stdout);
+
+    // Log human-readable summary
     let log_content = format!(
         "=== BEDROCK REQUEST ===\nModel: {BEDROCK_MODEL_ID}\nRegion: {BEDROCK_REGION}\n\n\
          === SYSTEM PROMPT ===\n{system_prompt}\n\n\
          === USER MESSAGE (first 2000 chars) ===\n{}\n\n\
-         === RESPONSE ===\n{stdout}\n\n\
          === STDERR ===\n{stderr}",
         &user_message[..user_message.len().min(2000)]
     );
@@ -1216,7 +1255,88 @@ fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) ->
         anyhow::bail!("bedrock converse failed: {stderr}");
     }
 
-    Ok(stdout.trim().to_string())
+    // Parse full response
+    let resp: serde_json::Value = serde_json::from_str(&stdout)
+        .with_context(|| format!("failed to parse Bedrock response: {}", &stdout[..stdout.len().min(500)]))?;
+
+    let content = resp["output"]["message"]["content"][0]["text"]
+        .as_str()
+        .context("no text in Bedrock response")?
+        .trim()
+        .to_string();
+
+    let input_tokens = resp["usage"]["inputTokens"].as_u64().unwrap_or(0);
+    let output_tokens = resp["usage"]["outputTokens"].as_u64().unwrap_or(0);
+
+    Ok(LlmResponse { content, input_tokens, output_tokens })
+}
+
+/// Call OpenRouter chat completions API and return the assistant's text response.
+fn openrouter_converse(model: &str, system_prompt: &str, user_message: &str, log_path: &Path) -> Result<LlmResponse> {
+    let api_key = std::env::var("OPENROUTER_API_KEY")
+        .context("OPENROUTER_API_KEY env var not set")?;
+
+    let request = serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"}
+    });
+
+    let request_file = log_path.with_extension("request.json");
+    std::fs::write(&request_file, serde_json::to_string_pretty(&request)?)?;
+
+    let output = Command::new("curl")
+        .args(["-s", "--max-time", "600",
+            "-X", "POST", "https://openrouter.ai/api/v1/chat/completions",
+            "-H", &format!("Authorization: Bearer {api_key}"),
+            "-H", "Content-Type: application/json",
+            "-d", &format!("@{}", request_file.display()),
+        ])
+        .output()
+        .context("failed to invoke curl for OpenRouter")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    // Save full raw response
+    let response_file = log_path.parent().unwrap().join("translation.response.json");
+    let _ = std::fs::write(&response_file, &stdout);
+
+    // Log human-readable summary
+    let log_content = format!(
+        "=== OPENROUTER REQUEST ===\nModel: {model}\n\n\
+         === SYSTEM PROMPT ===\n{system_prompt}\n\n\
+         === USER MESSAGE (first 2000 chars) ===\n{}\n\n\
+         === RAW RESPONSE (first 2000 chars) ===\n{}",
+        &user_message[..user_message.len().min(2000)],
+        &stdout[..stdout.len().min(2000)]
+    );
+    let _ = std::fs::write(log_path, &log_content);
+
+    if !output.status.success() {
+        anyhow::bail!("curl failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // Parse OpenAI-compatible response
+    let resp: serde_json::Value = serde_json::from_str(&stdout)
+        .with_context(|| format!("failed to parse OpenRouter response: {}", &stdout[..stdout.len().min(500)]))?;
+
+    if let Some(err) = resp.get("error") {
+        anyhow::bail!("OpenRouter error: {err}");
+    }
+
+    let content = resp["choices"][0]["message"]["content"]
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .context("no content in OpenRouter response")?;
+
+    let input_tokens = resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = resp["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+
+    Ok(LlmResponse { content, input_tokens, output_tokens })
 }
 
 /// Parse a JSON response `{"files": [{"path": "...", "contents": "..."}]}` and write files.

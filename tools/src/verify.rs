@@ -197,7 +197,7 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                 .status()
                 .context("invoking claude for verification")?;
         }
-        Agent::C2rust | Agent::Laertes | Agent::Kimi => {
+        Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot => {
             return Ok(true);
         }
     }

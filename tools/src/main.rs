@@ -12,6 +12,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse_args();
     let repo_root = find_repo_root()?;
     let agent = cli.agent;
+    let model = cli.model.as_deref();
+
+    if agent == cli::Agent::Oneshot && model.is_none() {
+        anyhow::bail!("--model is required with --agent oneshot (e.g. --model openai/gpt-5.4)");
+    }
+    if agent != cli::Agent::Oneshot && model.is_some() {
+        anyhow::bail!("--model is only valid with --agent oneshot");
+    }
 
     match cli.command {
         Command::Run {
@@ -23,7 +31,7 @@ fn main() -> Result<()> {
             blind,
         } => {
             let dataset = Dataset::detect(target, blind);
-            let paths = battery::Paths::new(&repo_root, agent, dataset);
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model);
             let inner = Dataset::strip_prefix(target);
 
             let tp = make_translate_plan(&paths, inner, include_regex.as_deref(), parallel, limit)?;
@@ -46,7 +54,7 @@ fn main() -> Result<()> {
             blind,
         } => {
             let dataset = Dataset::detect(target, blind);
-            let paths = battery::Paths::new(&repo_root, agent, dataset);
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model);
             let inner = Dataset::strip_prefix(target);
 
             let plan = make_translate_plan(&paths, inner, include_regex.as_deref(), parallel, limit)?;
@@ -60,7 +68,7 @@ fn main() -> Result<()> {
             blind,
         } => {
             let dataset = Dataset::detect(target, blind);
-            let paths = battery::Paths::new(&repo_root, agent, dataset);
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model);
             let inner = Dataset::strip_prefix(target);
 
             let plan = make_verify_plan(&paths, inner, include_regex.as_deref(), parallel, force)?;
@@ -73,7 +81,7 @@ fn main() -> Result<()> {
             blind,
         } => {
             let dataset = Dataset::detect(target, blind);
-            let paths = battery::Paths::new(&repo_root, agent, dataset);
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model);
             let inner = Dataset::strip_prefix(target);
             let mode = if update {
                 test::TestMode::Update
@@ -95,7 +103,7 @@ fn main() -> Result<()> {
         }
         Command::Enrich { ref target, blind } => {
             let dataset = Dataset::detect(target, blind);
-            let paths = battery::Paths::new(&repo_root, agent, dataset);
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model);
             let inner = Dataset::strip_prefix(target);
             match dataset {
                 Dataset::BlindCrust => {
@@ -115,8 +123,8 @@ fn main() -> Result<()> {
         }
         Command::Populate { ref target, blind } => {
             let dataset = Dataset::detect(target, blind);
-            let dst_paths = battery::Paths::new(&repo_root, agent, dataset);
-            let src_paths = battery::Paths::new(&repo_root, cli::Agent::Kiro, dataset);
+            let dst_paths = battery::Paths::new(&repo_root, agent, dataset, model);
+            let src_paths = battery::Paths::new(&repo_root, cli::Agent::Kiro, dataset, None);
             let inner = Dataset::strip_prefix(target);
             match dataset {
                 Dataset::TestCorpus => {
