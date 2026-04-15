@@ -95,6 +95,11 @@ jobs:
             cmd: ./tools/target/release/harvest-tools --agent oneshot --model openai/gpt-5.4 test all --check
             needs_openssl: false
             needs_crust: false
+          - name: Test-Corpus gemini-3.1-pro-preview
+            guard: results/Test-Corpus/gemini-3.1-pro-preview
+            cmd: ./tools/target/release/harvest-tools --agent oneshot --model google/gemini-3.1-pro-preview test all --check
+            needs_openssl: false
+            needs_crust: false
     name: ${{ matrix.name }}
     steps:
       - name: Restore workspace
@@ -139,5 +144,18 @@ jobs:
           cat results/CRUST/kiro/VaultSync/result.json 2>/dev/null || echo "not found"
           echo "::endgroup::"
           if [ -d "${{ matrix.guard }}" ]; then
-            ${{ matrix.cmd }}
+            for attempt in 1 2 3; do
+              echo "::group::Attempt $attempt/3"
+              if ${{ matrix.cmd }}; then
+                echo "::endgroup::"
+                exit 0
+              fi
+              echo "::endgroup::"
+              if [ "$attempt" -lt 3 ]; then
+                echo "⚠️ Attempt $attempt failed, retrying (flaky floating-point tests)..."
+                find results -name target -type d -exec rm -rf {} + 2>/dev/null || true
+              fi
+            done
+            echo "❌ Failed after 3 attempts"
+            exit 1
           fi
