@@ -1,6 +1,6 @@
-# harvest-agentic
+# ACTOR
 
-Benchmarking agentic vs non-agentic C-to-Rust translation for [DARPA TRACTOR](https://www.darpa.mil/program/translating-all-c-to-rust).
+**A**gentic **C**-**to**-**R**ust translation for [DARPA TRACTOR](https://www.darpa.mil/program/translating-all-c-to-rust).
 
 This repository evaluates multiple translation agents — from mechanical transpilers to agentic LLM pipelines to one-shot LLM baselines — across MIT's TRACTOR Test-Corpus and CRUST-bench. All results are CI-validated with exact-match checks against stored summaries.
 
