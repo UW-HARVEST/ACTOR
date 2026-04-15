@@ -1,6 +1,7 @@
 mod battery;
 mod cargo_toml;
 mod cli;
+mod report;
 mod test;
 mod translate;
 mod verify;
@@ -138,6 +139,9 @@ fn main() -> Result<()> {
                 }
                 Dataset::Crust => anyhow::bail!("populate not supported for CRUST (no pre-verify snapshot)"),
             }
+        }
+        Command::Report => {
+            report::generate(&repo_root)?;
         }
     }
     Ok(())

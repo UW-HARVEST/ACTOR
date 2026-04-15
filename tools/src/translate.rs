@@ -221,7 +221,7 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
         agent => {
             let prompt = match agent {
                 Agent::Kiro | Agent::KiroTranslate => {
-                    let f = if is_lib { "library.md" } else { "executable.md" };
+                    let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
                     std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default()
                 }
                 Agent::Claude => std::fs::read_to_string(paths.prompts_dir.join("translate.md")).unwrap_or_default(),
@@ -239,7 +239,7 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
         Agent::Oneshot => oneshot_translate_case(paths, battery, name, true),
         agent => {
             let prompt = match agent {
-                Agent::Kiro | Agent::KiroTranslate => std::fs::read_to_string(paths.prompts_dir.join("configurable.md")).unwrap_or_default(),
+                Agent::Kiro | Agent::KiroTranslate => std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default(),
                 Agent::Claude => std::fs::read_to_string(paths.prompts_dir.join("translate.md")).unwrap_or_default(),
                 _ => String::new(),
             };
@@ -616,11 +616,11 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
 }
 
 pub fn run_crust(paths: &Paths, projects: &[battery::CrustProject], parallel: usize) -> Result<()> {
-    run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Standard, "crust.md")
+    run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Standard, "translate.md")
 }
 
 pub fn run_crust_blind(paths: &Paths, projects: &[battery::CrustProject], parallel: usize) -> Result<()> {
-    run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Blind, "crust_blind.md")
+    run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Blind, "translate-blind.md")
 }
 
 fn run_crust_with_mode(
@@ -717,8 +717,8 @@ fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject, mod
 pub fn verify_crust_blind(paths: &Paths, projects: &[battery::CrustProject], parallel: usize, force: bool) -> Result<()> {
     preflight_check(paths.agent)?;
 
-    let prompt = std::fs::read_to_string(paths.prompts_dir.join("crust_verify.md"))
-        .context("reading crust_verify.md")?;
+    let prompt = std::fs::read_to_string(paths.prompts_dir.join("verify-blind.md"))
+        .context("reading verify-blind.md")?;
 
     let total = projects.len();
     let sem = Semaphore::new(parallel);
@@ -1042,83 +1042,6 @@ const BEDROCK_MODEL_ID: &str = "moonshotai.kimi-k2.5";
 const BEDROCK_REGION: &str = "us-east-1";
 const BEDROCK_MAX_TOKENS: u32 = 16384;
 
-/// System prompt for library projects (from harvest repo, verbatim).
-const HARVEST_PROMPT_LIBRARY: &str = r#"You are a code translation tool. You translate provided C projects into a Rust projects including Cargo manifest. You translate functions, methods, structs, and modules but not comments. Do not include or write any new comments. You preserve external interfaces but internally use cannonical and safe Rust as much as possible. For example, given the following prompt:
-
-```
-Please translate the following C project into a Rust project including Cargo manifest:
-
-{ "files": [
-{
-  "path": "src/lib.c",
-  "contents": "int a_lib_function(const char* input) {\n  return strlen(input);\n}"
-},
-{
-  "path": "include/lib.h",
-  "contents": "int a_lib_function(const char* input);\n}"
-},
-{
-  "path": "CMakeLists.txt",
-  "contents": "cmake_minimum_required(VERSION 3.10)\nproject(noop)\nadd_library(mylibname\n    src/lib.c)",
-}
-]
-}
-
-return as JSON
-```
-
-You should return:
-
-```
-{ "files": [
-{
-  "path": "src/lib.rs",
-  "contents": "use std::ffi::{CStr, c_char};\nuse std::os::raw::c_int;\n\n#[unsafe(no_mangle)]\npub extern \"C\" fn a_lib_function(input: *const c_char) -> c_int {\n    let c_str = unsafe {\n        CStr::from_ptr(input)\n    };\n    c_str.to_bytes().len() as c_int\n}"
-},
-{
-  "path": "Cargo.toml",
-  "contents": "[package]\nname = \"noop\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n"
-}
-]
-}
-```"#;
-
-/// System prompt for executable projects (from harvest repo, verbatim).
-const HARVEST_PROMPT_EXECUTABLE: &str = r#"You are a code translation tool. You translate provided C projects into a Rust projects including Cargo manifest. You translate functions, methods, structs, and modules but not comments. Do not include or write any new comments. You preserve external interfaces but internally use cannonical and safe Rust as much as possible. When asked to generate a structured JSON response, you always respond with valid JSON only: never any preceeding markdown block formatting, and you take extreme care for the JSON to be valid. For example, given the following prompt:
-
-```
-Please translate the following C project into a Rust project including Cargo manifest:
-
-{ "files": [
-{
-  "path": "src/main.c",
-  "contents": "int main() {\n  return 0;\n}"
-},
-{
-  "path": "CMakeLists.txt",
-  "contents": "cmake_minimum_required(VERSION 3.10)\nproject(noop)\nadd_executable(driver\n    src/main.c)",
-}
-]
-}
-
-return as JSON
-```
-
-You should return:
-
-```
-{ "files": [
-{
-  "path": "src/main.rs",
-  "contents": "fn main() {\n\n}",
-},
-{
-  "path": "Cargo.toml",
-  "contents": "[package]\nname = \"noop\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n"
-}
-]
-}
-```"#;
 
 fn kimi_translate_case(paths: &Paths, battery: &str, name: &str, is_lib_hint: bool) -> Result<()> {
     oneshot_llm_translate(paths, battery, name, is_lib_hint, None, bedrock_converse)
@@ -1158,14 +1081,16 @@ fn oneshot_llm_translate(
     // Collect C files and detect project kind
     let files_json = collect_c_files_json(&input_test_case)?;
     let is_lib = detect_is_library(&input_test_case).unwrap_or(is_lib_hint);
-    let system_prompt = if is_lib { HARVEST_PROMPT_LIBRARY } else { HARVEST_PROMPT_EXECUTABLE };
+    let prompt_file = if is_lib { "translate-library.md" } else { "translate-executable.md" };
+    let system_prompt = std::fs::read_to_string(paths.prompts_dir.join(prompt_file))
+        .with_context(|| format!("reading {prompt_file}"))?;
 
     let user_msg = format!(
         "Please translate the following C project into a Rust project including Cargo manifest:\n\n{files_json}\n\nreturn as JSON"
     );
 
     // Call LLM backend and write output files
-    let resp = invoke_llm(system_prompt, &user_msg, &log_path)?;
+    let resp = invoke_llm(&system_prompt, &user_msg, &log_path)?;
 
     // Write usage metadata
     let mut usage = serde_json::json!({
