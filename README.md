@@ -191,14 +191,14 @@ Auto-generated from validated `result.json` and `summary.json` files.
 
 ## CRUST
 
-| Agent | Projects Passed | Tests Passed | LOC | Unsafe Lines | Unsafe % |
-|-------|----------------|-------------|-----|-------------|----------|
-| kiro | 86/95 | 616/632 | 56466 | 536 | 0.9% |
+| Agent | Projects Passed | Adjusted* | Tests Passed | LOC | Unsafe Lines | Unsafe % |
+|-------|----------------|-----------|-------------|-----|-------------|----------|
+| kiro | 86/95 | 86/90 | 616/632 | 56466 | 536 | 0.9% |
 
 ## CRUST-blind
 
-| Agent | Projects Passed | Tests Passed | LOC | Unsafe Lines | Unsafe % |
-|-------|----------------|-------------|-----|-------------|----------|
-| kiro | 59/94 | 443/478 | 46669 | 466 | 1.0% |
-| kiro-translate | 54/95 | 410/454 | 47395 | 466 | 1.0% |
+| Agent | Projects Passed | Adjusted* | Tests Passed | LOC | Unsafe Lines | Unsafe % |
+|-------|----------------|-----------|-------------|-----|-------------|----------|
+| kiro | 59/94 | 58/89 | 443/478 | 46669 | 466 | 1.0% |
+| kiro-translate | 54/95 | 53/90 | 410/454 | 47395 | 466 | 1.0% |
 
