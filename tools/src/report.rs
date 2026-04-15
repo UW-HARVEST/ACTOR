@@ -37,6 +37,7 @@ struct BatteryRow {
     cases_tested: u32,
     vectors_passed: u32,
     vectors_total: u32,
+    c_loc: u32,
     total_loc: u32,
     unsafe_lines: u32,
 }
@@ -44,10 +45,13 @@ struct BatteryRow {
 /// Generate markdown tables from results/Test-Corpus/ into tables/.
 pub fn generate(repo_root: &Path) -> Result<()> {
     let results_dir = repo_root.join("results/Test-Corpus");
+    let test_corpus_dir = repo_root.join("test-corpus/Public-Tests");
     let tables_dir = repo_root.join("tables");
     std::fs::create_dir_all(&tables_dir)?;
 
-    // agent → battery → BatteryRow
+    // Cache C LOC per battery (same for all agents)
+    let mut c_loc_cache: BTreeMap<String, u32> = BTreeMap::new();
+
     let mut rows: Vec<BatteryRow> = Vec::new();
 
     for agent_entry in sorted_read_dir(&results_dir)? {
@@ -68,6 +72,10 @@ pub fn generate(repo_root: &Path) -> Result<()> {
 
             let (total_loc, unsafe_lines) = aggregate_cases(&bat_dir);
 
+            let c_loc = *c_loc_cache.entry(battery.clone()).or_insert_with(|| {
+                count_c_loc_battery(&test_corpus_dir, &battery)
+            });
+
             rows.push(BatteryRow {
                 agent: agent.clone(),
                 battery,
@@ -75,6 +83,7 @@ pub fn generate(repo_root: &Path) -> Result<()> {
                 cases_tested: summary.cases_tested,
                 vectors_passed: summary.vectors_passed,
                 vectors_total: summary.vectors_passed + summary.vectors_failed,
+                c_loc,
                 total_loc,
                 unsafe_lines,
             });
@@ -94,8 +103,8 @@ pub fn generate(repo_root: &Path) -> Result<()> {
 
     for (battery, brows) in &by_battery {
         writeln!(all, "## {battery}\n")?;
-        writeln!(all, "| Agent | Cases Passed | Vectors Passed | LOC | Unsafe Lines | Unsafe % |")?;
-        writeln!(all, "|-------|-------------|----------------|-----|-------------|----------|")?;
+        writeln!(all, "| Agent | Cases Passed | Vectors Passed | C LOC | Rust LOC | Unsafe Lines | Unsafe % |")?;
+        writeln!(all, "|-------|-------------|----------------|-------|----------|-------------|----------|")?;
         for r in brows {
             let unsafe_pct = if r.total_loc > 0 {
                 format!("{:.1}%", r.unsafe_lines as f64 / r.total_loc as f64 * 100.0)
@@ -104,10 +113,10 @@ pub fn generate(repo_root: &Path) -> Result<()> {
             };
             writeln!(
                 all,
-                "| {} | {}/{} | {}/{} | {} | {} | {} |",
+                "| {} | {}/{} | {}/{} | {} | {} | {} | {} |",
                 r.agent, r.cases_passed, r.cases_tested,
                 r.vectors_passed, r.vectors_total,
-                r.total_loc, r.unsafe_lines, unsafe_pct,
+                r.c_loc, r.total_loc, r.unsafe_lines, unsafe_pct,
             )?;
         }
         writeln!(all)?;
@@ -219,4 +228,44 @@ fn sorted_read_dir(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
     Ok(entries)
+}
+
+/// Count C LOC (non-blank, non-comment *.c/*.h lines) across all cases in a battery.
+/// Reads from test-corpus/Public-Tests/<battery>/<case>/test_case/.
+/// For shared-source batteries (P01), deduplicates like aggregate_cases.
+fn count_c_loc_battery(test_corpus_dir: &Path, battery: &str) -> u32 {
+    let bat_dir = test_corpus_dir.join(battery);
+    let Ok(entries) = std::fs::read_dir(&bat_dir) else { return 0 };
+    let mut locs = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() { continue; }
+        let test_case = entry.path().join("test_case");
+        if !test_case.is_dir() { continue; }
+        locs.push(count_c_loc_dir(&test_case));
+    }
+    if locs.is_empty() { return 0; }
+    let min = *locs.iter().min().unwrap();
+    let max = *locs.iter().max().unwrap();
+    if locs.len() > 1 && min > 0 && max <= min * 2 {
+        max // shared translation — count once
+    } else {
+        locs.iter().sum()
+    }
+}
+
+fn count_c_loc_dir(dir: &Path) -> u32 {
+    let mut total = 0u32;
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total += count_c_loc_dir(&path);
+        } else if path.extension().is_some_and(|x| x == "c" || x == "h") {
+            let Ok(src) = std::fs::read_to_string(&path) else { continue };
+            total += src.lines()
+                .filter(|l| { let t = l.trim(); !t.is_empty() && !t.starts_with("//") && !t.starts_with("/*") })
+                .count() as u32;
+        }
+    }
+    total
 }
