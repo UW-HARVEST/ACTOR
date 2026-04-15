@@ -128,6 +128,8 @@ pub enum Command {
         #[arg(long)]
         blind: bool,
     },
+    /// Generate markdown report tables from validated results into tables/
+    Report,
 }
 
 // ── Type-safe execution plans ──────────────────────────────────────────
