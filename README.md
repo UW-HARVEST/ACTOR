@@ -185,3 +185,16 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | P00_perlin_noise | 1/1 | 1/1 | 0/1 | 0/1 | 0/1 | 1/1 | 1/1 | 1/1 |
 | P01_sphincs_plus | 0/128 | 115/128 | 0/128 | 0/128 | 0/1 | 128/128 | 36/128 | 0/128 |
 
+## CRUST
+
+| Agent | Projects Passed | Tests Passed | LOC | Unsafe Lines | Unsafe % |
+|-------|----------------|-------------|-----|-------------|----------|
+| kiro | 86/95 | 616/632 | 56466 | 536 | 0.9% |
+
+## CRUST-blind
+
+| Agent | Projects Passed | Tests Passed | LOC | Unsafe Lines | Unsafe % |
+|-------|----------------|-------------|-----|-------------|----------|
+| kiro | 59/94 | 443/478 | 46669 | 466 | 1.0% |
+| kiro-translate | 54/95 | 410/454 | 47395 | 466 | 1.0% |
+
