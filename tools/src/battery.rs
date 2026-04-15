@@ -568,7 +568,10 @@ impl Paths {
         let prompts_dir = match agent {
             Agent::Claude => repo_root.join("prompts/claude"),
             Agent::Kimi | Agent::Oneshot => repo_root.join("prompts/oneshot"),
-            _ => repo_root.join("prompts/kiro"),
+            _ => match dataset {
+                Dataset::TestCorpus => repo_root.join("prompts/kiro/test-corpus"),
+                Dataset::Crust | Dataset::BlindCrust => repo_root.join("prompts/kiro/crust"),
+            },
         };
         Self { corpus_dir, results_dir, prompts_dir, agent, dataset, model: model.map(String::from) }
     }
@@ -730,7 +733,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("crust-bench/datasets")).unwrap();
         fs::create_dir_all(tmp.path().join("results/CRUST-blind/kiro")).unwrap();
-        fs::create_dir_all(tmp.path().join("prompts/kiro")).unwrap();
+        fs::create_dir_all(tmp.path().join("prompts/kiro/test-corpus")).unwrap();
 
         let paths = Paths::new(tmp.path(), crate::cli::Agent::Kiro, crate::cli::Dataset::BlindCrust, None);
 

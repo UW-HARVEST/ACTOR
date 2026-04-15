@@ -616,11 +616,11 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
 }
 
 pub fn run_crust(paths: &Paths, projects: &[battery::CrustProject], parallel: usize) -> Result<()> {
-    run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Standard, "translate-crust.md")
+    run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Standard, "translate.md")
 }
 
 pub fn run_crust_blind(paths: &Paths, projects: &[battery::CrustProject], parallel: usize) -> Result<()> {
-    run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Blind, "translate-crust-blind.md")
+    run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Blind, "translate-blind.md")
 }
 
 fn run_crust_with_mode(
@@ -717,8 +717,8 @@ fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject, mod
 pub fn verify_crust_blind(paths: &Paths, projects: &[battery::CrustProject], parallel: usize, force: bool) -> Result<()> {
     preflight_check(paths.agent)?;
 
-    let prompt = std::fs::read_to_string(paths.prompts_dir.join("verify-crust-blind.md"))
-        .context("reading verify-crust-blind.md")?;
+    let prompt = std::fs::read_to_string(paths.prompts_dir.join("verify-blind.md"))
+        .context("reading verify-blind.md")?;
 
     let total = projects.len();
     let sem = Semaphore::new(parallel);
