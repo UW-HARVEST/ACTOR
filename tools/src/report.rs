@@ -154,7 +154,6 @@ fn aggregate_cases(bat_dir: &Path) -> (u32, u32) {
             Some(r) => r,
             None => continue,
         };
-        if !cr.passed { continue; }
         locs.push(cr.loc.map_or(0, |l| l.code));
         unsafes.push(cr.unsafe_.map_or(0, |u| u.lines));
     }
