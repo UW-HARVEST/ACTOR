@@ -52,7 +52,8 @@ Requirements:
   The Rust #[no_mangle] name must match the FINAL linker symbol, not the
   source-level name. Check header files for namespace macros.
 - Preserve the exact C function signatures (use *const c_char, c_int, etc. from std::ffi)
-- Do NOT fix bugs in the original C code — reproduce behavior exactly
+- Do NOT fix bugs in the original C code — if the C has incorrect behavior, reproduce it exactly
+- Preserve the exact order of error checks and validation
 - Use safe Rust internally where possible
 
 Do NOT modify anything in c_src/.

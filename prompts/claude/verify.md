@@ -6,7 +6,7 @@ ground truth — the Rust code must produce byte-identical results.
 - `src/` contains the Rust translation
 - The C code can be compiled as a shared library. Look at c_src/CMakeLists.txt
   to understand the build system. Build it with:
-  ```
+  ```sh
   cd c_src && mkdir -p build && cd build && \
   cmake .. -DCMAKE_POSITION_INDEPENDENT_CODE=ON CMAKE_BUILD_FLAGS && \
   cmake --build .

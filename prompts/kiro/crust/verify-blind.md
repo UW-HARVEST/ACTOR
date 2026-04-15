@@ -7,10 +7,11 @@ the Rust code behaves identically to the C code.
 
 ## Project Layout
 
-- `c_src/` — the original C source files (the ground truth for behavior)
+- `c_src/` — the original C source files: the ground truth for behavior (read-only, do NOT modify)
 - `src/*.rs` — the Rust translation you are testing
-- `src/lib.rs` — re-exports the modules
-- `Cargo.toml` — project manifest (package name defines the `use` import path)
+- `src/lib.rs` — re-exports the modules (do NOT modify)
+- `Cargo.toml` — project manifest; package name defines the `use` import
+  path  (add dependencies if needed, do NOT remove existing ones)
 
 ## Your Task
 
@@ -19,7 +20,7 @@ the Rust code behaves identically to the C code.
 3. Read `src/lib.rs` to get the full list of public modules. You MUST write
    tests for EVERY module — do not skip any.
 4. Build and run the C code to get ground truth outputs. Compile with:
-   ```
+   ```sh
    cd c_src && gcc -o test_prog *.c -lm 2>/dev/null || gcc -o test_prog src/*.c -I include -lm 2>/dev/null
    ```
    Use the C executable to compute expected values for your tests. Do NOT

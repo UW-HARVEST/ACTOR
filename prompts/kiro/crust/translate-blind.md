@@ -4,12 +4,13 @@ You are translating a C project to idiomatic, safe Rust.
 
 ## Project Layout
 
-- `c_src/` — the original C source files (read-only, do NOT modify)
+- `c_src/` — the original C source files: the ground truth for behavior (read-only, do NOT modify)
 - `src/*.rs` — Rust interface files with struct definitions, function
   signatures, and constants. The function bodies contain `unimplemented!()`.
   **Your job is to replace every `unimplemented!()` with a correct implementation.**
 - `src/lib.rs` — re-exports the modules (do NOT modify)
-- `Cargo.toml` — project manifest (add dependencies if needed, do NOT remove existing ones)
+- `Cargo.toml` — project manifest; package name defines the `use` import
+  path  (add dependencies if needed, do NOT remove existing ones)
 
 ## Rules
 
@@ -25,7 +26,8 @@ You are translating a C project to idiomatic, safe Rust.
 7. You may add helper functions or private modules if needed.
 8. You may add crate dependencies to `Cargo.toml` if the C code uses functionality
    that has a well-known Rust crate equivalent (e.g., `rand`, `chrono`).
-9. After implementing, run `cargo build` to verify it compiles. Fix any errors.
+9. After implementing:
+   * Run `cargo build` to verify it compiles. Fix any errors.
 10. Do NOT leave any `unimplemented!()`, `todo!()`, or `panic!()` placeholders.
 11. If a file is too large to write in one go, build it up piece by piece
     using multiple smaller writes.

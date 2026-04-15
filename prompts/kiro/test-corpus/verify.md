@@ -13,7 +13,7 @@ Working directory: CASE_DIR_PLACEHOLDER
 - `translated_rust/src/` contains the Rust translation
 - The C code can be compiled as a shared library. Look at c_src/CMakeLists.txt
   to understand the build system. Build it with:
-  ```
+  ```sh
   cd translated_rust/c_src && mkdir -p build && cd build && \
   cmake .. -DCMAKE_POSITION_INDEPENDENT_CODE=ON CMAKE_BUILD_FLAGS && \
   cmake --build .
