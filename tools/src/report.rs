@@ -138,19 +138,26 @@ pub fn generate(repo_root: &Path) -> Result<()> {
     writeln!(all)?;
 
     // 3. CRUST-bench tables
+    // Projects with known benchmark bugs (test translation errors or C→Rust type gaps)
+    let benchmark_bugs: std::collections::HashSet<&str> = [
+        "cissy", "libpgn", "libwecan", "razz_simulation", "fs_c",
+    ].into_iter().collect();
+
     for (label, dir_name) in [("CRUST", "CRUST"), ("CRUST-blind", "CRUST-blind")] {
         let crust_dir = repo_root.join("results").join(dir_name);
         if !crust_dir.is_dir() { continue; }
         writeln!(all, "## {label}\n")?;
-        writeln!(all, "| Agent | Projects Passed | Tests Passed | LOC | Unsafe Lines | Unsafe % |")?;
-        writeln!(all, "|-------|----------------|-------------|-----|-------------|----------|")?;
+        writeln!(all, "| Agent | Projects Passed | Adjusted* | Tests Passed | LOC | Unsafe Lines | Unsafe % |")?;
+        writeln!(all, "|-------|----------------|-----------|-------------|-----|-------------|----------|")?;
         for agent_entry in sorted_read_dir(&crust_dir)? {
             let agent = agent_entry.file_name().to_string_lossy().to_string();
             if !agent_entry.path().is_dir() { continue; }
             let (mut total, mut passed, mut tests_ok, mut tests_failed) = (0u32, 0u32, 0u32, 0u32);
             let (mut total_loc, mut unsafe_lines) = (0u32, 0u32);
+            let (mut adj_total, mut adj_passed, mut adj_tok, mut adj_tfail) = (0u32, 0u32, 0u32, 0u32);
             for proj_entry in sorted_read_dir(&agent_entry.path())? {
                 if !proj_entry.path().is_dir() { continue; }
+                let proj_name = proj_entry.file_name().to_string_lossy().to_string();
                 // CRUST: result.json at top; CRUST-blind: verify/result.json
                 let rp = proj_entry.path().join("result.json");
                 let rp = if rp.exists() { rp } else { proj_entry.path().join("verify/result.json") };
@@ -160,17 +167,26 @@ pub fn generate(repo_root: &Path) -> Result<()> {
                 let tfail = r.get("tests_failed").or(r.get("real_tests_failed")).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 tests_ok += tok;
                 tests_failed += tfail;
-                if r.get("build_ok").and_then(|v| v.as_bool()).unwrap_or(false) && tfail == 0 {
+                let build_ok = r.get("build_ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                if build_ok && tfail == 0 {
                     passed += 1;
                 }
                 total_loc += r.pointer("/loc/code").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 unsafe_lines += r.pointer("/unsafe/lines").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                // Adjusted: exclude benchmark bugs
+                if !benchmark_bugs.contains(proj_name.as_str()) {
+                    adj_total += 1;
+                    adj_tok += tok;
+                    adj_tfail += tfail;
+                    if build_ok && tfail == 0 { adj_passed += 1; }
+                }
             }
             let unsafe_pct = if total_loc > 0 {
                 format!("{:.1}%", unsafe_lines as f64 / total_loc as f64 * 100.0)
             } else { "N/A".into() };
-            writeln!(all, "| {} | {}/{} | {}/{} | {} | {} | {} |",
-                agent, passed, total, tests_ok, tests_ok + tests_failed,
+            writeln!(all, "| {} | {}/{} | {}/{} | {}/{} | {} | {} | {} |",
+                agent, passed, total, adj_passed, adj_total,
+                tests_ok, tests_ok + tests_failed,
                 total_loc, unsafe_lines, unsafe_pct)?;
         }
         writeln!(all)?;
