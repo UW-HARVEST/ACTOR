@@ -73,7 +73,7 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | gemini-3.1-pro-preview | 0/128 | 0/0 | 0 | 0 | N/A |
 | gpt-5.4 | 0/128 | 0/0 | 0 | 0 | N/A |
 | kimi | 0/1 | 0/0 | 0 | 0 | N/A |
-| kiro | 127/128 | 127/128 | 4948 | 3187 | 64.4% |
+| kiro | 128/128 | 128/128 | 4948 | 3187 | 64.4% |
 | kiro-translate | 36/128 | 36/128 | 4078 | 151 | 3.7% |
 | laertes | 0/128 | 0/0 | 0 | 0 | N/A |
 
@@ -86,5 +86,5 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | B02_organic | 42/44 | — | 22/44 | 25/44 | 16/44 | 42/44 | 41/44 | 41/44 |
 | B02_synthetic | 38/42 | — | 23/42 | 25/42 | 16/42 | 31/42 | 31/42 | 39/42 |
 | P00_perlin_noise | 1/1 | 1/1 | 0/1 | 0/1 | 0/1 | 1/1 | 1/1 | 1/1 |
-| P01_sphincs_plus | 0/128 | 115/128 | 0/128 | 0/128 | 0/1 | 127/128 | 36/128 | 0/128 |
+| P01_sphincs_plus | 0/128 | 115/128 | 0/128 | 0/128 | 0/1 | 128/128 | 36/128 | 0/128 |
 

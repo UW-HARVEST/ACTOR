@@ -179,6 +179,16 @@ fn translate_one_shared(
         || {
             if let Ok(mut cargo) = CargoToml::open(&real_dir.join("translated_rust/Cargo.toml")) {
                 cargo.add_workspace();
+                // Patch default features from CMakePresets.json (same as config copies)
+                let features = battery::extract_features_from_path(
+                    &paths.input_dir(battery_name).join(&group.real_case).join("CMakePresets.json"),
+                ).unwrap_or_default();
+                let resolved = battery::resolve_features(
+                    &real_dir.join("translated_rust/Cargo.toml"), &features,
+                ).unwrap_or_default();
+                if !resolved.is_empty() {
+                    cargo.set_default_features(&resolved);
+                }
                 let _ = cargo.save();
             }
             Ok(())
