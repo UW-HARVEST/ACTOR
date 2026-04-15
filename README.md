@@ -41,7 +41,10 @@ tools/                      # harvest-tools CLI (Rust)
 │   ├── test.rs             # MIT runtests + CI --check mode
 │   ├── battery.rs          # Path resolution, unsafe counting, LOC
 │   └── report.rs           # Markdown table generation
-scripts/prompts/            # System prompts for each agent/mode
+prompts/                    # System prompts organized by agent
+├── kiro/                   # kiro + kiro-translate prompts
+├── claude/                 # Claude Code prompts
+└── oneshot/                # One-shot LLM prompts (kimi, gpt-5.4, gemini)
 test-corpus/                # MIT TRACTOR Test-Corpus (submodule)
 crust-bench/                # CRUST-bench dataset (submodule)
 results/                    # All translation results (submodule)
