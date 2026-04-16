@@ -46,7 +46,7 @@ prompts/                    # System prompts organized by agent
 ├── claude/                 # Claude Code prompts
 └── oneshot/                # One-shot LLM prompts (kimi, gpt-5.4, gemini)
 test-corpus/                # MIT TRACTOR Test-Corpus (submodule)
-crust-bench/                # CRUST-bench dataset (submodule)
+crust-bench/                # CRUST-bench dataset (submodule, see https://github.com/benedikt-schesch/CRUST-bench)
 results/                    # All translation results (submodule)
 tables/                     # Auto-generated result tables
 ```
@@ -87,6 +87,10 @@ harvest-tools --agent kiro run B01_synthetic/001_helloworld
 harvest-tools report
 
 # CRUST-bench
+
+One-shot LLM results and per-project metrics (LOC, unsafe) live in our fork: https://github.com/benedikt-schesch/CRUST-bench
+
+```bash
 harvest-tools --agent kiro run CRUST/all
 harvest-tools --agent kiro run CRUST/all --blind  # blind mode (no ground-truth tests)
 ```
@@ -187,14 +191,14 @@ Auto-generated from validated `result.json` and `summary.json` files.
 
 ## CRUST
 
-| Agent | Projects Passed | Tests Passed | LOC | Unsafe Lines | Unsafe % |
-|-------|----------------|-------------|-----|-------------|----------|
-| kiro | 86/95 | 616/632 | 56466 | 536 | 0.9% |
+| Agent | Projects Passed | Adjusted* | Tests Passed | LOC | Unsafe Lines | Unsafe % |
+|-------|----------------|-----------|-------------|-----|-------------|----------|
+| kiro | 86/95 | 86/90 | 616/632 | 56466 | 536 | 0.9% |
 
 ## CRUST-blind
 
-| Agent | Projects Passed | Tests Passed | LOC | Unsafe Lines | Unsafe % |
-|-------|----------------|-------------|-----|-------------|----------|
-| kiro | 59/94 | 443/478 | 46669 | 466 | 1.0% |
-| kiro-translate | 54/95 | 410/454 | 47395 | 466 | 1.0% |
+| Agent | Projects Passed | Adjusted* | Tests Passed | LOC | Unsafe Lines | Unsafe % |
+|-------|----------------|-----------|-------------|-----|-------------|----------|
+| kiro | 59/94 | 58/89 | 443/478 | 46669 | 466 | 1.0% |
+| kiro-translate | 54/95 | 53/90 | 410/454 | 47395 | 466 | 1.0% |
 
