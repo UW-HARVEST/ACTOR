@@ -183,15 +183,20 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                 }).to_string(),
             )?;
 
+            let settings_path = claude_dir.join("settings.json");
             let _status = Command::new("bash")
                 .arg("-c")
-                .arg("set -o pipefail; claude -p \"$PROMPT\" \
-                    --allowedTools 'Bash(*)' 'Write' 'Edit' \
+                .arg("set -o pipefail; timeout 10800 claude -p \"$PROMPT\" \
+                    --strict-mcp-config --disable-slash-commands --settings \"$SETTINGS\" \
+                    --agents \"$AGENTS\" --agent claude_plain \
+                    --max-turns 1000 --permission-mode bypassPermissions \
                     --verbose \
                     --output-format stream-json \
                     < /dev/null 2>&1 | tee \"$LOG\"")
                 .env("PROMPT", &prompt)
                 .env("LOG", &log_path)
+                .env("SETTINGS", &settings_path)
+                .env("AGENTS", crate::translate::CLAUDE_PLAIN_AGENT_JSON)
                 .env("OPENSSL_DIR", &openssl_dir)
                 .current_dir(work.translated_rust())
                 .status()

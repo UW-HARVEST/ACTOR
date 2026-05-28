@@ -56,13 +56,11 @@ and run `cargo check` for each. Same for running tests across combinations.
 Do not manually repeat commands for each configuration — automate it.
 
 **This may be a large verification task.** If the project has more than one
-configuration or code path to verify, you MUST invoke subagents — do NOT try
-to verify everything in a single session. Create a plan, then for each subtask
-use the use_subagent tool with agent_name "kiro_plain" and a focused query
-covering a specific subset of the code or functionality to verify and fix.
-Only invoke one subagent at a time — wait for it to complete before starting
-the next. After each subagent completes, check that its fixes didn't break
-anything else.
+configuration or code path to verify, break the work into focused subtasks —
+do NOT try to verify everything in a single session. Create a plan, then
+work through each subtask with a focused scope covering a specific subset of
+the code or functionality to verify and fix. After each subtask completes,
+check that its fixes didn't break anything else.
 
 Add `libloading = "0.8"` to [dev-dependencies] in translated_rust/Cargo.toml.
 Do NOT modify anything in c_src/.
