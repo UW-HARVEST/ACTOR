@@ -7,6 +7,12 @@ use std::process::Command;
 use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
+// ── claude_plain agent (mirrors kiro_plain) ────────────────────────────
+// Used with `--agent claude_plain` to give Claude Code a neutral profile
+// matching kiro_plain.json: built-in tools only (Bash/Edit/Read/Write/Task),
+// no skills/plugins/MCP, no extra system prompt.
+pub const CLAUDE_PLAIN_AGENT_JSON: &str = r#"{"claude_plain":{"description":"Bare-bones agent matching kiro_plain","prompt":"You are a coding assistant. Use the available tools to complete the user's task.","tools":["Bash","Edit","Read","Write","Task"]}}"#;
+
 // ── Semaphore ──────────────────────────────────────────────────────────
 
 pub struct Semaphore {
@@ -228,17 +234,12 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
         Agent::Laertes => laertes_translate_case(paths, battery, name),
         Agent::Kimi => kimi_translate_case(paths, battery, name, is_lib),
         Agent::Oneshot => oneshot_translate_case(paths, battery, name, is_lib),
-        agent => {
-            let prompt = match agent {
-                Agent::Kiro | Agent::KiroTranslate => {
-                    let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
-                    std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default()
-                }
-                Agent::Claude => std::fs::read_to_string(paths.prompts_dir.join("translate.md")).unwrap_or_default(),
-                _ => String::new(),
-            };
+        Agent::Kiro | Agent::KiroTranslate | Agent::Claude => {
+            let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
+        Agent::C2rust => translate_case(paths, battery, name, ""),
     }
 }
 
@@ -247,14 +248,11 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
         Agent::Laertes => laertes_translate_case(paths, battery, name),
         Agent::Kimi => kimi_translate_case(paths, battery, name, true),
         Agent::Oneshot => oneshot_translate_case(paths, battery, name, true),
-        agent => {
-            let prompt = match agent {
-                Agent::Kiro | Agent::KiroTranslate => std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default(),
-                Agent::Claude => std::fs::read_to_string(paths.prompts_dir.join("translate.md")).unwrap_or_default(),
-                _ => String::new(),
-            };
+        Agent::Kiro | Agent::KiroTranslate | Agent::Claude => {
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
+        Agent::C2rust => translate_case(paths, battery, name, ""),
     }
 }
 
@@ -376,12 +374,15 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
                 .context("invoking kiro-cli")?;
         }
         Agent::Claude => {
+            let settings_path = work_dir.parent().unwrap().join(".claude/settings.json");
             let _status = Command::new("bash")
                 .arg("-lc")
-                .arg(r#"set -o pipefail; timeout 10800 claude -p "$1" --allowedTools 'Bash(*)' 'Write' 'Edit' --max-turns 50 --verbose --output-format stream-json < /dev/null 2>&1 | tee "$2""#)
+                .arg(r#"set -o pipefail; timeout 10800 claude -p "$1" --strict-mcp-config --disable-slash-commands --settings "$3" --agents "$4" --agent claude_plain --max-turns 1000 --permission-mode bypassPermissions --verbose --output-format stream-json < /dev/null 2>&1 | tee "$2""#)
                 .arg("--")
                 .arg(prompt)
                 .arg(&log_path)
+                .arg(&settings_path)
+                .arg(CLAUDE_PLAIN_AGENT_JSON)
                 .env("OPENSSL_DIR", &openssl_dir)
                 .current_dir(&work_dir)
                 .status()
@@ -610,12 +611,19 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
                 .context("invoking kiro-cli for CRUST")?;
         }
         Agent::Claude => {
+            // Write a minimal settings.json so --settings can find one
+            let claude_dir = work.parent().unwrap_or(work).join(".claude");
+            std::fs::create_dir_all(&claude_dir)?;
+            let settings_path = claude_dir.join("settings.json");
+            std::fs::write(&settings_path, "{}")?;
             Command::new("bash")
                 .arg("-lc")
-                .arg(r#"set -o pipefail; timeout 10800 claude -p "$1" --allowedTools 'Bash(*)' 'Write' 'Edit' --max-turns 50 --verbose --output-format stream-json < /dev/null 2>&1 | tee "$2""#)
+                .arg(r#"set -o pipefail; timeout 10800 claude -p "$1" --strict-mcp-config --disable-slash-commands --settings "$3" --agents "$4" --agent claude_plain --max-turns 1000 --permission-mode bypassPermissions --verbose --output-format stream-json < /dev/null 2>&1 | tee "$2""#)
                 .arg("--")
                 .arg(prompt)
                 .arg(log_path)
+                .arg(&settings_path)
+                .arg(CLAUDE_PLAIN_AGENT_JSON)
                 .current_dir(work)
                 .status()
                 .context("invoking claude for CRUST")?;
