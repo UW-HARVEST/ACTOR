@@ -239,6 +239,11 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
             let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
+        Agent::ClaudeCombined => {
+            let f = if is_lib { "translate-and-verify-library.md" } else { "translate-and-verify-executable.md" };
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
+            translate_case(paths, battery, name, &prompt)
+        }
         Agent::C2rust => translate_case(paths, battery, name, ""),
     }
 }
@@ -252,6 +257,10 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
             let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
+        Agent::ClaudeCombined => {
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-and-verify-shared.md")).unwrap_or_default();
+            translate_case(paths, battery, name, &prompt)
+        }
         Agent::C2rust => translate_case(paths, battery, name, ""),
     }
 }
@@ -261,7 +270,7 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
 fn preflight_check(agent: Agent) -> Result<()> {
     let (cmd, version_args): (&str, &[&str]) = match agent {
         Agent::Kiro | Agent::KiroTranslate => ("kiro-cli", &["--version"]),
-        Agent::Claude => ("claude", &["--version"]),
+        Agent::Claude | Agent::ClaudeCombined => ("claude", &["--version"]),
         Agent::C2rust => ("c2rust", &["--version"]),
         Agent::Laertes => ("docker", &["--version"]),
         Agent::Kimi => ("aws", &["sts", "get-caller-identity"]),
@@ -286,7 +295,7 @@ fn preflight_check(agent: Agent) -> Result<()> {
         println!("  {line}");
     }
 
-    if agent == Agent::Claude {
+    if matches!(agent, Agent::Claude | Agent::ClaudeCombined) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let version_str = stdout.lines()
             .find(|l| l.chars().next().map_or(false, |c| c.is_ascii_digit()))
@@ -326,7 +335,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
     let (work_dir, _tmp_guard) = match paths.agent {
-        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot => {
+        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::ClaudeCombined | Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot => {
             let tmp = tempfile::Builder::new()
                 .prefix("harvest-translate-")
                 .tempdir()
@@ -336,7 +345,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
             std::fs::create_dir_all(&c_src)?;
             copy_dir_all(&input_test_case, &c_src)?;
 
-            if paths.agent == Agent::Claude {
+            if matches!(paths.agent, Agent::Claude | Agent::ClaudeCombined) {
                 let claude_dir = tmp.path().join(".claude");
                 std::fs::create_dir_all(&claude_dir)?;
                 let repo_root = paths.results_dir.parent().unwrap_or(Path::new("/"));
@@ -373,7 +382,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
                 .status()
                 .context("invoking kiro-cli")?;
         }
-        Agent::Claude => {
+        Agent::Claude | Agent::ClaudeCombined => {
             let settings_path = work_dir.parent().unwrap().join(".claude/settings.json");
             let _status = Command::new("bash")
                 .arg("-lc")
@@ -610,7 +619,7 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
                 .status()
                 .context("invoking kiro-cli for CRUST")?;
         }
-        Agent::Claude => {
+        Agent::Claude | Agent::ClaudeCombined => {
             // Write a minimal settings.json so --settings can find one
             let claude_dir = work.parent().unwrap_or(work).join(".claude");
             std::fs::create_dir_all(&claude_dir)?;
@@ -634,10 +643,18 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
 }
 
 pub fn run_crust(paths: &Paths, projects: &[battery::CrustProject], parallel: usize) -> Result<()> {
+    // CRUST regular: existing translate.md already has "iterate cargo test until passing"
+    // built in, so claude-combined uses the same prompt as claude.
     run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Standard, "translate.md")
 }
 
 pub fn run_crust_blind(paths: &Paths, projects: &[battery::CrustProject], parallel: usize) -> Result<()> {
+    if paths.agent == Agent::ClaudeCombined {
+        anyhow::bail!(
+            "claude-combined does not support CRUST-blind: the dataset's translate/ vs verify/ \
+             split requires a separate verify phase. Use --agent claude for CRUST-blind."
+        );
+    }
     run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Blind, "translate-blind.md")
 }
 
