@@ -5,6 +5,10 @@ pub enum Agent {
     Kiro,
     KiroTranslate,
     Claude,
+    /// Claude Code with combined translate+verify in a single session.
+    /// Reads translate-and-verify-{exec,lib,shared}.md instead of separate prompts.
+    /// Verify phase is skipped.
+    ClaudeCombined,
     C2rust,
     Laertes,
     Kimi,

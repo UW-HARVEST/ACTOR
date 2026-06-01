@@ -544,6 +544,7 @@ impl Paths {
             Agent::Kiro => "kiro",
             Agent::KiroTranslate => "kiro-translate",
             Agent::Claude => "claude",
+            Agent::ClaudeCombined => "claude-combined",
             Agent::C2rust => "c2rust",
             Agent::Laertes => "laertes",
             Agent::Kimi => "kimi",
@@ -566,7 +567,7 @@ impl Paths {
             ),
         };
         let prompts_dir = match agent {
-            Agent::Claude => match dataset {
+            Agent::Claude | Agent::ClaudeCombined => match dataset {
                 Dataset::TestCorpus => repo_root.join("prompts/claude"),
                 Dataset::Crust | Dataset::BlindCrust => repo_root.join("prompts/claude/crust"),
             },

@@ -36,7 +36,8 @@ fn main() -> Result<()> {
             let inner = Dataset::strip_prefix(target);
 
             let tp = make_translate_plan(&paths, inner, include_regex.as_deref(), parallel, limit)?;
-            let vp = if no_verify || dataset == Dataset::Crust {
+            // ClaudeCombined merges translate+verify into one prompt; skip the verify phase.
+            let vp = if no_verify || dataset == Dataset::Crust || agent == cli::Agent::ClaudeCombined {
                 VerifyPlan::Skip
             } else {
                 make_verify_plan(&paths, inner, include_regex.as_deref(), parallel, false)?

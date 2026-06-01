@@ -202,7 +202,9 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                 .status()
                 .context("invoking claude for verification")?;
         }
-        Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot => {
+        Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot | Agent::ClaudeCombined => {
+            // ClaudeCombined: translate phase already did verify, skip this phase.
+            // c2rust/laertes/kimi/oneshot: no verify phase by design.
             return Ok(true);
         }
     }
