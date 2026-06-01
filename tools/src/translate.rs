@@ -297,8 +297,10 @@ fn preflight_check(agent: Agent) -> Result<()> {
 
     if matches!(agent, Agent::Claude | Agent::ClaudeCombined) {
         let stdout = String::from_utf8_lossy(&output.stdout);
+        // Claude version output may be "2.1.150.280 ..." (older) or
+        // "claude 2.1.158.312 ..." (newer). Match any line containing a digit-dot-digit pattern.
         let version_str = stdout.lines()
-            .find(|l| l.chars().next().map_or(false, |c| c.is_ascii_digit()))
+            .find(|l| l.chars().any(|c| c.is_ascii_digit()))
             .unwrap_or("");
         let parts: Vec<u32> = version_str
             .split(|c: char| !c.is_ascii_digit())
@@ -649,13 +651,15 @@ pub fn run_crust(paths: &Paths, projects: &[battery::CrustProject], parallel: us
 }
 
 pub fn run_crust_blind(paths: &Paths, projects: &[battery::CrustProject], parallel: usize) -> Result<()> {
-    if paths.agent == Agent::ClaudeCombined {
-        anyhow::bail!(
-            "claude-combined does not support CRUST-blind: the dataset's translate/ vs verify/ \
-             split requires a separate verify phase. Use --agent claude for CRUST-blind."
-        );
-    }
-    run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Blind, "translate-blind.md")
+    let prompt_file = if paths.agent == Agent::ClaudeCombined {
+        // Combined prompt: agent translates AND writes its own tests in one session.
+        // After translate, the harness mirrors translate/ → verify/ so the test phase
+        // (which reads from verify_dir) finds both the Rust translation and the tests.
+        "translate-and-verify-blind.md"
+    } else {
+        "translate-blind.md"
+    };
+    run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Blind, prompt_file)
 }
 
 fn run_crust_with_mode(
@@ -744,6 +748,18 @@ fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject, mod
 
     let success = out.join("Cargo.toml").exists();
     write_translation_metrics(&out, paths.agent, elapsed, success);
+
+    // Blind CRUST + ClaudeCombined: the combined prompt produces both translation
+    // AND tests in one session; mirror translate/ → verify/ so the test phase
+    // (which reads from verify_dir) finds the agent's tests.
+    if is_blind && paths.agent == Agent::ClaudeCombined && success {
+        let verify = paths.verify_dir(project.name());
+        if verify.is_dir() {
+            std::fs::remove_dir_all(verify.as_ref())?;
+        }
+        copy_dir_filtered(&out, verify.as_ref(), &["target", "logs"])?;
+    }
+
     Ok(CaseResult { name: project.name().into(), elapsed_secs: elapsed, success, error: None, skipped: false })
 }
 
@@ -885,14 +901,16 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
             let target = std::fs::metadata(entry.path());
             match target {
                 Ok(m) if m.is_dir() => copy_dir_all(&entry.path(), &dst_path)?,
-                Ok(_) => { std::fs::copy(entry.path(), &dst_path)?; }
+                Ok(m) if m.is_file() => { std::fs::copy(entry.path(), &dst_path)?; }
+                Ok(_) => continue, // non-regular target (pipe, socket, etc.)
                 Err(_) => continue, // dangling symlink
             }
         } else if ft.is_dir() {
             copy_dir_all(&entry.path(), &dst_path)?;
-        } else {
+        } else if ft.is_file() {
             std::fs::copy(entry.path(), &dst_path)?;
         }
+        // Skip non-regular files: FIFOs, sockets, char/block devices.
     }
     Ok(())
 }
@@ -917,7 +935,8 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
                         copy_dir_all(&entry.path(), &dst_path)?;
                     }
                 }
-                Ok(_) => { std::fs::copy(entry.path(), &dst_path)?; }
+                Ok(m) if m.is_file() => { std::fs::copy(entry.path(), &dst_path)?; }
+                Ok(_) => continue, // non-regular target (pipe, socket, etc.), skip
                 Err(_) => continue, // dangling symlink, skip
             }
         } else if ft.is_dir() {
@@ -925,9 +944,12 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
                 continue;
             }
             copy_dir_all(&entry.path(), &dst_path)?;
-        } else {
+        } else if ft.is_file() {
             std::fs::copy(entry.path(), &dst_path)?;
         }
+        // Skip non-regular files: FIFOs, sockets, char/block devices.
+        // These can appear in agent workspaces (e.g. impcheck creates .pipe FIFOs)
+        // and would cause std::fs::copy to block forever.
     }
     Ok(())
 }

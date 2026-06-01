@@ -203,7 +203,7 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | Agent | Projects Passed | Adjusted* | Tests Passed | LOC | Unsafe Lines | Unsafe % |
 |-------|----------------|-----------|-------------|-----|-------------|----------|
 | claude | 84/94 | 81/89 | 584/622 | 49757 | 209 | 0.4% |
-| claude-combined | 0/0 | 0/0 | 0/0 | 0 | 0 | N/A |
+| claude-combined | 88/95 | 85/90 | 646/654 | 55300 | 910 | 1.6% |
 | kiro | 86/95 | 86/90 | 616/632 | 56466 | 536 | 0.9% |
 
 ## CRUST-blind
@@ -211,6 +211,7 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | Agent | Projects Passed | Adjusted* | Tests Passed | LOC | Unsafe Lines | Unsafe % |
 |-------|----------------|-----------|-------------|-----|-------------|----------|
 | claude | 60/95 | 59/90 | 462/500 | 59989 | 412 | 0.7% |
+| claude-combined | 61/95 | 60/90 | 454/514 | 55369 | 584 | 1.1% |
 | kiro | 59/94 | 58/89 | 443/478 | 46669 | 466 | 1.0% |
 | kiro-translate | 54/95 | 53/90 | 410/454 | 47395 | 466 | 1.0% |
 
