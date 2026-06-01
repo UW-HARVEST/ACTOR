@@ -566,7 +566,10 @@ impl Paths {
             ),
         };
         let prompts_dir = match agent {
-            Agent::Claude => repo_root.join("prompts/claude"),
+            Agent::Claude => match dataset {
+                Dataset::TestCorpus => repo_root.join("prompts/claude"),
+                Dataset::Crust | Dataset::BlindCrust => repo_root.join("prompts/claude/crust"),
+            },
             Agent::Kimi | Agent::Oneshot => repo_root.join("prompts/oneshot"),
             _ => match dataset {
                 Dataset::TestCorpus => repo_root.join("prompts/kiro/test-corpus"),
