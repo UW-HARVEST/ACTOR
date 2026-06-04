@@ -202,10 +202,11 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                 .status()
                 .context("invoking claude for verification")?;
         }
-        Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter => {
+        Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures => {
             // ClaudeCombined: translate phase already did verify, skip this phase.
             // ClaudeMinimal: no verify phase (calibration baseline).
             // ClaudeNoIter: no verify phase (E3 prompt-sensitivity ablation).
+            // ClaudeNoFeatures: no verify phase (E2 prompt-sensitivity ablation).
             // c2rust/laertes/kimi/oneshot: no verify phase by design.
             return Ok(true);
         }

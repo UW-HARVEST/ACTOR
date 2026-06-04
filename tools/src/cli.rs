@@ -21,6 +21,12 @@ pub enum Agent {
     /// loop in the prompt is actually load-bearing.
     /// Verify phase is skipped.
     ClaudeNoIter,
+    /// Claude Code with engineered prompts but no cmake-features → cargo-features
+    /// guidance (E2 prompt-sensitivity ablation). Identical to `claude` except
+    /// the shared-source prompt strips the build-time configurability section.
+    /// Tests whether the cmake-features dispatch is what carries P01_sphincs_plus.
+    /// Verify phase is skipped.
+    ClaudeNoFeatures,
     C2rust,
     Laertes,
     Kimi,
