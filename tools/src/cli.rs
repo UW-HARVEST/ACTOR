@@ -9,6 +9,18 @@ pub enum Agent {
     /// Reads translate-and-verify-{exec,lib,shared}.md instead of separate prompts.
     /// Verify phase is skipped.
     ClaudeCombined,
+    /// Claude Code with a minimal universal prompt (calibration baseline for
+    /// prompt-sensitivity ablation). One prompt for all project types, no
+    /// engineered guidance about cdylib, FFI types, namespace macros, etc.
+    /// Verify phase is skipped.
+    ClaudeMinimal,
+    /// Claude Code with engineered prompts but no iteration-loop instructions
+    /// (E3 prompt-sensitivity ablation). Same project-type dispatch and FFI
+    /// guidance as `claude`, but the prompt does not tell the agent to run
+    /// `cargo build`/`cargo test` and fix errors. Tests whether the iteration
+    /// loop in the prompt is actually load-bearing.
+    /// Verify phase is skipped.
+    ClaudeNoIter,
     C2rust,
     Laertes,
     Kimi,

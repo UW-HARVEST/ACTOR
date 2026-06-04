@@ -244,6 +244,17 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
             let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
+        Agent::ClaudeMinimal => {
+            // Universal minimal prompt — no project-type dispatch.
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-minimal.md")).unwrap_or_default();
+            translate_case(paths, battery, name, &prompt)
+        }
+        Agent::ClaudeNoIter => {
+            // Same project-type dispatch as Claude, but without "build → fix → iterate" steps.
+            let f = if is_lib { "translate-no-iter-library.md" } else { "translate-no-iter-executable.md" };
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
+            translate_case(paths, battery, name, &prompt)
+        }
         Agent::C2rust => translate_case(paths, battery, name, ""),
     }
 }
@@ -261,6 +272,15 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
             let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-and-verify-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
+        Agent::ClaudeMinimal => {
+            // Universal minimal prompt — same as for executables/libraries.
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-minimal.md")).unwrap_or_default();
+            translate_case(paths, battery, name, &prompt)
+        }
+        Agent::ClaudeNoIter => {
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-no-iter-shared.md")).unwrap_or_default();
+            translate_case(paths, battery, name, &prompt)
+        }
         Agent::C2rust => translate_case(paths, battery, name, ""),
     }
 }
@@ -270,7 +290,7 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
 fn preflight_check(agent: Agent) -> Result<()> {
     let (cmd, version_args): (&str, &[&str]) = match agent {
         Agent::Kiro | Agent::KiroTranslate => ("kiro-cli", &["--version"]),
-        Agent::Claude | Agent::ClaudeCombined => ("claude", &["--version"]),
+        Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter => ("claude", &["--version"]),
         Agent::C2rust => ("c2rust", &["--version"]),
         Agent::Laertes => ("docker", &["--version"]),
         Agent::Kimi => ("aws", &["sts", "get-caller-identity"]),
@@ -295,7 +315,7 @@ fn preflight_check(agent: Agent) -> Result<()> {
         println!("  {line}");
     }
 
-    if matches!(agent, Agent::Claude | Agent::ClaudeCombined) {
+    if matches!(agent, Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         // Claude version output may be "2.1.150.280 ..." (older) or
         // "claude 2.1.158.312 ..." (newer). Match any line containing a digit-dot-digit pattern.
@@ -337,7 +357,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
     let (work_dir, _tmp_guard) = match paths.agent {
-        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::ClaudeCombined | Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot => {
+        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot => {
             let tmp = tempfile::Builder::new()
                 .prefix("harvest-translate-")
                 .tempdir()
@@ -347,7 +367,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
             std::fs::create_dir_all(&c_src)?;
             copy_dir_all(&input_test_case, &c_src)?;
 
-            if matches!(paths.agent, Agent::Claude | Agent::ClaudeCombined) {
+            if matches!(paths.agent, Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter) {
                 let claude_dir = tmp.path().join(".claude");
                 std::fs::create_dir_all(&claude_dir)?;
                 let repo_root = paths.results_dir.parent().unwrap_or(Path::new("/"));
@@ -384,7 +404,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
                 .status()
                 .context("invoking kiro-cli")?;
         }
-        Agent::Claude | Agent::ClaudeCombined => {
+        Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter => {
             let settings_path = work_dir.parent().unwrap().join(".claude/settings.json");
             let _status = Command::new("bash")
                 .arg("-lc")
@@ -621,7 +641,7 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
                 .status()
                 .context("invoking kiro-cli for CRUST")?;
         }
-        Agent::Claude | Agent::ClaudeCombined => {
+        Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter => {
             // Write a minimal settings.json so --settings can find one
             let claude_dir = work.parent().unwrap_or(work).join(".claude");
             std::fs::create_dir_all(&claude_dir)?;
@@ -647,17 +667,25 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
 pub fn run_crust(paths: &Paths, projects: &[battery::CrustProject], parallel: usize) -> Result<()> {
     // CRUST regular: existing translate.md already has "iterate cargo test until passing"
     // built in, so claude-combined uses the same prompt as claude.
-    run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Standard, "translate.md")
+    let prompt_file = match paths.agent {
+        Agent::ClaudeMinimal => "translate-minimal.md",
+        Agent::ClaudeNoIter => "translate-no-iter.md",
+        _ => "translate.md",
+    };
+    run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Standard, prompt_file)
 }
 
 pub fn run_crust_blind(paths: &Paths, projects: &[battery::CrustProject], parallel: usize) -> Result<()> {
-    let prompt_file = if paths.agent == Agent::ClaudeCombined {
-        // Combined prompt: agent translates AND writes its own tests in one session.
-        // After translate, the harness mirrors translate/ → verify/ so the test phase
-        // (which reads from verify_dir) finds both the Rust translation and the tests.
-        "translate-and-verify-blind.md"
-    } else {
-        "translate-blind.md"
+    let prompt_file = match paths.agent {
+        Agent::ClaudeCombined => {
+            // Combined prompt: agent translates AND writes its own tests in one session.
+            // After translate, the harness mirrors translate/ → verify/ so the test phase
+            // (which reads from verify_dir) finds both the Rust translation and the tests.
+            "translate-and-verify-blind.md"
+        }
+        Agent::ClaudeMinimal => "translate-minimal-blind.md",
+        Agent::ClaudeNoIter => "translate-no-iter-blind.md",
+        _ => "translate-blind.md",
     };
     run_crust_with_mode(paths, projects, parallel, ScaffoldMode::Blind, prompt_file)
 }
@@ -749,10 +777,11 @@ fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject, mod
     let success = out.join("Cargo.toml").exists();
     write_translation_metrics(&out, paths.agent, elapsed, success);
 
-    // Blind CRUST + ClaudeCombined: the combined prompt produces both translation
-    // AND tests in one session; mirror translate/ → verify/ so the test phase
-    // (which reads from verify_dir) finds the agent's tests.
-    if is_blind && paths.agent == Agent::ClaudeCombined && success {
+    // Blind CRUST + Claude{Combined,Minimal,NoIter}: when the translate prompt does not
+    // run a separate verify phase, mirror translate/ → verify/ so the test phase
+    // (which reads from verify_dir) finds the translation. ClaudeMinimal/NoIter won't
+    // have written tests; the test phase scores against held-out real tests.
+    if is_blind && matches!(paths.agent, Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter) && success {
         let verify = paths.verify_dir(project.name());
         if verify.is_dir() {
             std::fs::remove_dir_all(verify.as_ref())?;
