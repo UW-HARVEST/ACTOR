@@ -262,6 +262,13 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
             let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
+        Agent::ClaudeNoSubtask => {
+            // E6: subtask-decomposition ablation only affects shared-source cases.
+            // Independent (executable/library) cases reuse the engineered claude prompts.
+            let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
+            translate_case(paths, battery, name, &prompt)
+        }
         Agent::C2rust => translate_case(paths, battery, name, ""),
     }
 }
@@ -293,6 +300,11 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
             let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-no-features-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
+        Agent::ClaudeNoSubtask => {
+            // E6: shared-source prompt without subtask-decomposition guidance.
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-no-subtask-shared.md")).unwrap_or_default();
+            translate_case(paths, battery, name, &prompt)
+        }
         Agent::C2rust => translate_case(paths, battery, name, ""),
     }
 }
@@ -302,7 +314,7 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
 fn preflight_check(agent: Agent) -> Result<()> {
     let (cmd, version_args): (&str, &[&str]) = match agent {
         Agent::Kiro | Agent::KiroTranslate => ("kiro-cli", &["--version"]),
-        Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures => ("claude", &["--version"]),
+        Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask => ("claude", &["--version"]),
         Agent::C2rust => ("c2rust", &["--version"]),
         Agent::Laertes => ("docker", &["--version"]),
         Agent::Kimi => ("aws", &["sts", "get-caller-identity"]),
@@ -327,7 +339,7 @@ fn preflight_check(agent: Agent) -> Result<()> {
         println!("  {line}");
     }
 
-    if matches!(agent, Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures) {
+    if matches!(agent, Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         // Claude version output may be "2.1.150.280 ..." (older) or
         // "claude 2.1.158.312 ..." (newer). Match any line containing a digit-dot-digit pattern.
@@ -369,7 +381,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
     let (work_dir, _tmp_guard) = match paths.agent {
-        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot => {
+        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot => {
             let tmp = tempfile::Builder::new()
                 .prefix("harvest-translate-")
                 .tempdir()
@@ -379,7 +391,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
             std::fs::create_dir_all(&c_src)?;
             copy_dir_all(&input_test_case, &c_src)?;
 
-            if matches!(paths.agent, Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures) {
+            if matches!(paths.agent, Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask) {
                 let claude_dir = tmp.path().join(".claude");
                 std::fs::create_dir_all(&claude_dir)?;
                 let repo_root = paths.results_dir.parent().unwrap_or(Path::new("/"));
@@ -416,7 +428,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
                 .status()
                 .context("invoking kiro-cli")?;
         }
-        Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures => {
+        Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask => {
             let settings_path = work_dir.parent().unwrap().join(".claude/settings.json");
             let _status = Command::new("bash")
                 .arg("-lc")
@@ -653,7 +665,7 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
                 .status()
                 .context("invoking kiro-cli for CRUST")?;
         }
-        Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures => {
+        Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask => {
             // Write a minimal settings.json so --settings can find one
             let claude_dir = work.parent().unwrap_or(work).join(".claude");
             std::fs::create_dir_all(&claude_dir)?;
