@@ -801,11 +801,11 @@ fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject, mod
     let success = out.join("Cargo.toml").exists();
     write_translation_metrics(&out, paths.agent, elapsed, success);
 
-    // Blind CRUST + Claude{Combined,Minimal,NoIter}: when the translate prompt does not
-    // run a separate verify phase, mirror translate/ → verify/ so the test phase
-    // (which reads from verify_dir) finds the translation. ClaudeMinimal/NoIter won't
-    // have written tests; the test phase scores against held-out real tests.
-    if is_blind && matches!(paths.agent, Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter) && success {
+    // Blind CRUST + Claude{Combined,Minimal,NoIter,NoFeatures,NoSubtask}: when the translate
+    // prompt does not run a separate verify phase, mirror translate/ → verify/ so the test
+    // phase (which reads from verify_dir) finds the translation. The minimal/no-iter/no-features/
+    // no-subtask agents won't have written tests; the test phase scores against held-out real tests.
+    if is_blind && matches!(paths.agent, Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask) && success {
         let verify = paths.verify_dir(project.name());
         if verify.is_dir() {
             std::fs::remove_dir_all(verify.as_ref())?;
