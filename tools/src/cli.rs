@@ -27,6 +27,13 @@ pub enum Agent {
     /// Tests whether the cmake-features dispatch is what carries P01_sphincs_plus.
     /// Verify phase is skipped.
     ClaudeNoFeatures,
+    /// Claude Code with engineered prompts but no subtask-decomposition
+    /// guidance (E6 prompt-sensitivity ablation). Identical to `claude` except
+    /// the shared-source prompt drops the "create a TODO list, work through
+    /// subtasks one at a time" block. Tests whether explicit decomposition
+    /// guidance is needed for large multi-file projects (P01_sphincs_plus).
+    /// Verify phase is skipped.
+    ClaudeNoSubtask,
     C2rust,
     Laertes,
     Kimi,

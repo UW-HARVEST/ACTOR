@@ -548,6 +548,7 @@ impl Paths {
             Agent::ClaudeMinimal => "claude-minimal",
             Agent::ClaudeNoIter => "claude-no-iter",
             Agent::ClaudeNoFeatures => "claude-no-features",
+            Agent::ClaudeNoSubtask => "claude-no-subtask",
             Agent::C2rust => "c2rust",
             Agent::Laertes => "laertes",
             Agent::Kimi => "kimi",
@@ -570,7 +571,7 @@ impl Paths {
             ),
         };
         let prompts_dir = match agent {
-            Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures => match dataset {
+            Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask => match dataset {
                 Dataset::TestCorpus => repo_root.join("prompts/claude"),
                 Dataset::Crust | Dataset::BlindCrust => repo_root.join("prompts/claude/crust"),
             },
