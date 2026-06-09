@@ -36,9 +36,9 @@ fn main() -> Result<()> {
             let inner = Dataset::strip_prefix(target);
 
             let tp = make_translate_plan(&paths, inner, include_regex.as_deref(), parallel, limit)?;
-            // ClaudeCombined merges translate+verify into one prompt; ClaudeMinimal,
-            // ClaudeNoIter, ClaudeNoFeatures, and ClaudeNoSubtask have no verify by
-            // design (prompt-sensitivity ablations). All five skip the verify phase.
+            // ClaudeCombined merges translate+verify into one prompt; the other
+            // ClaudeNo* / ClaudeCrossPrompt variants have no verify by design
+            // (prompt-sensitivity ablations). All six skip the verify phase.
             let vp = if no_verify
                 || dataset == Dataset::Crust
                 || agent == cli::Agent::ClaudeCombined
@@ -46,6 +46,7 @@ fn main() -> Result<()> {
                 || agent == cli::Agent::ClaudeNoIter
                 || agent == cli::Agent::ClaudeNoFeatures
                 || agent == cli::Agent::ClaudeNoSubtask
+                || agent == cli::Agent::ClaudeCrossPrompt
             {
                 VerifyPlan::Skip
             } else {

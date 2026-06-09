@@ -34,6 +34,13 @@ pub enum Agent {
     /// guidance is needed for large multi-file projects (P01_sphincs_plus).
     /// Verify phase is skipped.
     ClaudeNoSubtask,
+    /// Claude Code with project-type prompts SWAPPED (E4 prompt-sensitivity
+    /// ablation). Libraries get translate-executable.md, executables get
+    /// translate-library.md. Directly answers Reviewer 2's question: "What
+    /// happens when translate-library.md is used to translate an executable?"
+    /// Tests whether the project-type dispatch is structurally necessary.
+    /// Verify phase is skipped.
+    ClaudeCrossPrompt,
     C2rust,
     Laertes,
     Kimi,
