@@ -818,11 +818,19 @@ fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary
 
     // Parse ALL per-case outcomes from runtests output.
     // Runtests reports every failure as: "- CASE_NAME: Build failed ..." or "- CASE_NAME: Test failed ..."
-    // and every executed case as: "Executing CASE_NAME"
+    // and every executed case as: "Executing CASE_NAME". Each "Test failed" line
+    // belongs to ONE failed test vector and is followed by a multi-line block:
+    //   - NAME: Test failed (testN: REASON
+    //   <diff lines>
+    //   expected rc=A, actual rc=B
+    //   )
+    // We accumulate per-vector failures so result.json reflects the true
+    // vectors_failed count and includes per-vector diff snippets — without this,
+    // analyzing failures requires hand-grepping the battery-level test.log.
     let mut per_case: HashMap<String, serde_json::Value> = HashMap::new();
     let mut failed_cases: Vec<String> = Vec::new();
 
-    // 1. Parse "- NAME: Build failed ..." lines
+    // 1. Parse "- NAME: Build failed ..." lines (single-line, one per case)
     let build_fail_re = Regex::new(r"^- (\S+): Build failed")?;
     for line in text.lines() {
         if let Some(caps) = build_fail_re.captures(line) {
@@ -836,18 +844,82 @@ fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary
         }
     }
 
-    // 2. Parse "- NAME: Test failed ..." lines
-    let test_fail_re = Regex::new(r"^- (\S+): Test failed")?;
+    // 2. Parse "- NAME: Test failed (testN: REASON\n...diff...\n)" blocks.
+    //    Multiple consecutive blocks belong to the same case (one per vector).
+    let test_fail_open_re = Regex::new(r"^- (\S+): Test failed \((test\w+): ([^\n]*)$")?;
+    let rc_re = Regex::new(r"expected rc=(\d+), actual rc=(\d+)")?;
+    let mut case_vector_fails: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(caps) = test_fail_open_re.captures(lines[i]) {
+            let name = caps[1].to_string();
+            let vector = caps[2].to_string();
+            let reason_first_line = caps[3].to_string();
+
+            // Walk forward to the closing `)` line (blocks are short, ~10 lines).
+            let start = i + 1;
+            let mut end = start;
+            while end < lines.len() && lines[end].trim() != ")" {
+                end += 1;
+            }
+            let body = lines[start..end].join("\n");
+            let (expected_rc, actual_rc) = rc_re.captures(&body)
+                .map(|c| (c[1].parse::<i64>().unwrap_or(-1), c[2].parse::<i64>().unwrap_or(-1)))
+                .unwrap_or((-1, -1));
+
+            // Strip the rc line + trailing blank lines from the diff snippet.
+            let diff = body.lines()
+                .filter(|l| !rc_re.is_match(l))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let diff = diff.trim().to_string();
+
+            // Reason like "stdout mismatch", "stderr mismatch, return code mismatch", etc.
+            let reason = reason_first_line.trim_end_matches(',').trim().to_string();
+
+            case_vector_fails.entry(name.clone()).or_default().push(serde_json::json!({
+                "vector": vector,
+                "reason": reason,
+                "expected_rc": expected_rc,
+                "actual_rc": actual_rc,
+                "diff": diff,
+            }));
+            if !failed_cases.contains(&name) { failed_cases.push(name.clone()); }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Some cases fail without any vector-level "(testN:" block (e.g. timeout,
+    // build mid-run). Detect them by a fallback regex and surface a 1-vector
+    // generic failure record.
+    let test_fail_simple_re = Regex::new(r"^- (\S+): Test failed")?;
     for line in text.lines() {
-        if let Some(caps) = test_fail_re.captures(line) {
+        if let Some(caps) = test_fail_simple_re.captures(line) {
             let name = caps[1].to_string();
             if !failed_cases.contains(&name) { failed_cases.push(name.clone()); }
-            per_case.insert(name.clone(), serde_json::json!({
-                "case": name, "battery": battery,
-                "vectors_failed": 1, "passed": false,
-                "error": "test failed",
-            }));
+            case_vector_fails.entry(name).or_insert_with(|| vec![serde_json::json!({
+                "vector": "unknown",
+                "reason": "test failed (no vector-level detail)",
+                "expected_rc": -1,
+                "actual_rc": -1,
+                "diff": "",
+            })]);
         }
+    }
+
+    for (name, failures) in case_vector_fails {
+        per_case.insert(name.clone(), serde_json::json!({
+            "case": name,
+            "battery": battery,
+            "vectors_failed": failures.len(),
+            "passed": false,
+            "error": "test failed",
+            "failures": failures,
+        }));
     }
 
     // 3. Parse "Executing NAME" lines — these passed (unless already marked failed)
