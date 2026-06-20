@@ -172,6 +172,13 @@ fn find_regressions(expected: &CrustBaseline, actual: &CrustBaseline) -> Vec<Reg
     regressions
 }
 
+/// Default OpenSSL location for `openssl-sys` builds. Projects like
+/// `c_blind_rsa_signatures` depend on it; without this set the build
+/// fails for environmental reasons unrelated to the translation.
+fn openssl_dir() -> String {
+    std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into())
+}
+
 /// Run cargo test on a single CRUST project, return typed result.
 fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
     // Clean up test artifacts and shared temp dirs (some CRUST tests use ./tmp)
@@ -180,8 +187,10 @@ fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
         if p.exists() { let _ = std::fs::remove_dir_all(&p); }
     }
 
+    let openssl = openssl_dir();
     let output = Command::new("timeout")
         .args(["60", "cargo", "test", "--", "--test-threads=1"])
+        .env("OPENSSL_DIR", &openssl)
         .current_dir(proj_dir)
         .output()
         .with_context(|| format!("running cargo test in {}", proj_dir.display()))?;
@@ -197,6 +206,7 @@ fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
     let (final_stdout, final_stderr) = if !build_ok || (tests_ok == 0 && tests_failed == 0) {
         let verbose = Command::new("timeout")
             .args(["60", "cargo", "test", "--verbose"])
+            .env("OPENSSL_DIR", &openssl)
             .current_dir(proj_dir)
             .output()
             .ok();
@@ -788,6 +798,7 @@ fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary
         .args(["-m", "runtests.rust", "--root", &output_dir.to_string_lossy(),
                "--subset", &output_dir.to_string_lossy(), "--keep-going", "--verbose"])
         .env("PYTHONPATH", &pythonpath)
+        .env("OPENSSL_DIR", openssl_dir())
         .current_dir(&paths.corpus_dir)
         .output()
         .context("running MIT runtests")?;
