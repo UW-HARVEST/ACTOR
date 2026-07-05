@@ -7,3 +7,7 @@
 [submodule "crust-bench"]
 	path = crust-bench
 	url = https://github.com/anirudhkhatry/CRUST-bench.git
+[submodule "c2saferrust"]
+	path = c2saferrust
+	url = https://github.com/benedikt-schesch/c2saferrust.git
+	branch = bedrock

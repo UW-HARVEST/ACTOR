@@ -47,6 +47,8 @@ fn main() -> Result<()> {
                 || agent == cli::Agent::ClaudeNoFeatures
                 || agent == cli::Agent::ClaudeNoSubtask
                 || agent == cli::Agent::ClaudeCrossPrompt
+                || agent == cli::Agent::CodexGpt55
+                || agent == cli::Agent::CodexGpt54
             {
                 VerifyPlan::Skip
             } else {

@@ -202,13 +202,15 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                 .status()
                 .context("invoking claude for verification")?;
         }
-        Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt => {
+        Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 => {
             // ClaudeCombined: translate phase already did verify, skip this phase.
             // ClaudeMinimal: no verify phase (calibration baseline).
             // ClaudeNoIter: no verify phase (E3 prompt-sensitivity ablation).
             // ClaudeNoFeatures: no verify phase (E2 prompt-sensitivity ablation).
             // ClaudeNoSubtask: no verify phase (E6 prompt-sensitivity ablation).
             // ClaudeCrossPrompt: no verify phase (E4 prompt-sensitivity ablation).
+            // Codex: skip verify; the agent over-fixates on irrelevant linker
+            // symbols during C-as-oracle verification (model-specific behavior).
             // c2rust/laertes/kimi/oneshot: no verify phase by design.
             return Ok(true);
         }
