@@ -1,0 +1,129 @@
+# SmartC2Rust runner image (Amazon Bedrock / Claude variant), native x86_64.
+#
+# The upstream prebuilt image (ghcr.io/momo-trip/smartc2rust) is arm64-only
+# (built on Apple Silicon) and won't run on our amd64 Cloud Desktop. We build
+# our own x86_64 image from source.
+#
+# Cost-saving choice: the kiso C parser loads STOCK libclang
+# (c_parser.py hardcodes /usr/lib/llvm-19/lib/libclang.so.1, the apt path), and
+# the custom-patched-LLVM-from-source build (download_clang.sh) only produces
+# the compiled macro-analyzer binaries used for #ifdef/conditional-compilation
+# handling. Simple _lib pilot cases have no macro config matrix, so we install
+# stock clang-19 and SKIP the multi-hour custom LLVM build. If macro-heavy cases
+# later need it, add the download_clang.sh + analyzer build.sh steps.
+#
+# kiso-llm is our fork's `bedrock` branch (fixes claude_bedrock for ada creds).
+#
+# Build (from repo root):
+#   docker build -f Dockerfile.smartc2rust -t smartc2rust:latest .
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System deps: python, clang-19 + libclang (stock), build tools, cmake/ninja,
+# graphviz, bear (for compile_commands.json), git, ssl/gmp.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv \
+        clang-19 libclang-19-dev llvm-19-dev \
+        git curl ca-certificates build-essential pkg-config cmake ninja-build \
+        bear graphviz libssl-dev libgmp-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# clang.cindex expects libclang.so.1 at /usr/lib/llvm-19/lib/ (hardcoded in
+# kiso c_parser.py). apt installs it under the arch triplet; symlink it.
+RUN mkdir -p /usr/lib/llvm-19/lib \
+    && ln -sf /usr/lib/x86_64-linux-gnu/libclang-19.so.1 /usr/lib/llvm-19/lib/libclang.so.1 \
+    && ln -sf /usr/bin/clang-19 /usr/bin/clang \
+    && ln -sf /usr/bin/clang++-19 /usr/bin/clang++
+
+# Rust (stable is fine; SmartC2Rust builds/tests the translated crate with cargo)
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+# Rust CLI tools the pipeline shells out to (from setup.sh): bindgen (FFI bind
+# generation), rustfilt (demangling), cargo-modules (module graph).
+RUN cargo install bindgen-cli rustfilt cargo-modules
+
+# Python deps: clang bindings (match apt clang major = 19), anthropic (Bedrock),
+# boto3 (default credential chain for ada session tokens), pycparser, requests.
+# pyproject declares no deps, so install the full runtime set the kiso + trans
+# modules import (discovered by scanning their sources). Legacy LLM backends
+# (databricks/replicate/openai/gemini) are not needed for the claude_bedrock path.
+RUN pip3 install --no-cache-dir --break-system-packages \
+        "clang==19.*" anthropic boto3 pycparser requests python-dotenv \
+        chardet networkx ijson intervaltree graphviz matplotlib numpy \
+        pydantic tiktoken toml tomlkit watchdog \
+        # eagerly-imported legacy backends (client.py imports all at module load,
+        # even though we only use the claude_bedrock path)
+        openai databricks-sdk replicate google-generativeai
+
+# Fetch the tool + kiso packages. kiso-llm from our fork's bedrock branch;
+# the rest from upstream at their default branch.
+# CACHEBUST invalidates the clone layer so fork updates are picked up.
+ARG CACHEBUST=1
+WORKDIR /root
+RUN git clone --depth 1 https://github.com/momo-trip/SmartC2Rust.git \
+ && git clone --depth 1 https://github.com/momo-trip/kiso-utils.git \
+ && git clone --depth 1 -b bedrock https://github.com/benedikt-schesch/kiso-llm.git \
+ && git clone --depth 1 https://github.com/momo-trip/kiso-parser-c.git \
+ && git clone --depth 1 https://github.com/momo-trip/kiso-parser-rust.git \
+ && git clone --depth 1 https://github.com/momo-trip/kiso-parser-macro.git
+
+# Editable-install the python packages (the pip-install part of setup.sh).
+RUN cd /root/kiso-utils      && pip3 install --no-cache-dir --break-system-packages -e . \
+ && cd /root/kiso-llm        && pip3 install --no-cache-dir --break-system-packages -e . \
+ && cd /root/kiso-parser-c   && pip3 install --no-cache-dir --break-system-packages -e . \
+ && cd /root/kiso-parser-rust && pip3 install --no-cache-dir --break-system-packages -e .
+
+# libtracer.so (plain gcc shared lib; used by the golden-flow tracer). Cheap.
+RUN cd /root/kiso-parser-c/c_parser_api && ./build_tracer.sh \
+ && cp libtracer.so /usr/local/lib/ && ldconfig
+
+# Custom-patched LLVM/Clang 19.1.7 for the macro analyzers. The macro stage's
+# pragma-finder / macro-finder link against a patched clang preprocessor
+# (adds SkippedIf/SkippedElif hooks to see inactive #if branches) — stock clang
+# lacks those symbols. Only kiso-parser-macro needs this (the pipeline invokes
+# macro-finder/pragma-finder; the kiso-parser-c analyzers are not called on our
+# path), so we build LLVM once. This is the slow, RAM-heavy step (~cores*time).
+RUN cd /root/kiso-parser-macro \
+ && git clone --depth 1 --branch llvmorg-19.1.7 https://github.com/llvm/llvm-project.git \
+ && cd llvm-project && git apply ../clang-modifications.patch \
+ && cmake -S llvm -B build -G Ninja \
+      -DLLVM_ENABLE_PROJECTS=clang \
+      -DLLVM_TARGETS_TO_BUILD=X86 \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/root/kiso-parser-macro/llvm-custom \
+ && cmake --build build --parallel 8 \
+ && cmake --install build \
+ && rm -rf /root/kiso-parser-macro/llvm-project
+
+# Build the macro analyzer binaries against the custom LLVM.
+RUN cd /root/kiso-parser-macro/pragma_finder && bash build.sh \
+ && cd /root/kiso-parser-macro/macro_finder && bash build.sh \
+ && cd /root/kiso-parser-macro/macro_analyzer && bash build.sh \
+ && cd /root/kiso-parser-macro/strip_line && bash build.sh
+
+# kiso-parser-c also ships analyzers (usage/include/macro-ref) that the compile
+# stage invokes (/build/analyzer, strip-line, etc.) and they link against a
+# SEPARATE custom-patched LLVM (a different patch that adds macro-expansion-origin
+# tracking). Build it and the c-parser analyzers. This is a second full LLVM
+# build — the tool genuinely requires two patched compilers.
+RUN cd /root/kiso-parser-c \
+ && git clone --depth 1 --branch llvmorg-19.1.7 https://github.com/llvm/llvm-project.git \
+ && cd llvm-project && git apply ../clang-modifications.patch \
+ && cmake -S llvm -B build -G Ninja \
+      -DLLVM_ENABLE_PROJECTS=clang \
+      -DLLVM_TARGETS_TO_BUILD=X86 \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/root/kiso-parser-c/llvm-custom \
+ && cmake --build build --parallel 8 \
+ && cmake --install build \
+ && rm -rf /root/kiso-parser-c/llvm-project
+RUN cd /root/kiso-parser-c/include_finder && bash build.sh \
+ && cd /root/kiso-parser-c/usage_analyzer && bash build.sh \
+ && cd /root/kiso-parser-c/usage_macro_ref_analyzer && bash build.sh
+
+# Record commit provenance.
+RUN cd /root/kiso-llm && git rev-parse HEAD > /root/kiso-llm_commit.txt 2>/dev/null || true
+
+WORKDIR /root/SmartC2Rust
+CMD ["/bin/bash"]

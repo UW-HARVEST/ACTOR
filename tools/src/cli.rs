@@ -41,8 +41,31 @@ pub enum Agent {
     /// Tests whether the project-type dispatch is structurally necessary.
     /// Verify phase is skipped.
     ClaudeCrossPrompt,
+    /// OpenAI Codex CLI on Amazon Bedrock with gpt-5.5 (us-east-2).  Same
+    /// methodology as `claude`: same prompts, translate-then-verify pipeline.
+    /// Used to validate that ACTOR is portable across multiple agentic
+    /// harnesses (Kiro CLI, Claude Code, Codex).  All requests go through
+    /// Bedrock; OpenAI telemetry/auth is disabled.
+    CodexGpt55,
+    /// OpenAI Codex CLI on Amazon Bedrock with gpt-5.4 (us-west-2).  Same
+    /// methodology as `CodexGpt55`; different model version for cross-model
+    /// comparison within the Codex harness.
+    CodexGpt54,
     C2rust,
     Laertes,
+    /// C2SaferRust: post-processes C2Rust output with an LLM to reduce unsafe
+    /// code. Runs in Docker from the pinned `c2saferrust/` submodule (our fork's
+    /// `bedrock` branch), driven by gpt-5.4 via Amazon Bedrock. Like Laertes, it
+    /// consumes this repo's c2rust `translated_rust_original` as input and has no
+    /// separate C-as-oracle verify phase.
+    #[value(name = "c2saferrust")]
+    C2SaferRust,
+    /// SmartC2Rust: from-C translator (segment + LLM + feedback repair), preserve
+    /// FFI mode, run in Docker via Amazon Bedrock Claude. Translation is driven by
+    /// an external fixture pipeline; harvest-tools is used here only to score the
+    /// collected results, so it has no in-tool translate/verify phase.
+    #[value(name = "smartc2rust")]
+    SmartC2Rust,
     Kimi,
     Oneshot,
 }

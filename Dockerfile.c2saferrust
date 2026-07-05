@@ -1,0 +1,51 @@
+# C2SaferRust runner image (Amazon Bedrock variant).
+#
+# Builds the C2SaferRust tool from the pinned `c2saferrust/` submodule
+# (fork benedikt-schesch/c2saferrust @ branch `bedrock`), so the image always
+# matches the exact commit recorded in this repo — no network clone, fully
+# reproducible.
+#
+# The tool's translation logic is upstream; the submodule adds only an additive
+# Amazon Bedrock backend (models/bedrock/, requests-based, no openai SDK) and a
+# one-line env-driven model selector. See the submodule's git history.
+#
+# Build (from repo root):
+#   docker build -f Dockerfile.c2saferrust -t c2saferrust:latest .
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv \
+        git curl ca-certificates build-essential pkg-config \
+        graphviz libssl-dev libgmp-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pinned nightly toolchain required by the slicer/metrics (rustc-internal APIs)
+ENV RUSTUP_HOME=/opt/rustup
+ENV CARGO_HOME=/opt/cargo
+ENV PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain nightly-2022-08-08 \
+    && rustup default nightly-2022-08-08 \
+    && rustup component add rust-src rustc-dev llvm-tools-preview rustfmt
+
+ENV RUSTFLAGS="-L /opt/rustup/toolchains/nightly-2022-08-08-x86_64-unknown-linux-gnu/lib"
+ENV LD_LIBRARY_PATH="/opt/rustup/toolchains/nightly-2022-08-08-x86_64-unknown-linux-gnu/lib"
+
+# The tool, straight from the pinned submodule working tree.
+COPY c2saferrust /opt/c2saferrust
+WORKDIR /opt/c2saferrust
+
+# Python deps. requirements.txt covers the Bedrock backend (needs only requests
+# + python-dotenv). pydot is needed for the callgraph write in translate.py.
+RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt \
+    && pip3 install --no-cache-dir --break-system-packages pydot
+
+# Build + install the two rustc-internal tools (slicer, metrics)
+RUN cd slicer  && cargo install --debug --locked --path . --force
+RUN cd metrics && cargo install --debug --locked --path . --force
+
+RUN git rev-parse HEAD > /opt/c2saferrust_commit.txt 2>/dev/null || true
+
+CMD ["/bin/bash"]

@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Condvar, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ── claude_plain agent (mirrors kiro_plain) ────────────────────────────
 // Used with `--agent claude_plain` to give Claude Code a neutral profile
@@ -248,6 +248,8 @@ fn run_and_record(
 fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) -> Result<()> {
     match paths.agent {
         Agent::Laertes => laertes_translate_case(paths, battery, name),
+        Agent::C2SaferRust => c2saferrust_translate_case(paths, battery, name, is_lib),
+        Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
         Agent::Kimi => kimi_translate_case(paths, battery, name, is_lib),
         Agent::Oneshot => oneshot_translate_case(paths, battery, name, is_lib),
         Agent::Kiro | Agent::KiroTranslate | Agent::Claude => {
@@ -293,6 +295,12 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
             let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
+        Agent::CodexGpt55 | Agent::CodexGpt54 => {
+            // Codex on Bedrock — same prompts as Claude Code, different harness.
+            let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
+            translate_case(paths, battery, name, &prompt)
+        }
         Agent::C2rust => translate_case(paths, battery, name, ""),
     }
 }
@@ -300,6 +308,8 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
 fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result<()> {
     match paths.agent {
         Agent::Laertes => laertes_translate_case(paths, battery, name),
+        Agent::C2SaferRust => c2saferrust_translate_case(paths, battery, name, true),
+        Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
         Agent::Kimi => kimi_translate_case(paths, battery, name, true),
         Agent::Oneshot => oneshot_translate_case(paths, battery, name, true),
         Agent::Kiro | Agent::KiroTranslate | Agent::Claude => {
@@ -336,6 +346,11 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
             let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
+        Agent::CodexGpt55 | Agent::CodexGpt54 => {
+            // Codex on Bedrock — same shared prompt as Claude Code.
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default();
+            translate_case(paths, battery, name, &prompt)
+        }
         Agent::C2rust => translate_case(paths, battery, name, ""),
     }
 }
@@ -346,8 +361,11 @@ fn preflight_check(agent: Agent) -> Result<()> {
     let (cmd, version_args): (&str, &[&str]) = match agent {
         Agent::Kiro | Agent::KiroTranslate => ("kiro-cli", &["--version"]),
         Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt => ("claude", &["--version"]),
+        Agent::CodexGpt55 | Agent::CodexGpt54 => ("codex", &["--version"]),
         Agent::C2rust => ("c2rust", &["--version"]),
         Agent::Laertes => ("docker", &["--version"]),
+        Agent::C2SaferRust => ("docker", &["--version"]),
+        Agent::SmartC2Rust => ("docker", &["--version"]),
         Agent::Kimi => ("aws", &["sts", "get-caller-identity"]),
         Agent::Oneshot => ("curl", &["--version"]),
     };
@@ -412,7 +430,7 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
     let (work_dir, _tmp_guard) = match paths.agent {
-        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot => {
+        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot => {
             let tmp = tempfile::Builder::new()
                 .prefix("harvest-translate-")
                 .tempdir()
@@ -474,10 +492,25 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
                 .status()
                 .context("invoking claude")?;
         }
+        Agent::CodexGpt55 | Agent::CodexGpt54 => {
+            // Codex CLI on Bedrock. Bedrock backend only — OpenAI auth/telemetry
+            // disabled. Model + region overridden per-agent via -c flags so
+            // we don't depend on a global ~/.codex/config.toml.
+            let (model, region) = match paths.agent {
+                Agent::CodexGpt55 => ("openai.gpt-5.5", "us-east-2"),
+                Agent::CodexGpt54 => ("openai.gpt-5.4", "us-west-2"),
+                _ => unreachable!(),
+            };
+            invoke_codex_with_retry(
+                prompt, &log_path, &work_dir, model, region, &openssl_dir, "translate",
+            )?;
+        }
         Agent::C2rust => {
             c2rust_translate(&work_dir, &log_path)?;
         }
         Agent::Laertes => unreachable!("laertes uses laertes_translate_case"),
+        Agent::C2SaferRust => unreachable!("c2saferrust uses c2saferrust_translate_case"),
+        Agent::SmartC2Rust => unreachable!("smartc2rust is not translated in-tool"),
         Agent::Kimi => unreachable!("kimi uses kimi_translate_case"),
         Agent::Oneshot => unreachable!("oneshot uses oneshot_translate_case"),
     };
@@ -714,7 +747,18 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
                 .status()
                 .context("invoking claude for CRUST")?;
         }
-        Agent::C2rust | Agent::Laertes | Agent::Kimi | Agent::Oneshot => anyhow::bail!("c2rust/laertes/kimi/oneshot not supported for CRUST-bench"),
+        Agent::CodexGpt55 | Agent::CodexGpt54 => {
+            let (model, region) = match agent {
+                Agent::CodexGpt55 => ("openai.gpt-5.5", "us-east-2"),
+                Agent::CodexGpt54 => ("openai.gpt-5.4", "us-west-2"),
+                _ => unreachable!(),
+            };
+            let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
+            invoke_codex_with_retry(
+                prompt, log_path, work, model, region, &openssl_dir, "CRUST",
+            )?;
+        }
+        Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot => anyhow::bail!("c2rust/laertes/c2saferrust/smartc2rust/kimi/oneshot not supported for CRUST-bench"),
     }
     Ok(())
 }
@@ -836,7 +880,7 @@ fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject, mod
     // run a separate verify phase, mirror translate/ → verify/ so the test phase
     // (which reads from verify_dir) finds the translation. ClaudeMinimal/NoIter won't
     // have written tests; the test phase scores against held-out real tests.
-    if is_blind && matches!(paths.agent, Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter) && success {
+    if is_blind && matches!(paths.agent, Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::CodexGpt55 | Agent::CodexGpt54) && success {
         let verify = paths.verify_dir(project.name());
         if verify.is_dir() {
             std::fs::remove_dir_all(verify.as_ref())?;
@@ -1537,6 +1581,254 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     Ok(())
 }
 
+// ── C2SaferRust (c2rust output -> LLM unsafe-reduction via Bedrock) ────────
+
+const C2SAFERRUST_DOCKER_IMAGE: &str = "c2saferrust:latest";
+const C2SAFERRUST_MODEL: &str = "bedrock-gpt54";
+const C2SAFERRUST_DEFAULT_BASE_URL: &str =
+    "https://bedrock-mantle.us-west-2.api.aws/openai/v1";
+
+/// Shell script run inside the C2SaferRust container.
+/// The mounted workspace is at /work; the reshaped crate is /work/rust.
+/// We give the (non-root) container user a writable HOME + CARGO_HOME and seed
+/// the cargo registry from the image so the pinned-nightly build has no network
+/// dependency. translate.py writes its result to /work/rust_WIP.
+const C2SAFERRUST_DOCKER_SCRIPT: &str = r#"
+set -e
+mkdir -p /work/home /work/cargo
+cp -r /opt/cargo/registry /work/cargo/ 2>/dev/null || true
+export HOME=/work/home
+export CARGO_HOME=/work/cargo
+export C2SR_MODEL=bedrock-gpt54
+cd /opt/c2saferrust
+# Per-case wall-clock cap: table-heavy functions (large CRC/float lookup tables)
+# make gpt-5.4 regenerate thousands of entries in one call, which can run for
+# many minutes, hit the per-call timeout, retry, and monopolize a parallel slot.
+# 900s lets normal cases finish comfortably while failing pathological ones fast
+# so they free their slot instead of wedging the batch. `timeout` exits 124 on
+# expiry; the harness then sees no rust_WIP and records the case as failed.
+timeout 900 python3 translate.py --code_dir /work/rust 2>&1
+"#;
+
+// Process-lived Bedrock bearer-token cache. Follows the internal pattern
+// (e.g. ElasticGumbyAgenticMCP, SageMaker hosting benchmark, CodeBlocksLibrary
+// midway token-refresh): mint a 12h token but refresh well before expiry so a
+// long batch run can never outlive its token. We refresh at 50% of the 12h
+// lifetime (6h), matching ElasticGumby's "hours of retry headroom" guidance.
+static BEDROCK_TOKEN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+const BEDROCK_TOKEN_REFRESH_AFTER: Duration = Duration::from_secs(6 * 3600);
+
+/// Return a valid Bedrock bearer token. Precedence:
+///   1. BEDROCK_API_KEY / AWS_BEARER_TOKEN_BEDROCK env (CI / manual injection)
+///   2. process cache, if the cached token is younger than the refresh window
+///   3. a freshly minted token from the host (aws_bedrock_token_generator)
+/// Minting strips AWS_PROFILE/AWS_DEFAULT_PROFILE so the token is issued for the
+/// operator's `default` (ada) profile, not any session profile that Claude Code
+/// or other tooling may have exported (a real bug we hit: wrong-account 401s).
+fn bedrock_token(region: &str) -> Result<String> {
+    if let Ok(t) = std::env::var("BEDROCK_API_KEY") {
+        if !t.trim().is_empty() { return Ok(t); }
+    }
+    if let Ok(t) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
+        if !t.trim().is_empty() { return Ok(t); }
+    }
+
+    let mut guard = BEDROCK_TOKEN.lock().unwrap();
+    if let Some((tok, born)) = guard.as_ref() {
+        if born.elapsed() < BEDROCK_TOKEN_REFRESH_AFTER {
+            return Ok(tok.clone());
+        }
+    }
+
+    let tok = mint_bedrock_token(region)?;
+    *guard = Some((tok.clone(), Instant::now()));
+    Ok(tok)
+}
+
+/// Mint a short-term (12h) Bedrock bearer token on the host via the standard
+/// `aws_bedrock_token_generator` python package, using the `default` AWS profile.
+fn mint_bedrock_token(region: &str) -> Result<String> {
+    let py = "import sys; from aws_bedrock_token_generator import provide_token; \
+              sys.stdout.write(provide_token(region=sys.argv[1]))";
+    let out = Command::new("python3")
+        .args(["-c", py, region])
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_DEFAULT_PROFILE")
+        .output()
+        .context("minting Bedrock token (is aws_bedrock_token_generator installed \
+                  and are `default`-profile creds valid? run `aws-creds <account>`)")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "Bedrock token mint failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tok = String::from_utf8(out.stdout)?.trim().to_string();
+    anyhow::ensure!(
+        tok.starts_with("bedrock-api-key-"),
+        "unexpected token format from provide_token (got {} chars)", tok.len()
+    );
+    Ok(tok)
+}
+
+/// C2SaferRust: post-process this repo's c2rust output with an LLM to reduce
+/// unsafe code. Input is the sibling `c2rust/.../translated_rust_original`
+/// (same source as Laertes). Runs the pinned submodule tool in Docker, driven
+/// by gpt-5.4 via Amazon Bedrock. Blind by design (no `--test_dir`): the tool
+/// is compile-gated only, making its numbers comparable to ACTOR self-verified.
+///
+/// Requires `BEDROCK_API_KEY` in the environment (a Bedrock bearer token).
+/// `BEDROCK_BASE_URL` may override the default us-west-2 mantle endpoint.
+fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib: bool) -> Result<()> {
+    use std::io::Write;
+
+    // Locate c2rust source (sibling directory under results/Test-Corpus/).
+    let c2rust_original = paths.results_dir
+        .parent().context("no parent for results_dir")?
+        .join("c2rust").join(battery).join(name).join("translated_rust_original");
+    anyhow::ensure!(c2rust_original.is_dir(),
+        "c2rust translated_rust_original not found (run the c2rust agent first): {}",
+        c2rust_original.display());
+
+    // Bedrock bearer token: env override wins (CI/manual), else a fresh token
+    // is minted on the host and cached with early refresh (see bedrock_token).
+    let base_url = std::env::var("BEDROCK_BASE_URL")
+        .unwrap_or_else(|_| C2SAFERRUST_DEFAULT_BASE_URL.to_string());
+    let region = base_url
+        .split("bedrock-mantle.").nth(1)
+        .and_then(|s| s.split('.').next())
+        .unwrap_or("us-west-2")
+        .to_string();
+    let token = bedrock_token(&region)?;
+
+    let case_dir = paths.case_dir(battery, name);
+    if case_dir.exists() { std::fs::remove_dir_all(&case_dir)?; }
+    let logs_dir = case_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    let log_path = logs_dir.join("translation.log");
+    let translated = case_dir.join("translated_rust");
+
+    // Isolated workspace we bind-mount into the container. The tool reshapes
+    // <work>/rust and writes <work>/rust_WIP.
+    let tmp = tempfile::Builder::new()
+        .prefix("harvest-c2sr-")
+        .tempdir()
+        .context("creating c2saferrust temp workspace")?;
+    let work_rust = tmp.path().join("rust");
+    // Copy c2rust output as the tool's input (skip build artifacts + bundled C).
+    copy_dir_filtered(&c2rust_original, &work_rust, &["target", "c_src"])?;
+    let _ = std::fs::remove_file(work_rust.join("Cargo.lock"));
+
+    let mut log = std::fs::File::create(&log_path)?;
+    writeln!(log, "source: {}", c2rust_original.display())?;
+    writeln!(log, "model: {} via {}", C2SAFERRUST_MODEL, base_url)?;
+
+    // Pre-process: reshape the c2rust crate into what the slicer expects.
+    writeln!(log, "\n=== C2SaferRust pre-process ===")?;
+    c2saferrust_preprocess(&work_rust)?;
+    writeln!(log, "done")?;
+
+    // Run the tool in Docker, as the host user so outputs are not root-owned.
+    writeln!(log, "\n=== C2SaferRust Docker (gpt-5.4 via Bedrock) ===")?;
+    let uid = unsafe { libc_getuid() };
+    let gid = unsafe { libc_getgid() };
+    let mount = format!("{}:/work", tmp.path().display());
+    let docker_out = Command::new("docker")
+        .args(["run", "--rm",
+               "--user", &format!("{uid}:{gid}"),
+               "-e", "C2SR_MODEL",
+               "-e", &format!("BEDROCK_API_KEY={token}"),
+               "-e", &format!("BEDROCK_BASE_URL={base_url}"),
+               "-v", &mount,
+               C2SAFERRUST_DOCKER_IMAGE, "bash", "-c", C2SAFERRUST_DOCKER_SCRIPT])
+        .env("C2SR_MODEL", C2SAFERRUST_MODEL)
+        .output()
+        .context("running c2saferrust docker container")?;
+    log.write_all(&docker_out.stdout)?;
+    log.write_all(&docker_out.stderr)?;
+
+    // Collect the tool's output (<work>/rust_WIP) into translated_rust/.
+    // If the tool produced no rust_WIP, the C2Rust input did not compile under
+    // the pinned nightly (e.g. SPHINCS+, whose duplicate `randombytes` symbol is
+    // a hard error on nightly-2022-08-08) or translation otherwise failed. In
+    // that case fall back to emitting the unmodified C2Rust input as the result,
+    // so the case is still counted and fails at test time — the faithful
+    // representation of "C2SaferRust could not improve this input", matching how
+    // c2rust/laertes are reported (0/128 on P01) rather than silently vanishing.
+    let wip = tmp.path().join("rust_WIP");
+    let source_dir = if wip.join("Cargo.toml").exists() {
+        writeln!(log, "\nrust_WIP produced; collecting C2SaferRust output")?;
+        wip.clone()
+    } else {
+        writeln!(log, "\nNo rust_WIP produced (C2Rust input failed to compile under \
+                       nightly-2022-08-08, or translation failed). Falling back to the \
+                       unmodified C2Rust input so the case is counted as a failure.")?;
+        work_rust.clone()
+    };
+    // Keep only source + manifest; drop the tool's bookkeeping + build artifacts.
+    copy_dir_filtered(&source_dir, &translated, &["target"])?;
+    for junk in ["callgraph.dot", "callgraph.pdf", "slices.json", "log.txt", "prompts.txt", "ordering.txt"] {
+        let _ = std::fs::remove_file(translated.join(junk));
+    }
+    // Remove any leftover .old rollback files.
+    if let Ok(entries) = std::fs::read_dir(&translated) {
+        for e in entries.flatten() {
+            if e.path().extension().map_or(false, |x| x == "old") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+
+    // Post-process: restore a standard toolchain so downstream testing matches
+    // the other agents (the tool pins nightly-2022-08-08 only for its slicer).
+    c2saferrust_postprocess(&translated)?;
+
+    // Copy the tool's per-function log alongside for provenance.
+    if wip.join("log.txt").exists() {
+        let _ = std::fs::copy(wip.join("log.txt"), logs_dir.join("c2saferrust_log.txt"));
+    }
+
+    writeln!(log, "\nc2saferrust translation collected into {}", translated.display())?;
+    Ok(())
+}
+
+/// Reshape a c2rust crate so the C2SaferRust slicer can build it as a library:
+/// ensure an rlib crate-type and pin the nightly the tool requires.
+fn c2saferrust_preprocess(work_dir: &Path) -> Result<()> {
+    // crate-type must include rlib (c2rust emits cdylib for _lib cases).
+    let cargo = work_dir.join("Cargo.toml");
+    if cargo.exists() {
+        let mut s = std::fs::read_to_string(&cargo)?;
+        let re = regex::Regex::new(r#"crate-type\s*=\s*\[[^\]]*\]"#).unwrap();
+        if re.is_match(&s) {
+            s = re.replace(&s, r#"crate-type = ["staticlib","rlib"]"#).into_owned();
+        }
+        std::fs::write(&cargo, s)?;
+    }
+    // Pin the toolchain the slicer/metrics were built against.
+    std::fs::write(
+        work_dir.join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"nightly-2022-08-08\"\ncomponents = [\"rustfmt\", \"rustc-dev\", \"rust-src\", \"llvm-tools-preview\"]\n",
+    )?;
+    Ok(())
+}
+
+/// Restore a standard toolchain after translation so downstream build/test uses
+/// the same toolchain as the other agents rather than the slicer's old pin.
+fn c2saferrust_postprocess(work_dir: &Path) -> Result<()> {
+    std::fs::write(
+        work_dir.join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"nightly\"\n",
+    )?;
+    Ok(())
+}
+
+extern "C" {
+    fn getuid() -> u32;
+    fn getgid() -> u32;
+}
+unsafe fn libc_getuid() -> u32 { getuid() }
+unsafe fn libc_getgid() -> u32 { getgid() }
+
 /// Adapt c2rust output for Laertes' nightly-2020-10-15 toolchain.
 fn laertes_preprocess(work_dir: &Path) -> Result<()> {
     for path in walkdir(work_dir)? {
@@ -1615,4 +1907,101 @@ fn walkdir(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
         }
     }
     Ok(files)
+}
+
+/// Retry-aware codex invocation. Bedrock occasionally returns transient
+/// errors mid-conversation (404 "Engine not found", "stream disconnected",
+/// "server had an error") that surface in the JSON log as `"type":"error"`
+/// followed by `"type":"turn.failed"`. The codex process exits 0 in those
+/// cases, so the harness has historically treated a Bedrock failure as a
+/// successful (but empty) translation.
+///
+/// This helper runs codex, scans the log for those patterns, and re-runs
+/// up to MAX_RETRIES times if a transient error is detected. Each retry
+/// clears the log (codex's `tee` overwrites anyway) and gets a fresh
+/// invocation so any partial state is discarded.
+fn invoke_codex_with_retry(
+    prompt: &str,
+    log_path: &Path,
+    work_dir: &Path,
+    model: &str,
+    region: &str,
+    openssl_dir: &str,
+    context_label: &str,
+) -> Result<()> {
+    const MAX_RETRIES: u32 = 3;
+    const RETRY_BACKOFF_SECS: u64 = 30;
+
+    for attempt in 1..=MAX_RETRIES {
+        let _status = Command::new("bash")
+            .arg("-lc")
+            .arg(r#"set -o pipefail; timeout 10800 codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C "$3" -c model="$5" -c model_providers.amazon-bedrock.aws.region="$6" --json "$1" < /dev/null 2>&1 | tee "$2""#)
+            .arg("--")
+            .arg(prompt)
+            .arg(log_path)
+            .arg(work_dir)
+            .arg("__unused__")
+            .arg(model)
+            .arg(region)
+            .env("OPENSSL_DIR", openssl_dir)
+            .current_dir(work_dir)
+            .status()
+            .with_context(|| format!("invoking codex ({context_label})"))?;
+
+        match scan_codex_log_for_transient_error(log_path) {
+            None => return Ok(()), // success or non-transient
+            Some(err) if attempt < MAX_RETRIES => {
+                eprintln!(
+                    "  codex transient error ({err}) on attempt {attempt}/{MAX_RETRIES}, retrying in {RETRY_BACKOFF_SECS}s..."
+                );
+                std::thread::sleep(std::time::Duration::from_secs(RETRY_BACKOFF_SECS));
+            }
+            Some(err) => {
+                eprintln!(
+                    "  codex transient error ({err}) on final attempt {attempt}/{MAX_RETRIES} — giving up"
+                );
+                return Ok(()); // let caller's "no Cargo.toml" check fail it
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns Some(reason) if the log indicates a transient Bedrock failure.
+/// Detected patterns:
+///   - 404 "Engine not found" (Bedrock model registration race)
+///   - "stream disconnected before completion"
+///   - "The server had an error" / "Server error"
+///   - "ThrottlingException" (rate limit, retryable)
+fn scan_codex_log_for_transient_error(log_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(log_path).ok()?;
+
+    // The transient errors all appear as `"type":"error"` events. We require
+    // the run to ALSO end in `"turn.failed"` (so it really aborted) and
+    // NOT contain a `"turn.completed"` (would mean it recovered).
+    if !content.contains(r#""type":"turn.failed""#) {
+        return None;
+    }
+    if content.contains(r#""type":"turn.completed""#) {
+        return None;
+    }
+
+    let patterns: &[(&str, &str)] = &[
+        ("Engine not found", "bedrock 404"),
+        ("stream disconnected", "stream disconnected"),
+        ("server had an error", "server error"),
+        ("ThrottlingException", "throttled"),
+        ("RequestTimeout", "request timeout"),
+        ("InternalServerError", "internal server error"),
+        ("503 Service Unavailable", "503"),
+    ];
+
+    for (needle, label) in patterns {
+        if content.contains(needle) {
+            return Some((*label).to_string());
+        }
+    }
+
+    None
 }

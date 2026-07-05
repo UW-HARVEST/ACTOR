@@ -550,8 +550,12 @@ impl Paths {
             Agent::ClaudeNoFeatures => "claude-no-features",
             Agent::ClaudeNoSubtask => "claude-no-subtask",
             Agent::ClaudeCrossPrompt => "claude-cross-prompt",
+            Agent::CodexGpt55 => "codex-gpt55",
+            Agent::CodexGpt54 => "codex-gpt54",
             Agent::C2rust => "c2rust",
             Agent::Laertes => "laertes",
+            Agent::C2SaferRust => "c2saferrust",
+            Agent::SmartC2Rust => "smartc2rust",
             Agent::Kimi => "kimi",
             Agent::Oneshot => model
                 .and_then(|m| m.rsplit('/').next())
@@ -572,7 +576,7 @@ impl Paths {
             ),
         };
         let prompts_dir = match agent {
-            Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt => match dataset {
+            Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 => match dataset {
                 Dataset::TestCorpus => repo_root.join("prompts/claude"),
                 Dataset::Crust | Dataset::BlindCrust => repo_root.join("prompts/claude/crust"),
             },
