@@ -85,6 +85,7 @@ harvest-tools --agent kiro run B01_synthetic/001_helloworld
 
 # Generate result tables
 harvest-tools report
+```
 
 # CRUST-bench
 
