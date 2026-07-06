@@ -1,6 +1,8 @@
 # ACTOR
 
-**A**gentic **C**-**to**-**R**ust translation for [DARPA TRACTOR](https://www.darpa.mil/program/translating-all-c-to-rust).
+ACTOR performs **A**gentic **C**-**to**-**R**ust translation.
+Its input is a C program and its output is a Rust program.
+
 
 ## Running ACTOR on your own C program
 
