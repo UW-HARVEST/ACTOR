@@ -2,6 +2,60 @@
 
 **A**gentic **C**-**to**-**R**ust translation for [DARPA TRACTOR](https://www.darpa.mil/program/translating-all-c-to-rust).
 
+## Running ACTOR on your own C program
+
+To translate an arbitrary
+C program of your own, add it as a one-off case and run any agent on it.
+
+1. Create a case directory under a battery. A case is a folder named
+   `<something>` (suffix it with `_lib` if it is a library rather than an
+   executable) containing a `test_case/` subdirectory with your C sources
+   and headers. The harness only discovers a case if a sibling
+   `test_vectors/` directory also exists, so create one — it may be empty
+   if you only want to translate:
+
+   ```bash
+   mkdir -p test-corpus/Public-Tests/mycases/hello/test_case
+   mkdir -p test-corpus/Public-Tests/mycases/hello/test_vectors
+   cp path/to/your/*.c path/to/your/*.h \
+      test-corpus/Public-Tests/mycases/hello/test_case/
+   ```
+
+2. Translate it with any agent. The agent works only from the C source in
+   `test_case/`; it writes a Cargo project (`Cargo.toml` + `src/`) with the
+   translated Rust:
+
+   ```bash
+   # Agentic translation with Claude Code (or --agent kiro)
+   harvest-tools --agent claude translate mycases/hello
+
+   # Mechanical transpilation with c2rust
+   harvest-tools --agent c2rust translate mycases/hello
+   ```
+
+   The translated crate is written under `results/.../mycases/hello/translated_rust/`.
+
+3. (Optional) To also *score* correctness the way the benchmarks do, put
+   JSON input/expected-output vectors in the `test_vectors/` directory, then
+   run the full pipeline instead of just `translate`:
+
+   ```bash
+   harvest-tools --agent claude run mycases/hello
+   ```
+
+   With an empty `test_vectors/`, ACTOR still translates the program (and,
+   for the agentic agents, verifies it against tests it generates itself);
+   only the built-in benchmark scorer is skipped.
+
+At its core, ACTOR is an off-the-shelf coding agent pointed at a directory
+whose `c_src/` holds the C code, driven by the prompts in `prompts/`. The
+case layout above is just how the benchmark harness feeds that C to the
+agent and (optionally) scores the result.
+
+## Evaluation
+
+The remainder of this README file discusses our experimental evaluation of ACTOR.
+
 This repository evaluates multiple translation agents — from mechanical transpilers to agentic LLM pipelines to one-shot LLM baselines — across CRUST-bench and the public parts of Lincoln Labs's TRACTOR Test-Corpus. All results are CI-validated with exact-match checks against stored summaries.
 
 ## Agents
@@ -87,7 +141,7 @@ harvest-tools --agent kiro run B01_synthetic/001_helloworld
 harvest-tools report
 ```
 
-# CRUST-bench
+## CRUST-bench
 
 One-shot LLM results and per-project metrics (LOC, unsafe) live in our fork: https://github.com/benedikt-schesch/CRUST-bench
 
@@ -109,63 +163,13 @@ harvest-tools --agent kiro run CRUST/all --blind   # self-generated tests (groun
 
 All commands are resume-friendly — they skip already-completed cases.
 
-## Running ACTOR on your own C program
-
-The commands above run the built-in benchmarks. To translate an arbitrary
-C program of your own, add it as a one-off case and run any agent on it.
-
-1. Create a case directory under a battery. A case is a folder named
-   `<something>` (suffix it with `_lib` if it is a library rather than an
-   executable) containing a `test_case/` subdirectory with your C sources
-   and headers. The harness only discovers a case if a sibling
-   `test_vectors/` directory also exists, so create one — it may be empty
-   if you only want to translate:
-
-   ```bash
-   mkdir -p test-corpus/Public-Tests/mycases/hello/test_case
-   mkdir -p test-corpus/Public-Tests/mycases/hello/test_vectors
-   cp path/to/your/*.c path/to/your/*.h \
-      test-corpus/Public-Tests/mycases/hello/test_case/
-   ```
-
-2. Translate it with any agent. The agent works only from the C source in
-   `test_case/`; it writes a Cargo project (`Cargo.toml` + `src/`) with the
-   translated Rust:
-
-   ```bash
-   # Agentic translation with Claude Code (or --agent kiro)
-   harvest-tools --agent claude translate mycases/hello
-
-   # Mechanical transpilation with c2rust
-   harvest-tools --agent c2rust translate mycases/hello
-   ```
-
-   The translated crate is written under `results/.../mycases/hello/translated_rust/`.
-
-3. (Optional) To also *score* correctness the way the benchmarks do, put
-   JSON input/expected-output vectors in the `test_vectors/` directory, then
-   run the full pipeline instead of just `translate`:
-
-   ```bash
-   harvest-tools --agent claude run mycases/hello
-   ```
-
-   With an empty `test_vectors/`, ACTOR still translates the program (and,
-   for the agentic agents, verifies it against tests it generates itself);
-   only the built-in benchmark scorer is skipped.
-
-At its core, ACTOR is an off-the-shelf coding agent pointed at a directory
-whose `c_src/` holds the C code, driven by the prompts in `prompts/`. The
-case layout above is just how the benchmark harness feeds that C to the
-agent and (optionally) scores the result.
-
-## Results
+### Results
 
 Auto-generated from validated `result.json` and `summary.json` files.
 C LOC counted from `test-corpus/Public-Tests/`. Regenerate with `harvest-tools report`.
 Auto-generated from validated `result.json` and `summary.json` files.
 
-## B01_organic
+### B01_organic
 
 | Agent | Cases Passed | Vectors Passed | C LOC | Rust LOC | Unsafe Lines | Unsafe % |
 |-------|-------------|----------------|-------|----------|-------------|----------|
@@ -179,7 +183,7 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | kiro-translate | 38/38 | 775/775 | 2455 | 2505 | 954 | 38.1% |
 | laertes | 37/38 | 775/775 | 2455 | 9636 | 2618 | 27.2% |
 
-## B01_synthetic
+### B01_synthetic
 
 | Agent | Cases Passed | Vectors Passed | C LOC | Rust LOC | Unsafe Lines | Unsafe % |
 |-------|-------------|----------------|-------|----------|-------------|----------|
@@ -193,7 +197,7 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | kiro-translate | 83/85 | 391/393 | 2597 | 2888 | 483 | 16.7% |
 | laertes | 83/85 | 389/389 | 2597 | 5970 | 2972 | 49.8% |
 
-## B02_organic
+### B02_organic
 
 | Agent | Cases Passed | Vectors Passed | C LOC | Rust LOC | Unsafe Lines | Unsafe % |
 |-------|-------------|----------------|-------|----------|-------------|----------|
@@ -207,7 +211,7 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | kiro-translate | 41/44 | 254/261 | 23072 | 18329 | 12176 | 66.4% |
 | laertes | 41/44 | 245/245 | 23072 | 44821 | 32559 | 72.6% |
 
-## B02_synthetic
+### B02_synthetic
 
 | Agent | Cases Passed | Vectors Passed | C LOC | Rust LOC | Unsafe Lines | Unsafe % |
 |-------|-------------|----------------|-------|----------|-------------|----------|
@@ -221,7 +225,7 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | kiro-translate | 31/42 | 942/1025 | 9877 | 8420 | 1922 | 22.8% |
 | laertes | 39/42 | 818/819 | 9877 | 21664 | 15770 | 72.8% |
 
-## P00_perlin_noise
+### P00_perlin_noise
 
 | Agent | Cases Passed | Vectors Passed | C LOC | Rust LOC | Unsafe Lines | Unsafe % |
 |-------|-------------|----------------|-------|----------|-------------|----------|
@@ -235,7 +239,7 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | kiro-translate | 1/1 | 30/30 | 380 | 315 | 0 | 0.0% |
 | laertes | 1/1 | 30/30 | 380 | 1643 | 514 | 31.3% |
 
-## P01_sphincs_plus
+### P01_sphincs_plus
 
 | Agent | Cases Passed | Vectors Passed | C LOC | Rust LOC | Unsafe Lines | Unsafe % |
 |-------|-------------|----------------|-------|----------|-------------|----------|
@@ -249,7 +253,7 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | kiro-translate | 36/128 | 36/128 | 6611 | 4921 | 3181 | 64.6% |
 | laertes | 0/128 | 0/0 | 6611 | 4887 | 3571 | 73.1% |
 
-## Summary: Cases Passed
+### Summary: Cases Passed
 
 | Battery | c2rust | claude | claude-combined | gemini-3.1-pro-preview | gpt-5.4 | kimi | kiro | kiro-translate | laertes |
 |---------|------|------|------|------|------|------|------|------|------|
@@ -260,7 +264,7 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | P00_perlin_noise | 1/1 | 1/1 | 1/1 | 0/1 | 0/1 | 0/1 | 1/1 | 1/1 | 1/1 |
 | P01_sphincs_plus | 0/128 | 116/128 | 116/128 | 0/128 | 0/128 | 0/1 | 128/128 | 36/128 | 0/128 |
 
-## CRUST (test repair)
+### CRUST (test repair)
 
 Results for the default modality: the agent is given the benchmark's
 ground-truth tests (the paper's *test repair* setting).
@@ -271,7 +275,7 @@ ground-truth tests (the paper's *test repair* setting).
 | claude-combined | 88/95 | 85/90 | 646/654 | 55300 | 910 | 1.6% |
 | kiro | 86/95 | 86/90 | 616/632 | 56466 | 536 | 0.9% |
 
-## CRUST-blind (self-generated tests)
+### CRUST-blind (self-generated tests)
 
 Results for the `--blind` modality: the benchmark's ground-truth tests
 are withheld and the agent verifies against tests it generates itself
