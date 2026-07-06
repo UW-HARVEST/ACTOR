@@ -126,7 +126,7 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | P00_perlin_noise | 1/1 | 1/1 | 1/1 | 1/1 | 1/1 | 1/1 | 1/1 | 1/1 | 0/1 | 0/1 | 0/1 | 1/1 | 1/1 | 1/1 |
 | P01_sphincs_plus | 0/128 | 116/128 | 116/128 | — | 1/128 | 5/128 | 48/128 | 116/128 | 0/128 | 0/128 | 0/1 | 128/128 | 36/128 | 0/128 |
 
-## CRUST
+## CRUST (test repair)
 
 | Agent | Projects Passed | Adjusted* | Tests Passed | LOC | Unsafe Lines | Unsafe % |
 |-------|----------------|-----------|-------------|-----|-------------|----------|
@@ -138,7 +138,7 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | claude-no-subtask | 87/95 | 84/90 | 640/647 | 54742 | 626 | 1.1% |
 | kiro | 86/95 | 86/90 | 616/632 | 56466 | 536 | 0.9% |
 
-## CRUST-blind
+## CRUST-blind (self-generated tests)
 
 | Agent | Projects Passed | Adjusted* | Tests Passed | LOC | Unsafe Lines | Unsafe % |
 |-------|----------------|-----------|-------------|-----|-------------|----------|
