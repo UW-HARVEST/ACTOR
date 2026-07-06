@@ -152,7 +152,10 @@ pub fn generate(repo_root: &Path) -> Result<()> {
         "cissy", "libpgn", "libwecan", "razz_simulation", "fs_c",
     ].into_iter().collect();
 
-    for (label, dir_name) in [("CRUST", "CRUST"), ("CRUST-blind", "CRUST-blind")] {
+    for (label, dir_name) in [
+        ("CRUST (test repair)", "CRUST"),
+        ("CRUST-blind (self-generated tests)", "CRUST-blind"),
+    ] {
         let crust_dir = repo_root.join("results").join(dir_name);
         if !crust_dir.is_dir() { continue; }
         writeln!(all, "## {label}\n")?;
