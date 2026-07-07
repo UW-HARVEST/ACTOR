@@ -15,6 +15,9 @@ struct Summary {
 #[derive(Deserialize)]
 struct CaseResult {
     passed: bool,
+    /// Present and equal to "build failed" when the crate did not compile.
+    /// Any other value (or absent) means the crate compiled.
+    error: Option<String>,
     loc: Option<Loc>,
     #[serde(rename = "unsafe")]
     unsafe_: Option<Unsafe>,
@@ -35,6 +38,8 @@ struct BatteryRow {
     battery: String,
     cases_passed: u32,
     cases_tested: u32,
+    /// Cases whose translated crate compiled (error != "build failed").
+    cases_built: u32,
     vectors_passed: u32,
     vectors_total: u32,
     c_loc: u32,
@@ -48,6 +53,13 @@ pub fn generate(repo_root: &Path) -> Result<()> {
     let test_corpus_dir = repo_root.join("test-corpus/Public-Tests");
     let tables_dir = repo_root.join("tables");
     std::fs::create_dir_all(&tables_dir)?;
+
+    // The Markdown table's "C LOC" column is read from the test-corpus submodule.
+    // If it is not checked out, every C LOC would silently become 0 and clobber
+    // the committed results.md. We therefore skip rewriting results.md when the
+    // submodule is absent. The LaTeX table (tractor.tex) uses Rust LOC from the
+    // results data and never needs the corpus, so it is always regenerated.
+    let has_c_corpus = test_corpus_dir.is_dir();
 
     // Cache C LOC per battery (same for all agents)
     let mut c_loc_cache: BTreeMap<String, u32> = BTreeMap::new();
@@ -70,7 +82,7 @@ pub fn generate(repo_root: &Path) -> Result<()> {
                 None => continue,
             };
 
-            let (total_loc, unsafe_lines) = aggregate_cases(&bat_dir);
+            let (total_loc, unsafe_lines, cases_built) = aggregate_cases(&bat_dir);
 
             let c_loc = *c_loc_cache.entry(battery.clone()).or_insert_with(|| {
                 count_c_loc_battery(&test_corpus_dir, &battery)
@@ -81,6 +93,7 @@ pub fn generate(repo_root: &Path) -> Result<()> {
                 battery,
                 cases_passed: summary.cases_passed,
                 cases_tested: summary.cases_tested,
+                cases_built,
                 vectors_passed: summary.vectors_passed,
                 vectors_total: summary.vectors_passed + summary.vectors_failed,
                 c_loc,
@@ -204,16 +217,170 @@ pub fn generate(repo_root: &Path) -> Result<()> {
         writeln!(all)?;
     }
 
+    // Only rewrite results.md when the C corpus is present; otherwise its C LOC
+    // column would be zeroed. (See has_c_corpus above.)
     let out_path = tables_dir.join("results.md");
-    std::fs::write(&out_path, &all)?;
-    println!("✅ Wrote {}", out_path.display());
+    if has_c_corpus {
+        std::fs::write(&out_path, &all)?;
+        println!("✅ Wrote {}", out_path.display());
+    } else {
+        println!(
+            "⚠️  Skipped {} (test-corpus submodule not checked out; \
+             C LOC would be zeroed). Run `git submodule update --init test-corpus` \
+             to regenerate it.",
+            out_path.display(),
+        );
+    }
+
+    // LaTeX table for the paper. Numbers are derived from the results data
+    // (Rust LOC, not C LOC), so this is always regenerated.
+    let tex = generate_tractor_tex(&rows);
+    let tex_path = tables_dir.join("tractor.tex");
+    std::fs::write(&tex_path, &tex)?;
+    println!("✅ Wrote {}", tex_path.display());
+
     Ok(())
 }
 
-fn aggregate_cases(bat_dir: &Path) -> (u32, u32) {
+/// Rows of the TRACTOR table, in paper order. Each entry maps a display label
+/// to the results/Test-Corpus/ agent directory. ACTOR harness rows are grouped
+/// first, then the transpiler/LLM baselines.
+const TRACTOR_TABLE_ROWS: &[(&str, &str, bool)] = &[
+    // (display label, results dir, is_actor_harness)
+    ("ACTOR (Kiro)", "kiro", true),
+    ("ACTOR (Claude Code)", "claude", true),
+    ("ACTOR (Codex)", "codex-gpt54", true),
+    ("ACTOR (Kiro, no verify)", "kiro-translate", true),
+    ("C2Rust", "c2rust", false),
+    ("Laertes", "laertes", false),
+    ("C2SaferRust", "c2saferrust", false),
+    ("SmartC2Rust", "smartc2rust", false),
+    ("Kimi K2.5 (query)", "kimi", false),
+    ("GPT-5.4 (query)", "gpt-5.4", false),
+    ("Gemini 3.1 Pro (query)", "gemini-3.1-pro-preview", false),
+];
+
+/// Battery display names and their results-directory names, in paper order.
+const TRACTOR_BATTERIES: &[(&str, &str)] = &[
+    ("B01-syn", "B01_synthetic"),
+    ("B01-org", "B01_organic"),
+    ("B02-syn", "B02_synthetic"),
+    ("B02-org", "B02_organic"),
+    ("P00 (Perlin)", "P00_perlin_noise"),
+    ("P01 (SPHINCS+)", "P01_sphincs_plus"),
+    ("Total", ""), // empty battery dir => aggregate across all
+];
+
+/// Format a LOC count the way the paper's table does: raw below 1000, one
+/// decimal place for 1000-1999 (e.g. 1.6k), rounded integer-k at/above 2000.
+fn fmt_k(loc: u32) -> String {
+    if loc < 1000 {
+        loc.to_string()
+    } else if loc < 2000 {
+        format!("{:.1}k", loc as f64 / 1000.0)
+    } else {
+        format!("{}k", (loc as f64 / 1000.0).round() as u32)
+    }
+}
+
+/// Build the LaTeX body (table rows only) for tab:tractor. The surrounding
+/// table/tabular/caption stays in paper.tex, which \input{}s this file.
+fn generate_tractor_tex(rows: &[BatteryRow]) -> String {
+    use std::collections::HashMap;
+    // (agent dir, battery dir) -> row
+    let mut idx: HashMap<(&str, &str), &BatteryRow> = HashMap::new();
+    for r in rows {
+        idx.insert((r.agent.as_str(), r.battery.as_str()), r);
+    }
+
+    // Canonical battery size = the largest cases_tested any agent recorded for it.
+    // (The ACTOR harnesses ran every case, so this is the full battery size.)
+    // A partial run by some baseline still divides by this full size, so a case
+    // it never attempted counts as a failure — matching the paper's methodology.
+    let mut battery_size: HashMap<&str, u32> = HashMap::new();
+    for r in rows {
+        let e = battery_size.entry(r.battery.as_str()).or_insert(0);
+        *e = (*e).max(r.cases_tested);
+    }
+    // Total case count = sum of the batteries shown in the table (derived from
+    // the data, not hardcoded, so it stays correct if the corpus changes).
+    let total_cases: u32 = TRACTOR_BATTERIES.iter()
+        .filter_map(|(_, d)| (!d.is_empty()).then(|| battery_size.get(d).copied().unwrap_or(0)))
+        .sum();
+
+    // For each (agent, battery-or-Total) produce built/tested/tests_pass/loc/unsafe,
+    // always over the full battery size so untranslated cases count as failures.
+    struct Cell { built: u32, denom: u32, tests_pass: u32, loc: u32, unsafe_lines: u32, present: bool }
+    let cell = |agent: &str, bat_dir: &str| -> Cell {
+        if bat_dir.is_empty() {
+            // Total: sum across all batteries, denom = full corpus size.
+            let (mut b, mut tp, mut loc, mut un) = (0u32, 0u32, 0u32, 0u32);
+            let mut present = false;
+            for (_, bd) in TRACTOR_BATTERIES.iter().filter(|(_, d)| !d.is_empty()) {
+                if let Some(r) = idx.get(&(agent, *bd)) {
+                    present = true;
+                    b += r.cases_built; tp += r.cases_passed; loc += r.total_loc; un += r.unsafe_lines;
+                }
+            }
+            Cell { built: b, denom: total_cases, tests_pass: tp, loc, unsafe_lines: un, present }
+        } else {
+            // Denominator is the canonical battery size, so partial runs still
+            // divide by the full size (unattempted cases count as failures).
+            let denom = battery_size.get(bat_dir).copied().unwrap_or(0);
+            if let Some(r) = idx.get(&(agent, bat_dir)) {
+                Cell { built: r.cases_built, denom, tests_pass: r.cases_passed,
+                       loc: r.total_loc, unsafe_lines: r.unsafe_lines, present: true }
+            } else {
+                Cell { built: 0, denom, tests_pass: 0, loc: 0, unsafe_lines: 0, present: false }
+            }
+        }
+    };
+
+    let mut out = String::new();
+    out.push_str("% GENERATED by `harvest-tools report` from results/Test-Corpus/. Do not edit by hand.\n");
+    out.push_str("% Builds = crate compiles (result.json error != \"build failed\").\n");
+    out.push_str("% Tests = cases passing all vectors. Every system is scored over all cases.\n");
+
+    for (bi, (bat_label, bat_dir)) in TRACTOR_BATTERIES.iter().enumerate() {
+        // Best Tests among ACTOR harness rows in this battery, for bold.
+        let best = TRACTOR_TABLE_ROWS.iter().filter(|(_, _, actor)| *actor)
+            .map(|(_, a, _)| cell(a, bat_dir).tests_pass)
+            .max().unwrap_or(0);
+        for (label, agent, _) in TRACTOR_TABLE_ROWS {
+            let c = cell(agent, bat_dir);
+            let denom = c.denom;
+            let first_col = if *label == TRACTOR_TABLE_ROWS[0].0 { *bat_label } else { "" };
+            let tests = if c.tests_pass == best && best > 0 {
+                format!("\\textbf{{{}/{}}}", c.tests_pass, denom)
+            } else {
+                format!("{}/{}", c.tests_pass, denom)
+            };
+            // LOC/unsafe are "--" only when the system produced no output for this
+            // battery at all (matches the paper's dashes for e.g. SmartC2Rust P01).
+            let (loc, un) = if c.present && c.loc > 0 {
+                (fmt_k(c.loc), format!("{}\\%",
+                    (c.unsafe_lines as f64 / c.loc as f64 * 100.0).round() as u32))
+            } else {
+                ("--".into(), "--".into())
+            };
+            out.push_str(&format!("{} & {} & {}/{} & {} & {} & {} \\\\\n",
+                first_col, label, c.built, denom, tests, loc, un));
+        }
+        // hline between batteries; double before Total.
+        if bi + 2 == TRACTOR_BATTERIES.len() { out.push_str("\\hline\\hline\n"); }
+        else if bi + 1 < TRACTOR_BATTERIES.len() { out.push_str("\\hline\n"); }
+    }
+    out
+}
+
+/// Returns (total_loc, unsafe_lines, cases_built) for a battery directory.
+/// `cases_built` counts cases whose crate compiled (result.json error != "build failed"),
+/// which is the runner's own build/no-build signal (see test.rs).
+fn aggregate_cases(bat_dir: &Path) -> (u32, u32, u32) {
     let mut locs = Vec::new();
     let mut unsafes = Vec::new();
-    let Ok(entries) = std::fs::read_dir(bat_dir) else { return (0, 0) };
+    let mut built = 0u32;
+    let Ok(entries) = std::fs::read_dir(bat_dir) else { return (0, 0, 0) };
     for entry in entries.flatten() {
         if !entry.path().is_dir() { continue; }
         let result_path = entry.path().join("result.json");
@@ -221,10 +388,13 @@ fn aggregate_cases(bat_dir: &Path) -> (u32, u32) {
             Some(r) => r,
             None => continue,
         };
+        if cr.error.as_deref() != Some("build failed") {
+            built += 1;
+        }
         locs.push(cr.loc.map_or(0, |l| l.code));
         unsafes.push(cr.unsafe_.map_or(0, |u| u.lines));
     }
-    if locs.is_empty() { return (0, 0); }
+    if locs.is_empty() { return (0, 0, built); }
     // Shared-translation detection: if cases share a translated_rust directory
     // (P00/P01 style), LOC values cluster tightly. Use max instead of sum.
     // Heuristic: if max/min ratio < 2, it's a shared translation.
@@ -232,9 +402,9 @@ fn aggregate_cases(bat_dir: &Path) -> (u32, u32) {
     let max_loc = *locs.iter().max().unwrap();
     if locs.len() > 1 && min_loc > 0 && max_loc <= min_loc * 2 {
         let max_unsafe = *unsafes.iter().max().unwrap();
-        (max_loc, max_unsafe)
+        (max_loc, max_unsafe, built)
     } else {
-        (locs.iter().sum(), unsafes.iter().sum())
+        (locs.iter().sum(), unsafes.iter().sum(), built)
     }
 }
 
