@@ -282,6 +282,41 @@ fn crust_pass_adjusted(repo_root: &Path, mode_dir: &str) -> std::collections::BT
     out
 }
 
+/// Per-case build outcome (crate compiles?) for one agent, keyed by
+/// "battery/case". Reads the runner's own build result from result.json.
+fn case_builds(repo_root: &Path, agent: &str) -> std::collections::BTreeMap<String, bool> {
+    let mut out = std::collections::BTreeMap::new();
+    let agent_dir = repo_root.join("results/Test-Corpus").join(agent);
+    let Ok(bats) = sorted_read_dir(&agent_dir) else { return out };
+    for be in bats {
+        if !be.path().is_dir() { continue; }
+        let battery = be.file_name().to_string_lossy().to_string();
+        let Ok(cases) = sorted_read_dir(&be.path()) else { continue };
+        for ce in cases {
+            if !ce.path().is_dir() { continue; }
+            let case = ce.file_name().to_string_lossy().to_string();
+            let Some(r) = read_json::<CaseResult>(&ce.path().join("result.json")) else { continue };
+            out.insert(format!("{battery}/{case}"), r.error.as_deref() != Some("build failed"));
+        }
+    }
+    out
+}
+
+/// Count cases where Laertes breaks a compilation that C2Rust had working
+/// (and, separately, where it fixes one C2Rust could not build).
+fn laertes_vs_c2rust(repo_root: &Path) -> (u32, u32) {
+    let c2 = case_builds(repo_root, "c2rust");
+    let la = case_builds(repo_root, "laertes");
+    let (mut broke, mut fixed) = (0u32, 0u32);
+    for (case, c2_ok) in &c2 {
+        if let Some(&la_ok) = la.get(case) {
+            if *c2_ok && !la_ok { broke += 1; }
+            if !*c2_ok && la_ok { fixed += 1; }
+        }
+    }
+    (broke, fixed)
+}
+
 /// Emit \newcommand constants for result numbers that are quoted in the prose.
 /// Only numbers that are derived directly from the committed results appear
 /// here; figures the results data does not reproduce (e.g. the CRUST
@@ -318,6 +353,9 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
     o.push_str(&format!("\\newcommand{{\\ActorKiroPOneTests}}{{{}/128}}\n", g(&p01_tests, "kiro")));
     o.push_str(&format!("\\newcommand{{\\ActorKiroNoVerifyPOneTests}}{{{}/128}}\n", g(&p01_tests, "kiro-translate")));
     o.push_str(&format!("\\newcommand{{\\CrustKiroTestRepair}}{{{}/90}}\n", crust_tr.get("kiro").copied().unwrap_or(0)));
+    let (laertes_breaks, laertes_fixes) = laertes_vs_c2rust(repo_root);
+    o.push_str(&format!("\\newcommand{{\\LaertesBreaks}}{{{}}}\n", laertes_breaks));
+    o.push_str(&format!("\\newcommand{{\\LaertesFixes}}{{{}}}\n", laertes_fixes));
     o
 }
 
