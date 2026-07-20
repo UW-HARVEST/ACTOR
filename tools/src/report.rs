@@ -345,6 +345,29 @@ pub fn generate(repo_root: &Path) -> Result<()> {
         }
     }
 
+    // (2b-gap) The manual gap classification (defects + bugs) must equal the
+    //      derived gap size (kiro test-repair passes − self-generated passes).
+    //      This is the drift guard for the "tests encode a specification absent
+    //      from the C" prose: if a re-score moves either endpoint, the sum in
+    //      manual_constants.toml [crust_gap] must be re-reconciled or generation
+    //      fails here, before the paper can print a split that doesn't add up.
+    {
+        let tr = crust_pass_adjusted(repo_root, "CRUST");
+        let bl = crust_pass_adjusted(repo_root, "CRUST-blind");
+        let (kp, _) = tr.get("kiro").copied().unwrap_or((0, 0));
+        let (kb, _) = bl.get("kiro").copied().unwrap_or((0, 0));
+        let gap = kp.saturating_sub(kb);
+        let (defects, bugs) = crust_gap_split(repo_root);
+        anyhow::ensure!(
+            defects + bugs == gap,
+            "CRUST gap invariant failed: manual_constants.toml [crust_gap] defects ({defects}) \
+             + bugs ({bugs}) = {} but the data-derived gap (kiro test-repair {kp} − self-gen {kb}) \
+             is {gap}. Re-reconcile the per-project classification in \
+             CRUST_SELFGEN_GAP_AUDIT.md and update [crust_gap].",
+            defects + bugs
+        );
+    }
+
     // (2c) Every re-scored baseline report must also cover exactly 87 included
     //      projects, so a malformed report can't shift a baseline denominator.
     for name in ["gpt54", "kimi_k25", "gemini31pro",
@@ -960,6 +983,24 @@ fn crust_leaderboard(repo_root: &Path) -> std::collections::BTreeMap<String, u32
     out
 }
 
+/// Read the `[crust_gap]` block from `manual_constants.toml`: the human
+/// classification of the self-generated-vs-test-repair gap into `defects`
+/// (ground-truth test expects behavior the C never produces; ACTOR faithful)
+/// and `bugs` (ACTOR genuinely diverges from C). Returns `(defects, bugs)`, or
+/// `(0, 0)` if absent. The gap SIZE is derived, not read; a generator invariant
+/// asserts `defects + bugs == gap` so this manual split cannot drift.
+fn crust_gap_split(repo_root: &Path) -> (u32, u32) {
+    let path = repo_root.join("manual_constants.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else { return (0, 0) };
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else { return (0, 0) };
+    let get = |k: &str| doc.get("crust_gap")
+        .and_then(|t| t.as_table())
+        .and_then(|t| t.get(k))
+        .and_then(|v| v.as_integer())
+        .unwrap_or(0) as u32;
+    (get("defects"), get("bugs"))
+}
+
 /// Per-mode/agent count of CRUST projects whose translated crate compiled
 /// (build_ok == true) over the canonical 87 subset. Mirrors `crust_pass_adjusted`
 /// but reports builds rather than test passes.
@@ -1205,6 +1246,30 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
     // contrasts it with test-repair. Same source as the tab:crust self-gen row.
     let (kbp, kbt) = crust_bl.get("kiro").copied().unwrap_or((0, 0));
     o.push_str(&format!("\\newcommand{{\\CrustKiroSelfGen}}{{{}/{}}}\n", kbp, kbt));
+
+    // ── Self-generated vs test-repair gap, for the "tests encode a specification
+    //    absent from the C" prose. The reported denominator and the count of
+    //    excluded suites come straight from the exclusions module (single source).
+    //    The gap SIZE is derived here (test-repair passes − self-gen passes for
+    //    kiro) so it can never disagree with the tab:crust cells; the split of
+    //    that gap into benchmark defects vs genuine bugs is a manual per-project
+    //    judgment read from manual_constants.toml, and an invariant below asserts
+    //    defects + bugs == gap so the manual split cannot drift from the data.
+    o.push_str(&format!("\\newcommand{{\\CrustReported}}{{{}}}\n",
+        crate::exclusions::CRUST_REPORTED));
+    o.push_str(&format!("\\newcommand{{\\CrustExcluded}}{{{}}}\n",
+        crate::exclusions::excluded_count()));
+    let gap = kiro_p.saturating_sub(kbp);
+    o.push_str(&format!("\\newcommand{{\\CrustGapProjects}}{{{}}}\n", gap));
+    let (gap_defects, gap_bugs) = crust_gap_split(repo_root);
+    o.push_str(&format!("\\newcommand{{\\CrustGapDefects}}{{{}}}\n", gap_defects));
+    o.push_str(&format!("\\newcommand{{\\CrustGapBugs}}{{{}}}\n", gap_bugs));
+    // Next-best test-blind system, to substantiate the ceiling claim. Derived from
+    // the SAME re-scored self-gen baseline path as the tab:crust GPT-5.4 row.
+    if let Some((_, gpt_pass, gpt_total)) = crust_baseline_selfgen_87(repo_root, "gpt54") {
+        o.push_str(&format!("\\newcommand{{\\CrustGptFourSelfGen}}{{{}/{}}}\n", gpt_pass, gpt_total));
+    }
+
     let (laertes_breaks, laertes_fixes) = laertes_vs_c2rust(repo_root);
     o.push_str(&format!("\\newcommand{{\\LaertesBreaks}}{{{}}}\n", laertes_breaks));
     o.push_str(&format!("\\newcommand{{\\LaertesFixes}}{{{}}}\n", laertes_fixes));
