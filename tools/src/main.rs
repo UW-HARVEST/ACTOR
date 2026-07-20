@@ -1,7 +1,9 @@
 mod battery;
 mod cargo_toml;
 mod cli;
+mod exclusions;
 mod report;
+mod scoring;
 mod test;
 mod translate;
 mod verify;
@@ -155,6 +157,9 @@ fn main() -> Result<()> {
         }
         Command::Report => {
             report::generate(&repo_root)?;
+        }
+        Command::ScoreSelfgenBaselines => {
+            test::score_selfgen_baselines(&repo_root)?;
         }
     }
     Ok(())

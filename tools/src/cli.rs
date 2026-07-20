@@ -189,6 +189,12 @@ pub enum Command {
     },
     /// Generate markdown report tables from validated results into tables/
     Report,
+    /// Score the CRUST-Bench self-generated (no-test-access) baseline translations
+    /// against ground-truth tests, caching results in the baseline
+    /// `test_report_<N>.json` format so the report generator reads them exactly
+    /// like the test-repair baselines. One workspace per model under
+    /// `crust-bench/src/outputs/{gpt54,kimi_k25,gemini31pro}/`.
+    ScoreSelfgenBaselines,
 }
 
 // ── Type-safe execution plans ──────────────────────────────────────────

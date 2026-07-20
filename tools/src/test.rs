@@ -125,6 +125,21 @@ struct CrustTestResult {
     build_ok: bool,
 }
 
+impl CrustTestResult {
+    /// THE canonical CRUST pass rule (see `crate::scoring::CrustOutcome::passed`):
+    /// at least one ground-truth test passed and none failed. A crate that builds
+    /// but runs zero tests is NOT a pass. Kept identical to the report generator
+    /// and the baselines so ACTOR is never scored more leniently than its rivals.
+    fn passed(&self) -> bool {
+        crate::scoring::CrustOutcome {
+            built: self.build_ok,
+            tests_ok: self.tests_ok as u32,
+            tests_failed: self.tests_failed as u32,
+        }
+        .passed()
+    }
+}
+
 /// Aggregated CRUST results keyed by project name.
 #[derive(Debug, Serialize, Deserialize)]
 struct CrustBaseline(std::collections::BTreeMap<String, CrustTestResult>);
@@ -179,6 +194,64 @@ fn openssl_dir() -> String {
     std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into())
 }
 
+/// Extract the body of a Cargo.toml `[dependencies]` table (the lines after the
+/// header up to the next `[section]` or EOF), trimmed. Empty if absent.
+fn extract_dependencies(toml: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_deps = false;
+    for line in toml.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_deps = t == "[dependencies]";
+            continue;
+        }
+        if in_deps && !t.is_empty() {
+            out.push(line);
+        }
+    }
+    out.join("\n")
+}
+
+/// Merge a scaffold Cargo.toml (authoritative for package metadata and
+/// `[[test]]`/`[[bin]]` targets) with the agent's `[dependencies]`. When the
+/// scaffold's dependency table is empty but the agent declared crates, keep the
+/// agent's — otherwise the real-test build fails to resolve those crates even
+/// though the translation is correct. If the scaffold already lists
+/// dependencies, it wins (it is the ground truth for that project).
+fn merge_cargo_deps(scaffold: &str, agent: &str) -> String {
+    let scaffold_deps = extract_dependencies(scaffold);
+    if !scaffold_deps.is_empty() {
+        return scaffold.to_string();
+    }
+    let agent_deps = extract_dependencies(agent);
+    if agent_deps.is_empty() {
+        return scaffold.to_string();
+    }
+    // Replace the scaffold's (empty) [dependencies] block with the agent's,
+    // or append one if the scaffold has no [dependencies] section at all.
+    if scaffold.contains("[dependencies]") {
+        let mut result = Vec::new();
+        let mut in_deps = false;
+        for line in scaffold.lines() {
+            let t = line.trim();
+            if t == "[dependencies]" {
+                result.push(line.to_string());
+                result.push(agent_deps.clone());
+                in_deps = true;
+                continue;
+            }
+            if in_deps {
+                // skip the scaffold's (empty) dep lines until the next section
+                if t.starts_with('[') { in_deps = false; } else { continue; }
+            }
+            result.push(line.to_string());
+        }
+        result.join("\n") + "\n"
+    } else {
+        format!("{}\n\n[dependencies]\n{}\n", scaffold.trim_end(), agent_deps)
+    }
+}
+
 /// Run cargo test on a single CRUST project, return typed result.
 fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
     // Clean up test artifacts and shared temp dirs (some CRUST tests use ./tmp)
@@ -188,25 +261,65 @@ fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
     }
 
     let openssl = openssl_dir();
-    let output = Command::new("timeout")
-        .args(["60", "cargo", "test", "--", "--test-threads=1"])
-        .env("OPENSSL_DIR", &openssl)
-        .current_dir(proj_dir)
-        .output()
-        .with_context(|| format!("running cargo test in {}", proj_dir.display()))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Pre-fetch dependencies before the timed build. Otherwise a first-run
+    // crates.io index population can race the `cargo test` step and surface as
+    // a spurious `E0432: unresolved import` build failure (the crate is fetched
+    // moments later). Fetching first makes the build deterministic and offline.
+    let _ = Command::new("cargo")
+        .arg("fetch")
+        .env("OPENSSL_DIR", &openssl)
+        .env("OPENSSL_NO_VENDOR", "1")
+        .current_dir(proj_dir)
+        .output();
+
+    let run_cargo_test = || -> Result<std::process::Output> {
+        Command::new("timeout")
+            .args(["60", "cargo", "test", "--", "--test-threads=1"])
+            .env("OPENSSL_DIR", &openssl)
+        .env("OPENSSL_NO_VENDOR", "1")
+            .current_dir(proj_dir)
+            .output()
+            .with_context(|| format!("running cargo test in {}", proj_dir.display()))
+    };
+
+    let mut output = run_cargo_test()?;
+    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // `OPENSSL_NO_VENDOR=1` (set above) forces the system OpenSSL and is the primary
+    // fix for the flake below: a few crates enable openssl's `vendored` feature,
+    // which builds OpenSSL from source via `openssl-src` and non-deterministically
+    // fails ("'perl' reported failure"). Forcing system OpenSSL makes it stable.
+    // This retry stays as a belt-and-suspenders: retry ONCE on the openssl-sys
+    // build-script signature (never on genuine `error[...]`/`could not compile`, so
+    // real compile bugs are still caught first-run).
+    let openssl_flake = stderr.contains("failed to run custom build command for `openssl-sys`")
+        && !stderr.contains("error[")
+        && !stderr.contains("could not compile");
+    if openssl_flake {
+        output = run_cargo_test()?;
+        stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 
     let (tests_ok, tests_failed) = parse_cargo_test_results(&stdout);
     let build_ok = !stderr.contains("error[") && !stderr.contains("could not compile")
         && !stderr.contains("failed to run custom build command");
+
+    // NOTE: we deliberately do NOT add an exit-code guard here. CRUST-Bench's
+    // protocol (compile_projects.py) scores purely by counting `... ok`/`... FAILED`
+    // in stdout and ignores the process exit code — so a test binary that aborts
+    // AFTER printing some `... ok` lines still counts those as passes. To keep our
+    // numbers directly comparable to the CRUST-Bench leaderboard we match that
+    // behavior exactly (a stricter exit-code rule would diverge from upstream).
 
     // If build failed or no tests ran, re-run with --verbose for full diagnostics
     let (final_stdout, final_stderr) = if !build_ok || (tests_ok == 0 && tests_failed == 0) {
         let verbose = Command::new("timeout")
             .args(["60", "cargo", "test", "--verbose"])
             .env("OPENSSL_DIR", &openssl)
+        .env("OPENSSL_NO_VENDOR", "1")
             .current_dir(proj_dir)
             .output()
             .ok();
@@ -214,10 +327,10 @@ fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
             (String::from_utf8_lossy(&v.stdout).into_owned(),
              String::from_utf8_lossy(&v.stderr).into_owned())
         } else {
-            (stdout.into_owned(), stderr.into_owned())
+            (stdout.clone(), stderr.clone())
         }
     } else {
-        (stdout.into_owned(), stderr.into_owned())
+        (stdout.clone(), stderr.clone())
     };
 
     let logs_dir = proj_dir.join("logs");
@@ -241,15 +354,166 @@ fn test_one_crust(proj_dir: &Path) -> Result<CrustTestResult> {
     Ok(CrustTestResult { tests_ok, tests_failed, build_ok })
 }
 
+/// Read the Cargo package name from a crate's `Cargo.toml` `[package] name`. The
+/// workspace directory name and the package name often DIFFER (e.g. dir
+/// `lambda_calculus_eval` -> pkg `lambda-calculus-eval`, dir `proj_2DPartInt` ->
+/// pkg `twoDPartInt`), and `cargo -p` matches the PACKAGE name; using the dir name
+/// silently matches nothing and runs zero tests. Falls back to the dir name.
+fn workspace_member_package_name(crate_dir: &Path, dir_name: &str) -> String {
+    let toml_path = crate_dir.join("Cargo.toml");
+    if let Ok(text) = std::fs::read_to_string(&toml_path) {
+        if let Ok(doc) = text.parse::<toml_edit::DocumentMut>() {
+            if let Some(name) = doc
+                .get("package")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+            {
+                return name.to_string();
+            }
+        }
+    }
+    dir_name.to_string()
+}
+
+/// Score one workspace member via `cargo test -p <pkg>` from the workspace root.
+/// The baseline crates use `{ workspace = true }` dependencies, so each must be
+/// built inside its workspace rather than copied out standalone. `pkg` MUST be the
+/// Cargo package name (see `workspace_member_package_name`), not the directory
+/// name. Returns `(tests_ok, tests_failed, built)`, where `built` is a real
+/// compile check (same build-failure detection as `test_one_crust`), so the
+/// "Builds" column means exactly the same thing for baselines as ACTOR's
+/// `build_ok` flag.
+fn score_workspace_member(workspace_root: &Path, pkg: &str) -> (usize, usize, bool) {
+    let openssl = openssl_dir();
+    // Pre-fetch to keep the timed build deterministic/offline (mirrors test_one_crust).
+    let _ = Command::new("cargo")
+        .args(["fetch", "-p", pkg])
+        .env("OPENSSL_DIR", &openssl)
+        .env("OPENSSL_NO_VENDOR", "1")
+        .current_dir(workspace_root)
+        .output();
+    let run_cargo_test = || {
+        Command::new("timeout")
+            .args(["120", "cargo", "test", "-p", pkg, "--", "--test-threads=1"])
+            .env("OPENSSL_DIR", &openssl)
+        .env("OPENSSL_NO_VENDOR", "1")
+            .current_dir(workspace_root)
+            .output()
+    };
+    let Ok(mut output) = run_cargo_test() else { return (0, 0, false) };
+    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    // Retry once on the openssl-sys cold-build flake (see test_one_crust); do not
+    // retry genuine compile errors, so real bugs are still caught first-run.
+    if stderr.contains("failed to run custom build command for `openssl-sys`")
+        && !stderr.contains("error[") && !stderr.contains("could not compile")
+    {
+        if let Ok(retry) = run_cargo_test() {
+            output = retry;
+            stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        }
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    // Same compile-failure signature as test_one_crust, so "Builds" is consistent.
+    // `cargo -p` matching no package is a hard usage error, not a build failure —
+    // guard against it so a name-resolution slip can't masquerade as "built".
+    let no_match = stderr.contains("did not match any packages");
+    let built = !no_match
+        && !stderr.contains("error[")
+        && !stderr.contains("could not compile")
+        && !stderr.contains("failed to run custom build command");
+    let (ok, fail) = parse_cargo_test_results(&stdout);
+    // No exit-code guard: match CRUST-Bench's protocol exactly (count `... ok`/
+    // `... FAILED` in stdout, ignore exit code), so baselines and ACTOR are scored
+    // identically to the upstream leaderboard.
+    (ok, fail, built)
+}
+
+/// Score one CRUST-Bench baseline workspace against ground-truth tests, writing a
+/// `{project, ok, fail, built}` array to `<workspace>/<out_file>`. `built` is a
+/// real compile check, so the report generator's "Builds"/"Tests" columns mean
+/// exactly the same thing for baselines as for ACTOR (one `CrustOutcome` rule).
+fn score_baseline_workspace(ws: &Path, out_file: &str) -> Result<Option<(u32, u32, u32)>> {
+    if !ws.join("Cargo.toml").is_file() {
+        println!("⏭️  {}: no workspace Cargo.toml, skipping", ws.display());
+        return Ok(None);
+    }
+    // Workspace members = immediate subdirectories containing a Cargo.toml.
+    let mut projects: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(ws)? {
+        let entry = entry?;
+        if entry.path().is_dir() && entry.path().join("Cargo.toml").is_file() {
+            projects.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    projects.sort();
+    println!("▶ scoring {}: {} member crates (ground-truth tests)", ws.display(), projects.len());
+
+    let mut report: Vec<serde_json::Value> = Vec::new();
+    let (mut pass, mut builds, mut counted) = (0u32, 0u32, 0u32);
+    for proj in &projects {
+        // `proj` is the directory name (the key used by exclusions + the authors'
+        // reports); `cargo -p` needs the actual package name, which often differs.
+        let pkg = workspace_member_package_name(&ws.join(proj), proj);
+        let (ok, fail, built) = score_workspace_member(ws, &pkg);
+        report.push(serde_json::json!({ "project": proj, "ok": ok, "fail": fail, "built": built }));
+        if !crate::exclusions::is_excluded(proj) {
+            counted += 1;
+            let outcome = crate::scoring::CrustOutcome::from_baseline(
+                &serde_json::json!({ "ok": ok, "fail": fail, "built": built }),
+            );
+            if outcome.passed() { pass += 1; }
+            if outcome.built() { builds += 1; }
+            let mark = if outcome.passed() { "✅" } else { "❌" };
+            let b = if built { "" } else { " (build FAILED)" };
+            println!("  {mark} {proj}: {ok} ok, {fail} fail{b}");
+        }
+    }
+    let out_path = ws.join(out_file);
+    std::fs::write(&out_path, serde_json::to_string_pretty(&report)? + "\n")?;
+    println!(
+        "📝 {}: builds {builds}/{counted}, tests {pass}/{counted} over the 87-subset",
+        out_path.display()
+    );
+    Ok(Some((builds, pass, counted)))
+}
+
+/// Re-score ALL CRUST-Bench baselines (self-generated single-shot AND test-repair)
+/// against ground-truth tests through the one shared pipeline, so every baseline
+/// cell — Builds and Tests — is data-derived by the identical rule as ACTOR.
+///
+/// Self-generated workspaces (`gpt54`, `kimi_k25`, `gemini31pro`) are single-shot
+/// transpilations (verified: transpilation-only prompt, no repair metadata, no
+/// test access). Test-repair workspaces (`*_test_repair`) additionally iterate
+/// with test feedback. Both ship identical ground-truth tests. Output goes to
+/// `test_report_selfgen.json` (self-gen) / `test_report_scored.json` (test-repair)
+/// as `{project, ok, fail, built}`.
+pub fn score_selfgen_baselines(repo_root: &Path) -> Result<()> {
+    let outputs = repo_root.join("crust-bench/src/outputs");
+    let workspaces = [
+        ("gpt54", "test_report_selfgen.json"),
+        ("kimi_k25", "test_report_selfgen.json"),
+        ("gemini31pro", "test_report_selfgen.json"),
+        ("gpt54_test_repair", "test_report_scored.json"),
+        ("kimi_k25_test_repair", "test_report_scored.json"),
+        ("gemini31pro_test_repair", "test_report_scored.json"),
+    ];
+    for (name, out_file) in workspaces {
+        score_baseline_workspace(&outputs.join(name), out_file)?;
+    }
+    Ok(())
+}
+
 /// Parse `test result: ok. N passed; M failed; ...` lines from cargo test stdout.
 /// Deterministic regardless of output interleaving.
 fn parse_cargo_test_results(stdout: &str) -> (usize, usize) {
-    let re = Regex::new(r"test result: \S+\. (\d+) passed; (\d+) failed;").unwrap();
-    let (mut ok, mut failed) = (0usize, 0usize);
-    for caps in re.captures_iter(stdout) {
-        ok += caps[1].parse::<usize>().unwrap_or(0);
-        failed += caps[2].parse::<usize>().unwrap_or(0);
-    }
+    // Match CRUST-Bench's protocol EXACTLY (compile_projects.py::test):
+    //   oks   = stdout.count('... ok')
+    //   fails = stdout.count('... FAILED')
+    // i.e. count per-test result lines, NOT the `test result:` summary line. This is
+    // deliberately identical to upstream so our numbers are directly comparable to the
+    // CRUST-Bench leaderboard (a crate is scored pass downstream iff ok>0 && fail==0).
+    let ok = stdout.matches("... ok").count();
+    let failed = stdout.matches("... FAILED").count();
     (ok, failed)
 }
 
@@ -425,7 +689,7 @@ pub fn run_blind_crust_test(
             (CrustTestResult { tests_ok: 0, tests_failed: 0, build_ok: true }, false)
         } else {
             let r = test_one_crust(proj_dir.as_ref())?;
-            let ok = r.build_ok && r.tests_ok > 0 && r.tests_failed == 0;
+            let ok = r.passed();
             if ok { llm_passed += 1; }
             // Preserve LLM test log
             let logs_dir = proj_dir.join("logs");
@@ -448,13 +712,21 @@ pub fn run_blind_crust_test(
             if bin_dir.is_dir() { std::fs::remove_dir_all(&bin_dir)?; }
             let _ = std::fs::remove_dir_all(proj_dir.join("target"));
             crate::translate::copy_dir_all(&real_bin, &bin_dir)?;
-            // Swap Cargo.toml so [[test]] entries match the real test files
+            // Swap in the scaffold's Cargo.toml so [[test]]/[[bin]] entries match
+            // the real test files, BUT preserve the agent's [dependencies]. The
+            // scaffold ships an empty [dependencies]; blindly overwriting drops
+            // crates the translation legitimately needs (e.g. termion for a C
+            // program that uses termios/ioctl), spuriously failing the build.
             std::fs::rename(&cargo_toml, &cargo_backup)?;
-            std::fs::copy(project.scaffold().join("Cargo.toml"), &cargo_toml)?;
+            let scaffold_toml = std::fs::read_to_string(project.scaffold().join("Cargo.toml"))
+                .unwrap_or_default();
+            let agent_toml = std::fs::read_to_string(&cargo_backup).unwrap_or_default();
+            let merged = merge_cargo_deps(&scaffold_toml, &agent_toml);
+            std::fs::write(&cargo_toml, merged)?;
         }
 
         let real_result = test_one_crust(proj_dir.as_ref())?;
-        let real_ok = real_result.build_ok && real_result.tests_ok > 0 && real_result.tests_failed == 0;
+        let real_ok = real_result.passed();
         if real_ok { real_passed += 1; }
 
         // Preserve real test log

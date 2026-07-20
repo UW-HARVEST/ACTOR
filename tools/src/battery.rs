@@ -66,14 +66,6 @@ pub fn has_shared_source_groups(corpus_dir: &Path, battery_name: &str) -> bool {
 
 // ── CRUST-bench project (validated newtype) ────────────────────────────
 
-const CRUST_SKIP: &[&str] = &[
-    "Genetic_neural_network_for_simple_control", // C test >120s with -O2, https://github.com/anirudhkhatry/CRUST-bench/issues/40
-    "Holdem_Odds", // contradictory tests, https://github.com/anirudhkhatry/CRUST-bench/issues/37
-    "VaultSync", // test hardcodes /home/elhalili/... absolute path, only passes with leftover state
-    "bitset", // test uses bs.test() but C checks raw bits, https://github.com/anirudhkhatry/CRUST-bench/issues/41
-    "clog", // THIS_FILE hardcodes C filename, https://github.com/anirudhkhatry/CRUST-bench/issues/39
-];
-
 /// A validated CRUST project. Can only be constructed through `discover()` or
 /// `validated()`, which enforce the skip list and resolve paths.
 #[derive(Debug, Clone)]
@@ -97,7 +89,7 @@ impl CrustProject {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| !CRUST_SKIP.contains(&n.as_str()))
+            .filter(|n| !crate::exclusions::is_not_run(n))
             .collect();
         names.sort();
         if let Some(n) = limit { names.truncate(n); }
@@ -110,7 +102,7 @@ impl CrustProject {
     /// Validate a single project name against the skip list and resolve paths.
     pub fn validated(datasets_dir: &Path, name: &str) -> Result<Self> {
         anyhow::ensure!(
-            !CRUST_SKIP.contains(&name),
+            !crate::exclusions::is_not_run(name),
             "{name} is in the CRUST skip list"
         );
         Self::resolve(datasets_dir, name.to_string())
