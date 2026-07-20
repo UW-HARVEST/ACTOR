@@ -57,6 +57,22 @@ blank_lines = 7020
 # generator reads through the same CrustOutcome rule as ACTOR. Removed from here.
 #
 # ---------------------------------------------------------------------------
+# Self-generated vs test-repair gap classification (prose: "The tests encode
+# expectations that the C does not"). The GAP SIZE itself is derived by the
+# generator (CRUST test-repair passes − self-generated passes) and asserted to
+# equal defects + bugs below, so this split cannot drift from the tables. The
+# split into "benchmark defect" vs "genuine ACTOR bug" is a human per-project
+# judgment (comparing each failing ground-truth test against the original C;
+# see harvest-agentic/CRUST_SELFGEN_GAP_AUDIT.md for file:line proof of each),
+# which no committed pipeline reproduces, so it is entered here.
+#   defects: ground-truth test expects a value the reference C never produces
+#            (test's expectation not derivable from the C); ACTOR is faithful.
+#   bugs:    ACTOR's translation genuinely diverges from C; test feedback fixes.
+[crust_gap]
+defects = 21
+bugs = 5
+
+# ---------------------------------------------------------------------------
 # tab:crust prior CRUST-Bench leaderboard block — external cited results from
 # the CRUST-Bench paper (out of 100). Not our runs; cited, not reproduced.
 # ---------------------------------------------------------------------------
