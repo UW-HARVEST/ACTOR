@@ -1,0 +1,87 @@
+# MANUALLY ENTERED constants — NOT derived from the results data.
+#
+# Every number here is the product of human analysis or is external cited data
+# that no committed pipeline reproduces. The generator (`harvest-tools report`)
+# only transcribes this file into tables/manual.tex as \newcommand macros; it
+# never computes these values. Edit here (one place) to change them.
+#
+# Each entry documents WHY it is manual. If a value later becomes derivable,
+# move it out of this file and into the generated numbers.tex.
+
+# ---------------------------------------------------------------------------
+# tab:root-causes — manual triage of ACTOR's TRACTOR failures into categories.
+# No categorizer exists; a human read each failing case's diff and assigned
+# (possibly multiple) categories. Counts sum to 30 across the failing cases.
+# ---------------------------------------------------------------------------
+[root_causes]
+undefined_behavior = 3
+macros = 3
+configuration = 1
+input_processing = 9
+underspecified_behavior = 2
+truncated_output = 12
+
+# ---------------------------------------------------------------------------
+# tab:unsafe-root-causes — manual classification of unsafe constructs in
+# ACTOR's translated output. count_unsafe() yields only blocks/fns/impls/lines,
+# never categories; these were produced by a one-off grep-and-classify pass
+# over a de-duplicated file set.
+# ---------------------------------------------------------------------------
+[unsafe_categories]
+c_abi_preservation = 1648
+external_ffi_calls = 208
+function_pointer_dispatch = 36
+mutable_global_state = 116
+bridging_raw_pointers = 60
+c_string_pointer_conversions = 2194
+ptr_intrinsics = 527
+uninitialized_zero_init = 70
+raw_pointer_types = 5957
+pointer_arithmetic = 3931
+others = 44
+total = 14791
+
+# Caption aggregates for tab:unsafe-root-causes (de-duplicated file set;
+# comment/blank counting the generator does not currently do).
+[unsafe_caption]
+files = 382
+loc = 56258
+comment_lines = 1070
+blank_lines = 7020
+
+# ---------------------------------------------------------------------------
+# tab:crust self-generated (no-tests) one-shot baselines are NO LONGER MANUAL.
+# `harvest-tools score-selfgen-baselines` compiles+tests the committed baseline
+# translations (crust-bench/src/outputs/{gpt54,kimi_k25,gemini31pro}) against the
+# ground-truth tests and writes test_report_selfgen.json, which the report
+# generator reads through the same CrustOutcome rule as ACTOR. Removed from here.
+#
+# ---------------------------------------------------------------------------
+# tab:crust prior CRUST-Bench leaderboard block — external cited results from
+# the CRUST-Bench paper (out of 100). Not our runs; cited, not reproduced.
+# ---------------------------------------------------------------------------
+[crust_leaderboard]
+gpt5_compiler_builds = 92
+gpt5_compiler_tests = 43
+gemini3_compiler_builds = 88
+gemini3_compiler_tests = 41
+o3_compiler_builds = 68
+o3_compiler_tests = 31
+sweagent_builds = 41
+sweagent_tests = 32
+gpt5_testrepair_builds = 85
+gpt5_testrepair_tests = 70
+gemini3_testrepair_builds = 83
+gemini3_testrepair_tests = 66
+o3_testrepair_builds = 63
+o3_testrepair_tests = 48
+
+# ---------------------------------------------------------------------------
+# tab:prompt-sensitivity cross-prompt swap block (TRACTOR B0X, n=210). A one-off
+# experiment: each library translated with the executable prompt and vice versa,
+# split by exec/lib. TRACTOR-derived (summary.json), unaffected by the CRUST
+# scoring protocol; kept here as it is a bespoke subset run, not a standard cell.
+# ---------------------------------------------------------------------------
+[prompt_sensitivity]
+lib_prompt_on_execs = "59/61"
+exec_prompt_on_libs = "4/149"
