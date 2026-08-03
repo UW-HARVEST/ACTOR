@@ -27,7 +27,10 @@ use std::path::Path;
 
 /// A benchmark dataset's participation in the shared lifecycle.
 pub trait Benchmark {
-    /// Human-readable label, for diagnostics.
+    /// Human-readable label, for diagnostics. Part of the trait's public
+    /// surface so callers can identify a `Box<dyn Benchmark>`; not all call
+    /// sites use it today.
+    #[allow(dead_code)]
     fn name(&self) -> &'static str;
 
     /// Does a separate C-as-oracle verify phase run for this agent?
@@ -56,12 +59,6 @@ pub trait Benchmark {
     /// Backfill result.json enrichment (unsafe/loc/credits). This is folded
     /// into `test --update`; the `enrich` subcommand re-runs just this step.
     fn enrich(&self, paths: &Paths, target: &str) -> Result<()>;
-
-    /// Copy a pre-verify snapshot into the kiro-translate ablation tree.
-    /// Only meaningful for datasets that keep such a snapshot.
-    fn populate(&self, _src: &Paths, _dst: &Paths, _target: &str) -> Result<()> {
-        anyhow::bail!("populate not supported for {} (no pre-verify snapshot)", self.name())
-    }
 }
 
 /// Construct the benchmark for a dataset. The single dispatch point.
@@ -217,13 +214,6 @@ impl Benchmark for TestCorpus {
         }
         Ok(())
     }
-
-    fn populate(&self, src: &Paths, dst: &Paths, target: &str) -> Result<()> {
-        for bat in resolve_batteries(&src.corpus_dir, target)? {
-            crate::populate_test_corpus(src, dst, &bat)?;
-        }
-        Ok(())
-    }
 }
 
 // ── CRUST ──────────────────────────────────────────────────────────────
@@ -283,11 +273,6 @@ impl Benchmark for BlindCrust {
     fn enrich(&self, paths: &Paths, target: &str) -> Result<()> {
         let projects = resolve_crust_projects(&paths.corpus_dir, target, None)?;
         test::enrich_blind_crust(paths, &projects)
-    }
-
-    fn populate(&self, src: &Paths, dst: &Paths, target: &str) -> Result<()> {
-        let projects = resolve_crust_projects(&src.corpus_dir, target, None)?;
-        crate::populate_blind_crust(src, dst, &projects)
     }
 }
 

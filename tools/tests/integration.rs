@@ -103,7 +103,7 @@ mod cargo_toml_manipulation {
     #[test]
     fn real_p01_cargo_toml_roundtrip() {
         let root = repo_root();
-        let cargo_path = root.join("results/P01_sphincs_plus/005_sphincs_PQCgenKAT_sign_blake_128f_simple/translated_rust/Cargo.toml");
+        let cargo_path = root.join("results/P01_sphincs_plus/005_sphincs_PQCgenKAT_sign_blake_128f_simple/translated/Cargo.toml");
         if !cargo_path.exists() {
             eprintln!("Skipping: no P01 translation available");
             return;
@@ -144,12 +144,13 @@ mod cargo_toml_manipulation {
             let entry = entry.unwrap();
             let name = entry.file_name().to_string_lossy().to_string();
             if !name.ends_with("_lib") { continue; }
-            let original = entry.path().join("translated_rust_original");
+            // The translated/ phase dir is the immutable pre-verify crate.
+            let original = entry.path().join("translated");
             if !original.exists() { continue; }
 
             // Copy to temp and strip
             let tmp = tempfile::tempdir().unwrap();
-            let dst = tmp.path().join("translated_rust");
+            let dst = tmp.path().join("translated");
             harvest_tools::translate::copy_dir_all(&original, &dst).unwrap();
 
             // Create a fake main.rs and tests/ to verify they get removed

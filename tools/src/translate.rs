@@ -126,14 +126,13 @@ pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, 
 
         for cfg in &group.configs {
             current += 1;
-            if output_dir.join(&cfg.name).join(crate::battery::TRANSLATED_RUST).join("Cargo.toml").exists() {
+            if crate::battery::phase_dir(&output_dir.join(&cfg.name), crate::battery::TRANSLATED).join("Cargo.toml").exists() {
                 translated += 1;
                 println!("[{current}/{total}] ⏭️  {} (already done)", cfg.name);
                 continue;
             }
             match propagate_config(&paths, battery_name, &group.real_case, cfg) {
                 Ok(()) => {
-                    let _ = save_original(&output_dir, &cfg.name);
                     translated += 1;
                     println!("[{current}/{total}] 🔗 {} → {}", cfg.name, group.real_case);
                 }
@@ -158,18 +157,18 @@ fn translate_one_independent(
     battery_name: &str,
     case: &battery::IndependentCase,
 ) -> CaseResult {
-    if output_dir.join(&case.name).join(crate::battery::TRANSLATED_RUST).join("Cargo.toml").exists() {
+    if crate::battery::phase_dir(&output_dir.join(&case.name), crate::battery::TRANSLATED).join("Cargo.toml").exists() {
         return CaseResult { name: case.name.clone(), elapsed_secs: 0, success: true, error: None, skipped: true };
     }
 
-    run_and_record(&case.name, &output_dir.join(&case.name), paths.agent, output_dir,
+    run_and_record(&case.name, &output_dir.join(&case.name), paths.agent,
         || dispatch_translate(paths, battery_name, &case.name, case.is_lib),
         || {
             if paths.agent == Agent::ClaudeCrossPrompt {
                 // E4: SWAP prompts. Don't override the agent's lib-vs-bin choice
                 // (that IS the experiment), but DO add `[workspace]` so cargo
                 // doesn't try to absorb each case into a parent workspace.
-                let cargo_path = paths.case_dir(battery_name, &case.name).join(crate::battery::TRANSLATED_RUST).join("Cargo.toml");
+                let cargo_path = crate::battery::phase_dir(&paths.case_dir(battery_name, &case.name), crate::battery::TRANSLATED).join("Cargo.toml");
                 if cargo_path.exists() {
                     if let Ok(mut cargo) = CargoToml::open(&cargo_path) {
                         cargo.add_workspace();
@@ -191,22 +190,22 @@ fn translate_one_shared(
     group: &battery::SharedSourceGroup,
 ) -> CaseResult {
     let real_dir = output_dir.join(&group.real_case);
-    if real_dir.join(crate::battery::TRANSLATED_RUST).join("Cargo.toml").exists() {
+    if crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
         return CaseResult { name: group.real_case.clone(), elapsed_secs: 0, success: true, error: None, skipped: true };
     }
 
     println!("Translating: {} (shared-source, {} configs)", group.real_case, group.configs.len());
-    run_and_record(&group.real_case, &real_dir, paths.agent, output_dir,
+    run_and_record(&group.real_case, &real_dir, paths.agent,
         || dispatch_translate_shared(paths, battery_name, &group.real_case),
         || {
-            if let Ok(mut cargo) = CargoToml::open(&real_dir.join(crate::battery::TRANSLATED_RUST).join("Cargo.toml")) {
+            if let Ok(mut cargo) = CargoToml::open(&crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED).join("Cargo.toml")) {
                 cargo.add_workspace();
                 // Patch default features from CMakePresets.json (same as config copies)
                 let features = battery::extract_features_from_path(
                     &paths.input_dir(battery_name).join(&group.real_case).join("CMakePresets.json"),
                 ).unwrap_or_default();
                 let resolved = battery::resolve_features(
-                    &real_dir.join(crate::battery::TRANSLATED_RUST).join("Cargo.toml"), &features,
+                    &crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED).join("Cargo.toml"), &features,
                 ).unwrap_or_default();
                 if !resolved.is_empty() {
                     cargo.set_default_features(&resolved);
@@ -224,7 +223,6 @@ fn run_and_record(
     name: &str,
     case_dir: &Path,
     agent: Agent,
-    output_dir: &Path,
     translate_fn: impl FnOnce() -> Result<()>,
     post_process_fn: impl FnOnce() -> Result<()>,
 ) -> CaseResult {
@@ -234,7 +232,6 @@ fn run_and_record(
             let elapsed = start.elapsed().as_secs();
             write_translation_metrics(case_dir, agent, elapsed, true);
             let _ = post_process_fn();
-            let _ = save_original(output_dir, name);
             CaseResult { name: name.to_owned(), elapsed_secs: elapsed, success: true, error: None, skipped: false }
         }
         Err(e) => {
@@ -252,7 +249,7 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
         Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
         Agent::Kimi => kimi_translate_case(paths, battery, name, is_lib),
         Agent::Oneshot => oneshot_translate_case(paths, battery, name, is_lib),
-        Agent::Kiro | Agent::KiroTranslate | Agent::Claude => {
+        Agent::Kiro | Agent::Claude => {
             let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
             let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
@@ -312,7 +309,7 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
         Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
         Agent::Kimi => kimi_translate_case(paths, battery, name, true),
         Agent::Oneshot => oneshot_translate_case(paths, battery, name, true),
-        Agent::Kiro | Agent::KiroTranslate | Agent::Claude => {
+        Agent::Kiro | Agent::Claude => {
             let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
@@ -411,24 +408,24 @@ fn translate_one_harvest_bench(paths: &Paths, project: &battery::HarvestBenchPro
     let name = project.name();
     let case_dir = paths.output_dir(name);
 
-    if case_dir.join(crate::battery::TRANSLATED_RUST).join("Cargo.toml").exists() {
+    if crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
         return CaseResult { name: name.into(), elapsed_secs: 0, success: true, error: None, skipped: true };
     }
 
-    run_and_record(name, &case_dir, paths.agent, &paths.results_dir,
+    run_and_record(name, &case_dir, paths.agent,
         || translate_case_at(paths, project.test_case(), &case_dir, prompt),
         || {
             // Post-process to a library crate: cdylib + strip bin/tests, same as
             // the test-corpus independent-lib path. The lib name is the project
             // name (the suite links `lib<name>.so` by ABI, not by symbol crate name).
-            let cargo_path = case_dir.join(crate::battery::TRANSLATED_RUST).join("Cargo.toml");
+            let cargo_path = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml");
             if cargo_path.exists() {
                 let mut cargo = CargoToml::open(&cargo_path)?;
                 cargo.add_workspace();
                 cargo.remove_bin();
                 cargo.set_lib(name);
                 cargo.save()?;
-                cargo_toml::strip_for_lib(&case_dir.join(crate::battery::TRANSLATED_RUST))?;
+                cargo_toml::strip_for_lib(&crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED))?;
             }
             Ok(())
         },
@@ -439,7 +436,7 @@ fn translate_one_harvest_bench(paths: &Paths, project: &battery::HarvestBenchPro
 
 fn preflight_check(agent: Agent) -> Result<()> {
     let (cmd, version_args): (&str, &[&str]) = match agent {
-        Agent::Kiro | Agent::KiroTranslate => ("kiro-cli", &["--version"]),
+        Agent::Kiro => ("kiro-cli", &["--version"]),
         Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt => ("claude", &["--version"]),
         Agent::CodexGpt55 | Agent::CodexGpt54 => ("codex", &["--version"]),
         Agent::C2rust => ("c2rust", &["--version"]),
@@ -515,14 +512,19 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
         std::fs::remove_dir_all(case_dir)?;
     }
 
-    let logs_dir = case_dir.join("logs");
+    // Translation output is the immutable `translated/` phase dir; its logs live
+    // inside it (translated/logs/translation.log). Created before the agent runs
+    // so `tee` can write there live; the crate copy-back below merges into this
+    // dir without clobbering logs.
+    let translated_dir = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
+    let logs_dir = translated_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
 
     let log_path = logs_dir.join("translation.log");
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
     let (work_dir, _tmp_guard) = match paths.agent {
-        Agent::Kiro | Agent::KiroTranslate | Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot => {
+        Agent::Kiro | Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot => {
             let tmp = tempfile::Builder::new()
                 .prefix("harvest-translate-")
                 .tempdir()
@@ -557,7 +559,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
     };
 
     match paths.agent {
-        Agent::Kiro | Agent::KiroTranslate => {
+        Agent::Kiro => {
             let _status = Command::new("bash")
                 .arg("-lc")
                 .arg(r#"set -o pipefail; timeout 5400 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
@@ -611,12 +613,9 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
         anyhow::bail!("no Cargo.toml produced");
     }
 
-    // Copy from temp dir back to results
-    let translated = case_dir.join(crate::battery::TRANSLATED_RUST);
-    if translated.exists() {
-        std::fs::remove_dir_all(&translated)?;
-    }
-    copy_dir_all(&work_dir, &translated)?;
+    // Merge the produced crate from the temp dir into `translated/`, preserving
+    // the logs/ already written there (copy_dir_all merges, never wipes the dst).
+    copy_dir_all(&work_dir, &translated_dir)?;
 
     Ok(())
 }
@@ -624,7 +623,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
 // ── Post-processing ────────────────────────────────────────────────────
 
 fn post_process_independent(paths: &Paths, battery: &str, name: &str, is_lib: bool) -> Result<()> {
-    let cargo_path = paths.case_dir(battery, name).join(crate::battery::TRANSLATED_RUST).join("Cargo.toml");
+    let cargo_path = crate::battery::phase_dir(&paths.case_dir(battery, name), crate::battery::TRANSLATED).join("Cargo.toml");
     if !cargo_path.exists() {
         return Ok(());
     }
@@ -636,7 +635,7 @@ fn post_process_independent(paths: &Paths, battery: &str, name: &str, is_lib: bo
         let lib_name = battery::extract_lib_name(&paths.input_dir(battery), name);
         cargo.set_lib(lib_name.as_deref().unwrap_or(name));
         cargo.save()?;
-        cargo_toml::strip_for_lib(&paths.case_dir(battery, name).join(crate::battery::TRANSLATED_RUST))?;
+        cargo_toml::strip_for_lib(&crate::battery::phase_dir(&paths.case_dir(battery, name), crate::battery::TRANSLATED))?;
     } else {
         cargo.set_bin_driver();
         cargo.save()?;
@@ -644,18 +643,27 @@ fn post_process_independent(paths: &Paths, battery: &str, name: &str, is_lib: bo
     Ok(())
 }
 
-pub fn propagate_config(
+/// Propagate the real case's crate to a shared-source config follower, for a
+/// given phase. Translate propagates the `translated/` phase; verify (after
+/// fixing the real case) re-propagates the `verified/` phase, so every config
+/// follower has the SAME post-verify crate the real case ended with — this is
+/// what makes runtests score all N configs as verified, not just the real one.
+pub fn propagate_config_phase(
     paths: &Paths,
     battery: &str,
     real_case: &str,
     cfg: &battery::Config,
+    phase: &str,
 ) -> Result<()> {
-    let real_dir = paths.case_dir(battery, real_case).join(crate::battery::TRANSLATED_RUST);
+    let real_dir = crate::battery::phase_dir(&paths.case_dir(battery, real_case), phase);
+    // Nothing to propagate if the real case never produced this phase (e.g. an
+    // agent with no verify phase → no verified/ to copy).
+    if !real_dir.is_dir() { return Ok(()); }
     let cfg_dir = paths.case_dir(battery, &cfg.name);
-    let translated = cfg_dir.join(crate::battery::TRANSLATED_RUST);
+    let translated = crate::battery::phase_dir(&cfg_dir, phase);
 
     std::fs::create_dir_all(&translated)?;
-    std::fs::create_dir_all(cfg_dir.join("logs"))?;
+    std::fs::create_dir_all(translated.join("logs"))?;
 
     let src_dst = translated.join("src");
     if src_dst.exists() {
@@ -704,6 +712,17 @@ pub fn propagate_config(
     Ok(())
 }
 
+/// Propagate the real case's `translated/` crate to a config follower (the
+/// translate-phase default).
+pub fn propagate_config(
+    paths: &Paths,
+    battery: &str,
+    real_case: &str,
+    cfg: &battery::Config,
+) -> Result<()> {
+    propagate_config_phase(paths, battery, real_case, cfg, crate::battery::TRANSLATED)
+}
+
 // ── Metrics ────────────────────────────────────────────────────────────
 
 fn write_translation_metrics(case_dir: &Path, agent: Agent, duration_secs: u64, success: bool) {
@@ -718,16 +737,6 @@ fn write_translation_metrics(case_dir: &Path, agent: Agent, duration_secs: u64, 
         case_dir.join("translation.json"),
         serde_json::to_string_pretty(&metrics).unwrap_or_default() + "\n",
     );
-}
-
-fn save_original(output_dir: &Path, name: &str) -> Result<()> {
-    let translated = output_dir.join(name).join(crate::battery::TRANSLATED_RUST);
-    let original = output_dir.join(name).join(crate::battery::TRANSLATED_RUST_ORIGINAL);
-    if original.exists() {
-        std::fs::remove_dir_all(&original)?;
-    }
-    copy_dir_all(&translated, &original)?;
-    Ok(())
 }
 
 fn count_cases(battery: &battery::Battery) -> usize {
@@ -810,7 +819,7 @@ fn prepare_crust_workspace(
 /// Invoke the agent in a working directory with a prompt.
 fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Result<()> {
     match agent {
-        Agent::Kiro | Agent::KiroTranslate => {
+        Agent::Kiro => {
             Command::new("bash")
                 .arg("-lc")
                 .arg(r#"set -o pipefail; timeout 1800 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
@@ -1189,7 +1198,7 @@ impl IsolatedWorkDir {
             .prefix("harvest-work-")
             .tempdir()
             .context("creating isolated work dir")?;
-        let src = case_dir.join(crate::battery::TRANSLATED_RUST);
+        let src = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
         if src.is_dir() {
             copy_dir_filtered(&src, &tmp.path().join(crate::battery::TRANSLATED_RUST), &["target"])?;
         }
@@ -1206,11 +1215,33 @@ impl IsolatedWorkDir {
         self.tmp.path()
     }
 
-    /// Copy results back to the case dir. Consumes self.
-    /// Skips target/ and c_src/ (kept from original).
+    /// Write the verified crate to the case's `verified/` phase dir. Consumes
+    /// self. Pure: `translated/` is never touched.
+    ///
+    /// `verified/` is seeded from `translated/` (so `c_src/` and any files the
+    /// agent didn't rewrite are present), then the agent's temp output is
+    /// overlaid on top. `target/` is skipped from both (build artifact).
     pub fn finish(mut self) -> Result<()> {
-        let dst = self.dest.join(crate::battery::TRANSLATED_RUST);
-        // Copy back everything except target/ and c_src/ (those stay from original)
+        let translated = crate::battery::phase_dir(&self.dest, crate::battery::TRANSLATED);
+        let dst = crate::battery::phase_dir(&self.dest, crate::battery::VERIFIED);
+        // Wipe verified/ EXCEPT logs/ — the caller writes verify.log into
+        // verified/logs/ live during the run, so preserve it across the reseed.
+        if dst.exists() {
+            for entry in std::fs::read_dir(&dst)? {
+                let entry = entry?;
+                if entry.file_name() == "logs" { continue; }
+                let p = entry.path();
+                if entry.file_type()?.is_dir() { std::fs::remove_dir_all(&p)?; }
+                else { std::fs::remove_file(&p)?; }
+            }
+        }
+        // 1. Seed verified/ from the immutable translated/ crate (incl. c_src/),
+        //    skipping translated/'s own logs/ so the verify log isn't shadowed.
+        if translated.is_dir() {
+            copy_dir_filtered(&translated, &dst, &["target", "logs"])?;
+        }
+        // 2. Overlay the agent's temp output (its src/Cargo.toml edits), keeping
+        //    the seeded c_src/ and dropping build artifacts.
         copy_dir_filtered(
             &self.tmp.path().join(crate::battery::TRANSLATED_RUST),
             &dst,
@@ -1347,7 +1378,7 @@ fn oneshot_llm_translate(
     let log_path = logs_dir.join("translation.log");
 
     let input_test_case = paths.input_dir(battery).join(name).join("test_case");
-    let translated = case_dir.join(crate::battery::TRANSLATED_RUST);
+    let translated = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
     std::fs::create_dir_all(&translated)?;
 
     // Copy c_src for the test harness
@@ -1619,19 +1650,21 @@ done
 fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()> {
     use std::io::Write;
 
-    // Locate c2rust source (sibling directory under results/Test-Corpus/)
-    let c2rust_original = paths.results_dir
+    // Locate c2rust source: its translated/ crate (sibling under results/).
+    // c2rust never runs a verify phase, so translated/ IS the crate to consume.
+    let c2rust_case = paths.results_dir
         .parent().context("no parent for results_dir")?
-        .join("c2rust").join(battery).join(name).join(crate::battery::TRANSLATED_RUST_ORIGINAL);
+        .join("c2rust").join(battery).join(name);
+    let c2rust_original = crate::battery::phase_dir(&c2rust_case, crate::battery::TRANSLATED);
     anyhow::ensure!(c2rust_original.is_dir(),
-        "c2rust translated_rust_original not found: {}", c2rust_original.display());
+        "c2rust translated/ crate not found: {}", c2rust_original.display());
 
     let case_dir = paths.case_dir(battery, name);
     if case_dir.exists() { std::fs::remove_dir_all(&case_dir)?; }
     let logs_dir = case_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
     let log_path = logs_dir.join("translation.log");
-    let translated = case_dir.join(crate::battery::TRANSLATED_RUST);
+    let translated = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
 
     // Copy c2rust output (skip target/ and Cargo.lock)
     copy_dir_filtered(&c2rust_original, &translated, &["target"])?;
@@ -1773,12 +1806,14 @@ fn mint_bedrock_token(region: &str) -> Result<String> {
 fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib: bool) -> Result<()> {
     use std::io::Write;
 
-    // Locate c2rust source (sibling directory under results/Test-Corpus/).
-    let c2rust_original = paths.results_dir
+    // Locate c2rust source: its translated/ crate (sibling under results/).
+    // c2rust never runs a verify phase, so translated/ IS the crate to consume.
+    let c2rust_case = paths.results_dir
         .parent().context("no parent for results_dir")?
-        .join("c2rust").join(battery).join(name).join(crate::battery::TRANSLATED_RUST_ORIGINAL);
+        .join("c2rust").join(battery).join(name);
+    let c2rust_original = crate::battery::phase_dir(&c2rust_case, crate::battery::TRANSLATED);
     anyhow::ensure!(c2rust_original.is_dir(),
-        "c2rust translated_rust_original not found (run the c2rust agent first): {}",
+        "c2rust translated/ crate not found (run the c2rust agent first): {}",
         c2rust_original.display());
 
     // Bedrock bearer token: env override wins (CI/manual), else a fresh token
@@ -1797,7 +1832,7 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
     let logs_dir = case_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
     let log_path = logs_dir.join("translation.log");
-    let translated = case_dir.join(crate::battery::TRANSLATED_RUST);
+    let translated = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
 
     // Isolated workspace we bind-mount into the container. The tool reshapes
     // <work>/rust and writes <work>/rust_WIP.

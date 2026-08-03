@@ -4,28 +4,48 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-// ── Intermediate-state directory names: ONE source of truth ────────────
+// ── Per-case phase directories: ONE source of truth ────────────────────
 //
-// These are the on-disk names of the per-case translation artifacts. They
-// were previously spelled as bare string literals in ~40 `join(...)` calls
-// across five modules; a rename or typo in any one silently produced a
-// dangling path. Defining them once here (and joining via the helpers below
-// / these constants) keeps the physical layout in a single place. The names
-// themselves are unchanged, so committed `results/` trees stay valid.
+// A case's results live in two self-contained PHASE DIRECTORIES, uniform
+// across every dataset:
+//
+//   <case>/translated/   what translation produced (pre-verify). Always present.
+//   <case>/verified/     what the verify phase produced. Present iff verify ran.
+//
+// Each phase dir is fully self-contained: it IS the crate root (src/,
+// Cargo.toml, c_src/), and carries that phase's own `result.json` and
+// `logs/`. Reading a case's "current" score uses [`crate_dir`]: verified/ if
+// it exists, else translated/. This replaces the old asymmetric layout
+// (`translated_rust/` crate + `translated_rust_original/` snapshot + a
+// case-root result.json/logs, plus blind-CRUST's `translate/`+`verify/`).
 
-/// The translated Rust crate a case produces (post-verify for two-phase
-/// pipelines; the sole output for single-phase ones).
+/// Pre-verify phase dir: exactly what translation produced. Always present.
+pub const TRANSLATED: &str = "translated";
+
+/// Post-verify phase dir: what the verify phase produced. Present iff verify ran.
+pub const VERIFIED: &str = "verified";
+
+/// The phase dir for `phase` under a case dir (`case_dir/translated` or
+/// `case_dir/verified`).
+pub fn phase_dir(case_dir: &Path, phase: &str) -> PathBuf {
+    case_dir.join(phase)
+}
+
+/// The canonical crate/result dir for a case under the reader rule:
+/// `verified/` if it exists, else `translated/`. Every reader that wants "the
+/// current state of this case" (score, LOC, unsafe, crate source) uses this,
+/// so pre- and post-verify cases resolve uniformly.
+pub fn crate_dir(case_dir: &Path) -> PathBuf {
+    let verified = case_dir.join(VERIFIED);
+    if verified.is_dir() { verified } else { case_dir.join(TRANSLATED) }
+}
+
+/// The crate-dir name MIT `runtests` hardcodes (`<case>/translated_rust/`,
+/// test-corpus/.../discovery/rust.py) and the neutral name used for the
+/// agent's temp workspace during translate/verify. NOT a storage phase dir —
+/// canonical storage uses [`TRANSLATED`]/[`VERIFIED`]. For runtests scoring a
+/// phase, `<case>/translated_rust` is staged as a symlink to that phase dir.
 pub const TRANSLATED_RUST: &str = "translated_rust";
-
-/// Immutable pre-verify snapshot of [`TRANSLATED_RUST`], saved right after
-/// translation so the mutable verify phase can always reset to it.
-pub const TRANSLATED_RUST_ORIGINAL: &str = "translated_rust_original";
-
-/// Blind-CRUST immutable translation output (agent's crate, no tests).
-pub const TRANSLATE_DIR: &str = "translate";
-
-/// Blind-CRUST mutable verify workspace (tests + any source fixes).
-pub const VERIFY_DIR: &str = "verify";
 
 /// A test case that is independently translated and verified.
 #[derive(Debug, Clone)]
@@ -598,7 +618,6 @@ impl Paths {
     pub fn new(repo_root: &Path, agent: Agent, dataset: Dataset, model: Option<&str>) -> Self {
         let agent_name: &str = match agent {
             Agent::Kiro => "kiro",
-            Agent::KiroTranslate => "kiro-translate",
             Agent::Claude => "claude",
             Agent::ClaudeCombined => "claude-combined",
             Agent::ClaudeMinimal => "claude-minimal",
@@ -660,20 +679,16 @@ impl Paths {
         self.results_dir.join(name)
     }
 
-    /// The translated-Rust crate dir for a flat-layout case (CRUST, harvest-bench):
-    /// `<results>/<name>/translated_rust`.
-    pub fn translated_rust(&self, name: &str) -> PathBuf {
-        self.results_dir.join(name).join(TRANSLATED_RUST)
-    }
-
-    /// Blind CRUST: immutable translation output.
+    /// Blind CRUST: immutable translation output. This is the case's
+    /// `translated/` phase dir (the uniform pre-verify location).
     pub fn translate_dir(&self, name: &str) -> TranslateDir {
-        TranslateDir(self.results_dir.join(name).join(TRANSLATE_DIR))
+        TranslateDir(self.results_dir.join(name).join(TRANSLATED))
     }
 
     /// Blind CRUST: mutable verify workspace (tests + possible src fixes).
+    /// This is the case's `verified/` phase dir.
     pub fn verify_dir(&self, name: &str) -> VerifyDir {
-        VerifyDir(self.results_dir.join(name).join(VERIFY_DIR))
+        VerifyDir(self.results_dir.join(name).join(VERIFIED))
     }
 
     pub fn case_dir(&self, battery: &str, case: &str) -> PathBuf {
@@ -823,8 +838,8 @@ mod tests {
         let v = paths.verify_dir("vec");
 
         assert_ne!(t.as_ref(), v.as_ref());
-        assert!(t.as_ref().ends_with("vec/translate"));
-        assert!(v.as_ref().ends_with("vec/verify"));
+        assert!(t.as_ref().ends_with("vec/translated"));
+        assert!(v.as_ref().ends_with("vec/verified"));
         assert_eq!(t.as_ref().parent(), v.as_ref().parent());
     }
 

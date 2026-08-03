@@ -1,6 +1,6 @@
 use crate::battery::{self, Case, Paths};
 use crate::cli::Agent;
-use crate::translate::{copy_dir_all, IsolatedWorkDir, Semaphore};
+use crate::translate::{IsolatedWorkDir, Semaphore};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -58,10 +58,10 @@ fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filte
             s.spawn(|| {
                 let _permit = sem.acquire();
                 let case_dir = output_dir.join(&c.name);
-                if !case_dir.join(crate::battery::TRANSLATED_RUST).join("Cargo.toml").exists() {
+                if !crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
                     return (c.name.clone(), None);
                 }
-                if !force && case_dir.join("logs/verify.log").exists() {
+                if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
                     return (c.name.clone(), None); // skipped
                 }
                 let cmake_flags = get_cmake_flags(paths, battery_name, &c.name);
@@ -90,11 +90,11 @@ fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filte
         current += 1;
         let real_dir = output_dir.join(&group.real_case);
 
-        if !real_dir.join(crate::battery::TRANSLATED_RUST).join("Cargo.toml").exists() {
+        if !crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
             continue;
         }
 
-        if !force && real_dir.join("logs/verify.log").exists() {
+        if !force && crate::battery::phase_dir(&real_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
             println!("[{current}/{total}] ⏭️  {} (already verified)", group.real_case);
         } else {
             println!("[{current}/{total}] 🔬 {} (shared-source, {} configs)", group.real_case, group.configs.len());
@@ -106,10 +106,14 @@ fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filte
             else { failed += 1; println!("[{current}/{total}] ❌ {} — verification incomplete", group.real_case); }
         }
 
-        // Always propagate fixes to configs
-        println!("Re-propagating fixes from {} to {} configs...", group.real_case, group.configs.len());
+        // Always re-propagate the real case's VERIFIED crate to each config
+        // follower, so every config carries the post-verify fixes (this is what
+        // lets runtests score all N configs as verified, not just the real one).
+        println!("Re-propagating verified fixes from {} to {} configs...", group.real_case, group.configs.len());
         for cfg in &group.configs {
-            crate::translate::propagate_config(paths, battery_name, &group.real_case, cfg)?;
+            crate::translate::propagate_config_phase(
+                paths, battery_name, &group.real_case, cfg, crate::battery::VERIFIED,
+            )?;
         }
         println!("Propagated to {} cases", group.configs.len());
     }
@@ -120,29 +124,18 @@ fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filte
 }
 
 fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, configs_text: &str, agent: Agent) -> Result<bool> {
-    let translated = case_dir.join(crate::battery::TRANSLATED_RUST);
-    let original = case_dir.join(crate::battery::TRANSLATED_RUST_ORIGINAL);
-
-    // Restore from original (clean slate)
-    if original.is_dir() {
-        if translated.exists() {
-            std::fs::remove_dir_all(&translated)?;
-        }
-        copy_dir_all(&original, &translated)?;
-    }
-
-    // Remove test_vectors and runner — verify must use C-as-oracle only
-    let tv = case_dir.join("test_vectors");
-    let runner = case_dir.join("runner");
-    if tv.exists() { std::fs::remove_dir_all(&tv)?; }
-    if runner.exists() { std::fs::remove_dir_all(&runner)?; }
-
-    let logs_dir = case_dir.join("logs");
-    std::fs::create_dir_all(&logs_dir)?;
-    let log_path = logs_dir.join("verify.log");
+    // Verify is PURE: it reads the immutable `translated/` crate (via
+    // IsolatedWorkDir), works in a temp dir, and writes the result to
+    // `verified/`. It never mutates `translated/`, so no snapshot/restore is
+    // needed. The verify log lives in `verified/logs/`.
+    let verified_logs = crate::battery::phase_dir(case_dir, crate::battery::VERIFIED).join("logs");
+    std::fs::create_dir_all(&verified_logs)?;
+    let log_path = verified_logs.join("verify.log");
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
-    // Work in an isolated temp dir — agent sees no config-specific path names
+    // Work in an isolated temp dir seeded from translated/ — the agent sees no
+    // config-specific path names, and C-as-oracle verification uses only the
+    // crate's own c_src (test_vectors/runner never enter the temp workspace).
     let work = IsolatedWorkDir::new(case_dir)?;
 
     let prompt = prompt_template
@@ -151,7 +144,7 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
         .replace("ALL_CONFIGURATIONS", configs_text);
 
     match agent {
-        Agent::Kiro | Agent::KiroTranslate => {
+        Agent::Kiro => {
             let _status = Command::new("bash")
                 .arg("-lc")
                 .arg(r#"timeout 2700 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)

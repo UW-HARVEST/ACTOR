@@ -101,13 +101,6 @@ fn main() -> Result<()> {
             let inner = Dataset::strip_prefix(target);
             benchmark::for_dataset(dataset).enrich(&paths, inner)?;
         }
-        Command::Populate { ref target, blind } => {
-            let dataset = Dataset::detect(target, blind);
-            let dst_paths = battery::Paths::new(&repo_root, agent, dataset, model);
-            let src_paths = battery::Paths::new(&repo_root, cli::Agent::Kiro, dataset, None);
-            let inner = Dataset::strip_prefix(target);
-            benchmark::for_dataset(dataset).populate(&src_paths, &dst_paths, inner)?;
-        }
         Command::Report => {
             report::generate(&repo_root)?;
         }
@@ -127,76 +120,6 @@ fn report_test_outcome(outcome: test::TestOutcome) {
         }
         std::process::exit(1);
     }
-}
-
-// ── Populate: copy pre-verify artifacts into kiro-translate tree ────────
-// Called from the Benchmark::populate impls in benchmark.rs.
-
-pub(crate) fn populate_test_corpus(src: &battery::Paths, dst: &battery::Paths, battery: &str) -> Result<()> {
-    let src_dir = src.results_dir.join(battery);
-    let dst_dir = dst.results_dir.join(battery);
-    if !src_dir.is_dir() { anyhow::bail!("{} not found", src_dir.display()); }
-    let mut count = 0usize;
-    for entry in std::fs::read_dir(&src_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() { continue; }
-        let name = entry.file_name();
-        let orig = entry.path().join(crate::battery::TRANSLATED_RUST_ORIGINAL);
-        if !orig.is_dir() { continue; }
-        let case_dst = dst_dir.join(&name);
-        let tr_dst = case_dst.join(crate::battery::TRANSLATED_RUST);
-        if tr_dst.is_dir() { count += 1; continue; } // already populated
-        // Copy translated_rust_original → translated_rust (skip target/)
-        copy_tree_no_target(&orig, &tr_dst)?;
-        // Copy translation log for credits
-        let log_src = entry.path().join("logs/translation.log");
-        if log_src.exists() {
-            let log_dst = case_dst.join("logs");
-            std::fs::create_dir_all(&log_dst)?;
-            std::fs::copy(&log_src, log_dst.join("translation.log"))?;
-        }
-        count += 1;
-    }
-    println!("✅ Populated {count} cases → {}", dst_dir.display());
-    Ok(())
-}
-
-pub(crate) fn populate_blind_crust(
-    src: &battery::Paths, dst: &battery::Paths,
-    projects: &[battery::CrustProject],
-) -> Result<()> {
-    let mut count = 0usize;
-    for project in projects {
-        let name = project.name();
-        let translate_src = src.results_dir.join(name).join(battery::TRANSLATE_DIR);
-        if !translate_src.is_dir() { continue; }
-        let proj_dst = dst.results_dir.join(name);
-        if proj_dst.join(battery::VERIFY_DIR).join("Cargo.toml").exists() { count += 1; continue; }
-        // translate/ → translate/ (unchanged)
-        copy_tree_no_target(&translate_src, &proj_dst.join(battery::TRANSLATE_DIR))?;
-        // translate/ → verify/ (test harness runs from verify_dir)
-        copy_tree_no_target(&translate_src, &proj_dst.join(battery::VERIFY_DIR))?;
-        count += 1;
-    }
-    println!("✅ Populated {count} CRUST-blind projects → {}", dst.results_dir.display());
-    Ok(())
-}
-
-/// Copy a directory tree, skipping `target/` build artifacts.
-fn copy_tree_no_target(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name == "target" { continue; }
-        let dst_path = dst.join(&name);
-        if entry.file_type()?.is_dir() {
-            copy_tree_no_target(&entry.path(), &dst_path)?;
-        } else {
-            std::fs::copy(entry.path(), &dst_path)?;
-        }
-    }
-    Ok(())
 }
 
 fn find_repo_root() -> Result<std::path::PathBuf> {

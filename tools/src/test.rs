@@ -524,7 +524,9 @@ fn load_stored_results(paths: &Paths) -> Result<CrustBaseline> {
     for entry in std::fs::read_dir(&paths.results_dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() { continue; }
-        let result_path = entry.path().join("result.json");
+        // Reader rule: score lives in the case's current phase dir (verified/
+        // else translated/). CRUST is single-phase → translated/result.json.
+        let result_path = crate::battery::crate_dir(&entry.path()).join("result.json");
         if result_path.exists() {
             let data = std::fs::read_to_string(&result_path)?;
             if let Ok(r) = serde_json::from_str::<CrustTestResult>(&data) {
@@ -552,7 +554,8 @@ fn load_blind_stored_results(paths: &Paths) -> Result<std::collections::BTreeMap
     for entry in std::fs::read_dir(&paths.results_dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() { continue; }
-        let rj = entry.path().join("verify/result.json");
+        // Blind-CRUST's verified/ phase dir holds the scored result.json.
+        let rj = crate::battery::phase_dir(&entry.path(), crate::battery::VERIFIED).join("result.json");
         if rj.exists() {
             let data = std::fs::read_to_string(&rj)?;
             if let Ok(r) = serde_json::from_str::<BlindCrustStored>(&data) {
@@ -573,7 +576,9 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
 
     for project in projects {
         let name = project.name();
-        let proj_dir = paths.output_dir(name);
+        // CRUST is single-phase: the crate is the case's `translated/` dir,
+        // carrying its own result.json + logs.
+        let proj_dir = crate::battery::phase_dir(&paths.output_dir(name), crate::battery::TRANSLATED);
         if !proj_dir.join("Cargo.toml").exists() { continue; }
 
         let r = test_one_crust(&proj_dir)?;
@@ -620,7 +625,7 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
             // Check credits + unsafe
             let mut enrich_diffs = Vec::new();
             for name in results.0.keys() {
-                let proj_dir = paths.output_dir(name);
+                let proj_dir = crate::battery::phase_dir(&paths.output_dir(name), crate::battery::TRANSLATED);
                 let tlog = proj_dir.join("logs/translation.log");
                 for d in check_enrichment(&proj_dir.join("result.json"), &proj_dir.join("src"), &[("agent", &tlog)], paths.agent) {
                     enrich_diffs.push(format!("{name}: {d}"));
@@ -635,7 +640,7 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
                 for r in &regressions {
                     println!("  {}: {} expected={} actual={}", r.project, r.field, r.expected, r.actual);
                     // Dump test log for regression diagnosis
-                    let log_path = paths.output_dir(&r.project).join("logs/test.log");
+                    let log_path = crate::battery::phase_dir(&paths.output_dir(&r.project), crate::battery::TRANSLATED).join("logs/test.log");
                     if let Ok(log) = std::fs::read_to_string(&log_path) {
                         println!("  ┌── test.log for {} ──", r.project);
                         for line in log.lines().take(200) {
@@ -834,10 +839,10 @@ fn discover_batteries(results_dir: &Path) -> Result<Vec<String>> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        // Must contain at least one case with translated_rust/
+        // Must contain at least one case with a translated/ phase dir
         let has_cases = std::fs::read_dir(entry.path())?
             .filter_map(|e| e.ok())
-            .any(|e| e.path().join(crate::battery::TRANSLATED_RUST).is_dir());
+            .any(|e| crate::battery::phase_dir(&e.path(), crate::battery::TRANSLATED).is_dir());
         if has_cases {
             batteries.push(name);
         }
@@ -865,29 +870,48 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
     copy_test_artifacts(paths, battery)?;
     let _guard = TestArtifactGuard { output_dir: output_dir.clone() };
 
-    // Clean stale build artifacts
-    clean_targets(&output_dir)?;
-
     // Generate workspace Cargo.toml for lib runners
     generate_workspace(&output_dir)?;
 
-    // Run MIT runtests — the source of truth for all test outcomes.
-    let (summary, per_case) = run_runtests(paths, battery, mode)?;
+    // Does any case have a verified/ phase (i.e. did a verify phase run)? If so
+    // we score TWO phases: the validated result (verified/) and the no-validate
+    // result (translated/). Otherwise a single translated/ pass suffices.
+    let has_verified = std::fs::read_dir(&output_dir)?.filter_map(|e| e.ok())
+        .any(|e| crate::battery::phase_dir(&e.path(), crate::battery::VERIFIED).join("Cargo.toml").exists());
 
-    // Print summary line
-    let vt = summary.vectors_passed + summary.vectors_failed;
-    let pct = if vt > 0 {
-        format!("{:.1}%", 100.0 * summary.vectors_passed as f64 / vt as f64)
-    } else {
-        "N/A".to_string()
-    };
-    println!("  {battery}: {}/{} cases, {}/{vt} vectors ({pct})",
-        summary.cases_passed, summary.cases_tested, summary.vectors_passed);
+    // Score the pre-verify (translated/) phase first; if a verify phase ran,
+    // score the post-verify (verified/) phase second and treat IT as the
+    // battery's headline summary. Each pass stages `translated_rust` → its
+    // phase dir so unmodified runtests scores that crate, writes result.json
+    // into that phase dir, and writes a per-phase battery summary.
+    let mut phases: Vec<&str> = vec![crate::battery::TRANSLATED];
+    if has_verified { phases.push(crate::battery::VERIFIED); }
+
+    let mut headline: Option<(Summary, HashMap<String, serde_json::Value>)> = None;
+    for phase in &phases {
+        stage_phase_for_runtests(&output_dir, phase)?;
+        clean_targets(&output_dir)?;
+        let (summary, per_case) = run_runtests(paths, battery, mode)?;
+        unstage_phase(&output_dir)?;
+
+        let vt = summary.vectors_passed + summary.vectors_failed;
+        let pct = if vt > 0 {
+            format!("{:.1}%", 100.0 * summary.vectors_passed as f64 / vt as f64)
+        } else { "N/A".to_string() };
+        println!("  {battery} [{phase}]: {}/{} cases, {}/{vt} vectors ({pct})",
+            summary.cases_passed, summary.cases_tested, summary.vectors_passed);
+
+        if matches!(mode, TestMode::Update) {
+            write_results(&output_dir, phase, &summary, &per_case)?;
+        }
+        headline = Some((summary, per_case)); // last phase (verified if present) is headline
+    }
     println!("========================================");
+
+    let (summary, per_case) = headline.expect("at least the translated phase is scored");
 
     match mode {
         TestMode::Update => {
-            write_results(&output_dir, battery, &summary, &per_case)?;
             let vt = summary.vectors_passed + summary.vectors_failed;
             println!("   📝 Updated: {}/{} cases, {}/{vt} vectors",
                 summary.cases_passed, summary.cases_tested, summary.vectors_passed);
@@ -899,11 +923,12 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
             // Check credits + unsafe per case
             for case_name in per_case.keys() {
                 let case_dir = output_dir.join(case_name);
-                let tlog = case_dir.join("logs/translation.log");
-                let vlog = case_dir.join("logs/verify.log");
+                let phase = crate::battery::crate_dir(&case_dir);
+                let tlog = phase.join("logs/translation.log");
+                let vlog = phase.join("logs/verify.log");
                 for d in check_enrichment(
-                    &case_dir.join("result.json"),
-                    &case_dir.join(crate::battery::TRANSLATED_RUST).join("src"),
+                    &phase.join("result.json"),
+                    &phase.join("src"),
                     &[("translate", &tlog), ("verify", &vlog)],
                     paths.agent,
                 ) {
@@ -934,6 +959,52 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
     }
 }
 
+// ── runtests phase staging ─────────────────────────────────────────────
+//
+// MIT's `runtests` (unmodified) discovers each case's crate at the hardcoded
+// path `<case>/translated_rust/` (test-corpus/.../discovery/rust.py). Our
+// canonical storage uses `translated/` and `verified/` instead. To score a
+// given phase with runtests WITHOUT touching runtests, we stage the phase dir
+// under the name runtests expects: `<case>/translated_rust` becomes a symlink
+// to `<case>/<phase>`. runtests resolves the symlink (`.resolve()`), so it
+// transparently builds and scores that phase's crate. The symlink is a
+// transient scoring artifact, removed by the TestArtifactGuard.
+
+/// Point every case's `translated_rust` symlink at the given phase dir, for the
+/// cases that have that phase. Returns the number of cases staged.
+fn stage_phase_for_runtests(output_dir: &Path, phase: &str) -> Result<usize> {
+    let mut staged = 0usize;
+    for entry in std::fs::read_dir(output_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() { continue; }
+        let case_dir = entry.path();
+        let phase_path = crate::battery::phase_dir(&case_dir, phase);
+        if !phase_path.join("Cargo.toml").exists() { continue; }
+        let link = case_dir.join(crate::battery::TRANSLATED_RUST);
+        // Replace any prior symlink/dir at translated_rust.
+        if link.is_symlink() || link.exists() {
+            let _ = std::fs::remove_file(&link);
+            if link.is_dir() { let _ = std::fs::remove_dir_all(&link); }
+        }
+        std::os::unix::fs::symlink(phase, &link)?;
+        staged += 1;
+    }
+    Ok(staged)
+}
+
+/// Remove the transient `translated_rust` staging symlinks.
+fn unstage_phase(output_dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(output_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() { continue; }
+        let link = entry.path().join(crate::battery::TRANSLATED_RUST);
+        if link.is_symlink() {
+            let _ = std::fs::remove_file(&link);
+        }
+    }
+    Ok(())
+}
+
 // ── Test artifact management ───────────────────────────────────────────
 
 fn copy_test_artifacts(paths: &Paths, battery: &str) -> Result<()> {
@@ -949,7 +1020,7 @@ fn copy_test_artifacts(paths: &Paths, battery: &str) -> Result<()> {
         let corpus_case = input_dir.join(&name);
         let case_dir = entry.path();
 
-        if !case_dir.join(crate::battery::TRANSLATED_RUST).is_dir() {
+        if !crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).is_dir() {
             continue;
         }
 
@@ -999,6 +1070,11 @@ fn cleanup_test_artifacts(output_dir: &Path) -> Result<()> {
                 std::fs::remove_dir_all(&path)?;
             }
         }
+        // Remove the transient runtests staging symlink (translated_rust → phase).
+        let link = entry.path().join(crate::battery::TRANSLATED_RUST);
+        if link.is_symlink() {
+            let _ = std::fs::remove_file(&link);
+        }
     }
     // Remove workspace Cargo.toml generated for lib runners
     let ws_toml = output_dir.join("Cargo.toml");
@@ -1012,7 +1088,9 @@ fn clean_targets(output_dir: &Path) -> Result<()> {
     for entry in std::fs::read_dir(output_dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() { continue; }
-        let target = entry.path().join(crate::battery::TRANSLATED_RUST).join("target");
+        // Clean the build target of whichever phase dir is current (verified/
+        // else translated/) — the crate runtests will build.
+        let target = crate::battery::crate_dir(&entry.path()).join("target");
         if target.exists() {
             std::fs::remove_dir_all(&target)?;
         }
@@ -1218,33 +1296,47 @@ fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary
 
 // ── Summary I/O ────────────────────────────────────────────────────────
 
+/// Write per-case result.json + battery summary for one scored `phase`.
+/// Each case's result.json + enrichment goes INTO its `<case>/<phase>/` dir,
+/// co-located with the crate it scores (logs live there too). The battery
+/// summary goes to `<battery>/summary.json` for the verified phase (the
+/// headline) and `<battery>/summary_translated.json` for the pre-verify
+/// (no-validate) phase, so report.rs can read each independently.
 fn write_results(
     output_dir: &Path,
-    _battery: &str,
+    phase: &str,
     summary: &Summary,
     per_case: &HashMap<String, serde_json::Value>,
 ) -> Result<()> {
     for (case_name, data) in per_case {
-        let case_dir = output_dir.join(case_name);
-        if case_dir.is_dir() {
+        let phase_dir = crate::battery::phase_dir(&output_dir.join(case_name), phase);
+        if phase_dir.is_dir() {
             let mut val = data.clone();
-            let tlog = case_dir.join("logs/translation.log");
-            let vlog = case_dir.join("logs/verify.log");
+            let tlog = phase_dir.join("logs/translation.log");
+            let vlog = phase_dir.join("logs/verify.log");
             Enrichment::compute(
-                &case_dir.join(crate::battery::TRANSLATED_RUST).join("src"),
+                &phase_dir.join("src"),
                 &[("translate", &tlog), ("verify", &vlog)],
             ).merge_into(&mut val);
             let json = serde_json::to_string_pretty(&val)?;
-            std::fs::write(case_dir.join("result.json"), format!("{json}\n"))?;
+            std::fs::write(phase_dir.join("result.json"), format!("{json}\n"))?;
         }
     }
     let json = serde_json::to_string_pretty(summary)?;
-    std::fs::write(output_dir.join("summary.json"), format!("{json}\n"))?;
+    std::fs::write(output_dir.join(summary_file(phase)), format!("{json}\n"))?;
     Ok(())
 }
 
+/// The battery-level summary filename for a phase: the verified phase is the
+/// headline `summary.json`; the pre-verify phase is `summary_translated.json`.
+fn summary_file(phase: &str) -> &'static str {
+    if phase == crate::battery::VERIFIED { "summary.json" } else { "summary_translated.json" }
+}
+
 fn load_summary(output_dir: &Path) -> Summary {
-    let path = output_dir.join("summary.json");
+    // Headline summary: verified phase if it was scored, else the translated one.
+    let verified = output_dir.join("summary.json");
+    let path = if verified.exists() { verified } else { output_dir.join("summary_translated.json") };
     std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -1379,7 +1471,7 @@ fn check_enrichment(
     // existed (same filter as merge_into), keyed identically. A phase whose log
     // is absent is simply not compared — matching the original behavior, which
     // only checked keys with a live log.
-    let require_credits = matches!(agent, crate::cli::Agent::Kiro | crate::cli::Agent::KiroTranslate);
+    let require_credits = matches!(agent, crate::cli::Agent::Kiro);
     for (key, live) in &live.meta {
         match json.get(key) {
             Some(stored) => {
@@ -1524,7 +1616,8 @@ fn load_harvest_bench_stored(paths: &Paths) -> std::collections::BTreeMap<String
     let Ok(entries) = std::fs::read_dir(&paths.results_dir) else { return map };
     for entry in entries.filter_map(|e| e.ok()) {
         if !entry.path().is_dir() { continue; }
-        let rj = entry.path().join("result.json");
+        // Single-phase: score lives in translated/result.json (reader rule).
+        let rj = crate::battery::crate_dir(&entry.path()).join("result.json");
         if let Ok(data) = std::fs::read_to_string(&rj) {
             if let Ok(r) = serde_json::from_str::<HarvestBenchResult>(&data) {
                 map.insert(entry.file_name().to_string_lossy().into_owned(), r);
@@ -1549,10 +1642,12 @@ pub fn run_harvest_bench_test(
     for project in projects {
         let name = project.name();
         let case_dir = paths.output_dir(name);
-        let crate_dir = paths.translated_rust(name);
+        // harvest-bench is single-phase: crate + result.json + logs all live in
+        // the case's translated/ phase dir.
+        let crate_dir = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
         if !crate_dir.join("Cargo.toml").exists() { continue; }
 
-        let logs_dir = case_dir.join("logs");
+        let logs_dir = crate_dir.join("logs");
         std::fs::create_dir_all(&logs_dir)?;
 
         let (so, build_log) = build_harvest_bench_lib(&crate_dir, name);
@@ -1565,7 +1660,7 @@ pub fn run_harvest_bench_test(
                 HarvestBenchResult { tests_ok: 0, tests_failed: 0, tests_skipped: 0, build_ok: false }
             }
             Some(so) => {
-                let report = case_dir.join("harvest_bench_report.json");
+                let report = crate_dir.join("harvest_bench_report.json");
                 let (ok, fail, skip) = score_harvest_bench_suite(&runner, project.gtest_suite(), &so, &report)?;
                 let res = HarvestBenchResult { tests_ok: ok, tests_failed: fail, tests_skipped: skip, build_ok: true };
                 if res.passed() {
@@ -1584,7 +1679,7 @@ pub fn run_harvest_bench_test(
             let mut json = serde_json::to_value(&r)?;
             let tlog = logs_dir.join("translation.log");
             Enrichment::compute(&crate_dir.join("src"), &[("translate", &tlog)]).merge_into(&mut json);
-            std::fs::write(case_dir.join("result.json"), serde_json::to_string_pretty(&json)? + "\n")?;
+            std::fs::write(crate_dir.join("result.json"), serde_json::to_string_pretty(&json)? + "\n")?;
         }
 
         results.insert(name.to_string(), r);
@@ -1637,13 +1732,19 @@ pub fn enrich_test_corpus(paths: &Paths, battery: &str) -> Result<()> {
         let entry = entry?;
         if !entry.file_type()?.is_dir() { continue; }
         let case_dir = entry.path();
-        let tlog = case_dir.join("logs/translation.log");
-        let vlog = case_dir.join("logs/verify.log");
-        if Enrichment::enrich_file(
-            &case_dir.join("result.json"),
-            &case_dir.join(crate::battery::TRANSLATED_RUST).join("src"),
-            &[("translate", &tlog), ("verify", &vlog)],
-        )? { enriched += 1; }
+        // Enrich each phase dir's own result.json in place; enrich_file no-ops
+        // on absent files, so single-phase cases (only translated/) just skip
+        // verified/. Each phase's result.json is enriched against its own crate.
+        for phase in [crate::battery::TRANSLATED, crate::battery::VERIFIED] {
+            let pdir = crate::battery::phase_dir(&case_dir, phase);
+            let tlog = pdir.join("logs/translation.log");
+            let vlog = pdir.join("logs/verify.log");
+            if Enrichment::enrich_file(
+                &pdir.join("result.json"),
+                &pdir.join("src"),
+                &[("translate", &tlog), ("verify", &vlog)],
+            )? { enriched += 1; }
+        }
     }
     println!("✅ Enriched {enriched} {battery} result.json files");
     Ok(())
@@ -1705,12 +1806,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let results_dir = tmp.path().join("results/CRUST-blind/kiro");
 
-        // Create project with verify/result.json
-        let proj = results_dir.join("vec/verify");
+        // Create project with verified/result.json (post-verify phase dir)
+        let proj = results_dir.join("vec/verified");
         fs::create_dir_all(&proj).unwrap();
         fs::write(proj.join("result.json"), r#"{"real_tests_ok": 22, "real_tests_failed": 0}"#).unwrap();
 
-        // Create another project — result.json at root (old layout) should be ignored
+        // Create another project — result.json at case root (no phase dir)
+        // should be ignored: blind results live under verified/.
         let proj2 = results_dir.join("hamta");
         fs::create_dir_all(&proj2).unwrap();
         fs::write(proj2.join("result.json"), r#"{"real_tests_ok": 99, "real_tests_failed": 1}"#).unwrap();
@@ -1720,7 +1822,7 @@ mod tests {
         );
 
         let stored = load_blind_stored_results(&paths).unwrap();
-        assert_eq!(stored.len(), 1, "only verify/ layout should be found");
+        assert_eq!(stored.len(), 1, "only verified/ layout should be found");
         assert_eq!(stored["vec"].real_tests_ok, 22);
         assert_eq!(stored["vec"].real_tests_failed, 0);
     }
