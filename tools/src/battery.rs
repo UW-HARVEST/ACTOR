@@ -4,6 +4,29 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+// ── Intermediate-state directory names: ONE source of truth ────────────
+//
+// These are the on-disk names of the per-case translation artifacts. They
+// were previously spelled as bare string literals in ~40 `join(...)` calls
+// across five modules; a rename or typo in any one silently produced a
+// dangling path. Defining them once here (and joining via the helpers below
+// / these constants) keeps the physical layout in a single place. The names
+// themselves are unchanged, so committed `results/` trees stay valid.
+
+/// The translated Rust crate a case produces (post-verify for two-phase
+/// pipelines; the sole output for single-phase ones).
+pub const TRANSLATED_RUST: &str = "translated_rust";
+
+/// Immutable pre-verify snapshot of [`TRANSLATED_RUST`], saved right after
+/// translation so the mutable verify phase can always reset to it.
+pub const TRANSLATED_RUST_ORIGINAL: &str = "translated_rust_original";
+
+/// Blind-CRUST immutable translation output (agent's crate, no tests).
+pub const TRANSLATE_DIR: &str = "translate";
+
+/// Blind-CRUST mutable verify workspace (tests + any source fixes).
+pub const VERIFY_DIR: &str = "verify";
+
 /// A test case that is independently translated and verified.
 #[derive(Debug, Clone)]
 pub struct IndependentCase {
@@ -129,6 +152,48 @@ impl CrustProject {
             if p.is_dir() { return Some(p); }
         }
         None
+    }
+}
+
+// ── harvest-bench project ──────────────────────────────────────────────
+
+/// A harvest-bench project: `harvest-bench/tests/<name>/` with a `test_case/`
+/// (the C library the agent translates) and a `gtest_suite/` (the upstream test
+/// suite the runner links against the translated cdylib by ABI).
+#[derive(Debug, Clone)]
+pub struct HarvestBenchProject {
+    name: String,
+    test_case: PathBuf,
+    gtest_suite: PathBuf,
+}
+
+impl HarvestBenchProject {
+    pub fn name(&self) -> &str { &self.name }
+    pub fn test_case(&self) -> &Path { &self.test_case }
+    pub fn gtest_suite(&self) -> &Path { &self.gtest_suite }
+
+    /// Resolve a single named project under `tests_dir` (= harvest-bench/tests).
+    pub fn resolve(tests_dir: &Path, name: &str) -> Result<Self> {
+        let root = tests_dir.join(name);
+        let test_case = root.join("test_case");
+        let gtest_suite = root.join("gtest_suite");
+        anyhow::ensure!(test_case.is_dir(), "harvest-bench test_case not found: {}", test_case.display());
+        anyhow::ensure!(gtest_suite.is_dir(), "harvest-bench gtest_suite not found: {}", gtest_suite.display());
+        Ok(Self { name: name.to_string(), test_case, gtest_suite })
+    }
+
+    /// Discover all harvest-bench projects under `tests_dir` (dirs with both a
+    /// `test_case/` and a `gtest_suite/`).
+    pub fn discover(tests_dir: &Path) -> Result<Vec<Self>> {
+        anyhow::ensure!(tests_dir.is_dir(), "harvest-bench tests dir not found: {} (did you `git submodule update --init`?)", tests_dir.display());
+        let mut names: Vec<String> = std::fs::read_dir(tests_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+            .filter(|e| e.path().join("test_case").is_dir() && e.path().join("gtest_suite").is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names.into_iter().map(|n| Self::resolve(tests_dir, &n)).collect()
     }
 }
 
@@ -526,7 +591,6 @@ pub struct Paths {
     pub results_dir: PathBuf,
     pub prompts_dir: PathBuf,
     pub agent: Agent,
-    pub dataset: Dataset,
     pub model: Option<String>,
 }
 
@@ -566,19 +630,26 @@ impl Paths {
                 repo_root.join("crust-bench/datasets"),
                 repo_root.join("results/CRUST-blind").join(agent_name),
             ),
+            Dataset::HarvestBench => (
+                repo_root.join("harvest-bench/tests"),
+                repo_root.join("results/HarvestBench").join(agent_name),
+            ),
         };
         let prompts_dir = match agent {
             Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 => match dataset {
-                Dataset::TestCorpus => repo_root.join("prompts/claude"),
+                // harvest-bench cases are libraries; reuse the project-type-
+                // dispatching prompts the test-corpus path uses (they handle the
+                // shared-library / cdylib case).
+                Dataset::TestCorpus | Dataset::HarvestBench => repo_root.join("prompts/claude"),
                 Dataset::Crust | Dataset::BlindCrust => repo_root.join("prompts/claude/crust"),
             },
             Agent::Kimi | Agent::Oneshot => repo_root.join("prompts/oneshot"),
             _ => match dataset {
-                Dataset::TestCorpus => repo_root.join("prompts/kiro/test-corpus"),
+                Dataset::TestCorpus | Dataset::HarvestBench => repo_root.join("prompts/kiro/test-corpus"),
                 Dataset::Crust | Dataset::BlindCrust => repo_root.join("prompts/kiro/crust"),
             },
         };
-        Self { corpus_dir, results_dir, prompts_dir, agent, dataset, model: model.map(String::from) }
+        Self { corpus_dir, results_dir, prompts_dir, agent, model: model.map(String::from) }
     }
 
     pub fn input_dir(&self, battery: &str) -> PathBuf {
@@ -589,14 +660,20 @@ impl Paths {
         self.results_dir.join(name)
     }
 
+    /// The translated-Rust crate dir for a flat-layout case (CRUST, harvest-bench):
+    /// `<results>/<name>/translated_rust`.
+    pub fn translated_rust(&self, name: &str) -> PathBuf {
+        self.results_dir.join(name).join(TRANSLATED_RUST)
+    }
+
     /// Blind CRUST: immutable translation output.
     pub fn translate_dir(&self, name: &str) -> TranslateDir {
-        TranslateDir(self.results_dir.join(name).join("translate"))
+        TranslateDir(self.results_dir.join(name).join(TRANSLATE_DIR))
     }
 
     /// Blind CRUST: mutable verify workspace (tests + possible src fixes).
     pub fn verify_dir(&self, name: &str) -> VerifyDir {
-        VerifyDir(self.results_dir.join(name).join("verify"))
+        VerifyDir(self.results_dir.join(name).join(VERIFY_DIR))
     }
 
     pub fn case_dir(&self, battery: &str, case: &str) -> PathBuf {

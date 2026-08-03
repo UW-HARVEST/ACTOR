@@ -590,14 +590,12 @@ pub fn run_crust_test(paths: &Paths, projects: &[crate::battery::CrustProject], 
             println!("  ⚠️  {name}: no tests ran");
         }
 
-        // --update: write result.json immediately
+        // --update: write result.json immediately (enrichment is part of the
+        // write, never a separate step — see `Enrichment`).
         if matches!(mode, TestMode::Update) {
             let mut json = serde_json::to_value(&r)?;
-            if let Some(m) = crate::battery::extract_agent_meta(&proj_dir.join("logs/translation.log")) {
-                json["agent"] = serde_json::to_value(&m).unwrap();
-            }
-            json["unsafe"] = serde_json::to_value(&crate::battery::count_unsafe(&proj_dir.join("src"))).unwrap();
-            json["loc"] = serde_json::to_value(&crate::battery::count_loc(&proj_dir.join("src"))).unwrap();
+            let tlog = proj_dir.join("logs/translation.log");
+            Enrichment::compute(&proj_dir.join("src"), &[("agent", &tlog)]).merge_into(&mut json);
             std::fs::write(proj_dir.join("result.json"), serde_json::to_string_pretty(&json)? + "\n")?;
         }
 
@@ -754,27 +752,17 @@ pub fn run_blind_crust_test(
         results.push((name.to_string(), real_result.clone(), llm_result.clone()));
 
         if matches!(mode, TestMode::Update) {
-            let translate_meta = crate::battery::extract_agent_meta(
-                &paths.translate_dir(name).join("logs/translation.log"),
-            );
-            let verify_meta = crate::battery::extract_agent_meta(
-                &proj_dir.join("logs/verify.log"),
-            );
             let mut json = serde_json::json!({
                 "llm_tests_ok": llm_result.tests_ok,
                 "llm_tests_failed": llm_result.tests_failed,
                 "real_tests_ok": real_result.tests_ok,
                 "real_tests_failed": real_result.tests_failed,
                 "build_ok": real_result.build_ok,
-                "unsafe": crate::battery::count_unsafe(&paths.translate_dir(name).join("src")),
-                "loc": crate::battery::count_loc(&paths.translate_dir(name).join("src")),
             });
-            if let Some(m) = translate_meta {
-                json["translate"] = serde_json::to_value(&m).unwrap();
-            }
-            if let Some(m) = verify_meta {
-                json["verify"] = serde_json::to_value(&m).unwrap();
-            }
+            let src = paths.translate_dir(name).join("src");
+            let tlog = paths.translate_dir(name).join("logs/translation.log");
+            let vlog = proj_dir.join("logs/verify.log");
+            Enrichment::compute(&src, &[("translate", &tlog), ("verify", &vlog)]).merge_into(&mut json);
             std::fs::write(proj_dir.join("result.json"), serde_json::to_string_pretty(&json)? + "\n")?;
         }
     }
@@ -849,7 +837,7 @@ fn discover_batteries(results_dir: &Path) -> Result<Vec<String>> {
         // Must contain at least one case with translated_rust/
         let has_cases = std::fs::read_dir(entry.path())?
             .filter_map(|e| e.ok())
-            .any(|e| e.path().join("translated_rust").is_dir());
+            .any(|e| e.path().join(crate::battery::TRANSLATED_RUST).is_dir());
         if has_cases {
             batteries.push(name);
         }
@@ -915,7 +903,7 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
                 let vlog = case_dir.join("logs/verify.log");
                 for d in check_enrichment(
                     &case_dir.join("result.json"),
-                    &case_dir.join("translated_rust/src"),
+                    &case_dir.join(crate::battery::TRANSLATED_RUST).join("src"),
                     &[("translate", &tlog), ("verify", &vlog)],
                     paths.agent,
                 ) {
@@ -961,7 +949,7 @@ fn copy_test_artifacts(paths: &Paths, battery: &str) -> Result<()> {
         let corpus_case = input_dir.join(&name);
         let case_dir = entry.path();
 
-        if !case_dir.join("translated_rust").is_dir() {
+        if !case_dir.join(crate::battery::TRANSLATED_RUST).is_dir() {
             continue;
         }
 
@@ -1024,7 +1012,7 @@ fn clean_targets(output_dir: &Path) -> Result<()> {
     for entry in std::fs::read_dir(output_dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() { continue; }
-        let target = entry.path().join("translated_rust/target");
+        let target = entry.path().join(crate::battery::TRANSLATED_RUST).join("target");
         if target.exists() {
             std::fs::remove_dir_all(&target)?;
         }
@@ -1240,19 +1228,12 @@ fn write_results(
         let case_dir = output_dir.join(case_name);
         if case_dir.is_dir() {
             let mut val = data.clone();
-            for log in ["logs/translation.log", "logs/verify.log"] {
-                let log_path = case_dir.join(log);
-                if let Some(m) = crate::battery::extract_agent_meta(&log_path) {
-                    let key = if log.contains("translation") { "translate" } else { "verify" };
-                    val[key] = serde_json::to_value(&m).unwrap();
-                }
-            }
-            val["unsafe"] = serde_json::to_value(
-                &crate::battery::count_unsafe(&case_dir.join("translated_rust/src")),
-            ).unwrap();
-            val["loc"] = serde_json::to_value(
-                &crate::battery::count_loc(&case_dir.join("translated_rust/src")),
-            ).unwrap();
+            let tlog = case_dir.join("logs/translation.log");
+            let vlog = case_dir.join("logs/verify.log");
+            Enrichment::compute(
+                &case_dir.join(crate::battery::TRANSLATED_RUST).join("src"),
+                &[("translate", &tlog), ("verify", &vlog)],
+            ).merge_into(&mut val);
             let json = serde_json::to_string_pretty(&val)?;
             std::fs::write(case_dir.join("result.json"), format!("{json}\n"))?;
         }
@@ -1295,10 +1276,69 @@ fn diff_summaries(expected: &Summary, actual: &Summary) -> Vec<String> {
 }
 
 
-// ── Enrich: backfill result.json with credits + unsafe (no test runs) ──
+// ── Enrichment: the ONE definition of result.json metadata ─────────────
+//
+// Every result.json carries the same derived metadata alongside its test
+// outcome: `unsafe` (AST-counted unsafe usage), `loc` (translated LOC), and
+// one agent-run-meta object per phase (`agent` for single-phase CRUST,
+// `translate`+`verify` for the two-phase pipelines). This used to be
+// hand-written in six places (three `--update` blocks + three `enrich_*`
+// fns) and hand-checked in a seventh (`check_enrichment`) — which is exactly
+// how a result.json could drift from what `test --check` expected.
+//
+// `Enrichment` is now the single source of truth. `compute` gathers the live
+// values from a translated `src/` dir plus a set of `(json_key, log)` phase
+// logs; `merge_into` writes them onto a result.json value; `check` diffs
+// stored-vs-live and is a pure inverse of `merge_into`. All writers call
+// `merge_into` (via `enrich_file` or inline); `test --check` calls `check`.
+// They can no longer drift.
+pub struct Enrichment {
+    unsafe_: crate::battery::UnsafeCounts,
+    loc: crate::battery::LocCounts,
+    /// Per-phase run metadata, in the given key order, for logs that existed.
+    meta: Vec<(String, crate::battery::AgentRunMeta)>,
+}
 
-/// Compare stored credits + unsafe in result.json against live extraction.
-/// Returns a list of mismatch descriptions (empty = all good).
+impl Enrichment {
+    /// Gather live enrichment values. `src_dir` is the translated crate's
+    /// `src/`; `logs` maps each result.json phase key to its agent log.
+    pub fn compute(src_dir: &Path, logs: &[(&str, &Path)]) -> Self {
+        let meta = logs.iter()
+            .filter_map(|(key, log)| {
+                crate::battery::extract_agent_meta(log).map(|m| (key.to_string(), m))
+            })
+            .collect();
+        Self {
+            unsafe_: crate::battery::count_unsafe(src_dir),
+            loc: crate::battery::count_loc(src_dir),
+            meta,
+        }
+    }
+
+    /// Write the computed values onto a result.json value.
+    pub fn merge_into(&self, json: &mut serde_json::Value) {
+        json["unsafe"] = serde_json::to_value(&self.unsafe_).unwrap();
+        json["loc"] = serde_json::to_value(&self.loc).unwrap();
+        for (key, m) in &self.meta {
+            json[key] = serde_json::to_value(m).unwrap();
+        }
+    }
+
+    /// Enrich one result.json file in place (read → merge → write). No-op if
+    /// the file is missing. Returns whether it was written.
+    fn enrich_file(rj: &Path, src_dir: &Path, logs: &[(&str, &Path)]) -> Result<bool> {
+        if !rj.exists() { return Ok(false); }
+        let mut json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(rj)?)?;
+        Self::compute(src_dir, logs).merge_into(&mut json);
+        std::fs::write(rj, serde_json::to_string_pretty(&json)? + "\n")?;
+        Ok(true)
+    }
+}
+
+/// Compare stored credits + unsafe + loc in result.json against live values.
+/// Pure inverse of [`Enrichment::merge_into`]. Returns mismatch descriptions
+/// (empty = all good). `agent` gates the "missing meta" check to kiro, the
+/// only agent that records credits.
 fn check_enrichment(
     result_json: &Path,
     src_dir: &Path,
@@ -1309,38 +1349,40 @@ fn check_enrichment(
     let Ok(data) = std::fs::read_to_string(result_json) else { return diffs };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else { return diffs };
 
+    let live = Enrichment::compute(src_dir, log_paths);
+
     // All agents require unsafe counts
-    let live = crate::battery::count_unsafe(src_dir);
     match json.get("unsafe") {
         Some(stored) => {
             let sb = stored.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let sf = stored.get("fns").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let si = stored.get("impls").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            if sb != live.blocks { diffs.push(format!("unsafe.blocks expected={sb} actual={}", live.blocks)); }
-            if sf != live.fns { diffs.push(format!("unsafe.fns expected={sf} actual={}", live.fns)); }
-            if si != live.impls { diffs.push(format!("unsafe.impls expected={si} actual={}", live.impls)); }
+            if sb != live.unsafe_.blocks { diffs.push(format!("unsafe.blocks expected={sb} actual={}", live.unsafe_.blocks)); }
+            if sf != live.unsafe_.fns { diffs.push(format!("unsafe.fns expected={sf} actual={}", live.unsafe_.fns)); }
+            if si != live.unsafe_.impls { diffs.push(format!("unsafe.impls expected={si} actual={}", live.unsafe_.impls)); }
             let sl = stored.get("lines").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            if sl != live.lines { diffs.push(format!("unsafe.lines expected={sl} actual={}", live.lines)); }
+            if sl != live.unsafe_.lines { diffs.push(format!("unsafe.lines expected={sl} actual={}", live.unsafe_.lines)); }
         }
         None => diffs.push("missing unsafe field".into()),
     }
 
     // LOC counts
-    let live_loc = crate::battery::count_loc(src_dir);
     match json.get("loc") {
         Some(stored) => {
             let sc = stored.get("code").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            if sc != live_loc.code { diffs.push(format!("loc.code expected={sc} actual={}", live_loc.code)); }
+            if sc != live.loc.code { diffs.push(format!("loc.code expected={sc} actual={}", live.loc.code)); }
         }
         None => diffs.push("missing loc field".into()),
     }
 
-    // Only kiro has credits
+    // Only kiro has credits. `live.meta` holds exactly the phases whose logs
+    // existed (same filter as merge_into), keyed identically. A phase whose log
+    // is absent is simply not compared — matching the original behavior, which
+    // only checked keys with a live log.
     let require_credits = matches!(agent, crate::cli::Agent::Kiro | crate::cli::Agent::KiroTranslate);
-    for &(key, log) in log_paths {
-        let live_meta = crate::battery::extract_agent_meta(log);
-        match (json.get(key), live_meta) {
-            (Some(stored), Some(live)) => {
+    for (key, live) in &live.meta {
+        match json.get(key) {
+            Some(stored) => {
                 let sc = stored.get("credits").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let sw = stored.get("wall_secs").and_then(|v| v.as_u64()).unwrap_or(0);
                 if (sc - live.credits.0).abs() > 0.001 {
@@ -1350,8 +1392,8 @@ fn check_enrichment(
                     diffs.push(format!("{key}.wall_secs expected={sw} actual={}", live.wall_secs));
                 }
             }
-            (None, Some(_)) if require_credits => diffs.push(format!("missing {key} field")),
-            _ => {}
+            None if require_credits => diffs.push(format!("missing {key} field")),
+            None => {}
         }
     }
     diffs
@@ -1361,21 +1403,14 @@ pub fn enrich_blind_crust(paths: &Paths, projects: &[crate::battery::CrustProjec
     let mut enriched = 0usize;
     for project in projects {
         let name = project.name();
-        let rj = paths.verify_dir(name).join("result.json");
-        if !rj.exists() { continue; }
-        let mut json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&rj)?)?;
-
-        if let Some(m) = crate::battery::extract_agent_meta(&paths.translate_dir(name).join("logs/translation.log")) {
-            json["translate"] = serde_json::to_value(&m)?;
-        }
-        if let Some(m) = crate::battery::extract_agent_meta(&paths.verify_dir(name).join("logs/verify.log")) {
-            json["verify"] = serde_json::to_value(&m)?;
-        }
-        json["unsafe"] = serde_json::to_value(&crate::battery::count_unsafe(&paths.translate_dir(name).join("src")))?;
-        json["loc"] = serde_json::to_value(&crate::battery::count_loc(&paths.translate_dir(name).join("src")))?;
-
-        std::fs::write(&rj, serde_json::to_string_pretty(&json)? + "\n")?;
-        enriched += 1;
+        let src = paths.translate_dir(name).join("src");
+        let tlog = paths.translate_dir(name).join("logs/translation.log");
+        let vlog = paths.verify_dir(name).join("logs/verify.log");
+        if Enrichment::enrich_file(
+            &paths.verify_dir(name).join("result.json"),
+            &src,
+            &[("translate", &tlog), ("verify", &vlog)],
+        )? { enriched += 1; }
     }
     println!("✅ Enriched {enriched} CRUST-blind result.json files");
     Ok(())
@@ -1384,23 +1419,214 @@ pub fn enrich_blind_crust(paths: &Paths, projects: &[crate::battery::CrustProjec
 pub fn enrich_crust(paths: &Paths, projects: &[crate::battery::CrustProject]) -> Result<()> {
     let mut enriched = 0usize;
     for project in projects {
-        let name = project.name();
-        let proj_dir = paths.output_dir(name);
-        let rj = proj_dir.join("result.json");
-        if !rj.exists() { continue; }
-        let mut json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&rj)?)?;
-
-        if let Some(m) = crate::battery::extract_agent_meta(&proj_dir.join("logs/translation.log")) {
-            json["agent"] = serde_json::to_value(&m)?;
-        }
-        json["unsafe"] = serde_json::to_value(&crate::battery::count_unsafe(&proj_dir.join("src")))?;
-        json["loc"] = serde_json::to_value(&crate::battery::count_loc(&proj_dir.join("src")))?;
-
-        std::fs::write(&rj, serde_json::to_string_pretty(&json)? + "\n")?;
-        enriched += 1;
+        let proj_dir = paths.output_dir(project.name());
+        let tlog = proj_dir.join("logs/translation.log");
+        if Enrichment::enrich_file(
+            &proj_dir.join("result.json"),
+            &proj_dir.join("src"),
+            &[("agent", &tlog)],
+        )? { enriched += 1; }
     }
     println!("✅ Enriched {enriched} CRUST result.json files");
     Ok(())
+}
+
+// ── harvest-bench testing ──────────────────────────────────────────────
+
+/// Per-project harvest-bench result: build the translated crate into a cdylib,
+/// then run the upstream GoogleTest suite against it via the harvest-bench
+/// runner. `passed` uses the same rule as CRUST (built, ≥1 test ok, 0 failed)
+/// so the pass column means the same thing across datasets.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct HarvestBenchResult {
+    tests_ok: usize,
+    tests_failed: usize,
+    tests_skipped: usize,
+    build_ok: bool,
+}
+
+impl HarvestBenchResult {
+    fn passed(&self) -> bool {
+        crate::scoring::CrustOutcome {
+            built: self.build_ok,
+            tests_ok: self.tests_ok as u32,
+            tests_failed: self.tests_failed as u32,
+        }.passed()
+    }
+}
+
+/// Locate the prebuilt harvest-bench runner (`harvest-bench/runner/target/
+/// release/harvest-bench`). `corpus_dir` is `harvest-bench/tests`.
+fn harvest_bench_runner(corpus_dir: &Path) -> Result<PathBuf> {
+    let bin = corpus_dir
+        .parent().context("harvest-bench/tests has no parent")?
+        .join("runner/target/release/harvest-bench");
+    anyhow::ensure!(bin.is_file(),
+        "harvest-bench runner not built: {} (run `cargo build --release --manifest-path harvest-bench/runner/Cargo.toml`)",
+        bin.display());
+    Ok(bin)
+}
+
+/// Build the translated crate into a cdylib and return the `.so` path (or a
+/// build-failure). The suite links `lib<name>.so` by ABI.
+fn build_harvest_bench_lib(crate_dir: &Path, name: &str) -> (Option<PathBuf>, String) {
+    let out = Command::new("timeout")
+        .args(["600", "cargo", "build", "--release"])
+        .env("OPENSSL_DIR", openssl_dir())
+        .env("OPENSSL_NO_VENDOR", "1")
+        .current_dir(crate_dir)
+        .output();
+    let Ok(out) = out else { return (None, "failed to spawn cargo build".into()) };
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    // cdylib output name derives from the [lib] name (set to the project name),
+    // with `-`→`_` normalization cargo applies.
+    let lib_stem = name.replace('-', "_");
+    let so = crate_dir.join(format!("target/release/lib{lib_stem}.so"));
+    if so.is_file() { (Some(so), stderr) } else { (None, stderr) }
+}
+
+/// Run the upstream suite against a built `.so` and parse the JSON report.
+fn score_harvest_bench_suite(
+    runner: &Path, suite_dir: &Path, lib: &Path, report_json: &Path,
+) -> Result<(usize, usize, usize)> {
+    // Suite build dir is per-result so parallel/rerun don't collide.
+    let build_dir = report_json.parent().unwrap_or(Path::new(".")).join("gtest_build");
+    let _ = Command::new(runner)
+        .arg("run")
+        .args(["--suite".as_ref(), suite_dir.as_os_str()])
+        .args(["--lib".as_ref(), lib.as_os_str()])
+        .args(["--build-dir".as_ref(), build_dir.as_os_str()])
+        .args(["--json".as_ref(), report_json.as_os_str()])
+        .output()
+        .context("invoking harvest-bench runner")?;
+
+    // Parse `{"run": {"verdicts": [{"passed": bool, "skipped": bool}, ...]}}`.
+    let data = std::fs::read_to_string(report_json)
+        .with_context(|| format!("reading harvest-bench report {}", report_json.display()))?;
+    let json: serde_json::Value = serde_json::from_str(&data)?;
+    let verdicts = json.pointer("/run/verdicts").and_then(|v| v.as_array());
+    let Some(verdicts) = verdicts else { return Ok((0, 0, 0)) };
+
+    let mut ok = 0usize; let mut failed = 0usize; let mut skipped = 0usize;
+    for v in verdicts {
+        let passed = v.get("passed").and_then(|b| b.as_bool()).unwrap_or(false);
+        let skip = v.get("skipped").and_then(|b| b.as_bool()).unwrap_or(false);
+        if skip { skipped += 1; }
+        else if passed { ok += 1; }
+        else { failed += 1; }
+    }
+    Ok((ok, failed, skipped))
+}
+
+/// Load stored harvest-bench result.json files as a baseline for --check.
+fn load_harvest_bench_stored(paths: &Paths) -> std::collections::BTreeMap<String, HarvestBenchResult> {
+    let mut map = std::collections::BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(&paths.results_dir) else { return map };
+    for entry in entries.filter_map(|e| e.ok()) {
+        if !entry.path().is_dir() { continue; }
+        let rj = entry.path().join("result.json");
+        if let Ok(data) = std::fs::read_to_string(&rj) {
+            if let Ok(r) = serde_json::from_str::<HarvestBenchResult>(&data) {
+                map.insert(entry.file_name().to_string_lossy().into_owned(), r);
+            }
+        }
+    }
+    map
+}
+
+pub fn run_harvest_bench_test(
+    paths: &Paths,
+    projects: &[crate::battery::HarvestBenchProject],
+    mode: TestMode,
+) -> Result<TestOutcome> {
+    let runner = harvest_bench_runner(&paths.corpus_dir)?;
+    let stored = load_harvest_bench_stored(paths);
+
+    let mut results: std::collections::BTreeMap<String, HarvestBenchResult> = Default::default();
+    let mut passed = 0usize;
+    let mut build_failed = 0usize;
+
+    for project in projects {
+        let name = project.name();
+        let case_dir = paths.output_dir(name);
+        let crate_dir = paths.translated_rust(name);
+        if !crate_dir.join("Cargo.toml").exists() { continue; }
+
+        let logs_dir = case_dir.join("logs");
+        std::fs::create_dir_all(&logs_dir)?;
+
+        let (so, build_log) = build_harvest_bench_lib(&crate_dir, name);
+        std::fs::write(logs_dir.join("test.log"), &build_log)?;
+
+        let r = match so {
+            None => {
+                build_failed += 1;
+                println!("  ❌ {name}: build failed (no cdylib)");
+                HarvestBenchResult { tests_ok: 0, tests_failed: 0, tests_skipped: 0, build_ok: false }
+            }
+            Some(so) => {
+                let report = case_dir.join("harvest_bench_report.json");
+                let (ok, fail, skip) = score_harvest_bench_suite(&runner, project.gtest_suite(), &so, &report)?;
+                let res = HarvestBenchResult { tests_ok: ok, tests_failed: fail, tests_skipped: skip, build_ok: true };
+                if res.passed() {
+                    passed += 1;
+                    println!("  ✅ {name}: {ok} ok, {skip} skipped");
+                } else if fail > 0 {
+                    println!("  ⚠️  {name}: {ok} ok, {fail} FAILED, {skip} skipped");
+                } else {
+                    println!("  ⚠️  {name}: no tests passed");
+                }
+                res
+            }
+        };
+
+        if matches!(mode, TestMode::Update) {
+            let mut json = serde_json::to_value(&r)?;
+            let tlog = logs_dir.join("translation.log");
+            Enrichment::compute(&crate_dir.join("src"), &[("translate", &tlog)]).merge_into(&mut json);
+            std::fs::write(case_dir.join("result.json"), serde_json::to_string_pretty(&json)? + "\n")?;
+        }
+
+        results.insert(name.to_string(), r);
+    }
+
+    let total = results.len();
+    println!("\nharvest-bench: {passed}/{total} projects pass ({build_failed} build failures)");
+
+    match mode {
+        TestMode::Update => {
+            println!("📝 result.json written for {total} projects");
+            Ok(TestOutcome::Ok)
+        }
+        TestMode::Check => {
+            let mut diffs = Vec::new();
+            for (name, actual) in &results {
+                match stored.get(name) {
+                    None => diffs.push(format!("{name}: missing stored result")),
+                    Some(exp) => {
+                        if actual.tests_ok < exp.tests_ok {
+                            diffs.push(format!("{name}: tests_ok expected={} actual={}", exp.tests_ok, actual.tests_ok));
+                        }
+                        if actual.tests_failed > exp.tests_failed {
+                            diffs.push(format!("{name}: tests_failed expected={} actual={}", exp.tests_failed, actual.tests_failed));
+                        }
+                        if exp.build_ok && !actual.build_ok {
+                            diffs.push(format!("{name}: build_ok expected=true actual=false"));
+                        }
+                    }
+                }
+            }
+            if diffs.is_empty() {
+                println!("✅ No regressions");
+                Ok(TestOutcome::Passed)
+            } else {
+                println!("\n❌ {} regression(s):", diffs.len());
+                for d in &diffs { println!("  {d}"); }
+                Ok(TestOutcome::Failed(vec![BatteryMismatch { battery: "harvest-bench".into(), diffs }]))
+            }
+        }
+        TestMode::Run => Ok(TestOutcome::Ok),
+    }
 }
 
 pub fn enrich_test_corpus(paths: &Paths, battery: &str) -> Result<()> {
@@ -1411,21 +1637,13 @@ pub fn enrich_test_corpus(paths: &Paths, battery: &str) -> Result<()> {
         let entry = entry?;
         if !entry.file_type()?.is_dir() { continue; }
         let case_dir = entry.path();
-        let rj = case_dir.join("result.json");
-        if !rj.exists() { continue; }
-        let mut json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&rj)?)?;
-
-        for log in ["logs/translation.log", "logs/verify.log"] {
-            if let Some(m) = crate::battery::extract_agent_meta(&case_dir.join(log)) {
-                let key = if log.contains("translation") { "translate" } else { "verify" };
-                json[key] = serde_json::to_value(&m)?;
-            }
-        }
-        json["unsafe"] = serde_json::to_value(&crate::battery::count_unsafe(&case_dir.join("translated_rust/src")))?;
-        json["loc"] = serde_json::to_value(&crate::battery::count_loc(&case_dir.join("translated_rust/src")))?;
-
-        std::fs::write(&rj, serde_json::to_string_pretty(&json)? + "\n")?;
-        enriched += 1;
+        let tlog = case_dir.join("logs/translation.log");
+        let vlog = case_dir.join("logs/verify.log");
+        if Enrichment::enrich_file(
+            &case_dir.join("result.json"),
+            &case_dir.join(crate::battery::TRANSLATED_RUST).join("src"),
+            &[("translate", &tlog), ("verify", &vlog)],
+        )? { enriched += 1; }
     }
     println!("✅ Enriched {enriched} {battery} result.json files");
     Ok(())
@@ -1434,6 +1652,53 @@ pub fn enrich_test_corpus(paths: &Paths, battery: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// The whole point of Tier 1: `merge_into` and `check_enrichment` are
+    /// inverses. Enrich a fresh result.json, then check it — zero diffs. This
+    /// is the invariant that used to be maintained by hand across 7 sites.
+    #[test]
+    fn merge_into_then_check_has_no_diffs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("lib.rs"),
+            "pub fn f() { unsafe { let _p = 1u8 as *const u8; } }\npub fn g() {}\n").unwrap();
+
+        // No logs on disk → no meta phases; a claude-family agent (no credits).
+        let rj = tmp.path().join("result.json");
+        let mut json = serde_json::json!({"passed": true});
+        let missing = tmp.path().join("nope.log");
+        Enrichment::compute(&src, &[("translate", &missing)]).merge_into(&mut json);
+        fs::write(&rj, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let diffs = check_enrichment(&rj, &src, &[("translate", &missing)], crate::cli::Agent::Claude);
+        assert!(diffs.is_empty(), "merge_into output should pass its own check: {diffs:?}");
+
+        // And it actually recorded the unsafe block + loc (not a vacuous pass).
+        let stored: serde_json::Value = serde_json::from_str(&fs::read_to_string(&rj).unwrap()).unwrap();
+        assert_eq!(stored["unsafe"]["blocks"], 1);
+        assert!(stored["loc"]["code"].as_u64().unwrap() >= 2);
+    }
+
+    /// Tampering with a stored field is caught by check — proving check isn't
+    /// vacuously empty.
+    #[test]
+    fn check_detects_tampered_unsafe_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("lib.rs"), "pub fn f() { unsafe { let _x = 0; } }\n").unwrap();
+
+        let rj = tmp.path().join("result.json");
+        let mut json = serde_json::json!({});
+        let missing = tmp.path().join("nope.log");
+        Enrichment::compute(&src, &[]).merge_into(&mut json);
+        json["unsafe"]["blocks"] = serde_json::json!(99); // tamper
+        fs::write(&rj, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let diffs = check_enrichment(&rj, &src, &[], crate::cli::Agent::Claude);
+        assert!(diffs.iter().any(|d| d.contains("unsafe.blocks")), "tamper should be caught: {diffs:?}");
+    }
 
     #[test]
     fn load_blind_stored_results_reads_from_verify_subdir() {

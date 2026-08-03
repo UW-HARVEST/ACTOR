@@ -58,7 +58,7 @@ fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filte
             s.spawn(|| {
                 let _permit = sem.acquire();
                 let case_dir = output_dir.join(&c.name);
-                if !case_dir.join("translated_rust/Cargo.toml").exists() {
+                if !case_dir.join(crate::battery::TRANSLATED_RUST).join("Cargo.toml").exists() {
                     return (c.name.clone(), None);
                 }
                 if !force && case_dir.join("logs/verify.log").exists() {
@@ -90,7 +90,7 @@ fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filte
         current += 1;
         let real_dir = output_dir.join(&group.real_case);
 
-        if !real_dir.join("translated_rust/Cargo.toml").exists() {
+        if !real_dir.join(crate::battery::TRANSLATED_RUST).join("Cargo.toml").exists() {
             continue;
         }
 
@@ -120,8 +120,8 @@ fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filte
 }
 
 fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, configs_text: &str, agent: Agent) -> Result<bool> {
-    let translated = case_dir.join("translated_rust");
-    let original = case_dir.join("translated_rust_original");
+    let translated = case_dir.join(crate::battery::TRANSLATED_RUST);
+    let original = case_dir.join(crate::battery::TRANSLATED_RUST_ORIGINAL);
 
     // Restore from original (clean slate)
     if original.is_dir() {
