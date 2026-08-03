@@ -9,6 +9,34 @@ Its input is a C program and its output is a Rust program.
 To translate an arbitrary
 C program of your own, add it as a one-off case and run any agent on it.
 
+An arbitrary C program (i.e., a set of `.c` and `.h` files) must be supplied to ACTOR in the
+    `test-corpus` directory as test case.
+The test case directory must follow the structure:
+
+```
+ACTOR/test-corpus/Public-Tests/<BATTERY_NAME>/<TEST_CASE_NAME>
+```
+
+A battery comprises a collection of test cases.
+The source code file(s) must be placed in a directory named `test_case`, i.e.,
+
+```
+ACTOR/test-corpus/Public-Tests/<BATTERY_NAME>/<TEST_CASE_NAME>/<test_case>
+```
+
+The harness can only detect files in the `test_case` directory when a sibling `test_vectors`
+    directory is present, i.e.,
+
+
+```
+ACTOR/test-corpus/Public-Tests/<BATTERY_NAME>/<TEST_CASE_NAME>/<test_vectors>
+```
+
+`test_vectors` can be left empty if you only want to translate the code (and not run any evaluations
+    on it).
+
+### Steps to Supply a C Program to ACTOR
+
 1. Create a case directory under a battery. A case is a folder named
    `<something>` (suffix it with `_lib` if it is a library rather than an
    executable) containing a `test_case/` subdirectory with your C sources
