@@ -11,3 +11,6 @@
 	path = c2saferrust
 	url = https://github.com/benedikt-schesch/c2saferrust.git
 	branch = bedrock
+[submodule "harvest-bench"]
+	path = harvest-bench
+	url = https://github.com/UW-HARVEST/harvest-bench.git
