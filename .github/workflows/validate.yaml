@@ -70,16 +70,6 @@ jobs:
             cmd: ./tools/target/release/harvest-tools --agent claude test all --check
             needs_openssl: false
             needs_crust: false
-          - name: Test-Corpus kiro-translate
-            guard: results/Test-Corpus/kiro-translate
-            cmd: ./tools/target/release/harvest-tools --agent kiro-translate test all --check
-            needs_openssl: false
-            needs_crust: false
-          - name: CRUST-blind kiro-translate
-            guard: results/CRUST-blind/kiro-translate
-            cmd: ./tools/target/release/harvest-tools --agent kiro-translate test CRUST --blind --check
-            needs_openssl: true
-            needs_crust: true
           - name: Test-Corpus laertes
             guard: results/Test-Corpus/laertes
             cmd: ./tools/target/release/harvest-tools --agent laertes test all --check
@@ -137,11 +127,11 @@ jobs:
           echo "openssl version:"
           openssl version 2>&1 || echo "openssl not found"
           echo "VaultSync .vsync check:"
-          ls -la results/CRUST/kiro/VaultSync/.vsync 2>/dev/null && echo "WARNING: .vsync exists!" || echo ".vsync not present (good)"
+          ls -la results/CRUST/kiro/VaultSync/translated/.vsync 2>/dev/null && echo "WARNING: .vsync exists!" || echo ".vsync not present (good)"
           echo "c_blind_rsa result.json:"
-          cat results/CRUST/kiro/c_blind_rsa_signatures/result.json 2>/dev/null || echo "not found"
+          cat results/CRUST/kiro/c_blind_rsa_signatures/translated/result.json 2>/dev/null || echo "not found"
           echo "VaultSync result.json:"
-          cat results/CRUST/kiro/VaultSync/result.json 2>/dev/null || echo "not found"
+          cat results/CRUST/kiro/VaultSync/translated/result.json 2>/dev/null || echo "not found"
           echo "::endgroup::"
           if [ -d "${{ matrix.guard }}" ]; then
             for attempt in 1 2 3; do

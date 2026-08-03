@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn strip_for_lib_removes_main_and_tests() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("translated_rust");
+        let dir = tmp.path().join(crate::battery::TRANSLATED_RUST);
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::create_dir_all(dir.join("tests")).unwrap();
         fs::write(dir.join("src/main.rs"), "fn main() {}").unwrap();
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn strip_for_lib_noop_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("translated_rust");
+        let dir = tmp.path().join(crate::battery::TRANSLATED_RUST);
         fs::create_dir_all(dir.join("src")).unwrap();
         strip_for_lib(&dir).unwrap();
     }

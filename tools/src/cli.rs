@@ -3,7 +3,6 @@ use clap::Parser;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Agent {
     Kiro,
-    KiroTranslate,
     Claude,
     /// Claude Code with combined translate+verify in a single session.
     /// Reads translate-and-verify-{exec,lib,shared}.md instead of separate prompts.
@@ -79,21 +78,31 @@ pub enum Dataset {
     Crust,
     /// CRUST-bench blind mode (no ground-truth tests visible to agents).
     BlindCrust,
+    /// harvest-bench: real C libraries scored by their upstream GoogleTest
+    /// suites, linked against the translated cdylib by ABI. Targets are
+    /// `HB/<project>` (e.g. `HB/libsodium`) or `HB` for all.
+    HarvestBench,
 }
 
 impl Dataset {
-    /// Auto-detect from target name: "CRUST/<project>" or "CRUST" → Crust, else TestCorpus.
+    /// Auto-detect from target name: "CRUST/<project>" or "CRUST" → Crust,
+    /// "HB/<project>" or "HB" → HarvestBench, else TestCorpus.
     pub fn detect(target: &str, blind: bool) -> Self {
         if target.eq_ignore_ascii_case("crust") || target.starts_with("CRUST/") {
             if blind { Self::BlindCrust } else { Self::Crust }
+        } else if target.eq_ignore_ascii_case("hb") || target.starts_with("HB/") {
+            Self::HarvestBench
         } else {
             Self::TestCorpus
         }
     }
 
-    /// Strip the "CRUST/" prefix if present, returning the inner target.
+    /// Strip the "CRUST/" or "HB/" prefix if present, returning the inner target.
     pub fn strip_prefix(target: &str) -> &str {
-        target.strip_prefix("CRUST/").unwrap_or(target)
+        target
+            .strip_prefix("CRUST/")
+            .or_else(|| target.strip_prefix("HB/"))
+            .unwrap_or(target)
     }
 }
 
@@ -181,12 +190,6 @@ pub enum Command {
         #[arg(long)]
         blind: bool,
     },
-    /// Populate kiro-translate results from kiro's pre-verify artifacts
-    Populate {
-        target: String,
-        #[arg(long)]
-        blind: bool,
-    },
     /// Generate markdown report tables from validated results into tables/
     Report,
     /// Score the CRUST-Bench self-generated (no-test-access) baseline translations
@@ -197,59 +200,9 @@ pub enum Command {
     ScoreSelfgenBaselines,
 }
 
-// ── Type-safe execution plans ──────────────────────────────────────────
-// Each variant carries only the parameters valid for that dataset.
-// Invalid combinations (e.g. limit on TestCorpus) are unrepresentable.
-
-/// Plan for translation. Constructed once, consumed by translate module.
-pub enum TranslatePlan {
-    TestCorpus {
-        batteries: Vec<String>,
-        parallel: usize,
-    },
-    Crust {
-        projects: Vec<super::battery::CrustProject>,
-        parallel: usize,
-    },
-    /// Blind: scaffold copied WITHOUT src/bin/ (agent never sees tests).
-    BlindCrust {
-        projects: Vec<super::battery::CrustProject>,
-        parallel: usize,
-    },
-}
-
-/// Plan for verification.
-pub enum VerifyPlan {
-    TestCorpus {
-        batteries: Vec<String>,
-        parallel: usize,
-        force: bool,
-    },
-    /// Blind CRUST: agent writes src/bin/test_*.rs from C+Rust (no ground truth).
-    BlindCrust {
-        projects: Vec<super::battery::CrustProject>,
-        parallel: usize,
-        force: bool,
-    },
-    Skip,
-}
-
-/// Plan for testing.
-pub enum TestPlan {
-    TestCorpus {
-        batteries: Vec<String>,
-        mode: super::test::TestMode,
-    },
-    Crust {
-        projects: Vec<super::battery::CrustProject>,
-        mode: super::test::TestMode,
-    },
-    /// Blind: run LLM-generated tests, then swap in real tests and run again.
-    BlindCrust {
-        projects: Vec<super::battery::CrustProject>,
-        mode: super::test::TestMode,
-    },
-}
+// Execution is now driven by the `Benchmark` trait (see `benchmark.rs`): one
+// lifecycle parameterized per dataset, rather than a plan enum + match ladder
+// per phase. The old TranslatePlan / VerifyPlan / TestPlan enums are gone.
 
 impl Cli {
     pub fn parse_args() -> Self {

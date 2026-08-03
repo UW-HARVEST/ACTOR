@@ -36,7 +36,9 @@ C program of your own, add it as a one-off case and run any agent on it.
    harvest-tools --agent c2rust translate mycases/hello
    ```
 
-   The translated crate is written under `results/.../mycases/hello/translated_rust/`.
+   The translated crate is written under `results/.../mycases/hello/translated/`
+   (the pre-verify phase dir). If a verify phase runs, its output lands in a
+   sibling `verified/` dir; scoring reads `verified/` if present, else `translated/`.
 
 3. (Optional) To also *score* correctness the way the benchmarks do, put
    JSON input/expected-output vectors in the `test_vectors/` directory, then
@@ -66,7 +68,7 @@ This repository evaluates multiple translation agents — from mechanical transp
 | Agent | Type | Description |
 |-------|------|-------------|
 | **kiro** | Agentic | Multi-turn [kiro-cli](https://github.com/aws/kiro-cli) agent: translate → verify (C-as-oracle) → test |
-| **kiro-translate** | Agentic (translate-only) | kiro's translation without the verify/repair loop |
+| **kiro-translate** | Derived column (not an `--agent`) | kiro's pre-verify result — its `translated/` phase scored without the verify/repair loop (the "no validate" column). Reported for every agent automatically; no separate run. |
 | **claude** | Agentic | Claude Code with project-level context |
 | **c2rust** | Mechanical | [c2rust](https://github.com/immunant/c2rust) transpiler (unsafe, line-for-line) |
 | **laertes** | Mechanical + rules | c2rust + [Laertes](https://doi.org/10.1145/3453483.3454107) (PLDI 2021) rule-based unsafe reduction |
@@ -99,7 +101,7 @@ tools/                      # harvest-tools CLI (Rust)
 │   ├── battery.rs          # Path resolution, unsafe counting, LOC
 │   └── report.rs           # Markdown table generation
 prompts/                    # System prompts organized by agent
-├── kiro/                   # kiro + kiro-translate prompts
+├── kiro/                   # kiro prompts
 ├── claude/                 # Claude Code prompts
 └── oneshot/                # One-shot LLM prompts (kimi, gpt-5.4, gemini)
 test-corpus/                # MIT TRACTOR Test-Corpus (submodule)

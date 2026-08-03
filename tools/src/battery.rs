@@ -4,6 +4,49 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+// ── Per-case phase directories: ONE source of truth ────────────────────
+//
+// A case's results live in two self-contained PHASE DIRECTORIES, uniform
+// across every dataset:
+//
+//   <case>/translated/   what translation produced (pre-verify). Always present.
+//   <case>/verified/     what the verify phase produced. Present iff verify ran.
+//
+// Each phase dir is fully self-contained: it IS the crate root (src/,
+// Cargo.toml, c_src/), and carries that phase's own `result.json` and
+// `logs/`. Reading a case's "current" score uses [`crate_dir`]: verified/ if
+// it exists, else translated/. This replaces the old asymmetric layout
+// (`translated_rust/` crate + `translated_rust_original/` snapshot + a
+// case-root result.json/logs, plus blind-CRUST's `translate/`+`verify/`).
+
+/// Pre-verify phase dir: exactly what translation produced. Always present.
+pub const TRANSLATED: &str = "translated";
+
+/// Post-verify phase dir: what the verify phase produced. Present iff verify ran.
+pub const VERIFIED: &str = "verified";
+
+/// The phase dir for `phase` under a case dir (`case_dir/translated` or
+/// `case_dir/verified`).
+pub fn phase_dir(case_dir: &Path, phase: &str) -> PathBuf {
+    case_dir.join(phase)
+}
+
+/// The canonical crate/result dir for a case under the reader rule:
+/// `verified/` if it exists, else `translated/`. Every reader that wants "the
+/// current state of this case" (score, LOC, unsafe, crate source) uses this,
+/// so pre- and post-verify cases resolve uniformly.
+pub fn crate_dir(case_dir: &Path) -> PathBuf {
+    let verified = case_dir.join(VERIFIED);
+    if verified.is_dir() { verified } else { case_dir.join(TRANSLATED) }
+}
+
+/// The crate-dir name MIT `runtests` hardcodes (`<case>/translated_rust/`,
+/// test-corpus/.../discovery/rust.py) and the neutral name used for the
+/// agent's temp workspace during translate/verify. NOT a storage phase dir —
+/// canonical storage uses [`TRANSLATED`]/[`VERIFIED`]. For runtests scoring a
+/// phase, `<case>/translated_rust` is staged as a symlink to that phase dir.
+pub const TRANSLATED_RUST: &str = "translated_rust";
+
 /// A test case that is independently translated and verified.
 #[derive(Debug, Clone)]
 pub struct IndependentCase {
@@ -129,6 +172,48 @@ impl CrustProject {
             if p.is_dir() { return Some(p); }
         }
         None
+    }
+}
+
+// ── harvest-bench project ──────────────────────────────────────────────
+
+/// A harvest-bench project: `harvest-bench/tests/<name>/` with a `test_case/`
+/// (the C library the agent translates) and a `gtest_suite/` (the upstream test
+/// suite the runner links against the translated cdylib by ABI).
+#[derive(Debug, Clone)]
+pub struct HarvestBenchProject {
+    name: String,
+    test_case: PathBuf,
+    gtest_suite: PathBuf,
+}
+
+impl HarvestBenchProject {
+    pub fn name(&self) -> &str { &self.name }
+    pub fn test_case(&self) -> &Path { &self.test_case }
+    pub fn gtest_suite(&self) -> &Path { &self.gtest_suite }
+
+    /// Resolve a single named project under `tests_dir` (= harvest-bench/tests).
+    pub fn resolve(tests_dir: &Path, name: &str) -> Result<Self> {
+        let root = tests_dir.join(name);
+        let test_case = root.join("test_case");
+        let gtest_suite = root.join("gtest_suite");
+        anyhow::ensure!(test_case.is_dir(), "harvest-bench test_case not found: {}", test_case.display());
+        anyhow::ensure!(gtest_suite.is_dir(), "harvest-bench gtest_suite not found: {}", gtest_suite.display());
+        Ok(Self { name: name.to_string(), test_case, gtest_suite })
+    }
+
+    /// Discover all harvest-bench projects under `tests_dir` (dirs with both a
+    /// `test_case/` and a `gtest_suite/`).
+    pub fn discover(tests_dir: &Path) -> Result<Vec<Self>> {
+        anyhow::ensure!(tests_dir.is_dir(), "harvest-bench tests dir not found: {} (did you `git submodule update --init`?)", tests_dir.display());
+        let mut names: Vec<String> = std::fs::read_dir(tests_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+            .filter(|e| e.path().join("test_case").is_dir() && e.path().join("gtest_suite").is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names.into_iter().map(|n| Self::resolve(tests_dir, &n)).collect()
     }
 }
 
@@ -526,7 +611,6 @@ pub struct Paths {
     pub results_dir: PathBuf,
     pub prompts_dir: PathBuf,
     pub agent: Agent,
-    pub dataset: Dataset,
     pub model: Option<String>,
 }
 
@@ -534,7 +618,6 @@ impl Paths {
     pub fn new(repo_root: &Path, agent: Agent, dataset: Dataset, model: Option<&str>) -> Self {
         let agent_name: &str = match agent {
             Agent::Kiro => "kiro",
-            Agent::KiroTranslate => "kiro-translate",
             Agent::Claude => "claude",
             Agent::ClaudeCombined => "claude-combined",
             Agent::ClaudeMinimal => "claude-minimal",
@@ -566,19 +649,26 @@ impl Paths {
                 repo_root.join("crust-bench/datasets"),
                 repo_root.join("results/CRUST-blind").join(agent_name),
             ),
+            Dataset::HarvestBench => (
+                repo_root.join("harvest-bench/tests"),
+                repo_root.join("results/HarvestBench").join(agent_name),
+            ),
         };
         let prompts_dir = match agent {
             Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 => match dataset {
-                Dataset::TestCorpus => repo_root.join("prompts/claude"),
+                // harvest-bench cases are libraries; reuse the project-type-
+                // dispatching prompts the test-corpus path uses (they handle the
+                // shared-library / cdylib case).
+                Dataset::TestCorpus | Dataset::HarvestBench => repo_root.join("prompts/claude"),
                 Dataset::Crust | Dataset::BlindCrust => repo_root.join("prompts/claude/crust"),
             },
             Agent::Kimi | Agent::Oneshot => repo_root.join("prompts/oneshot"),
             _ => match dataset {
-                Dataset::TestCorpus => repo_root.join("prompts/kiro/test-corpus"),
+                Dataset::TestCorpus | Dataset::HarvestBench => repo_root.join("prompts/kiro/test-corpus"),
                 Dataset::Crust | Dataset::BlindCrust => repo_root.join("prompts/kiro/crust"),
             },
         };
-        Self { corpus_dir, results_dir, prompts_dir, agent, dataset, model: model.map(String::from) }
+        Self { corpus_dir, results_dir, prompts_dir, agent, model: model.map(String::from) }
     }
 
     pub fn input_dir(&self, battery: &str) -> PathBuf {
@@ -589,14 +679,16 @@ impl Paths {
         self.results_dir.join(name)
     }
 
-    /// Blind CRUST: immutable translation output.
+    /// Blind CRUST: immutable translation output. This is the case's
+    /// `translated/` phase dir (the uniform pre-verify location).
     pub fn translate_dir(&self, name: &str) -> TranslateDir {
-        TranslateDir(self.results_dir.join(name).join("translate"))
+        TranslateDir(self.results_dir.join(name).join(TRANSLATED))
     }
 
     /// Blind CRUST: mutable verify workspace (tests + possible src fixes).
+    /// This is the case's `verified/` phase dir.
     pub fn verify_dir(&self, name: &str) -> VerifyDir {
-        VerifyDir(self.results_dir.join(name).join("verify"))
+        VerifyDir(self.results_dir.join(name).join(VERIFIED))
     }
 
     pub fn case_dir(&self, battery: &str, case: &str) -> PathBuf {
@@ -746,8 +838,8 @@ mod tests {
         let v = paths.verify_dir("vec");
 
         assert_ne!(t.as_ref(), v.as_ref());
-        assert!(t.as_ref().ends_with("vec/translate"));
-        assert!(v.as_ref().ends_with("vec/verify"));
+        assert!(t.as_ref().ends_with("vec/translated"));
+        assert!(v.as_ref().ends_with("vec/verified"));
         assert_eq!(t.as_ref().parent(), v.as_ref().parent());
     }
 

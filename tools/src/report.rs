@@ -77,6 +77,7 @@ pub fn generate(repo_root: &Path) -> Result<()> {
             let bat_dir = bat_entry.path();
             if !bat_dir.is_dir() { continue; }
 
+            // Headline (validated) row: verified-phase summary + per-case data.
             let summary_path = bat_dir.join("summary.json");
             let summary: Summary = match read_json(&summary_path) {
                 Some(s) => s,
@@ -92,7 +93,7 @@ pub fn generate(repo_root: &Path) -> Result<()> {
 
             rows.push(BatteryRow {
                 agent: agent.clone(),
-                battery,
+                battery: battery.clone(),
                 cases_passed: summary.cases_passed,
                 cases_tested: summary.cases_tested,
                 cases_built,
@@ -102,6 +103,31 @@ pub fn generate(repo_root: &Path) -> Result<()> {
                 total_loc,
                 unsafe_lines,
             });
+
+            // No-validate ("kiro-translate") virtual agent: kiro's PRE-verify
+            // numbers, read from summary_translated.json + each case's
+            // translated/result.json. Emitted as a synthetic agent row so the
+            // \ActorKiroNoValidate* macros and TRACTOR_TABLE_ROWS keep reading
+            // it by the "kiro-translate" key without a separate results tree.
+            if agent == "kiro" {
+                if let Some(nv) = read_json::<Summary>(&bat_dir.join("summary_translated.json")) {
+                    let (nv_loc, nv_unsafe, nv_built) = aggregate_cases_phase(
+                        &bat_dir, &test_corpus_dir.join(&battery), Some(crate::battery::TRANSLATED),
+                    );
+                    rows.push(BatteryRow {
+                        agent: "kiro-translate".to_string(),
+                        battery: battery.clone(),
+                        cases_passed: nv.cases_passed,
+                        cases_tested: nv.cases_tested,
+                        cases_built: nv_built,
+                        vectors_passed: nv.vectors_passed,
+                        vectors_total: nv.vectors_passed + nv.vectors_failed,
+                        c_loc,
+                        total_loc: nv_loc,
+                        unsafe_lines: nv_unsafe,
+                    });
+                }
+            }
         }
     }
 
@@ -300,13 +326,25 @@ pub fn generate(repo_root: &Path) -> Result<()> {
     //      rows must exist. A renamed/missing dir otherwise emits a plausible
     //      all-zeros row (e.g. "0/338") that trips no other invariant and is
     //      indistinguishable from a legitimate baseline zero.
-    for agent in ["kiro", "claude", "codex-gpt54", "kiro-translate"] {
+    // kiro-translate is NOT a real dir anymore — it's the no-validate virtual
+    // agent derived from kiro's translated/ phase. Its presence is guaranteed
+    // by the summary_translated.json invariant just below, not a dir check.
+    for agent in ["kiro", "claude", "codex-gpt54"] {
         anyhow::ensure!(
             results_dir.join(agent).is_dir(),
             "TRACTOR agent-dir invariant failed: results/Test-Corpus/{agent} is missing \
              (a rename would silently emit a 0/338 row). Fix the mapping or restore the dir."
         );
     }
+    // The no-validate row is derived from kiro's pre-verify phase; require at
+    // least one battery to carry summary_translated.json so a missing pre-verify
+    // scoring pass can't silently emit a 0/338 no-validate row.
+    anyhow::ensure!(
+        sorted_read_dir(&results_dir.join("kiro")).map(|bats| bats.iter().any(|b|
+            b.path().join("summary_translated.json").is_file())).unwrap_or(false),
+        "no-validate invariant failed: no results/Test-Corpus/kiro/<battery>/summary_translated.json \
+         found (the pre-verify scoring pass did not run; \\ActorKiroNoValidate* would be 0/338)."
+    );
     for agent in ["kiro", "claude", "codex-gpt54"] {
         anyhow::ensure!(
             repo_root.join("results/CRUST").join(agent).is_dir(),
@@ -469,8 +507,7 @@ fn crust_pass_adjusted(
                 // stays the canonical 87 rather than shrinking to the number of
                 // successfully-scored projects.
                 total += 1;
-                let rp = pe.path().join("result.json");
-                let rp = if rp.exists() { rp } else { pe.path().join("verify/result.json") };
+                let rp = crate::battery::crate_dir(&pe.path()).join("result.json");
                 let Some(r) = read_json::<serde_json::Value>(&rp) else { continue };
                 // Single canonical rule, identical to the baselines (scoring.rs):
                 // a pass needs >=1 passing test and 0 failing. A crate that builds
@@ -659,8 +696,7 @@ fn crust_loc_unsafe(repo_root: &Path, mode_dir: &str, agent: &str) -> (u32, u32,
         if !pe.path().is_dir() { continue; }
         let name = pe.file_name().to_string_lossy().to_string();
         if crate::exclusions::is_excluded(name.as_str()) { continue; }
-        let rp = pe.path().join("result.json");
-        let rp = if rp.exists() { rp } else { pe.path().join("verify/result.json") };
+        let rp = crate::battery::crate_dir(&pe.path()).join("result.json");
         let Some(r) = read_json::<serde_json::Value>(&rp) else { continue };
         n += 1;
         loc += r.pointer("/loc/code").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -1017,8 +1053,7 @@ fn crust_build_counts(repo_root: &Path, mode_dir: &str) -> std::collections::BTr
                 if !pe.path().is_dir() { continue; }
                 let name = pe.file_name().to_string_lossy().to_string();
                 if crate::exclusions::is_excluded(name.as_str()) { continue; }
-                let rp = pe.path().join("result.json");
-                let rp = if rp.exists() { rp } else { pe.path().join("verify/result.json") };
+                let rp = crate::battery::crate_dir(&pe.path()).join("result.json");
                 let Some(r) = read_json::<serde_json::Value>(&rp) else { continue };
                 if crate::scoring::CrustOutcome::from_actor(&r).built() { builds += 1; }
             }
@@ -1091,7 +1126,8 @@ fn case_builds(repo_root: &Path, agent: &str) -> std::collections::BTreeMap<Stri
         for ce in cases {
             if !ce.path().is_dir() { continue; }
             let case = ce.file_name().to_string_lossy().to_string();
-            let Some(r) = read_json::<CaseResult>(&ce.path().join("result.json")) else { continue };
+            let rp = crate::battery::crate_dir(&ce.path()).join("result.json");
+            let Some(r) = read_json::<CaseResult>(&rp) else { continue };
             out.insert(format!("{battery}/{case}"), r.error.as_deref() != Some("build failed"));
         }
     }
@@ -1115,19 +1151,27 @@ fn laertes_vs_c2rust(repo_root: &Path) -> (u32, u32) {
 
 /// Sum ACTOR credits and wall-seconds over a results tree. Returns
 /// `(total_credits, verify_credits, total_wall_secs)` across the translate and
-/// verify phases of every result.json under `base`. Shared-source duplicates carry
-/// no credits (only the real translation does), so they don't double-count.
+/// verify phases.
+///
+/// Reads exactly ONE result.json per case — the canonical phase dir (verified/
+/// if present, else translated/, via [`crate::battery::crate_dir`]). This is
+/// essential now that each case has BOTH translated/result.json and (when
+/// verified) verified/result.json: the verified/ result.json carries the full
+/// translate+verify credit breakdown, so reading only it avoids double-counting
+/// the translate phase. A case dir is any directory that contains a translated/
+/// phase; shared-source duplicates carry no credits so they don't inflate.
 fn kiro_cost(base: &Path) -> (f64, f64, u64) {
     let (mut total, mut verify, mut secs) = (0.0f64, 0.0f64, 0u64);
     let Ok(rd) = std::fs::read_dir(base) else { return (0.0, 0.0, 0) };
     let mut stack: Vec<std::path::PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
     while let Some(p) = stack.pop() {
-        if p.is_dir() {
-            if let Ok(rd) = std::fs::read_dir(&p) {
-                stack.extend(rd.filter_map(|e| e.ok().map(|e| e.path())));
-            }
-        } else if p.file_name().is_some_and(|n| n == "result.json") {
-            if let Some(r) = read_json::<serde_json::Value>(&p) {
+        if !p.is_dir() { continue; }
+        // A case dir is one that has a translated/ phase. Read its canonical
+        // result.json once; do NOT also descend into its phase dirs (which each
+        // carry their own result.json and would double-count).
+        if crate::battery::phase_dir(&p, crate::battery::TRANSLATED).is_dir() {
+            let rp = crate::battery::crate_dir(&p).join("result.json");
+            if let Some(r) = read_json::<serde_json::Value>(&rp) {
                 for ph in ["translate", "verify"] {
                     let c = r.pointer(&format!("/{ph}/credits")).and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let s = r.pointer(&format!("/{ph}/wall_secs")).and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1135,6 +1179,8 @@ fn kiro_cost(base: &Path) -> (f64, f64, u64) {
                     if ph == "verify" { verify += c; }
                 }
             }
+        } else if let Ok(rd) = std::fs::read_dir(&p) {
+            stack.extend(rd.filter_map(|e| e.ok().map(|e| e.path())));
         }
     }
     (total, verify, secs)
@@ -1445,12 +1491,24 @@ fn generate_tractor_tex(rows: &[BatteryRow]) -> String {
 /// case (correct for the all-independent batteries; only P00/P01 need dedup and
 /// those require the corpus anyway).
 fn aggregate_cases(bat_dir: &Path, corpus_bat_dir: &Path) -> (u32, u32, u32) {
+    aggregate_cases_phase(bat_dir, corpus_bat_dir, None)
+}
+
+/// Aggregate LOC/unsafe/built across a battery's cases. `phase` selects which
+/// phase dir's result.json to read: `Some("translated")` for the pre-verify
+/// (no-validate) numbers, `None` for the current/headline phase (verified/ if
+/// present, else translated/ — the reader rule).
+fn aggregate_cases_phase(bat_dir: &Path, corpus_bat_dir: &Path, phase: Option<&str>) -> (u32, u32, u32) {
     let corpus_present = corpus_bat_dir.is_dir();
     let (mut total_loc, mut total_unsafe, mut built) = (0u32, 0u32, 0u32);
     let Ok(entries) = std::fs::read_dir(bat_dir) else { return (0, 0, 0) };
     for entry in entries.flatten() {
         if !entry.path().is_dir() { continue; }
-        let result_path = entry.path().join("result.json");
+        let phase_dir = match phase {
+            Some(p) => crate::battery::phase_dir(&entry.path(), p),
+            None => crate::battery::crate_dir(&entry.path()),
+        };
+        let result_path = phase_dir.join("result.json");
         let cr: CaseResult = match read_json(&result_path) {
             Some(r) => r,
             None => continue,
