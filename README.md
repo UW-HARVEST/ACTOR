@@ -12,9 +12,10 @@ C program of your own, add it as a one-off case and run any agent on it.
 1. Create a case directory under a battery. A case is a folder named
    `<something>` (suffix it with `_lib` if it is a library rather than an
    executable) containing a `test_case/` subdirectory with your C sources
-   and headers. The harness only discovers a case if a sibling
-   `test_vectors/` directory also exists, so create one — it may be empty
-   if you only want to translate:
+   and headers. The harness only discovers a case if the following conditions are met:
+   - It is placed under `Public-Tests`; and
+   - The `test_case` directory also has a sibling `test_vectors` directory - it may be empty if you
+     only want to translate.
 
    ```bash
    mkdir -p test-corpus/Public-Tests/mycases/hello/test_case
@@ -22,7 +23,7 @@ C program of your own, add it as a one-off case and run any agent on it.
    cp path/to/your/*.c path/to/your/*.h \
       test-corpus/Public-Tests/mycases/hello/test_case/
    ```
-
+   
 2. Translate it with any agent. The agent works only from the C source in
    `test_case/`; it writes a Cargo project (`Cargo.toml` + `src/`) with the
    translated Rust:
@@ -290,4 +291,3 @@ is the *test repair* setting, where the agent sees the ground-truth tests.
 | claude-combined | 61/95 | 60/90 | 454/514 | 55369 | 584 | 1.1% |
 | kiro | 59/94 | 58/89 | 443/478 | 46669 | 466 | 1.0% |
 | kiro-translate | 54/95 | 53/90 | 410/454 | 47395 | 466 | 1.0% |
-
