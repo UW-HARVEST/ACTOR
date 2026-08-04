@@ -56,6 +56,38 @@ struct CaseResult {
 
 // ── Public entry point ─────────────────────────────────────────────────
 
+/// The CLI value for an agent (e.g. `claude`), for copy-pasteable hints in
+/// diagnostics. Uses clap's derived `ValueEnum` mapping so it always matches
+/// what `--agent` accepts.
+fn agent_cli_name(agent: Agent) -> String {
+    use clap::ValueEnum;
+    agent.to_possible_value()
+        .map(|v| v.get_name().to_string())
+        .unwrap_or_else(|| format!("{agent:?}").to_lowercase())
+}
+
+/// A translate target names a BATTERY; cases live one level deeper as
+/// `<battery>/<case>/` with a `test_case/` (C sources) and a `test_vectors/`
+/// dir inside each. Discovering zero cases almost always means the target is a
+/// case dir mistaken for a battery (the #1 first-run pitfall). Fail loudly with
+/// a fix, rather than the old silent "0/0 translated".
+fn ensure_cases_found(count: usize, paths: &Paths, battery_name: &str) -> Result<()> {
+    if count > 0 { return Ok(()); }
+    let input_dir = paths.input_dir(battery_name);
+    let agent = agent_cli_name(paths.agent);
+    anyhow::bail!(
+        "No translatable cases found under battery '{battery_name}' ({}).\n\
+         A translate target is a BATTERY; each case must be one level deeper as \
+         `<battery>/<case>/`, with BOTH a `test_case/` (your C sources) and a \
+         `test_vectors/` dir (may be empty) inside it.\n\
+         If '{battery_name}' is itself your case, nest it under a battery, e.g.:\n  \
+           test-corpus/Public-Tests/mycases/{battery_name}/test_case/     (your .c/.h)\n  \
+           test-corpus/Public-Tests/mycases/{battery_name}/test_vectors/  (may be empty)\n\
+         then run:  harvest-tools --agent {agent} translate mycases/{battery_name}",
+        input_dir.display(),
+    );
+}
+
 pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, parallel: usize) -> Result<()> {
     preflight_check(paths.agent)?;
 
@@ -64,6 +96,7 @@ pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, 
     std::fs::create_dir_all(&output_dir)?;
 
     let total = count_cases(&battery);
+    ensure_cases_found(total, paths, battery_name)?;
 
     let mut independent: Vec<&battery::IndependentCase> = Vec::new();
     let mut shared: Vec<&battery::SharedSourceGroup> = Vec::new();
@@ -368,6 +401,10 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
     let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-library.md"))
         .context("reading translate-library.md for harvest-bench")?;
 
+    anyhow::ensure!(!projects.is_empty(),
+        "No harvest-bench projects to translate. Targets are `HB` (all) or \
+         `HB/<project>`; each project is a dir under harvest-bench/tests/ with \
+         both a `test_case/` and a `gtest_suite/`. Did you `git submodule update --init`?");
     let total = projects.len();
     let sem = Semaphore::new(parallel);
 
@@ -899,6 +936,10 @@ fn run_crust_with_mode(
 ) -> Result<()> {
     preflight_check(paths.agent)?;
 
+    anyhow::ensure!(!projects.is_empty(),
+        "No CRUST projects to translate. Targets are `CRUST` (all) or \
+         `CRUST/<project>`; projects come from crust-bench/datasets/RBench/. \
+         Did you unzip crust-bench/datasets and `git submodule update --init`?");
     let total = projects.len();
     let sem = Semaphore::new(parallel);
     // Read prompt once, share across threads
