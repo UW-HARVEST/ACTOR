@@ -259,6 +259,10 @@ fn run_and_record(
     translate_fn: impl FnOnce() -> Result<()>,
     post_process_fn: impl FnOnce() -> Result<()>,
 ) -> CaseResult {
+    // Clear any stale agent-exit from a prior case on this (possibly re-used)
+    // thread; CLI agents re-stamp it during translate_fn, non-CLI agents leave
+    // it absent so no exit_code is falsely attributed.
+    clear_agent_exit();
     let start = Instant::now();
     match translate_fn() {
         Ok(()) => {
@@ -597,7 +601,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
 
     match paths.agent {
         Agent::Kiro => {
-            let _status = Command::new("bash")
+            let status = Command::new("bash")
                 .arg("-lc")
                 .arg(r#"set -o pipefail; timeout 5400 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
                 .arg("--")
@@ -607,10 +611,11 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                 .current_dir(&work_dir)
                 .status()
                 .context("invoking kiro-cli")?;
+            record_agent_exit(status);
         }
         Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt => {
             let settings_path = work_dir.parent().unwrap().join(".claude/settings.json");
-            let _status = Command::new("bash")
+            let status = Command::new("bash")
                 .arg("-lc")
                 .arg(r#"set -o pipefail; timeout 10800 claude -p "$1" --strict-mcp-config --disable-slash-commands --settings "$3" --agents "$4" --agent claude_plain --max-turns 1000 --permission-mode bypassPermissions --verbose --output-format stream-json < /dev/null 2>&1 | tee "$2""#)
                 .arg("--")
@@ -622,6 +627,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                 .current_dir(&work_dir)
                 .status()
                 .context("invoking claude")?;
+            record_agent_exit(status);
         }
         Agent::CodexGpt55 | Agent::CodexGpt54 => {
             // Codex CLI on Bedrock. Bedrock backend only — OpenAI auth/telemetry
@@ -762,16 +768,94 @@ pub fn propagate_config(
 
 // ── Metrics ────────────────────────────────────────────────────────────
 
+// ── Agent process exit capture ─────────────────────────────────────────
+//
+// The agent CLIs (kiro-cli / claude / codex) are shelled out with `.status()`,
+// but the metrics JSON is written in a different, shallower function than the
+// one that invokes them (run_and_record vs translate_case_at, and similarly
+// for verify). Rather than thread the exit status back through
+// dispatch_translate's ~12 match arms, we stash the most recent agent exit in
+// a THREAD-LOCAL. This is sound because each case runs on its own thread
+// (translate/verify parallelize with one case per spawned thread), so the
+// "last agent exit on this thread" is unambiguously this case's agent run.
+//
+// `exit_code` is the shell pipeline's status (`set -o pipefail` makes it the
+// agent's own code, or `timeout`'s 124 on timeout → `timed_out`). It is absent
+// for non-CLI agents (API-based kimi/oneshot, in-process c2rust) which have no
+// single agent-process exit code.
+#[derive(Clone, Copy, Default)]
+pub struct AgentExit {
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub recorded: bool,
+}
+
+thread_local! {
+    static LAST_AGENT_EXIT: std::cell::Cell<AgentExit> =
+        const { std::cell::Cell::new(AgentExit { exit_code: None, timed_out: false, recorded: false }) };
+}
+
+/// Record the exit of an agent CLI invocation for the current case/thread.
+pub fn record_agent_exit(status: std::process::ExitStatus) {
+    let code = status.code();
+    LAST_AGENT_EXIT.with(|c| c.set(AgentExit {
+        exit_code: code,
+        timed_out: code == Some(124), // `timeout` exits 124 when it kills the child
+        recorded: true,
+    }));
+}
+
+/// Clear the stashed exit at the start of a case, so a non-CLI agent (or a
+/// re-used thread) can never inherit a previous case's exit code.
+pub fn clear_agent_exit() {
+    LAST_AGENT_EXIT.with(|c| c.set(AgentExit::default()));
+}
+
+/// Take (and clear) the stashed exit for the current thread.
+fn take_agent_exit() -> AgentExit {
+    LAST_AGENT_EXIT.with(|c| c.replace(AgentExit::default()))
+}
+
+/// Add `exit_code` / `timed_out` to a metrics object if a CLI agent exit was
+/// recorded this run. Shared by translate and verify so both report it
+/// identically — no double standard.
+fn merge_agent_exit(metrics: &mut serde_json::Value) {
+    let e = take_agent_exit();
+    if e.recorded {
+        metrics["exit_code"] = serde_json::json!(e.exit_code);
+        metrics["timed_out"] = serde_json::json!(e.timed_out);
+    }
+}
+
 fn write_translation_metrics(case_dir: &Path, agent: Agent, duration_secs: u64, success: bool) {
-    let metrics = serde_json::json!({
+    let mut metrics = serde_json::json!({
         "agent": format!("{agent:?}").to_lowercase(),
         "duration_secs": duration_secs,
         "success": success,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
+    merge_agent_exit(&mut metrics);
     let _ = std::fs::create_dir_all(case_dir);
     let _ = std::fs::write(
         case_dir.join("translation.json"),
+        serde_json::to_string_pretty(&metrics).unwrap_or_default() + "\n",
+    );
+}
+
+/// Verify-side sibling of [`write_translation_metrics`], writing
+/// `verification.json` with the same shape (incl. agent exit). No double
+/// standard: verify records agent process health exactly like translate.
+pub fn write_verification_metrics(case_dir: &Path, agent: Agent, duration_secs: u64, success: bool) {
+    let mut metrics = serde_json::json!({
+        "agent": format!("{agent:?}").to_lowercase(),
+        "duration_secs": duration_secs,
+        "success": success,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    merge_agent_exit(&mut metrics);
+    let _ = std::fs::create_dir_all(case_dir);
+    let _ = std::fs::write(
+        case_dir.join("verification.json"),
         serde_json::to_string_pretty(&metrics).unwrap_or_default() + "\n",
     );
 }
@@ -857,7 +941,7 @@ fn prepare_crust_workspace(
 fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Result<()> {
     match agent {
         Agent::Kiro => {
-            Command::new("bash")
+            let status = Command::new("bash")
                 .arg("-lc")
                 .arg(r#"set -o pipefail; timeout 1800 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
                 .arg("--")
@@ -866,6 +950,7 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
                 .current_dir(work)
                 .status()
                 .context("invoking kiro-cli for CRUST")?;
+            record_agent_exit(status);
         }
         Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt => {
             // Write a minimal settings.json so --settings can find one
@@ -873,7 +958,7 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
             std::fs::create_dir_all(&claude_dir)?;
             let settings_path = claude_dir.join("settings.json");
             std::fs::write(&settings_path, "{}")?;
-            Command::new("bash")
+            let status = Command::new("bash")
                 .arg("-lc")
                 .arg(r#"set -o pipefail; timeout 10800 claude -p "$1" --strict-mcp-config --disable-slash-commands --settings "$3" --agents "$4" --agent claude_plain --max-turns 1000 --permission-mode bypassPermissions --verbose --output-format stream-json < /dev/null 2>&1 | tee "$2""#)
                 .arg("--")
@@ -884,6 +969,7 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
                 .current_dir(work)
                 .status()
                 .context("invoking claude for CRUST")?;
+            record_agent_exit(status);
         }
         Agent::CodexGpt55 | Agent::CodexGpt54 => {
             let (model, region) = match agent {
@@ -1007,6 +1093,7 @@ fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject, mod
 
     let (_tmp, work, log_path) = prepare_crust_workspace(paths, project, mode, &out.join("logs"), "translation.log")?;
 
+    clear_agent_exit();
     let start = Instant::now();
     invoke_agent(paths.agent, prompt, &log_path, &work)?;
     let elapsed = start.elapsed().as_secs();
@@ -1119,6 +1206,7 @@ fn verify_one_crust_blind_inner(paths: &Paths, project: &battery::CrustProject, 
     std::fs::create_dir_all(&logs_dir)?;
     let log_path = logs_dir.join("verify.log");
 
+    clear_agent_exit();
     let start = Instant::now();
     invoke_agent(paths.agent, prompt, &log_path, &work)?;
     let elapsed = start.elapsed().as_secs();
@@ -1132,6 +1220,8 @@ fn verify_one_crust_blind_inner(paths: &Paths, project: &battery::CrustProject, 
 
     let bin_dir = verify.join("src/bin");
     let success = bin_dir.is_dir() && std::fs::read_dir(&bin_dir)?.next().is_some();
+    // Record verify agent exit + metrics, mirroring translate — no double standard.
+    write_verification_metrics(verify.as_ref(), paths.agent, elapsed, success);
     Ok(CaseResult { name: project.name().into(), elapsed_secs: elapsed, success, error: None, skipped: false })
 }
 
@@ -2101,7 +2191,7 @@ fn invoke_codex_with_retry(
     const RETRY_BACKOFF_SECS: u64 = 30;
 
     for attempt in 1..=MAX_RETRIES {
-        let _status = Command::new("bash")
+        let status = Command::new("bash")
             .arg("-lc")
             .arg(r#"set -o pipefail; timeout 10800 codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C "$3" -c model="$5" -c model_providers.amazon-bedrock.aws.region="$6" --json "$1" < /dev/null 2>&1 | tee "$2""#)
             .arg("--")
@@ -2115,6 +2205,9 @@ fn invoke_codex_with_retry(
             .current_dir(work_dir)
             .status()
             .with_context(|| format!("invoking codex ({context_label})"))?;
+        // Record the final attempt's exit (overwritten each retry, so the last
+        // one wins — the exit that actually determined the outcome).
+        record_agent_exit(status);
 
         match scan_codex_log_for_transient_error(log_path) {
             None => return Ok(()), // success or non-transient
@@ -2172,4 +2265,54 @@ fn scan_codex_log_for_transient_error(log_path: &Path) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// A real ExitStatus from `sh -c "exit N"`, for testing exit capture.
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        Command::new("sh").arg("-c").arg(format!("exit {code}")).status().unwrap()
+    }
+
+    #[test]
+    fn merge_agent_exit_records_code_when_captured() {
+        clear_agent_exit();
+        record_agent_exit(exit_status(0));
+        let mut m = serde_json::json!({"success": true});
+        merge_agent_exit(&mut m);
+        assert_eq!(m["exit_code"], serde_json::json!(0));
+        assert_eq!(m["timed_out"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn merge_agent_exit_flags_timeout_124() {
+        clear_agent_exit();
+        record_agent_exit(exit_status(124)); // `timeout` uses 124
+        let mut m = serde_json::json!({});
+        merge_agent_exit(&mut m);
+        assert_eq!(m["exit_code"], serde_json::json!(124));
+        assert_eq!(m["timed_out"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn merge_agent_exit_absent_for_non_cli_agent() {
+        // No record_agent_exit call (e.g. kimi/oneshot API path) → no fields,
+        // so a stale exit is never falsely attributed.
+        clear_agent_exit();
+        let mut m = serde_json::json!({"success": true});
+        merge_agent_exit(&mut m);
+        assert!(m.get("exit_code").is_none(), "exit_code must be absent when no CLI agent ran");
+        assert!(m.get("timed_out").is_none());
+    }
+
+    #[test]
+    fn take_agent_exit_clears_so_next_case_starts_fresh() {
+        record_agent_exit(exit_status(1));
+        let _ = take_agent_exit();          // consume
+        let second = take_agent_exit();     // must be empty now
+        assert!(!second.recorded, "exit must not leak into the next case on a reused thread");
+    }
 }
