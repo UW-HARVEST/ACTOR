@@ -45,9 +45,9 @@ fn main() -> Result<()> {
             if !no_verify && bench.verifies(agent) {
                 bench.verify(&repo_root, &paths, inner, include_regex.as_deref(), false, parallel)?;
             }
-            // `test --update` folds enrichment in; it is never a separate step.
-            let outcome = bench.test(&paths, inner, test::TestMode::Update)?;
-            report_test_outcome(outcome);
+            // `test --update` folds enrichment in; it is never a separate step,
+            // and run_test regenerates the tables so they never drift.
+            run_test(&repo_root, bench.as_ref(), &paths, inner, test::TestMode::Update)?;
         }
         Command::Translate {
             ref target,
@@ -92,8 +92,7 @@ fn main() -> Result<()> {
                 test::TestMode::Run
             };
 
-            let outcome = benchmark::for_dataset(dataset).test(&paths, inner, mode)?;
-            report_test_outcome(outcome);
+            run_test(&repo_root, benchmark::for_dataset(dataset).as_ref(), &paths, inner, mode)?;
         }
         Command::Enrich { ref target, blind } => {
             let dataset = Dataset::detect(target, blind);
@@ -108,6 +107,41 @@ fn main() -> Result<()> {
             test::score_selfgen_baselines(&repo_root)?;
         }
     }
+    Ok(())
+}
+
+/// Score a target, then — in `--update` mode — regenerate the report tables so
+/// `tables/` always reflect what has just been run. This is the single seam
+/// that keeps scored data and the generated tables from drifting: there is no
+/// separate `report` step to remember. `report::generate` reads every agent's
+/// data from disk, so the tables reflect the whole current state (not just the
+/// slice re-run), and it self-guards (skips results.md if the corpus submodule
+/// is absent, bails on inconsistency), so a partial run can't clobber tables.
+fn run_test(
+    repo_root: &std::path::Path,
+    bench: &dyn benchmark::Benchmark,
+    paths: &battery::Paths,
+    target: &str,
+    mode: test::TestMode,
+) -> Result<()> {
+    let outcome = bench.test(paths, target, mode)?;
+    if matches!(mode, test::TestMode::Update) {
+        // Regenerate tables from the current on-disk state. The tables are a
+        // whole-corpus roll-up with cross-agent invariants (report::generate
+        // bails if, say, an agent dir is missing), so on a partial/in-progress
+        // tree it can legitimately fail — that must NOT fail the score run the
+        // user asked for. Treat regeneration as best-effort: succeed silently
+        // when the tree is complete, warn (don't error) when it isn't, so a
+        // single-tool rerun always works and never silently leaves stale tables.
+        match report::generate(repo_root) {
+            Ok(()) => println!("📊 Tables regenerated (tables/)"),
+            Err(e) => eprintln!(
+                "⚠️  Skipped table regeneration (results tree not complete enough): {e}\n   \
+                 Run `harvest-tools report` once all agents/datasets are populated."
+            ),
+        }
+    }
+    report_test_outcome(outcome);
     Ok(())
 }
 
