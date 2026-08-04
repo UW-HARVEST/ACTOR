@@ -3,6 +3,11 @@
 ACTOR performs **A**gentic **C**-**to**-**R**ust translation.
 Its input is a C program and its output is a Rust program.
 
+## Requirements and Installation
+
+The [developer documentation](docs/DEVELOPER.md) document the prerequisite toolchain and steps
+    required to build and install the ACTOR binary (i.e., `harvest-tools`) and set up the evaluation
+    benchmarks and datasets.
 
 ## Running ACTOR on your own C program
 
@@ -136,42 +141,6 @@ test-corpus/                # MIT TRACTOR Test-Corpus (submodule)
 crust-bench/                # CRUST-bench dataset (submodule, see https://github.com/benedikt-schesch/CRUST-bench)
 results/                    # All translation results (submodule)
 tables/                     # Auto-generated result tables
-```
-
-## Setup
-
-```bash
-git submodule update --init --recursive
-cd tools && cargo build --release
-```
-
-One-shot LLM agents require API keys:
-- `--agent kimi`: AWS Bedrock access (account `121913092579` via `ada-auth`)
-- `--agent oneshot`: `OPENROUTER_API_KEY` environment variable
-
-## Usage
-
-```bash
-# Full pipeline: translate → verify → test
-harvest-tools --agent kiro run B01_synthetic
-
-# Translate only
-harvest-tools --agent c2rust translate B02_organic
-
-# One-shot LLM translation
-harvest-tools --agent oneshot --model openai/gpt-5.4 translate B01_organic
-
-# Test and update stored results
-harvest-tools --agent kiro test all --update
-
-# CI validation (exact-match against stored summary.json)
-harvest-tools --agent kiro test all --check
-
-# Single case
-harvest-tools --agent kiro run B01_synthetic/001_helloworld
-
-# Generate result tables
-harvest-tools report
 ```
 
 ## CRUST-bench
