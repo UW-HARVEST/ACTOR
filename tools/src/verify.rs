@@ -138,6 +138,11 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
     // crate's own c_src (test_vectors/runner never enter the temp workspace).
     let work = IsolatedWorkDir::new(case_dir)?;
 
+    // Capture the verify agent's process exit exactly like translate does — no
+    // double standard. Cleared here so a skipped/absent CLI run records nothing.
+    crate::translate::clear_agent_exit();
+    let start = std::time::Instant::now();
+
     let prompt = prompt_template
         .replace("CASE_DIR_PLACEHOLDER", &work.root().to_string_lossy())
         .replace("CMAKE_BUILD_FLAGS", cmake_flags)
@@ -145,7 +150,7 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
 
     match agent {
         Agent::Kiro => {
-            let _status = Command::new("bash")
+            let status = Command::new("bash")
                 .arg("-lc")
                 .arg(r#"timeout 2700 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
                 .arg("--")
@@ -155,6 +160,7 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                 .current_dir(work.root())
                 .status()
                 .context("invoking kiro-cli for verification")?;
+            crate::translate::record_agent_exit(status);
         }
         Agent::Claude => {
             // Write sandbox settings in temp dir
@@ -177,7 +183,7 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
             )?;
 
             let settings_path = claude_dir.join("settings.json");
-            let _status = Command::new("bash")
+            let status = Command::new("bash")
                 .arg("-c")
                 .arg("set -o pipefail; timeout 10800 claude -p \"$PROMPT\" \
                     --strict-mcp-config --disable-slash-commands --settings \"$SETTINGS\" \
@@ -194,6 +200,7 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                 .current_dir(work.translated_rust())
                 .status()
                 .context("invoking claude for verification")?;
+            crate::translate::record_agent_exit(status);
         }
         Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 => {
             // ClaudeCombined: translate phase already did verify, skip this phase.
@@ -211,6 +218,10 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
 
     // Copy verified results back (skips target/ and c_src/)
     work.finish()?;
+    // Record verify metrics (incl. agent process exit) alongside verify.log,
+    // mirroring translate's translation.json — no double standard.
+    let verified_dir = crate::battery::phase_dir(case_dir, crate::battery::VERIFIED);
+    crate::translate::write_verification_metrics(&verified_dir, agent, start.elapsed().as_secs(), true);
     Ok(true)
 }
 
