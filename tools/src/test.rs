@@ -1593,9 +1593,21 @@ fn score_harvest_bench_suite(
         .context("invoking harvest-bench runner")?;
 
     // Parse `{"run": {"verdicts": [{"passed": bool, "skipped": bool}, ...]}}`.
-    let data = std::fs::read_to_string(report_json)
-        .with_context(|| format!("reading harvest-bench report {}", report_json.display()))?;
-    let json: serde_json::Value = serde_json::from_str(&data)?;
+    //
+    // If the runner produced no report at all (e.g. the gtest suite failed to
+    // build, the cdylib is missing/incompatible, cmake choked, etc.), return a
+    // clean zero-score result instead of erroring out the whole `run` command
+    // — a scoring failure should record a failed case (build_ok already False
+    // from build_harvest_bench_lib caller), not abort the sweep. Same for a
+    // truncated/malformed report.
+    let Ok(data) = std::fs::read_to_string(report_json) else {
+        eprintln!("⚠️  harvest-bench runner produced no report {} — recording 0 tests", report_json.display());
+        return Ok((0, 0, 0));
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
+        eprintln!("⚠️  harvest-bench runner report at {} is not valid JSON — recording 0 tests", report_json.display());
+        return Ok((0, 0, 0));
+    };
     let verdicts = json.pointer("/run/verdicts").and_then(|v| v.as_array());
     let Some(verdicts) = verdicts else { return Ok((0, 0, 0)) };
 
@@ -1642,9 +1654,11 @@ pub fn run_harvest_bench_test(
     for project in projects {
         let name = project.name();
         let case_dir = paths.output_dir(name);
-        // harvest-bench is single-phase: crate + result.json + logs all live in
-        // the case's translated/ phase dir.
-        let crate_dir = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
+        // Score the canonical crate: verified/ if verify produced a valid one,
+        // else translated/ (the reader rule). This handles both single-phase
+        // (no verify → only translated/) and two-phase (verify ran → verified/,
+        // or verify broke the crate → compile-gate discarded verified/, fallback).
+        let crate_dir = crate::battery::crate_dir(&case_dir);
         if !crate_dir.join("Cargo.toml").exists() { continue; }
 
         let logs_dir = crate_dir.join("logs");
