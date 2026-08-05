@@ -123,6 +123,53 @@ fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filte
     Ok(())
 }
 
+/// Run the C-as-oracle verify phase over harvest-bench projects. Reuses the
+/// EXACT same shared prompts/claude/verify.md and verify_case mechanics as
+/// Test-Corpus — same libloading differential + Phase A/B/C/D + subagent
+/// protocol — so both benchmarks receive the same verification rigor. HB has
+/// no per-project cmake flags or configs, so those are empty.
+pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject], parallel: usize, force: bool) -> Result<()> {
+    let sem = Arc::new(Semaphore::new(parallel));
+    let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))
+        .context("reading verify.md")?;
+
+    let total = projects.len();
+    println!("=== Verifying harvest-bench ({total} projects) ===");
+
+    let results: Vec<(String, Option<bool>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = projects.iter().map(|p| {
+            let sem = sem.clone();
+            let prompt = &prompt_template;
+            s.spawn(move || {
+                let _permit = sem.acquire();
+                let name = p.name().to_string();
+                let case_dir = paths.output_dir(&name);
+                if !crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
+                    return (name, None); // no translated crate yet
+                }
+                if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
+                    return (name, None); // skip: already verified
+                }
+                let ok = verify_case(&case_dir, prompt, "", "", paths.agent).unwrap_or(false);
+                (name, Some(ok))
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().expect("verify thread panicked")).collect()
+    });
+
+    let (mut verified, mut failed) = (0usize, 0usize);
+    for (i, (name, result)) in results.iter().enumerate() {
+        let n = i + 1;
+        match result {
+            None => println!("[{n}/{total}] ⏭️  {name} (skipped: no translated/ or already verified)"),
+            Some(true) => { verified += 1; println!("[{n}/{total}] ✅ {name}"); }
+            Some(false) => { failed += 1; println!("[{n}/{total}] ❌ {name}"); }
+        }
+    }
+    println!("\nHB verify: {verified}/{total} verified, {failed} failed");
+    Ok(())
+}
+
 fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, configs_text: &str, agent: Agent) -> Result<bool> {
     // Verify is PURE: it reads the immutable `translated/` crate (via
     // IsolatedWorkDir), works in a temp dir, and writes the result to
@@ -218,11 +265,37 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
 
     // Copy verified results back (skips target/ and c_src/)
     work.finish()?;
+
+    // ── Compile-gate: verify only counts as success if the crate still builds.
+    // A mid-response API error can leave the crate half-written (missing symbols,
+    // unresolved imports). Recording such a broken crate as "verified" would then
+    // make the scorer build+score garbage. Better: detect the break, discard
+    // verified/, and let the scorer fall back to the (less complete but compilable)
+    // translated/ crate. The verify log is preserved for debugging.
+    let verified_dir = crate::battery::phase_dir(case_dir, crate::battery::VERIFIED);
+    let check = Command::new("timeout")
+        .args(["120", "cargo", "check"])
+        .current_dir(&verified_dir)
+        .output();
+    let compiles = check.map_or(false, |o| o.status.success());
+    if !compiles {
+        eprintln!("  ⚠️  verify produced a non-compiling crate — discarding verified/, scorer will use translated/");
+        // Keep the log for post-mortem; remove the broken crate so crate_dir() falls back.
+        let logs_backup = verified_dir.join("logs");
+        let logs_tmp = case_dir.join("_verify_logs_backup");
+        if logs_backup.is_dir() { let _ = std::fs::rename(&logs_backup, &logs_tmp); }
+        let _ = std::fs::remove_dir_all(&verified_dir);
+        // Restore just the logs dir under verified/ (so the log is still findable).
+        if logs_tmp.is_dir() {
+            let _ = std::fs::create_dir_all(&verified_dir);
+            let _ = std::fs::rename(&logs_tmp, &verified_dir.join("logs"));
+        }
+    }
+
     // Record verify metrics (incl. agent process exit) alongside verify.log,
     // mirroring translate's translation.json — no double standard.
-    let verified_dir = crate::battery::phase_dir(case_dir, crate::battery::VERIFIED);
-    crate::translate::write_verification_metrics(&verified_dir, agent, start.elapsed().as_secs(), true);
-    Ok(true)
+    crate::translate::write_verification_metrics(&verified_dir, agent, start.elapsed().as_secs(), compiles);
+    Ok(compiles)
 }
 
 /// Build a text block listing all distinct configurations for the verify prompt.

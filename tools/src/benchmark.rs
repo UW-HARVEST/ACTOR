@@ -283,14 +283,23 @@ struct HarvestBench;
 impl Benchmark for HarvestBench {
     fn name(&self) -> &'static str { "harvest-bench" }
 
-    // Like CRUST, harvest-bench verification is folded into the agentic
-    // translate-and-verify prompt; no separate verify phase runs.
-    fn verifies(&self, _agent: Agent) -> bool { false }
+    // Full parity with Test-Corpus: HB gets a real C-as-oracle verify phase
+    // for verifying agents (kiro/claude/codex-gpt5*), using the SAME shared
+    // prompts/claude/verify.md — subagent protocol + Phase A/B/C/D differential
+    // testing (SYMBOLS.md + ERRORS.md gated). Ablation agents (Combined/
+    // Minimal/NoIter/…) skip verify by design, same as elsewhere.
+    fn verifies(&self, agent: Agent) -> bool { agent_runs_separate_verify(agent) }
 
     fn translate(&self, paths: &Paths, target: &str, _filter: Option<&str>,
                  parallel: usize, _limit: Option<usize>) -> Result<()> {
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
         translate::run_harvest_bench(paths, &projects, parallel)
+    }
+
+    fn verify(&self, _repo_root: &Path, paths: &Paths, target: &str,
+              _filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
+        let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
+        verify::run_harvest_bench(paths, &projects, parallel, force)
     }
 
     fn test(&self, paths: &Paths, target: &str, mode: TestMode) -> Result<TestOutcome> {
