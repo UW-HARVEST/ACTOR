@@ -10,20 +10,21 @@ Separate instructions exist for [Evaluation benchmarks and results](#evaluation-
 
 ## Command-line Tools
 
-From the root of `ACTOR`, run:
+To build (but not install) the `harvest-tools` binary (which enables you to run ACTOR),
+Run the following comand from the root of ACTOR:
 
 ```sh
 cd tools && cargo build --release
 ```
 
-This builds the binary: `ACTOR/tools/target/release/harvest-tools`.
-Run:
+which builds the binary: `ACTOR/tools/target/release/harvest-tools`.
+
+To build **and** install the `harvest-tools` binary,
+Run the following comand from the root of ACTOR:
 
 ```sh
 cd tools && cargo install --path .
 ```
-
-from the root of `ACTOR` to make the `harvest-tools` binary executable from any directory.
 
 One-shot LLM agents require API keys:
 - `--agent kimi`: AWS Bedrock access (account `121913092579` via `ada-auth`)
