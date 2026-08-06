@@ -1,0 +1,21 @@
+# Differential property-test harness: dlopens the C reference `.so` and the
+# translated Rust `.so` and compares them across many proptest-generated inputs.
+# Pure Rust — no FuzzTest/abseil/antlr, so it builds in seconds and a rebuild
+# after an edit is incremental. `[workspace]` detaches it from the parent crate.
+[package]
+name = "difftest"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+libloading = "0.8"
+proptest = "1"
+
+[[bin]]
+name = "difftest"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+
+[workspace]

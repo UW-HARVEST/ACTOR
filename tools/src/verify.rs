@@ -65,7 +65,7 @@ fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filte
                     return (c.name.clone(), None); // skipped
                 }
                 let cmake_flags = get_cmake_flags(paths, battery_name, &c.name);
-                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths.agent)
+                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths.agent, None)
                     .unwrap_or(false);
                 (c.name.clone(), Some(ok))
             })
@@ -100,7 +100,7 @@ fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filte
             println!("[{current}/{total}] 🔬 {} (shared-source, {} configs)", group.real_case, group.configs.len());
             let cmake_flags = get_cmake_flags(paths, battery_name, &group.real_case);
             let configs_text = build_configs_text(paths, battery_name, group);
-            let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, paths.agent)?;
+            let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, paths.agent, None)?;
 
             if ok { verified += 1; println!("[{current}/{total}] ✅ {} — verified", group.real_case); }
             else { failed += 1; println!("[{current}/{total}] ❌ {} — verification incomplete", group.real_case); }
@@ -128,7 +128,7 @@ fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filte
 /// Test-Corpus — same libloading differential + Phase A/B/C/D + subagent
 /// protocol — so both benchmarks receive the same verification rigor. HB has
 /// no per-project cmake flags or configs, so those are empty.
-pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject], parallel: usize, force: bool) -> Result<()> {
+pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject], parallel: usize, force: bool, fuzz: bool) -> Result<()> {
     let sem = Arc::new(Semaphore::new(parallel));
     let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))
         .context("reading verify.md")?;
@@ -150,7 +150,7 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
                 if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
                     return (name, None); // skip: already verified
                 }
-                let ok = verify_case(&case_dir, prompt, "", "", paths.agent).unwrap_or(false);
+                let ok = verify_case(&case_dir, prompt, "", "", paths.agent, Some((&name, fuzz))).unwrap_or(false);
                 (name, Some(ok))
             })
         }).collect();
@@ -170,7 +170,13 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
     Ok(())
 }
 
-fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, configs_text: &str, agent: Agent) -> Result<bool> {
+/// `fuzz_case` is `Some((project, fuzz))` for harvest-bench LIBRARY cases and
+/// `None` for Test-Corpus (libloading-only; no `verify_env/` is materialized, so
+/// the fuzz phase in verify.md is inert there). Within the harvest-bench case,
+/// `fuzz` enables the fuzz phase: the agent runs coverage-guided campaigns (to
+/// plateau, its own judgment) and the gate MEASURES which public functions those
+/// campaigns covered. `--no-fuzz` ⇒ `false` ⇒ skip.
+fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, configs_text: &str, agent: Agent, fuzz_case: Option<(&str, bool)>) -> Result<bool> {
     // Verify is PURE: it reads the immutable `translated/` crate (via
     // IsolatedWorkDir), works in a temp dir, and writes the result to
     // `verified/`. It never mutates `translated/`, so no snapshot/restore is
@@ -180,10 +186,27 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
     let log_path = verified_logs.join("verify.log");
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
+    // The fuzz phase runs only for harvest-bench library cases with fuzz enabled.
+    let fuzz_lib: Option<&str> = fuzz_case.and_then(|(name, on)| on.then_some(name));
+
     // Work in an isolated temp dir seeded from translated/ — the agent sees no
     // config-specific path names, and C-as-oracle verification uses only the
     // crate's own c_src (test_vectors/runner never enter the temp workspace).
     let work = IsolatedWorkDir::new(case_dir)?;
+
+    // For harvest-bench library cases with fuzzing ENABLED, materialize the
+    // gtest/FuzzTest verify_env INTO the agent's workspace before it runs, so the
+    // agent sees it and writes coverage-guided FUZZ_TESTs (the verify.md fuzz
+    // phase activates on the presence of verify_env/). The C reference is built
+    // with source-based coverage whose profiles land under verify_env/cov/, so
+    // the agent's OWN campaigns accumulate the coverage the gate later measures —
+    // no separate gate-run campaign, no fixed duration. Test-Corpus (fuzz_case
+    // None) never gets it, so that phase stays inert there.
+    if fuzz_lib.is_some() {
+        if let Err(e) = crate::verify_env::materialize(&work.translated_rust(), true) {
+            eprintln!("  ⚠️  could not materialize verify_env/ (fuzz phase skipped): {e}");
+        }
+    }
 
     // Capture the verify agent's process exit exactly like translate does — no
     // double standard. Cleared here so a skipped/absent CLI run records nothing.
@@ -263,6 +286,53 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
         }
     }
 
+    // ── Fuzz-completeness gate: MEASURE the agent's own campaigns.
+    // The agent ran coverage-guided campaigns (to plateau, its own judgment); the
+    // C reference was built with a pooled coverage path, so those campaigns
+    // accumulated profiles under verify_env/cov/. We read them here — BEFORE
+    // work.finish(), while build-fuzz/lib<target>.so + cov/*.profraw still exist
+    // in the temp workspace — then strip the heavy fuzz BUILD dirs so finish()
+    // copies only the lean verify_env/ (CMake + the agent's FUZZ_TESTs) into
+    // verified/. This never runs its own campaign and never discards the crate:
+    // fuzz-completeness is a quality SIGNAL (verification.json + FUZZ_GATE.md),
+    // not a reason to fall back to translated/. (verified_logs is already in
+    // scope from the top of the fn — the verify.log lives there.)
+    let mut fuzz_metric: Option<serde_json::Value> = None;
+    if let Some(name) = fuzz_lib {
+        let crate_root = work.translated_rust();
+        match crate::fuzz_gate::measure_existing(&crate_root) {
+            Ok(report) => {
+                let md = crate::fuzz_gate::render_report(&report, name);
+                let _ = std::fs::create_dir_all(&verified_logs);
+                let _ = std::fs::write(verified_logs.join("FUZZ_GATE.md"), &md);
+                let verdict = if !report.measured { " ⚠️  (no campaigns measured)" }
+                    else if report.passed() { " ✅" } else { " ❌" };
+                println!(
+                    "  🧪 fuzz gate [{name}]: {}/{} public fns fuzzed, {} left behind{verdict}",
+                    report.covered.len(), report.symbols.len(), report.left_behind.len(),
+                );
+                fuzz_metric = Some(serde_json::json!({
+                    "measured": report.measured,
+                    "passed": report.passed(),
+                    "symbols": report.symbols.len(),
+                    "covered": report.covered.len(),
+                    "left_behind": report.left_behind.len(),
+                }));
+            }
+            Err(e) => {
+                eprintln!("  ⚠️  fuzz gate [{name}] inconclusive: {e}");
+                fuzz_metric = Some(serde_json::json!({ "measured": false, "error": e.to_string() }));
+            }
+        }
+        // Drop the difftest build output before finish() copies verify_env/ into
+        // verified/. Keep the source env (difftest/src, build.sh, cov/) so the run
+        // is reproducible/auditable; the built C .so + cargo targets are bulky
+        // throwaways. (The crate's own target/ is handled by finish()'s filter.)
+        let ve = crate_root.join(crate::verify_env::VERIFY_ENV_DIR);
+        let _ = std::fs::remove_dir_all(ve.join("difftest").join("target"));
+        let _ = std::fs::remove_dir_all(crate_root.join("c_src").join("build"));
+    }
+
     // Copy verified results back (skips target/ and c_src/)
     work.finish()?;
 
@@ -293,8 +363,9 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
     }
 
     // Record verify metrics (incl. agent process exit) alongside verify.log,
-    // mirroring translate's translation.json — no double standard.
-    crate::translate::write_verification_metrics(&verified_dir, agent, start.elapsed().as_secs(), compiles);
+    // mirroring translate's translation.json — no double standard. The fuzz-gate
+    // result (when run) rides along as an extra field.
+    crate::translate::write_verification_metrics_ext(&verified_dir, agent, start.elapsed().as_secs(), compiles, fuzz_metric);
     Ok(compiles)
 }
 

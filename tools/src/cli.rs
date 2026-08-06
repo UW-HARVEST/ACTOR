@@ -130,6 +130,13 @@ pub enum Command {
         /// Skip verification phase
         #[arg(long)]
         no_verify: bool,
+        /// Skip the coverage-guided fuzz phase (harvest-bench library cases
+        /// only). By default a fuzz harness is set up and the agent runs
+        /// campaigns to plateau; the completeness gate then measures which public
+        /// functions its campaigns actually covered. Pass this to skip all of
+        /// that (much faster — no FuzzTest build or campaigns).
+        #[arg(long)]
+        no_fuzz: bool,
         /// Only process cases matching regex
         #[arg(long)]
         include_regex: Option<String>,
@@ -167,6 +174,9 @@ pub enum Command {
         force: bool,
         #[arg(long, default_value_t = 1)]
         parallel: usize,
+        /// Skip the coverage-guided fuzz phase (harvest-bench only).
+        #[arg(long)]
+        no_fuzz: bool,
         /// CRUST blind mode: agent generates tests without seeing ground truth
         #[arg(long)]
         blind: bool,

@@ -48,8 +48,14 @@ pub trait Benchmark {
     /// Run the verify phase. Only reached from `Run` when [`verifies`] is true;
     /// also invoked directly by the `verify` subcommand. Datasets with no
     /// separate verify phase inherit the no-op default.
+    ///
+    /// `fuzz` enables the coverage-guided fuzz phase + completeness gate for
+    /// harvest-bench library cases (the agent runs campaigns to plateau; the
+    /// gate measures which public functions they covered). Datasets with no
+    /// library ABI to fuzz ignore it.
     fn verify(&self, _repo_root: &Path, _paths: &Paths, _target: &str,
-              _filter: Option<&str>, _force: bool, _parallel: usize) -> Result<()> {
+              _filter: Option<&str>, _force: bool, _parallel: usize,
+              _fuzz: bool) -> Result<()> {
         Ok(())
     }
 
@@ -180,7 +186,10 @@ impl Benchmark for TestCorpus {
     }
 
     fn verify(&self, repo_root: &Path, paths: &Paths, target: &str,
-              _filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
+              _filter: Option<&str>, force: bool, parallel: usize,
+              _fuzz: bool) -> Result<()> {
+        // Test-Corpus cases are scored by MIT runtests, not by a library ABI —
+        // there is no fuzz harness here, so `_fuzz` is ignored.
         let batteries = resolve_batteries(&paths.corpus_dir, target)?;
         if batteries.len() > 1 {
             verify::run_all(repo_root, paths, &batteries, force, parallel)
@@ -260,7 +269,9 @@ impl Benchmark for BlindCrust {
     }
 
     fn verify(&self, _repo_root: &Path, paths: &Paths, target: &str,
-              _filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
+              _filter: Option<&str>, force: bool, parallel: usize,
+              _fuzz: bool) -> Result<()> {
+        // CRUST-blind is scored by cargo test, not a library ABI — no fuzz harness.
         let projects = resolve_crust_projects(&paths.corpus_dir, target, None)?;
         translate::verify_crust_blind(paths, &projects, parallel, force)
     }
@@ -297,9 +308,10 @@ impl Benchmark for HarvestBench {
     }
 
     fn verify(&self, _repo_root: &Path, paths: &Paths, target: &str,
-              _filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
+              _filter: Option<&str>, force: bool, parallel: usize,
+              fuzz: bool) -> Result<()> {
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
-        verify::run_harvest_bench(paths, &projects, parallel, force)
+        verify::run_harvest_bench(paths, &projects, parallel, force, fuzz)
     }
 
     fn test(&self, paths: &Paths, target: &str, mode: TestMode) -> Result<TestOutcome> {

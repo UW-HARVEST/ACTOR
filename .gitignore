@@ -5,3 +5,16 @@
 translating-c-to-rust.tgz
 Dockerfile.laertes
 *.res
+
+# Fuzz-gate build artifacts (coverage-guided verify_env campaigns)
+verify_env/build/
+verify_env/build-fuzz/
+verify_env/build-test/
+verify_env/prof/
+*.profraw
+*.profdata
+
+# Stale CMake build dir inside a case's c_src/ — a baked absolute path in its
+# CMakeCache makes the agent fight a path-mismatch before building the C ref.
+# The C reference is (re)built fresh in the temp workspace; never commit build/.
+c_src/build/

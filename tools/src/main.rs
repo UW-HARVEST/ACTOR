@@ -3,11 +3,13 @@ mod benchmark;
 mod cargo_toml;
 mod cli;
 mod exclusions;
+mod fuzz_gate;
 mod report;
 mod scoring;
 mod test;
 mod translate;
 mod verify;
+mod verify_env;
 
 use anyhow::Result;
 use cli::{Cli, Command, Dataset};
@@ -29,6 +31,7 @@ fn main() -> Result<()> {
         Command::Run {
             ref target,
             no_verify,
+            no_fuzz,
             include_regex,
             parallel,
             limit,
@@ -38,12 +41,15 @@ fn main() -> Result<()> {
             let paths = battery::Paths::new(&repo_root, agent, dataset, model);
             let inner = Dataset::strip_prefix(target);
             let bench = benchmark::for_dataset(dataset);
+            // Fuzz phase runs by default (harvest-bench library cases); --no-fuzz
+            // skips it. The agent decides campaign durations; the gate measures.
+            let fuzz = !no_fuzz;
 
             // The ONE lifecycle: translate → [verify?] → enrich → score.
             // `verifies` folds the old nine-clause skip `if` into a property.
             bench.translate(&paths, inner, include_regex.as_deref(), parallel, limit)?;
             if !no_verify && bench.verifies(agent) {
-                bench.verify(&repo_root, &paths, inner, include_regex.as_deref(), false, parallel)?;
+                bench.verify(&repo_root, &paths, inner, include_regex.as_deref(), false, parallel, fuzz)?;
             }
             // `test --update` folds enrichment in; it is never a separate step,
             // and run_test regenerates the tables so they never drift.
@@ -67,13 +73,15 @@ fn main() -> Result<()> {
             include_regex,
             force,
             parallel,
+            no_fuzz,
             blind,
         } => {
             let dataset = Dataset::detect(target, blind);
             let paths = battery::Paths::new(&repo_root, agent, dataset, model);
             let inner = Dataset::strip_prefix(target);
+            let fuzz = !no_fuzz;
             benchmark::for_dataset(dataset)
-                .verify(&repo_root, &paths, inner, include_regex.as_deref(), force, parallel)?;
+                .verify(&repo_root, &paths, inner, include_regex.as_deref(), force, parallel, fuzz)?;
         }
         Command::Test {
             ref target,

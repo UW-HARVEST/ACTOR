@@ -846,12 +846,27 @@ fn write_translation_metrics(case_dir: &Path, agent: Agent, duration_secs: u64, 
 /// `verification.json` with the same shape (incl. agent exit). No double
 /// standard: verify records agent process health exactly like translate.
 pub fn write_verification_metrics(case_dir: &Path, agent: Agent, duration_secs: u64, success: bool) {
+    write_verification_metrics_ext(case_dir, agent, duration_secs, success, None);
+}
+
+/// Like `write_verification_metrics` but folds in an optional extra field (e.g.
+/// the fuzz-gate result) so the whole verify outcome lands in one file.
+pub fn write_verification_metrics_ext(
+    case_dir: &Path,
+    agent: Agent,
+    duration_secs: u64,
+    success: bool,
+    fuzz_gate: Option<serde_json::Value>,
+) {
     let mut metrics = serde_json::json!({
         "agent": format!("{agent:?}").to_lowercase(),
         "duration_secs": duration_secs,
         "success": success,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
+    if let Some(fuzz) = fuzz_gate {
+        metrics["fuzz_gate"] = fuzz;
+    }
     merge_agent_exit(&mut metrics);
     let _ = std::fs::create_dir_all(case_dir);
     let _ = std::fs::write(

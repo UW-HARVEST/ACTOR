@@ -116,6 +116,79 @@ real input the C handles and the Rust must handle identically; this is exactly
 the class of bug that happy-path tests miss). You MAY NOT proceed to Phase D
 while any `ERRORS.md` row is unchecked.
 
+### Coverage-driven differential property testing — ONLY when `verify_env/` is present
+
+Check for a `verify_env/` directory in the crate root. If it does NOT exist,
+skip this section entirely (the libloading tests above are the whole job). If it
+DOES exist, this is a library case pre-wired for **differential property
+testing** — the PRIMARY differential harness, and where you catch the
+value-dependent bugs a fixed-seed random loop (Phase B) systematically misses.
+Read `verify_env/README.md`.
+
+The harness is a small pure-Rust crate at `verify_env/difftest/` (`proptest` +
+`libloading`). `verify_env/build.sh` builds three things: the C reference `.so`
+(coverage-instrumented, via the project's own `c_src` build), your translated
+Rust `.so`, and the `difftest` binary. Both `.so`s are loaded as black boxes and
+called through their identical C-ABI symbols; each property generates many
+varied + edge-biased inputs and asserts the two sides agree. A property lives in
+`verify_env/difftest/src/main.rs`:
+
+```rust
+// C is ground truth; both fns resolved by the SAME symbol name from each .so.
+type GetU32 = unsafe extern "C" fn(*const u8) -> u32;
+differential!("png_get_uint_32", b"png_get_uint_32", GetU32,
+    proptest::collection::vec(any::<u8>(), 4..=4),
+    |cf: GetU32, rf: GetU32, buf: &Vec<u8>| unsafe { (cf(buf.as_ptr()), rf(buf.as_ptr())) });
+```
+
+Cover EVERY public symbol (the same `nm -D` set as `SYMBOLS.md`). Write one
+property per function (or family), driving it the way a real consumer does —
+set up state, apply options, run the whole operation — and exercise the
+LOW-LEVEL entry points directly, not just the convenience wrappers (bugs in the
+composed pipeline are invisible to per-wrapper tests). Wherever an API has an
+input dimension — the primary payload, and any scalar/enum/flag that steers
+behavior (the axes you enumerated in `CONFIGS.md`) — make it a proptest input,
+not a few literals. Derive each domain from what the C treats as legal
+(`any::<T>()`, `0..=N`, `prop::collection::vec(any::<u8>(), 0..N)`,
+`prop::sample::select(...)` for enums); never generate a raw int then cast it to
+an enum, and never generate a pointer and a length independently (generate a
+`Vec`, pass `.as_ptr()`/`.len()`). Fold the `ERRORS.md` rows in too — include the
+invalid values in the domain, or add a fixed `#[test]` for the exact condition.
+proptest is edge-biased (it already tries 0, MAX, empty, boundaries), so a plain
+`any::<T>()` or a byte-vector payload usually surfaces value-dependent bugs.
+
+Running discipline — a property is NOT exercised until you actually run it.
+Iterate: add properties → `./verify_env/build.sh` (rebuilds are incremental,
+seconds) → run the harness (build.sh prints the exact `C_SO=… RUST_SO=…
+./difftest/target/release/difftest` command) → fix any divergence → re-run. Use
+enough cases per property to explore the space (the harness default is 2000; set
+`DIFFTEST_CASES` higher for the properties covering the most behavior). When a
+property finds a mismatch, proptest prints the minimized failing input — pin it
+as a fixed regression `#[test]`, fix the Rust (never the C), then re-run.
+
+Your runs are what get MEASURED. The C reference is built so that every run of
+the harness records which C functions it executed; the completeness gate reads
+exactly that coverage (not your `FUZZ.md` claims) and fails any public symbol
+your properties never actually exercised. A property that compiles but is never
+run counts as un-covered — run the harness after adding properties, and keep
+adding until every public symbol is covered.
+
+C is the ground-truth side: if the C reference itself crashes on an input, that
+is a reference-side issue (record it; do not conclude the Rust is wrong). If C
+completes (success or a normal error) and Rust diverges or crashes, that is a
+translation bug — fix the Rust.
+
+`FUZZ.md` — the COVERAGE manifest. One row per public symbol (the `SYMBOLS.md` /
+`nm -D` set), mapping it to the property that exercises it:
+
+| # | public symbol | covering property (label) | exercised (Y/N) |
+|---|---------------|---------------------------|-----------------|
+
+Every symbol MUST have a row backed by a property the harness actually ran. This
+manifest is checked MECHANICALLY after your run against the coverage the harness
+produced, and any symbol left behind fails verification. Do not pad the table: a
+row whose property never covered that symbol's code counts as left behind.
+
 ### Phase D — Symbol parity, feature combos, and completion gate
 
 - Compare `nm -D` on the C .so and the Rust .so. Every symbol the C .so
@@ -136,6 +209,10 @@ done; do not stop early just because symbols match or happy-path tests pass):
 - [ ] `SYMBOLS.md`: `nm -D` shows 0 missing/undefined non-libc symbols in Rust.
 - [ ] Phase B: EVERY row in `CONFIGS.md` passes across randomized inputs.
 - [ ] Phase C: EVERY row in `ERRORS.md` has a passing error-path differential test.
+- [ ] If `verify_env/` exists: `FUZZ.md` has a row for EVERY public symbol, each
+      backed by a differential property the harness actually ran and that covered
+      that symbol. No symbol left behind — this is checked mechanically against
+      the coverage the harness produced.
 - [ ] All of the above hold under EVERY feature combination — this code is
       shared across ALL configurations, not just the default.
 
