@@ -298,12 +298,12 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
         }
         Agent::ClaudeMinimal => {
             // Universal minimal prompt — no project-type dispatch.
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-minimal.md")).unwrap_or_default();
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-minimal.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeNoIter => {
             // Same project-type dispatch as Claude, but without "build → fix → iterate" steps.
-            let f = if is_lib { "translate-no-iter-library.md" } else { "translate-no-iter-executable.md" };
+            let f = if is_lib { "ablations/translate-no-iter-library.md" } else { "ablations/translate-no-iter-executable.md" };
             let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
@@ -356,21 +356,21 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
         }
         Agent::ClaudeMinimal => {
             // Universal minimal prompt — same as for executables/libraries.
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-minimal.md")).unwrap_or_default();
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-minimal.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeNoIter => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-no-iter-shared.md")).unwrap_or_default();
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-no-iter-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeNoFeatures => {
             // E2: shared-source prompt without cmake-features → cargo-features guidance.
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-no-features-shared.md")).unwrap_or_default();
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-no-features-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeNoSubtask => {
             // E6: shared-source prompt without subtask-decomposition guidance.
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-no-subtask-shared.md")).unwrap_or_default();
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-no-subtask-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeCrossPrompt => {
@@ -560,6 +560,15 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
     let translated_dir = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
     let logs_dir = translated_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
+
+    // Record the EXACT prompt the agent was given, verbatim, next to the result.
+    // Prompt files evolve over time, so the filename alone isn't enough to know
+    // what a past run actually saw — copying the rendered text makes every result
+    // self-documenting (no need to look up a git hash at the run's timestamp).
+    // Empty for non-prompt agents (c2rust etc.); skip those to avoid a blank file.
+    if !prompt.is_empty() {
+        let _ = std::fs::write(logs_dir.join("prompt.md"), prompt);
+    }
 
     let log_path = logs_dir.join("translation.log");
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
@@ -1523,6 +1532,11 @@ fn oneshot_llm_translate(
     let prompt_file = if is_lib { "translate-library.md" } else { "translate-executable.md" };
     let system_prompt = std::fs::read_to_string(paths.prompts_dir.join(prompt_file))
         .with_context(|| format!("reading {prompt_file}"))?;
+
+    // Record the exact system prompt used, verbatim, next to the result (same
+    // rationale as the CLI-agent path): the result is self-documenting about
+    // which prompt ran, robust to prompt files changing later.
+    let _ = std::fs::write(logs_dir.join("prompt.md"), &system_prompt);
 
     let user_msg = format!(
         "Please translate the following C project into a Rust project including Cargo manifest:\n\n{files_json}\n\nreturn as JSON"

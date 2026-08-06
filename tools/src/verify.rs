@@ -195,6 +195,11 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
         .replace("CMAKE_BUILD_FLAGS", cmake_flags)
         .replace("ALL_CONFIGURATIONS", configs_text);
 
+    // Record the EXACT verify prompt the agent was given (post-substitution),
+    // verbatim, next to the result — same rationale as translate/logs/prompt.md:
+    // makes every verified/ result self-documenting about what prompt ran.
+    let _ = std::fs::write(verified_logs.join("prompt.md"), &prompt);
+
     match agent {
         Agent::Kiro => {
             let status = Command::new("bash")
