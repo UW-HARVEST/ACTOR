@@ -3,6 +3,7 @@ mod benchmark;
 mod cargo_toml;
 mod cli;
 mod exclusions;
+mod opencode;
 mod report;
 mod scoring;
 mod test;
@@ -18,11 +19,24 @@ fn main() -> Result<()> {
     let agent = cli.agent;
     let model = cli.model.as_deref();
 
-    if agent == cli::Agent::Oneshot && model.is_none() {
-        anyhow::bail!("--model is required with --agent oneshot (e.g. --model openai/gpt-5.4)");
+    // Two agents pick their model at runtime: `oneshot` (an OpenRouter model id)
+    // and `opencode` (an OpenCode `provider/model` id). Every other agent has its
+    // model fixed by the variant, so a `--model` there would be silently ignored.
+    let model_driven = matches!(agent, cli::Agent::Oneshot | cli::Agent::OpenCode);
+    if model_driven && model.is_none() {
+        anyhow::bail!(
+            "--model is required with --agent {}\n  \
+             oneshot:  --model openai/gpt-5.4\n  \
+             opencode: --model amazon-bedrock/us.anthropic.claude-sonnet-5",
+            if agent == cli::Agent::Oneshot { "oneshot" } else { "opencode" },
+        );
     }
-    if agent != cli::Agent::Oneshot && model.is_some() {
-        anyhow::bail!("--model is only valid with --agent oneshot");
+    if !model_driven && model.is_some() {
+        anyhow::bail!("--model is only valid with --agent oneshot or --agent opencode");
+    }
+    // Fail at startup rather than deep inside a multi-hour agent run.
+    if agent == cli::Agent::OpenCode {
+        opencode::parse_model(model.unwrap_or_default())?;
     }
 
     match cli.command {

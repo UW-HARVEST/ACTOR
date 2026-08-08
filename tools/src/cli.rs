@@ -50,6 +50,14 @@ pub enum Agent {
     /// methodology as `CodexGpt55`; different model version for cross-model
     /// comparison within the Codex harness.
     CodexGpt54,
+    /// OpenCode CLI, with the model chosen by `--model <provider>/<model-id>`
+    /// (e.g. `amazon-bedrock/us.anthropic.claude-sonnet-5`). Same methodology
+    /// as `claude`: the SAME `prompts/claude/*.md` prompts and the same
+    /// translate-then-verify pipeline, so a result is comparable to the Claude
+    /// Code and Kiro runs. This is the backend that decouples ACTOR from any
+    /// one vendor's CLI, letting any Bedrock-hosted model be evaluated.
+    #[value(name = "opencode", alias = "oc")]
+    OpenCode,
     C2rust,
     Laertes,
     /// C2SaferRust: post-processes C2Rust output with an LLM to reduce unsafe
@@ -113,7 +121,11 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = Agent::Kiro)]
     pub agent: Agent,
 
-    /// OpenRouter model ID (required with --agent oneshot), e.g. "openai/gpt-5.4"
+    /// Model ID. Required with `--agent oneshot` (OpenRouter form, e.g.
+    /// "openai/gpt-5.4") and with `--agent opencode` (OpenCode
+    /// `<provider>/<model-id>` form, e.g.
+    /// "amazon-bedrock/us.anthropic.claude-sonnet-5"). Rejected for any other
+    /// agent, whose model is fixed by the agent variant.
     #[arg(long)]
     pub model: Option<String>,
 

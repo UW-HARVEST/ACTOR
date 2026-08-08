@@ -616,6 +616,18 @@ pub struct Paths {
 
 impl Paths {
     pub fn new(repo_root: &Path, agent: Agent, dataset: Dataset, model: Option<&str>) -> Self {
+        // OpenCode's results dir is derived from --model (like Agent::Oneshot),
+        // so each evaluated model gets its own directory. Owned because the slug
+        // is computed, not a literal; the match below borrows from it.
+        let opencode_slug = matches!(agent, Agent::OpenCode)
+            .then(|| {
+                let m = crate::opencode::parse_model(
+                    model.expect("--model required for --agent opencode (checked in main)"),
+                )
+                .expect("--model already validated in main");
+                crate::opencode::results_slug(&m)
+            })
+            .unwrap_or_default();
         let agent_name: &str = match agent {
             Agent::Kiro => "kiro",
             Agent::Claude => "claude",
@@ -627,6 +639,7 @@ impl Paths {
             Agent::ClaudeCrossPrompt => "claude-cross-prompt",
             Agent::CodexGpt55 => "codex-gpt55",
             Agent::CodexGpt54 => "codex-gpt54",
+            Agent::OpenCode => &opencode_slug,
             Agent::C2rust => "c2rust",
             Agent::Laertes => "laertes",
             Agent::C2SaferRust => "c2saferrust",
@@ -655,7 +668,7 @@ impl Paths {
             ),
         };
         let prompts_dir = match agent {
-            Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 => match dataset {
+            Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::OpenCode => match dataset {
                 // harvest-bench cases are libraries; reuse the project-type-
                 // dispatching prompts the test-corpus path uses (they handle the
                 // shared-library / cdylib case).

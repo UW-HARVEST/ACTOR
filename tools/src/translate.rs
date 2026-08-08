@@ -13,6 +13,25 @@ use std::time::{Duration, Instant};
 // no skills/plugins/MCP, no extra system prompt.
 pub const CLAUDE_PLAIN_AGENT_JSON: &str = r#"{"claude_plain":{"description":"Bare-bones agent matching kiro_plain","prompt":"You are a coding assistant. Use the available tools to complete the user's task.","tools":["Bash","Edit","Read","Write","Task"]}}"#;
 
+/// Wall-clock cap on one agentic translate/verify session, matching the
+/// `timeout 10800` already used by the claude and codex invocations.
+const TRANSLATE_TIMEOUT_SECS: u64 = 10800;
+
+/// CRUST cases are small single-crate projects; the kiro CRUST arm caps them at
+/// `timeout 1800`, so a new backend on the same dataset uses the same budget.
+const CRUST_TIMEOUT_SECS: u64 = 1800;
+
+/// The `--model` for `--agent opencode`, parsed. `Paths` carries the raw string;
+/// `main` has already validated it, so a failure here means an internal bug
+/// rather than bad user input.
+fn opencode_model(paths: &Paths) -> Result<crate::opencode::Model> {
+    let raw = paths.model.as_deref().context(
+        "--agent opencode requires --model <provider>/<model-id> (should have been \
+         rejected at startup)",
+    )?;
+    crate::opencode::parse_model(raw)
+}
+
 // ── Semaphore ──────────────────────────────────────────────────────────
 
 pub struct Semaphore {
@@ -286,7 +305,9 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
         Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
         Agent::Kimi => kimi_translate_case(paths, battery, name, is_lib),
         Agent::Oneshot => oneshot_translate_case(paths, battery, name, is_lib),
-        Agent::Kiro | Agent::Claude => {
+        // OpenCode runs the SAME engineered prompts as Claude Code / Kiro — the
+        // backend is what varies, not the methodology.
+        Agent::Kiro | Agent::Claude | Agent::OpenCode => {
             let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
             let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
@@ -346,7 +367,7 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
         Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
         Agent::Kimi => kimi_translate_case(paths, battery, name, true),
         Agent::Oneshot => oneshot_translate_case(paths, battery, name, true),
-        Agent::Kiro | Agent::Claude => {
+        Agent::Kiro | Agent::Claude | Agent::OpenCode => {
             let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
@@ -480,6 +501,7 @@ fn preflight_check(agent: Agent) -> Result<()> {
         Agent::Kiro => ("kiro-cli", &["--version"]),
         Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt => ("claude", &["--version"]),
         Agent::CodexGpt55 | Agent::CodexGpt54 => ("codex", &["--version"]),
+        Agent::OpenCode => ("opencode", &["--version"]),
         Agent::C2rust => ("c2rust", &["--version"]),
         Agent::Laertes => ("docker", &["--version"]),
         Agent::C2SaferRust => ("docker", &["--version"]),
@@ -561,20 +583,11 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
     let logs_dir = translated_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
 
-    // Record the EXACT prompt the agent was given, verbatim, next to the result.
-    // Prompt files evolve over time, so the filename alone isn't enough to know
-    // what a past run actually saw — copying the rendered text makes every result
-    // self-documenting (no need to look up a git hash at the run's timestamp).
-    // Empty for non-prompt agents (c2rust etc.); skip those to avoid a blank file.
-    if !prompt.is_empty() {
-        let _ = std::fs::write(logs_dir.join("prompt.md"), prompt);
-    }
-
     let log_path = logs_dir.join("translation.log");
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
     let (work_dir, _tmp_guard) = match paths.agent {
-        Agent::Kiro | Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot => {
+        Agent::Kiro | Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::OpenCode | Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot => {
             let tmp = tempfile::Builder::new()
                 .prefix("harvest-translate-")
                 .tempdir()
@@ -604,9 +617,42 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                 )?;
             }
 
+            if matches!(paths.agent, Agent::OpenCode) {
+                // OpenCode's run-private config: the Bedrock provider, the
+                // sub-agent permission policy, the compaction plugin, and the
+                // XDG isolation dir. Analogous to the .claude/settings.json
+                // sandbox written just above.
+                crate::opencode::materialize_config(
+                    tmp.path(),
+                    crate::opencode::Phase::Translate,
+                    &opencode_model(paths)?,
+                )?;
+            }
+
             (work, Some(tmp))
         }
     };
+
+    // OpenCode needs its filesystem-boundary contract and output-cap warning
+    // appended, and the boundary names the temp dir — so the final prompt is
+    // only known once the workspace exists. Every other agent appends nothing.
+    let prompt: &str = &match paths.agent {
+        Agent::OpenCode => {
+            let tmp_root = work_dir.parent().unwrap_or(&work_dir);
+            format!("{prompt}{}", crate::opencode::prompt_suffix(tmp_root))
+        }
+        _ => prompt.to_string(),
+    };
+
+    // Record the EXACT prompt the agent was given, verbatim, next to the result.
+    // Prompt files evolve over time, so the filename alone isn't enough to know
+    // what a past run actually saw — copying the rendered text makes every result
+    // self-documenting (no need to look up a git hash at the run's timestamp).
+    // Written AFTER any per-agent suffix so it captures what the agent truly saw.
+    // Empty for non-prompt agents (c2rust etc.); skip those to avoid a blank file.
+    if !prompt.is_empty() {
+        let _ = std::fs::write(logs_dir.join("prompt.md"), prompt);
+    }
 
     match paths.agent {
         Agent::Kiro => {
@@ -649,6 +695,13 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
             };
             invoke_codex_with_retry(
                 prompt, &log_path, &work_dir, model, region, &openssl_dir, "translate",
+            )?;
+        }
+        Agent::OpenCode => {
+            let tmp_root = work_dir.parent().unwrap_or(&work_dir).to_path_buf();
+            invoke_opencode_with_retry(
+                crate::opencode::Phase::Translate, prompt, &log_path, &work_dir,
+                &tmp_root, &opencode_model(paths)?, TRANSLATE_TIMEOUT_SECS, "translate",
             )?;
         }
         Agent::C2rust => {
@@ -947,7 +1000,11 @@ fn prepare_crust_workspace(
 }
 
 /// Invoke the agent in a working directory with a prompt.
-fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Result<()> {
+///
+/// `phase` only matters for backends whose per-phase setup differs (OpenCode's
+/// compaction-recovery command); the others ignore it.
+fn invoke_agent(paths: &Paths, phase: crate::opencode::Phase, prompt: &str, log_path: &Path, work: &Path) -> Result<()> {
+    let agent = paths.agent;
     match agent {
         Agent::Kiro => {
             let status = Command::new("bash")
@@ -989,6 +1046,16 @@ fn invoke_agent(agent: Agent, prompt: &str, log_path: &Path, work: &Path) -> Res
             let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
             invoke_codex_with_retry(
                 prompt, log_path, work, model, region, &openssl_dir, "CRUST",
+            )?;
+        }
+        Agent::OpenCode => {
+            let tmp_root = work.parent().unwrap_or(work).to_path_buf();
+            let model = opencode_model(paths)?;
+            crate::opencode::materialize_config(&tmp_root, phase, &model)?;
+            let prompt = format!("{prompt}{}", crate::opencode::prompt_suffix(&tmp_root));
+            invoke_opencode_with_retry(
+                phase, &prompt, log_path, work, &tmp_root, &model,
+                CRUST_TIMEOUT_SECS, "CRUST",
             )?;
         }
         Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot => anyhow::bail!("c2rust/laertes/c2saferrust/smartc2rust/kimi/oneshot not supported for CRUST-bench"),
@@ -1104,7 +1171,7 @@ fn translate_one_crust_inner(paths: &Paths, project: &battery::CrustProject, mod
 
     clear_agent_exit();
     let start = Instant::now();
-    invoke_agent(paths.agent, prompt, &log_path, &work)?;
+    invoke_agent(paths, crate::opencode::Phase::Translate, prompt, &log_path, &work)?;
     let elapsed = start.elapsed().as_secs();
 
     // Copy back code from temp, preserving logs dir
@@ -1217,7 +1284,7 @@ fn verify_one_crust_blind_inner(paths: &Paths, project: &battery::CrustProject, 
 
     clear_agent_exit();
     let start = Instant::now();
-    invoke_agent(paths.agent, prompt, &log_path, &work)?;
+    invoke_agent(paths, crate::opencode::Phase::Verify, prompt, &log_path, &work)?;
     let elapsed = start.elapsed().as_secs();
 
     // Copy agent output to verify/ (not back to translate/)
@@ -2243,12 +2310,28 @@ fn invoke_codex_with_retry(
     Ok(())
 }
 
+/// Transient Bedrock failures worth retrying, as (log needle, short label).
+/// Shared by every Bedrock-backed agent (codex, opencode) because the failures
+/// come from Bedrock, not from the CLI wrapping it.
+const TRANSIENT_BEDROCK_PATTERNS: &[(&str, &str)] = &[
+    ("Engine not found", "bedrock 404"),
+    ("stream disconnected", "stream disconnected"),
+    ("server had an error", "server error"),
+    ("ThrottlingException", "throttled"),
+    ("RequestTimeout", "request timeout"),
+    ("InternalServerError", "internal server error"),
+    ("503 Service Unavailable", "503"),
+];
+
+fn first_transient_pattern(content: &str) -> Option<String> {
+    TRANSIENT_BEDROCK_PATTERNS
+        .iter()
+        .find(|(needle, _)| content.contains(needle))
+        .map(|(_, label)| (*label).to_string())
+}
+
 /// Returns Some(reason) if the log indicates a transient Bedrock failure.
-/// Detected patterns:
-///   - 404 "Engine not found" (Bedrock model registration race)
-///   - "stream disconnected before completion"
-///   - "The server had an error" / "Server error"
-///   - "ThrottlingException" (rate limit, retryable)
+/// Detected patterns: see [`TRANSIENT_BEDROCK_PATTERNS`].
 fn scan_codex_log_for_transient_error(log_path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(log_path).ok()?;
 
@@ -2262,23 +2345,75 @@ fn scan_codex_log_for_transient_error(log_path: &Path) -> Option<String> {
         return None;
     }
 
-    let patterns: &[(&str, &str)] = &[
-        ("Engine not found", "bedrock 404"),
-        ("stream disconnected", "stream disconnected"),
-        ("server had an error", "server error"),
-        ("ThrottlingException", "throttled"),
-        ("RequestTimeout", "request timeout"),
-        ("InternalServerError", "internal server error"),
-        ("503 Service Unavailable", "503"),
-    ];
+    first_transient_pattern(&content)
+}
 
-    for (needle, label) in patterns {
-        if content.contains(needle) {
-            return Some((*label).to_string());
+/// Returns Some(reason) if an OpenCode log indicates a transient Bedrock
+/// failure. Same motivation as the codex scanner: the CLI can exit 0 after
+/// Bedrock drops the conversation, so the harness would otherwise record the
+/// throttle as a legitimately-empty translation.
+///
+/// OpenCode's `--format json` emits one event object per line. A transient
+/// failure surfaces as an error event; a session that produced any assistant
+/// output is treated as recovered, since retrying would discard real work.
+fn scan_opencode_log_for_transient_error(log_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(log_path).ok()?;
+
+    // No error surfaced at all → nothing to retry.
+    let has_error = content.contains(r#""type":"error""#)
+        || content.contains(r#""error":"#)
+        || content.contains("APICallError");
+    if !has_error {
+        return None;
+    }
+    // The session produced assistant/tool activity → it recovered on its own.
+    if content.contains(r#""type":"tool"#) || content.contains(r#""role":"assistant""#) {
+        return None;
+    }
+
+    first_transient_pattern(&content)
+}
+
+/// Retry-aware OpenCode invocation, mirroring [`invoke_codex_with_retry`].
+/// Bedrock throttles and 5xx responses are transient and can leave the CLI
+/// exiting 0 with nothing written; without this a throttle is indistinguishable
+/// from a genuine translation failure.
+#[allow(clippy::too_many_arguments)]
+fn invoke_opencode_with_retry(
+    phase: crate::opencode::Phase,
+    prompt: &str,
+    log_path: &Path,
+    work_dir: &Path,
+    tmp_root: &Path,
+    model: &crate::opencode::Model,
+    timeout_secs: u64,
+    context_label: &str,
+) -> Result<()> {
+    const MAX_RETRIES: u32 = 3;
+    const RETRY_BACKOFF_SECS: u64 = 30;
+
+    for attempt in 1..=MAX_RETRIES {
+        crate::opencode::invoke(phase, prompt, log_path, work_dir, tmp_root, model, timeout_secs)
+            .with_context(|| format!("invoking opencode ({context_label})"))?;
+
+        match scan_opencode_log_for_transient_error(log_path) {
+            None => return Ok(()), // success or non-transient
+            Some(err) if attempt < MAX_RETRIES => {
+                eprintln!(
+                    "  opencode transient error ({err}) on attempt {attempt}/{MAX_RETRIES}, retrying in {RETRY_BACKOFF_SECS}s..."
+                );
+                std::thread::sleep(Duration::from_secs(RETRY_BACKOFF_SECS));
+            }
+            Some(err) => {
+                eprintln!(
+                    "  opencode transient error ({err}) on final attempt {attempt}/{MAX_RETRIES} — giving up"
+                );
+                return Ok(()); // let the caller's artifact check fail it
+            }
         }
     }
 
-    None
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2328,5 +2463,55 @@ mod tests {
         let _ = take_agent_exit();          // consume
         let second = take_agent_exit();     // must be empty now
         assert!(!second.recorded, "exit must not leak into the next case on a reused thread");
+    }
+
+    fn write_log(body: &str) -> tempfile::NamedTempFile {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), body).unwrap();
+        f
+    }
+
+    #[test]
+    fn opencode_scanner_retries_a_throttle_that_produced_nothing() {
+        // Bedrock throttled before any assistant output: retrying is right,
+        // because otherwise the empty result is scored as a real failure.
+        let log = write_log(
+            r#"{"type":"error","error":{"message":"ThrottlingException: rate exceeded"}}"#,
+        );
+        assert_eq!(
+            scan_opencode_log_for_transient_error(log.path()).as_deref(),
+            Some("throttled"),
+        );
+    }
+
+    #[test]
+    fn opencode_scanner_does_not_retry_after_real_work() {
+        // An error followed by assistant/tool activity means the session
+        // recovered. Retrying would DISCARD a completed translation.
+        let log = write_log(
+            "{\"type\":\"error\",\"error\":{\"message\":\"ThrottlingException\"}}\n\
+             {\"type\":\"tool\",\"name\":\"write\"}\n",
+        );
+        assert_eq!(scan_opencode_log_for_transient_error(log.path()), None);
+    }
+
+    #[test]
+    fn opencode_scanner_ignores_clean_and_nontransient_logs() {
+        // No error at all → nothing to retry.
+        let clean = write_log(r#"{"type":"step","name":"done"}"#);
+        assert_eq!(scan_opencode_log_for_transient_error(clean.path()), None);
+        // An error that is NOT transient (a genuine model/tool failure) must
+        // not be retried either — retrying can't fix it and burns hours.
+        let hard = write_log(r#"{"type":"error","error":{"message":"ValidationException: bad request"}}"#);
+        assert_eq!(scan_opencode_log_for_transient_error(hard.path()), None);
+    }
+
+    #[test]
+    fn both_bedrock_backends_share_one_transient_pattern_table() {
+        // The failures come from Bedrock, not from the CLI wrapping it, so the
+        // codex and opencode scanners must agree on what is retryable.
+        for (needle, label) in TRANSIENT_BEDROCK_PATTERNS {
+            assert_eq!(first_transient_pattern(needle).as_deref(), Some(*label));
+        }
     }
 }
