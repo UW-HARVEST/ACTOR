@@ -6,6 +6,10 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
+/// Wall-clock cap on one verify session, matching the `timeout 10800` the
+/// claude verify invocation uses.
+const VERIFY_TIMEOUT_SECS: u64 = 10800;
+
 pub fn run(repo_root: &Path, paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
     let sem = Arc::new(Semaphore::new(parallel));
     run_with_semaphore(repo_root, paths, battery_name, filter, force, &sem)
@@ -65,7 +69,7 @@ fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filte
                     return (c.name.clone(), None); // skipped
                 }
                 let cmake_flags = get_cmake_flags(paths, battery_name, &c.name);
-                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths.agent)
+                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths)
                     .unwrap_or(false);
                 (c.name.clone(), Some(ok))
             })
@@ -100,7 +104,7 @@ fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filte
             println!("[{current}/{total}] 🔬 {} (shared-source, {} configs)", group.real_case, group.configs.len());
             let cmake_flags = get_cmake_flags(paths, battery_name, &group.real_case);
             let configs_text = build_configs_text(paths, battery_name, group);
-            let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, paths.agent)?;
+            let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, paths)?;
 
             if ok { verified += 1; println!("[{current}/{total}] ✅ {} — verified", group.real_case); }
             else { failed += 1; println!("[{current}/{total}] ❌ {} — verification incomplete", group.real_case); }
@@ -150,7 +154,7 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
                 if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
                     return (name, None); // skip: already verified
                 }
-                let ok = verify_case(&case_dir, prompt, "", "", paths.agent).unwrap_or(false);
+                let ok = verify_case(&case_dir, prompt, "", "", paths).unwrap_or(false);
                 (name, Some(ok))
             })
         }).collect();
@@ -170,7 +174,8 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
     Ok(())
 }
 
-fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, configs_text: &str, agent: Agent) -> Result<bool> {
+fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, configs_text: &str, paths: &Paths) -> Result<bool> {
+    let agent = paths.agent;
     // Verify is PURE: it reads the immutable `translated/` crate (via
     // IsolatedWorkDir), works in a temp dir, and writes the result to
     // `verified/`. It never mutates `translated/`, so no snapshot/restore is
@@ -190,14 +195,21 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
     crate::translate::clear_agent_exit();
     let start = std::time::Instant::now();
 
-    let prompt = prompt_template
+    let mut prompt = prompt_template
         .replace("CASE_DIR_PLACEHOLDER", &work.root().to_string_lossy())
         .replace("CMAKE_BUILD_FLAGS", cmake_flags)
         .replace("ALL_CONFIGURATIONS", configs_text);
 
-    // Record the EXACT verify prompt the agent was given (post-substitution),
-    // verbatim, next to the result — same rationale as translate/logs/prompt.md:
-    // makes every verified/ result self-documenting about what prompt ran.
+    // OpenCode needs its filesystem-boundary contract and output-cap warning
+    // appended (empty for every other agent, so no other prompt changes).
+    if matches!(agent, Agent::OpenCode) {
+        prompt.push_str(&crate::opencode::prompt_suffix(work.root()));
+    }
+
+    // Record the EXACT verify prompt the agent was given (post-substitution,
+    // post-suffix), verbatim, next to the result — same rationale as
+    // translate/logs/prompt.md: makes every verified/ result self-documenting
+    // about what prompt ran.
     let _ = std::fs::write(verified_logs.join("prompt.md"), &prompt);
 
     match agent {
@@ -253,6 +265,19 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                 .status()
                 .context("invoking claude for verification")?;
             crate::translate::record_agent_exit(status);
+        }
+        Agent::OpenCode => {
+            // Same C-as-oracle verify prompt as Claude Code, different backend.
+            // The compaction plugin restores SYMBOLS/ERRORS/CONFIGS.md, which
+            // verify.md's Phases B/C are gated on.
+            let model = crate::opencode::parse_model(paths.model.as_deref().unwrap_or_default())?;
+            crate::opencode::materialize_config(
+                work.root(), crate::opencode::Phase::Verify, &model,
+            )?;
+            crate::opencode::invoke(
+                crate::opencode::Phase::Verify, &prompt, &log_path,
+                &work.translated_rust(), work.root(), &model, VERIFY_TIMEOUT_SECS,
+            )?;
         }
         Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 => {
             // ClaudeCombined: translate phase already did verify, skip this phase.

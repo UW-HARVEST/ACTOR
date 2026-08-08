@@ -258,14 +258,15 @@ mod prompt_layout {
         let main = [
             "translate-library.md", "translate-executable.md",
             "translate-shared.md", "verify.md",
-            // combined-mode (claude-combined)
-            "translate-and-verify-library.md", "translate-and-verify-executable.md",
-            "translate-and-verify-shared.md",
         ];
         // Ablation variants (claude-minimal / no-iter / no-features / no-subtask),
         // now under ablations/. If one is moved without updating translate.rs, the
         // loader would silently read "" — this catches that.
         let ablations = [
+            // combined-mode (claude-combined)
+            "ablations/translate-and-verify-library.md",
+            "ablations/translate-and-verify-executable.md",
+            "ablations/translate-and-verify-shared.md",
             "ablations/translate-minimal.md",
             "ablations/translate-no-iter-library.md",
             "ablations/translate-no-iter-executable.md",

@@ -65,6 +65,11 @@ ACTOR/test-corpus/Public-Tests/<BATTERY_NAME>/<TEST_CASE_NAME>/<test_vectors>
    # Agentic translation with Claude Code (or --agent kiro)
    harvest-tools --agent claude translate mycases/hello
 
+   # Any model via OpenCode — here Claude Sonnet 5 on Amazon Bedrock
+   harvest-tools --agent opencode \
+     --model amazon-bedrock/us.anthropic.claude-sonnet-5 \
+     translate mycases/hello
+
    # Mechanical transpilation with c2rust
    harvest-tools --agent c2rust translate mycases/hello
    ```
@@ -103,11 +108,48 @@ This repository evaluates multiple translation agents — from mechanical transp
 | **kiro** | Agentic | Multi-turn [kiro-cli](https://github.com/aws/kiro-cli) agent: translate → verify (C-as-oracle) → test |
 | **kiro-translate** | Derived column (not an `--agent`) | kiro's pre-verify result — its `translated/` phase scored without the verify/repair loop (the "no validate" column). Reported for every agent automatically; no separate run. |
 | **claude** | Agentic | Claude Code with project-level context |
+| **opencode** | Agentic | [OpenCode](https://opencode.ai) driving any model, incl. Amazon Bedrock. Same prompts and translate → verify pipeline as `claude`; requires `--model <provider>/<model-id>` (see below) |
 | **c2rust** | Mechanical | [c2rust](https://github.com/immunant/c2rust) transpiler (unsafe, line-for-line) |
 | **laertes** | Mechanical + rules | c2rust + [Laertes](https://doi.org/10.1145/3453483.3454107) (PLDI 2021) rule-based unsafe reduction |
 | **kimi** | One-shot LLM | Kimi K2.5 via AWS Bedrock |
 | **gpt-5.4** | One-shot LLM | GPT-5.4 via OpenRouter |
 | **gemini-3.1-pro-preview** | One-shot LLM | Gemini 3.1 Pro Preview via OpenRouter |
+
+### The `opencode` backend
+
+`--agent opencode` (alias `oc`) runs the *same* `prompts/claude/*.md` prompts
+and the same translate → verify → score pipeline as `--agent claude`, so its
+numbers are directly comparable. What changes is only which CLI and model
+execute them, which is what lets ACTOR evaluate models with no coding CLI of
+their own.
+
+The model is required and takes OpenCode's `<provider>/<model-id>` form:
+
+```bash
+harvest-tools --agent opencode \
+  --model amazon-bedrock/us.anthropic.claude-sonnet-5 \
+  run HB/jansson
+```
+
+Results land in a per-model directory (e.g.
+`results/HarvestBench/opencode-claude-sonnet-5/`). The regional prefix
+(`us.`/`eu.`/`global.`/`au.`/`jp.`) is stripped from the directory name, since
+it is a routing detail rather than a different model.
+
+**Amazon Bedrock.** Region comes from `AWS_REGION` (default `us-west-2`) and
+the profile from `AWS_PROFILE` if set; otherwise the standard AWS credential
+chain applies. Both are written into a run-private `opencode.json`, so a run
+never depends on your global OpenCode config. You must already have access to
+the model in the Bedrock model catalog.
+
+**Prerequisites.** The `opencode` CLI must be on `PATH` (`harvest-tools`
+preflights `opencode --version`). Each run is sandboxed to its own temp
+directory and carries workarounds for three upstream OpenCode issues — a
+sub-agent permission deadlock, the 32k per-response output cap
+([opencode#29363](https://github.com/sst/opencode/issues/29363)), and
+post-compaction loss of the verify prompt's `SYMBOLS.md`/`ERRORS.md`/
+`CONFIGS.md` tables. See `tools/src/opencode.rs` for details; remove them when
+the upstream fixes ship.
 
 ## Datasets
 
