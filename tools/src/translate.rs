@@ -292,7 +292,7 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeCombined => {
-            let f = if is_lib { "translate-and-verify-library.md" } else { "translate-and-verify-executable.md" };
+            let f = if is_lib { "ablations/translate-and-verify-library.md" } else { "ablations/translate-and-verify-executable.md" };
             let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
@@ -351,7 +351,7 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeCombined => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-and-verify-shared.md")).unwrap_or_default();
+            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-and-verify-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeMinimal => {
