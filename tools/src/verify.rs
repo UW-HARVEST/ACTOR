@@ -288,8 +288,21 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
         }
     }
 
-    // Copy verified results back (skips target/ and c_src/)
-    work.finish()?;
+    // Copy verified results back — but only with PROOF the agent completed.
+    // `classify_log` is the same discriminator the scoring gate uses: an api_error
+    // run is not a measurement, and its output must not become `verified/`.
+    // Previously such a run published anyway and the compile gate below was the
+    // only thing standing between it and the scorer.
+    let health = crate::agent_health::classify_log(&log_path);
+    let Some(proof) = health.completed() else {
+        eprintln!(
+            "  {} — not publishing verified/: the agent did not complete ({:?})",
+            case_dir.display(),
+            health
+        );
+        return Ok(false);
+    };
+    work.finish(&proof)?;
 
     // ── Compile-gate: verify only counts as success if the crate still builds.
     // A mid-response API error can leave the crate half-written (missing symbols,

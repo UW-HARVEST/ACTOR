@@ -1,0 +1,5 @@
+error[E0599]: no method named `path` found for struct `Sealed<P>` in the current scope
+ --> tests/compile-fail/sealed_has_no_path.rs:6:20
+  |
+6 |     let _ = sealed.path();
+  |                    ^^^^ method not found in `Sealed<harvest_tools::artifact::Translate>`

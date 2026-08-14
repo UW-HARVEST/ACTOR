@@ -1,0 +1,16 @@
+error[E0603]: tuple struct constructor `Completed` is private
+ --> tests/compile-fail/completed_cannot_be_forged.rs:4:48
+  |
+4 |     let _forged = harvest_tools::agent_health::Completed(());
+  |                                                ^^^^^^^^^ private tuple struct constructor
+  |
+ ::: src/agent_health.rs
+  |
+  | pub struct Completed(());
+  |                      -- a constructor is private if any of the fields is private
+  |
+note: the tuple struct constructor `Completed` is defined here
+ --> src/agent_health.rs
+  |
+  | pub struct Completed(());
+  | ^^^^^^^^^^^^^^^^^^^^

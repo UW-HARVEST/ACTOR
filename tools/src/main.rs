@@ -1,4 +1,5 @@
 mod agent_health;
+mod artifact;
 mod battery;
 mod benchmark;
 mod cargo_toml;
