@@ -50,53 +50,10 @@ comment_lines = 1070
 blank_lines = 7020
 
 # ---------------------------------------------------------------------------
-# tab:crust self-generated (no-tests) one-shot baselines are NO LONGER MANUAL.
-# `harvest-tools score-selfgen-baselines` compiles+tests the committed baseline
-# translations (crust-bench/src/outputs/{gpt54,kimi_k25,gemini31pro}) against the
-# ground-truth tests and writes test_report_selfgen.json, which the report
-# generator reads through the same CrustOutcome rule as ACTOR. Removed from here.
-#
-# ---------------------------------------------------------------------------
-# Self-generated vs test-repair gap classification (prose: "The tests encode
-# expectations that the C does not"). The GAP SIZE itself is derived by the
-# generator (CRUST test-repair passes − self-generated passes) and asserted to
-# equal defects + bugs below, so this split cannot drift from the tables. The
-# split into "benchmark defect" vs "genuine ACTOR bug" is a human per-project
-# judgment (comparing each failing ground-truth test against the original C;
-# see harvest-agentic/CRUST_SELFGEN_GAP_AUDIT.md for file:line proof of each),
-# which no committed pipeline reproduces, so it is entered here.
-#   defects: ground-truth test expects a value the reference C never produces
-#            (test's expectation not derivable from the C); ACTOR is faithful.
-#   bugs:    ACTOR's translation genuinely diverges from C; test feedback fixes.
-[crust_gap]
-defects = 21
-bugs = 5
-
-# ---------------------------------------------------------------------------
-# tab:crust prior CRUST-Bench leaderboard block — external cited results from
-# the CRUST-Bench paper (out of 100). Not our runs; cited, not reproduced.
-# ---------------------------------------------------------------------------
-[crust_leaderboard]
-gpt5_compiler_builds = 92
-gpt5_compiler_tests = 43
-gemini3_compiler_builds = 88
-gemini3_compiler_tests = 41
-o3_compiler_builds = 68
-o3_compiler_tests = 31
-sweagent_builds = 41
-sweagent_tests = 32
-gpt5_testrepair_builds = 85
-gpt5_testrepair_tests = 70
-gemini3_testrepair_builds = 83
-gemini3_testrepair_tests = 66
-o3_testrepair_builds = 63
-o3_testrepair_tests = 48
-
-# ---------------------------------------------------------------------------
 # tab:prompt-sensitivity cross-prompt swap block (TRACTOR B0X, n=210). A one-off
 # experiment: each library translated with the executable prompt and vice versa,
-# split by exec/lib. TRACTOR-derived (summary.json), unaffected by the CRUST
-# scoring protocol; kept here as it is a bespoke subset run, not a standard cell.
+# split by exec/lib. TRACTOR-derived (summary.json); kept here as it is a bespoke
+# subset run, not a standard cell.
 # ---------------------------------------------------------------------------
 [prompt_sensitivity]
 lib_prompt_on_execs = "59/61"

@@ -274,14 +274,7 @@ mod prompt_layout {
             "ablations/translate-no-features-shared.md",
             "ablations/translate-no-subtask-shared.md",
         ];
-        // CRUST-dataset copies (prompts_dir = prompts/claude/crust for CRUST).
-        let crust = [
-            "crust/translate.md", "crust/translate-blind.md",
-            "crust/translate-minimal.md", "crust/translate-no-iter.md",
-            "crust/translate-minimal-blind.md", "crust/translate-no-iter-blind.md",
-            "crust/translate-and-verify-blind.md", "crust/verify-blind.md",
-        ];
-        for rel in main.iter().chain(ablations.iter()).chain(crust.iter()) {
+        for rel in main.iter().chain(ablations.iter()) {
             let p = claude.join(rel);
             assert!(p.is_file(), "referenced prompt missing (loader would run EMPTY): {}", p.display());
         }

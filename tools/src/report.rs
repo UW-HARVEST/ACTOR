@@ -187,39 +187,6 @@ pub fn generate(repo_root: &Path) -> Result<()> {
     }
     writeln!(all)?;
 
-    // 3. CRUST-bench tables. Every column is computed by the SAME functions the
-    // paper's crust.tex uses (crust_pass_adjusted / crust_build_counts /
-    // crust_loc_unsafe), over the canonical 87-project subset — so this markdown
-    // debug view can never drift from the paper table. (Earlier this block had its
-    // own inline loop that dropped missing projects from the denominator, yielding
-    // /86 where the paper says /87; consolidating onto the shared path removes that
-    // divergence.)
-    for (label, dir_name) in [
-        ("CRUST (test repair)", "CRUST"),
-        ("CRUST-blind (self-generated tests)", "CRUST-blind"),
-    ] {
-        let crust_dir = repo_root.join("results").join(dir_name);
-        if !crust_dir.is_dir() { continue; }
-        let pass = crust_pass_adjusted(repo_root, dir_name);
-        let builds = crust_build_counts(repo_root, dir_name);
-        writeln!(all, "## {label}\n")?;
-        writeln!(all, "| Agent | Builds (/87) | Tests (/87) | LOC | Unsafe Lines | Unsafe % |")?;
-        writeln!(all, "|-------|-------------|-------------|-----|-------------|----------|")?;
-        for agent_entry in sorted_read_dir(&crust_dir)? {
-            let agent = agent_entry.file_name().to_string_lossy().to_string();
-            if !agent_entry.path().is_dir() { continue; }
-            let (passed, total) = pass.get(&agent).copied().unwrap_or((0, 0));
-            let built = builds.get(&agent).copied().unwrap_or(0);
-            let (loc, unsafe_lines, _) = crust_loc_unsafe(repo_root, dir_name, &agent);
-            let unsafe_pct = if loc > 0 {
-                format!("{:.1}%", unsafe_lines as f64 / loc as f64 * 100.0)
-            } else { "N/A".into() };
-            writeln!(all, "| {} | {}/{} | {}/{} | {} | {} | {} |",
-                agent, built, total, passed, total, loc, unsafe_lines, unsafe_pct)?;
-        }
-        writeln!(all)?;
-    }
-
     // Only rewrite results.md when the C corpus is present; otherwise its C LOC
     // column would be zeroed. (See has_c_corpus above.)
     let out_path = tables_dir.join("results.md");
@@ -249,22 +216,14 @@ pub fn generate(repo_root: &Path) -> Result<()> {
     std::fs::write(&numbers_path, &numbers)?;
     println!("✅ Wrote {}", numbers_path.display());
 
-    // Dataset-size table body (tab:datasets), derived from the C corpus and the
-    // CRUST-Bench C sources copied into results/.
+    // Dataset-size table body (tab:datasets), derived from the C corpus.
     let datasets = generate_datasets_tex(repo_root);
     let datasets_path = tables_dir.join("datasets.tex");
     std::fs::write(&datasets_path, &datasets)?;
     println!("✅ Wrote {}", datasets_path.display());
 
-    // CRUST-Bench ACTOR + baseline table body (tab:crust). The leaderboard and
-    // self-generated baselines are manual (see manual.tex).
-    let crust = generate_crust_tex(repo_root, &rows);
-    let crust_path = tables_dir.join("crust.tex");
-    std::fs::write(&crust_path, &crust)?;
-    println!("✅ Wrote {}", crust_path.display());
-
     // Prompt-sensitivity ablations (tab:prompt-sensitivity): base + 4 variants,
-    // each over TRACTOR / CRUST self-gen / CRUST test-repair.
+    // each scored on TRACTOR.
     let promptsens = generate_prompt_sensitivity_tex(repo_root, &rows);
     let promptsens_path = tables_dir.join("prompt-sensitivity.tex");
     std::fs::write(&promptsens_path, &promptsens)?;
@@ -322,7 +281,7 @@ pub fn generate(repo_root: &Path) -> Result<()> {
         "TRACTOR battery sizes sum to {battery_sum}, expected 338"
     );
 
-    // (1c) The ACTOR agent directories that feed prose macros and TRACTOR/CRUST
+    // (1c) The ACTOR agent directories that feed prose macros and TRACTOR
     //      rows must exist. A renamed/missing dir otherwise emits a plausible
     //      all-zeros row (e.g. "0/338") that trips no other invariant and is
     //      indistinguishable from a legitimate baseline zero.
@@ -345,93 +304,11 @@ pub fn generate(repo_root: &Path) -> Result<()> {
         "no-validate invariant failed: no results/Test-Corpus/kiro/<battery>/summary_translated.json \
          found (the pre-verify scoring pass did not run; \\ActorKiroNoValidate* would be 0/338)."
     );
-    for agent in ["kiro", "claude", "codex-gpt54"] {
-        anyhow::ensure!(
-            repo_root.join("results/CRUST").join(agent).is_dir(),
-            "CRUST agent-dir invariant failed: results/CRUST/{agent} is missing \
-             (a rename would silently emit a 0/87 row)."
-        );
-    }
-
-    // (2) CRUST reported denominator must be 87 (100 − 13 canonical exclusions).
-    anyhow::ensure!(
-        crate::exclusions::CRUST_TOTAL - crate::exclusions::excluded_count()
-            == crate::exclusions::CRUST_REPORTED,
-        "CRUST invariant failed: 100 − {} ≠ 87",
-        crate::exclusions::excluded_count()
-    );
-
-    // (2b) Every CRUST agent's EMITTED denominator must actually equal 87, checked
-    //      against the data (not the constant). Catches an extra/missing/renamed
-    //      project dir that would silently shift the denominator to 86/88.
-    //      Also assert builds >= passes per agent (a passing crate must have built).
-    for mode in ["CRUST", "CRUST-blind"] {
-        let pass = crust_pass_adjusted(repo_root, mode);
-        let builds = crust_build_counts(repo_root, mode);
-        for (agent, (passed, total)) in &pass {
-            anyhow::ensure!(
-                *total == crate::exclusions::CRUST_REPORTED as u32,
-                "CRUST denominator invariant failed: {mode}/{agent} has {total} included projects, expected 87 \
-                 (an extra/missing/renamed project dir shifted the denominator)"
-            );
-            let built = builds.get(agent).copied().unwrap_or(0);
-            anyhow::ensure!(
-                built >= *passed,
-                "CRUST invariant failed: {mode}/{agent} reports {passed} passes but only {built} builds \
-                 (a passing crate must have compiled)"
-            );
-        }
-    }
-
-    // (2b-gap) The manual gap classification (defects + bugs) must equal the
-    //      derived gap size (kiro test-repair passes − self-generated passes).
-    //      This is the drift guard for the "tests encode a specification absent
-    //      from the C" prose: if a re-score moves either endpoint, the sum in
-    //      manual_constants.toml [crust_gap] must be re-reconciled or generation
-    //      fails here, before the paper can print a split that doesn't add up.
-    {
-        let tr = crust_pass_adjusted(repo_root, "CRUST");
-        let bl = crust_pass_adjusted(repo_root, "CRUST-blind");
-        let (kp, _) = tr.get("kiro").copied().unwrap_or((0, 0));
-        let (kb, _) = bl.get("kiro").copied().unwrap_or((0, 0));
-        let gap = kp.saturating_sub(kb);
-        let (defects, bugs) = crust_gap_split(repo_root);
-        anyhow::ensure!(
-            defects + bugs == gap,
-            "CRUST gap invariant failed: manual_constants.toml [crust_gap] defects ({defects}) \
-             + bugs ({bugs}) = {} but the data-derived gap (kiro test-repair {kp} − self-gen {kb}) \
-             is {gap}. Re-reconcile the per-project classification in \
-             CRUST_SELFGEN_GAP_AUDIT.md and update [crust_gap].",
-            defects + bugs
-        );
-    }
-
-    // (2c) Every re-scored baseline report must also cover exactly 87 included
-    //      projects, so a malformed report can't shift a baseline denominator.
-    for name in ["gpt54", "kimi_k25", "gemini31pro",
-                 "gpt54_test_repair", "kimi_k25_test_repair", "gemini31pro_test_repair"] {
-        let report = if name.ends_with("_test_repair") {
-            crust_baseline_87(repo_root, name)
-        } else {
-            crust_baseline_selfgen_87(repo_root, name)
-        };
-        if let Some((builds, passed, total)) = report {
-            anyhow::ensure!(
-                total == crate::exclusions::CRUST_REPORTED as u32,
-                "CRUST baseline invariant failed: {name} covers {total} included projects, expected 87"
-            );
-            anyhow::ensure!(
-                builds >= passed,
-                "CRUST baseline invariant failed: {name} reports {passed} passes but only {builds} builds"
-            );
-        }
-    }
-
-    // (2d) Shared-source dedup must have happened: P01/P00 collapse to one distinct
-    //      source. If the corpus is present but symlinks did not survive checkout
-    //      (materialized as real dirs), every config would be counted and LOC would
-    //      inflate ~120x silently. Fail loudly instead. (Skip when corpus absent —
-    //      then dedup can't run and datasets.tex omits these rows anyway.)
+    // (2) Shared-source dedup must have happened: P01/P00 collapse to one distinct
+    //     source. If the corpus is present but symlinks did not survive checkout
+    //     (materialized as real dirs), every config would be counted and LOC would
+    //     inflate ~120x silently. Fail loudly instead. (Skip when corpus absent —
+    //     then dedup can't run and datasets.tex omits these rows anyway.)
     if has_c_corpus {
         for (bat, expected_cases) in [("P01_sphincs_plus", 1u32), ("P00_perlin_noise", 1u32)] {
             let bat_dir = test_corpus_dir.join(bat);
@@ -480,46 +357,6 @@ pub fn generate(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Count CRUST projects that pass in a given mode, over the paper's canonical
-/// 87-project subset (see `crate::exclusions`). `mode_dir` is "CRUST"
-/// (test-repair) or "CRUST-blind" (self-generated tests). Returns, per agent,
-/// `(passed, total)` where `total` is the number of NON-excluded projects that
-/// have a result.json present (the reproducible /87 basis).
-fn crust_pass_adjusted(
-    repo_root: &Path,
-    mode_dir: &str,
-) -> std::collections::BTreeMap<String, (u32, u32)> {
-    let mut out = std::collections::BTreeMap::new();
-    let dir = repo_root.join("results").join(mode_dir);
-    let Ok(agents) = sorted_read_dir(&dir) else { return out };
-    for agent_entry in agents {
-        if !agent_entry.path().is_dir() { continue; }
-        let agent = agent_entry.file_name().to_string_lossy().to_string();
-        let (mut passed, mut total) = (0u32, 0u32);
-        if let Ok(projs) = sorted_read_dir(&agent_entry.path()) {
-            for pe in projs {
-                if !pe.path().is_dir() { continue; }
-                let name = pe.file_name().to_string_lossy().to_string();
-                if crate::exclusions::is_excluded(name.as_str()) { continue; }
-                // Denominator counts every INCLUDED project dir. A project whose
-                // result.json is missing/unscored counts as a non-pass (the same
-                // "unattempted = failure" rule TRACTOR uses), so the denominator
-                // stays the canonical 87 rather than shrinking to the number of
-                // successfully-scored projects.
-                total += 1;
-                let rp = crate::battery::crate_dir(&pe.path()).join("result.json");
-                let Some(r) = read_json::<serde_json::Value>(&rp) else { continue };
-                // Single canonical rule, identical to the baselines (scoring.rs):
-                // a pass needs >=1 passing test and 0 failing. A crate that builds
-                // but runs zero ground-truth tests is NOT a pass.
-                if crate::scoring::CrustOutcome::from_actor(&r).passed() { passed += 1; }
-            }
-        }
-        out.insert(agent, (passed, total));
-    }
-    out
-}
-
 /// Format an integer with comma thousands separators (e.g. 23072 -> "23,072"),
 /// matching the paper's dataset table.
 fn fmt_commas(n: u32) -> String {
@@ -551,40 +388,6 @@ fn median_round(values: &[u32]) -> u32 {
     m.round() as u32
 }
 
-/// Count C LOC in a directory the way CRUST-Bench's `get_c_stats.py` does:
-/// recurse over *.c / *.h, skip files whose path contains "test" or whose parent
-/// or grandparent directory name contains "bin"; strip C block (`/* */`) and line
-/// (`//`) comments, then count non-blank lines. `block_re`/`line_re` are shared,
-/// pre-compiled regexes so we do not recompile per file.
-fn count_crust_c_loc_dir(dir: &Path, block_re: &regex::Regex, line_re: &regex::Regex) -> u32 {
-    let mut total = 0u32;
-    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            total += count_crust_c_loc_dir(&path, block_re, line_re);
-        } else if path.extension().is_some_and(|x| x == "c" || x == "h") {
-            let path_lc = path.to_string_lossy().to_lowercase();
-            let parent_lc = path.parent()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            let grandparent_lc = path.parent().and_then(|p| p.parent())
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            if path_lc.contains("test") || parent_lc.contains("bin") || grandparent_lc.contains("bin") {
-                continue;
-            }
-            let Ok(src) = std::fs::read_to_string(&path) else { continue };
-            let src = block_re.replace_all(&src, "");
-            let src = line_re.replace_all(&src, "");
-            total += src.lines().filter(|l| !l.trim().is_empty()).count() as u32;
-        }
-    }
-    total
-}
-
 /// TRACTOR battery directory names, in paper order (results-dir keys).
 const TRACTOR_BATTERY_DIRS: &[&str] = &[
     "B01_synthetic", "B01_organic", "B02_synthetic",
@@ -612,8 +415,8 @@ fn tractor_battery_c_locs(corpus: &Path, dir_name: &str) -> Vec<u32> {
     locs
 }
 
-/// Emit the LaTeX body rows for tab:datasets: one row per TRACTOR battery plus a
-/// CRUST-Bench row, each `Dataset & Cases & Total & Mean & Median & Max`.
+/// Emit the LaTeX body rows for tab:datasets: one row per TRACTOR battery, each
+/// `Dataset & Cases & Total & Mean & Median & Max`.
 /// Counts are non-comment, non-blank C LOC. Numbers carry comma thousands
 /// separators (except Cases). Every value is derived from committed data.
 fn generate_datasets_tex(repo_root: &Path) -> String {
@@ -650,154 +453,15 @@ fn generate_datasets_tex(repo_root: &Path) -> String {
         emit_row(&mut out, display, locs.len() as u32, &locs);
     }
 
-    // CRUST-Bench row: C LOC over the 87 included projects (agent-independent,
-    // read from the benchmark corpus itself). See crust_bench_c_locs.
-    let locs = crust_bench_c_locs(repo_root, false);
-    if !locs.is_empty() {
-        let cases = locs.len() as u32;
-        // Rule off the TRACTOR batteries from the CRUST-Bench summary row.
-        out.push_str("\\hline\n");
-        emit_row(&mut out, "CRUST-Bench", cases, &locs);
-    }
-
     out
-}
-
-/// Per-project non-comment/non-blank C LOC for the CRUST-Bench corpus
-/// (crust-bench/datasets/CBench/<project>/), excluding test/bin paths. When
-/// `all` is false, the 13 excluded projects are dropped (the reported /87 subset);
-/// when true, all 100 projects are counted (for describing the full benchmark).
-/// Single definition shared by tab:datasets and the CRUST-Bench prose macros.
-fn crust_bench_c_locs(repo_root: &Path, all: bool) -> Vec<u32> {
-    let cbench = repo_root.join("crust-bench/datasets/CBench");
-    let mut locs: Vec<u32> = Vec::new();
-    if !cbench.is_dir() { return locs; }
-    let block_re = regex::Regex::new(r"(?s)/\*.*?\*/").unwrap();
-    let line_re = regex::Regex::new(r"(?m)//.*$").unwrap();
-    if let Ok(projs) = sorted_read_dir(&cbench) {
-        for pe in projs {
-            if !pe.path().is_dir() { continue; }
-            let name = pe.file_name().to_string_lossy().to_string();
-            if !all && crate::exclusions::is_excluded(&name) { continue; }
-            locs.push(count_crust_c_loc_dir(&pe.path(), &block_re, &line_re));
-        }
-    }
-    locs
-}
-
-/// Sum (loc.code, unsafe.lines) over the 87 included projects of one CRUST agent
-/// directory, returning `(total_loc, unsafe_lines, projects_counted)`. Reads the
-/// runner's own result.json (top-level for CRUST, verify/ for CRUST-blind).
-fn crust_loc_unsafe(repo_root: &Path, mode_dir: &str, agent: &str) -> (u32, u32, u32) {
-    let dir = repo_root.join("results").join(mode_dir).join(agent);
-    let (mut loc, mut unsafe_lines, mut n) = (0u32, 0u32, 0u32);
-    let Ok(projs) = sorted_read_dir(&dir) else { return (0, 0, 0) };
-    for pe in projs {
-        if !pe.path().is_dir() { continue; }
-        let name = pe.file_name().to_string_lossy().to_string();
-        if crate::exclusions::is_excluded(name.as_str()) { continue; }
-        let rp = crate::battery::crate_dir(&pe.path()).join("result.json");
-        let Some(r) = read_json::<serde_json::Value>(&rp) else { continue };
-        n += 1;
-        loc += r.pointer("/loc/code").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        unsafe_lines += r.pointer("/unsafe/lines").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    }
-    (loc, unsafe_lines, n)
-}
-
-/// LOC + unsafe lines for a CRUST-Bench baseline model, summed over its crates in
-/// the canonical 87 subset. The baselines have no result.json, so we count the
-/// committed translated crates directly with the SAME `battery::count_loc` /
-/// `count_unsafe` definitions used for ACTOR (recursive over `src/`, excluding
-/// `bin`/`tests`). `model` is a `crust-bench/src/outputs/<model>` dir. Returns
-/// `(loc, unsafe_lines)`, or (0,0) if the model dir is absent.
-fn crust_baseline_loc_unsafe(repo_root: &Path, model: &str) -> (u32, u32) {
-    let dir = repo_root.join("crust-bench/src/outputs").join(model);
-    let (mut loc, mut unsafe_lines) = (0u32, 0u32);
-    let Ok(projs) = sorted_read_dir(&dir) else { return (0, 0) };
-    for pe in projs {
-        if !pe.path().is_dir() { continue; }
-        let name = pe.file_name().to_string_lossy().to_string();
-        if crate::exclusions::is_excluded(name.as_str()) { continue; }
-        let src = pe.path().join("src");
-        if !src.is_dir() { continue; }
-        loc += crate::battery::count_loc(&src).code as u32;
-        unsafe_lines += crate::battery::count_unsafe(&src).lines as u32;
-    }
-    (loc, unsafe_lines)
-}
-
-/// Re-score a CRUST-Bench baseline test-repair run over the canonical 87 subset.
-/// Prefers our own `test_report_scored.json` (produced by
-/// `harvest-tools score-selfgen-baselines`, carrying a real `built` compile flag)
-/// so the Builds column is a true compile check identical to ACTOR's. Falls back
-/// to the CRUST-Bench authors' highest-numbered `test_report_<N>.json` (whose
-/// `built` is inferred from "ran a test") if we have not re-scored it. Counts
-/// builds and passes via the shared `crate::scoring::CrustOutcome` rule. Returns
-/// `(builds, tests_passed, total)` or None if no report exists.
-fn crust_baseline_87(repo_root: &Path, name: &str) -> Option<(u32, u32, u32)> {
-    let dir = repo_root.join("crust-bench/src/outputs").join(name);
-    if !dir.is_dir() { return None; }
-    // Prefer our re-scored report (has a real build flag).
-    let scored = dir.join("test_report_scored.json");
-    if scored.is_file() {
-        return score_baseline_report(&scored);
-    }
-    let mut best: Option<(u32, std::path::PathBuf)> = None;
-    for entry in std::fs::read_dir(&dir).ok()? {
-        let entry = entry.ok()?;
-        let fname = entry.file_name().to_string_lossy().to_string();
-        if let Some(n) = fname.strip_prefix("test_report_").and_then(|s| s.strip_suffix(".json")) {
-            if let Ok(n) = n.parse::<u32>() {
-                if best.as_ref().map_or(true, |(b, _)| n > *b) {
-                    best = Some((n, entry.path()));
-                }
-            }
-        }
-    }
-    let (_, path) = best?;
-    score_baseline_report(&path)
-}
-
-/// Score a CRUST-Bench self-generated (no-test-access) baseline over the canonical
-/// 87 subset. Reads `test_report_selfgen.json` (produced by
-/// `harvest-tools score-selfgen-baselines`), the SAME `{project, ok, fail}` format
-/// as the test-repair reports, so it goes through the identical scoring path.
-fn crust_baseline_selfgen_87(repo_root: &Path, name: &str) -> Option<(u32, u32, u32)> {
-    let path = repo_root
-        .join("crust-bench/src/outputs")
-        .join(name)
-        .join("test_report_selfgen.json");
-    if !path.is_file() { return None; }
-    score_baseline_report(&path)
-}
-
-/// Score a baseline `test_report` JSON array (`[{project, ok, fail}, ...]`) over the
-/// canonical 87 subset via the shared `crate::scoring::CrustOutcome` rule. Returns
-/// `(builds, tests_passed, total)` or None if the file is unreadable.
-fn score_baseline_report(path: &Path) -> Option<(u32, u32, u32)> {
-    let arr: serde_json::Value = read_json(path)?;
-    let items = arr.as_array()?;
-    let (mut builds, mut passed, mut total) = (0u32, 0u32, 0u32);
-    for it in items {
-        let proj = it.get("project").and_then(|v| v.as_str()).unwrap_or("");
-        if crate::exclusions::is_excluded(proj) { continue; }
-        total += 1;
-        let outcome = crate::scoring::CrustOutcome::from_baseline(it);
-        if outcome.built() { builds += 1; }
-        if outcome.passed() { passed += 1; }
-    }
-    Some((builds, passed, total))
 }
 
 /// Build the LaTeX body (rows only) for tab:prompt-sensitivity: the base
 /// ACTOR (Claude Code) run plus four prompt-ablation variants, each scored on
-/// TRACTOR (tests passed / total cases), CRUST self-generated, and CRUST
-/// test-repair — the SAME `crust_pass_adjusted` path as tab:crust, so the shared
-/// rows agree. Followed by the cross-prompt swap block (TRACTOR B0X, split by
-/// exec/lib via the `is_lib` naming); those two figures come from
-/// `manual_constants.toml [prompt_sensitivity]` because the swap runs are a
-/// one-off TRACTOR-subset experiment not re-derived here.
+/// TRACTOR (tests passed / total cases). Followed by the cross-prompt swap block
+/// (TRACTOR B0X, split by exec/lib via the `is_lib` naming); those two figures
+/// come from `manual_constants.toml [prompt_sensitivity]` because the swap runs
+/// are a one-off TRACTOR-subset experiment not re-derived here.
 fn generate_prompt_sensitivity_tex(repo_root: &Path, rows: &[BatteryRow]) -> String {
     use std::collections::HashMap;
     // TRACTOR tests passed per agent (sum of cases_passed over the batteries) and
@@ -810,10 +474,6 @@ fn generate_prompt_sensitivity_tex(repo_root: &Path, rows: &[BatteryRow]) -> Str
         *e = (*e).max(r.cases_tested);
     }
     let tractor_total: u32 = battery_size.values().sum();
-
-    let crust_tr = crust_pass_adjusted(repo_root, "CRUST");
-    let crust_bl = crust_pass_adjusted(repo_root, "CRUST-blind");
-    let reported = crate::exclusions::CRUST_REPORTED;
 
     // (paper label, results-dir agent key). Base row first, then the four variants.
     let variants: &[(&str, &str)] = &[
@@ -828,27 +488,22 @@ fn generate_prompt_sensitivity_tex(repo_root: &Path, rows: &[BatteryRow]) -> Str
     out.push_str("% GENERATED by harvest-tools report — do not edit\n");
     for (label, agent) in variants {
         let tp = tractor_pass.get(agent).copied().unwrap_or(0);
-        let (sg, _) = crust_bl.get(*agent).copied().unwrap_or((0, reported as u32));
-        let (tr, _) = crust_tr.get(*agent).copied().unwrap_or((0, reported as u32));
-        out.push_str(&format!(
-            "{} & {}/{} & {}/{} & {}/{} \\\\\n",
-            label, tp, tractor_total, sg, reported, tr, reported,
-        ));
+        out.push_str(&format!("{} & {}/{} \\\\\n", label, tp, tractor_total));
     }
 
     // Cross-prompt swap block (TRACTOR B0X only). Manual constants — a one-off
-    // experiment; unaffected by the CRUST protocol.
+    // experiment.
     let ps = prompt_sensitivity_manual(repo_root);
     let g = |k: &str| ps.get(k).cloned().unwrap_or_default();
     out.push_str("\\hline \\hline\n");
-    out.push_str("\\multicolumn{4}{l}{\\emph{Cross-prompt swap on TRACTOR B0X (n = 210)}} \\\\\n");
+    out.push_str("\\multicolumn{2}{l}{\\emph{Cross-prompt swap on TRACTOR B0X (n = 210)}} \\\\\n");
     out.push_str("\\hline\n");
     out.push_str(&format!(
-        "\\textit{{lib prompt on execs}} & \\multicolumn{{3}}{{l}}{{{}}} \\\\\n",
+        "\\textit{{lib prompt on execs}} & {} \\\\\n",
         g("lib_prompt_on_execs")
     ));
     out.push_str(&format!(
-        "\\textit{{exec prompt on libs}} & \\multicolumn{{3}}{{l}}{{{}}} \\\\\n",
+        "\\textit{{exec prompt on libs}} & {} \\\\\n",
         g("exec_prompt_on_libs")
     ));
     out
@@ -867,198 +522,6 @@ fn prompt_sensitivity_manual(repo_root: &Path) -> std::collections::BTreeMap<Str
                 out.insert(k.to_string(), s.to_string());
             }
         }
-    }
-    out
-}
-
-/// Build the LaTeX body (table rows only) for tab:crust's ACTOR and baseline
-/// sections. The prior-work leaderboard block and the self-generated baseline
-/// cells (GPT-5.4 58, etc.) are manual (manual.tex) and NOT emitted here.
-/// Columns: `System & Setting & Builds & Tests & LOC & Unsafe`.
-fn generate_crust_tex(repo_root: &Path, _rows: &[BatteryRow]) -> String {
-    let mut out = String::new();
-    out.push_str("% GENERATED by harvest-tools report — do not edit\n");
-
-    // Passed/total over 87 for each mode/agent.
-    let blind = crust_pass_adjusted(repo_root, "CRUST-blind");
-    let tr = crust_pass_adjusted(repo_root, "CRUST");
-    // Builds counts (compiled among the 87) per mode/agent.
-    let blind_builds = crust_build_counts(repo_root, "CRUST-blind");
-    let tr_builds = crust_build_counts(repo_root, "CRUST");
-
-    // Helper to format an ACTOR row with computed LOC/Unsafe.
-    let actor_row = |out: &mut String, label: &str, setting: &str, mode_dir: &str, agent: &str,
-                     builds_map: &std::collections::BTreeMap<String, u32>,
-                     pass_map: &std::collections::BTreeMap<String, (u32, u32)>| {
-        let (passed, total) = pass_map.get(agent).copied().unwrap_or((0, 0));
-        let builds = builds_map.get(agent).copied().unwrap_or(0);
-        let (loc, unsafe_lines, _) = crust_loc_unsafe(repo_root, mode_dir, agent);
-        let (loc_s, un_s) = if loc > 0 {
-            (fmt_k(loc), format!("{}\\%", (unsafe_lines as f64 / loc as f64 * 100.0).round() as u32))
-        } else {
-            ("--".into(), "--".into())
-        };
-        out.push_str(&format!(
-            "{} & {} & {}/{} & {}/{} & {} & {} \\\\\n",
-            label, setting, builds, total, passed, total, loc_s, un_s,
-        ));
-    };
-
-    // Reported CRUST denominator (87), single-sourced from the exclusions module.
-    let reported = crate::exclusions::CRUST_REPORTED;
-
-    // Self-generated (blank setting): ACTOR (Kiro) from CRUST-blind.
-    actor_row(&mut out, "ACTOR (Kiro)", "", "CRUST-blind", "kiro", &blind_builds, &blind);
-
-    // Transpiler baselines cannot do CRUST-Bench (no test-repair loop, and the
-    // scaffold-fill task is outside their design): all score 0 over the 87 subset.
-    // This is a structural fact, not a scored run, so the values are constants.
-    for label in ["C2Rust", "Laertes", "C2SaferRust", "SmartC2Rust"] {
-        out.push_str(&format!("{} & & 0/{reported} & 0/{reported} & -- & -- \\\\\n", label));
-    }
-
-    // LOC/unsafe formatter shared by the baseline rows (counted from the committed
-    // crates via crust_baseline_loc_unsafe). Dashes only when no crates were found.
-    let baseline_loc_un = |model: &str| -> (String, String) {
-        let (loc, un) = crust_baseline_loc_unsafe(repo_root, model);
-        if loc > 0 {
-            (fmt_k(loc), format!("{}\\%", (un as f64 / loc as f64 * 100.0).round() as u32))
-        } else {
-            ("--".into(), "--".into())
-        }
-    };
-
-    // Self-generated baseline rows (no test access), scored on ground-truth tests
-    // via the SAME rule as ACTOR (test_report_selfgen.json). LOC/Unsafe counted
-    // from the committed baseline crates.
-    for (label, out_name) in [
-        ("GPT-5.4", "gpt54"),
-        ("Kimi K2.5", "kimi_k25"),
-        ("Gemini 3.1 Pro", "gemini31pro"),
-    ] {
-        if let Some((builds, passed, total)) = crust_baseline_selfgen_87(repo_root, out_name) {
-            let (loc_s, un_s) = baseline_loc_un(out_name);
-            out.push_str(&format!(
-                "{} & & {}/{} & {}/{} & {} & {} \\\\\n",
-                label, builds, total, passed, total, loc_s, un_s,
-            ));
-        }
-    }
-
-    // ── Ablations section (test-repair) ──
-    out.push_str("\\hline\n");
-    out.push_str("\\multicolumn{6}{l}{\\emph{Ablations}} \\\\\n");
-    out.push_str("\\hline\n");
-
-    // Test-repair ACTOR rows from CRUST.
-    for (label, agent) in [
-        ("ACTOR (Kiro)", "kiro"),
-        ("ACTOR (Claude)", "claude"),
-        ("ACTOR (Codex)", "codex-gpt54"),
-    ] {
-        actor_row(&mut out, label, "test repair", "CRUST", agent, &tr_builds, &tr);
-    }
-
-    // Baseline test-repair rows, re-scored over the 87 subset. LOC/Unsafe counted
-    // from the committed test-repair baseline crates.
-    for (label, out_name) in [
-        ("GPT-5.4", "gpt54_test_repair"),
-        ("Kimi K2.5", "kimi_k25_test_repair"),
-        ("Gemini 3.1 Pro", "gemini31pro_test_repair"),
-    ] {
-        if let Some((builds, passed, total)) = crust_baseline_87(repo_root, out_name) {
-            let (loc_s, un_s) = baseline_loc_un(out_name);
-            out.push_str(&format!(
-                "{} & test repair & {}/{} & {}/{} & {} & {} \\\\\n",
-                label, builds, total, passed, total, loc_s, un_s,
-            ));
-        }
-    }
-
-    // ── Prior-work leaderboard section (over /100, cited external data). Values
-    //    come from manual_constants.toml [crust_leaderboard] — NOT our runs. ──
-    let lb = crust_leaderboard(repo_root);
-    let g = |k: &str| lb.get(k).copied().unwrap_or(0);
-    out.push_str("\\hline\n");
-    out.push_str("\\multicolumn{6}{l}{\\emph{Prior results from CRUST-Bench leaderboard}~\\cite{KhatryZPWCDD2025}} \\\\\n");
-    out.push_str("\\hline\n");
-    for (label, setting, b, t) in [
-        ("GPT-5", "", "gpt5_compiler_builds", "gpt5_compiler_tests"),
-        ("Gemini 3", "", "gemini3_compiler_builds", "gemini3_compiler_tests"),
-        ("o3", "", "o3_compiler_builds", "o3_compiler_tests"),
-        ("SWE-agent", "test repair", "sweagent_builds", "sweagent_tests"),
-        ("GPT-5", "test repair", "gpt5_testrepair_builds", "gpt5_testrepair_tests"),
-        ("Gemini 3", "test repair", "gemini3_testrepair_builds", "gemini3_testrepair_tests"),
-        ("o3", "test repair", "o3_testrepair_builds", "o3_testrepair_tests"),
-    ] {
-        out.push_str(&format!(
-            "{} & {} & {}/100 & {}/100 & -- & -- \\\\\n",
-            label, setting, g(b), g(t),
-        ));
-    }
-
-    out
-}
-
-/// Read the `[crust_leaderboard]` block from `manual_constants.toml` into a map of
-/// key -> value. These are external cited results from the CRUST-Bench paper (over
-/// /100), NOT our runs, so they live in the manual constants file. Returns an empty
-/// map if the file or section is absent (the leaderboard rows then read as 0).
-fn crust_leaderboard(repo_root: &Path) -> std::collections::BTreeMap<String, u32> {
-    let mut out = std::collections::BTreeMap::new();
-    let path = repo_root.join("manual_constants.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else { return out };
-    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else { return out };
-    if let Some(table) = doc.get("crust_leaderboard").and_then(|t| t.as_table()) {
-        for (k, v) in table.iter() {
-            if let Some(i) = v.as_integer() {
-                out.insert(k.to_string(), i as u32);
-            }
-        }
-    }
-    out
-}
-
-/// Read the `[crust_gap]` block from `manual_constants.toml`: the human
-/// classification of the self-generated-vs-test-repair gap into `defects`
-/// (ground-truth test expects behavior the C never produces; ACTOR faithful)
-/// and `bugs` (ACTOR genuinely diverges from C). Returns `(defects, bugs)`, or
-/// `(0, 0)` if absent. The gap SIZE is derived, not read; a generator invariant
-/// asserts `defects + bugs == gap` so this manual split cannot drift.
-fn crust_gap_split(repo_root: &Path) -> (u32, u32) {
-    let path = repo_root.join("manual_constants.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else { return (0, 0) };
-    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else { return (0, 0) };
-    let get = |k: &str| doc.get("crust_gap")
-        .and_then(|t| t.as_table())
-        .and_then(|t| t.get(k))
-        .and_then(|v| v.as_integer())
-        .unwrap_or(0) as u32;
-    (get("defects"), get("bugs"))
-}
-
-/// Per-mode/agent count of CRUST projects whose translated crate compiled
-/// (build_ok == true) over the canonical 87 subset. Mirrors `crust_pass_adjusted`
-/// but reports builds rather than test passes.
-fn crust_build_counts(repo_root: &Path, mode_dir: &str) -> std::collections::BTreeMap<String, u32> {
-    let mut out = std::collections::BTreeMap::new();
-    let dir = repo_root.join("results").join(mode_dir);
-    let Ok(agents) = sorted_read_dir(&dir) else { return out };
-    for agent_entry in agents {
-        if !agent_entry.path().is_dir() { continue; }
-        let agent = agent_entry.file_name().to_string_lossy().to_string();
-        let mut builds = 0u32;
-        if let Ok(projs) = sorted_read_dir(&agent_entry.path()) {
-            for pe in projs {
-                if !pe.path().is_dir() { continue; }
-                let name = pe.file_name().to_string_lossy().to_string();
-                if crate::exclusions::is_excluded(name.as_str()) { continue; }
-                let rp = crate::battery::crate_dir(&pe.path()).join("result.json");
-                let Some(r) = read_json::<serde_json::Value>(&rp) else { continue };
-                if crate::scoring::CrustOutcome::from_actor(&r).built() { builds += 1; }
-            }
-        }
-        out.insert(agent, builds);
     }
     out
 }
@@ -1188,8 +651,8 @@ fn kiro_cost(base: &Path) -> (f64, f64, u64) {
 
 /// Emit \newcommand constants for result numbers that are quoted in the prose.
 /// Only numbers that are derived directly from the committed results appear
-/// here; figures the results data does not reproduce (e.g. the CRUST
-/// self-generated pass count) are intentionally left to the paper text.
+/// here; figures the results data does not reproduce are intentionally left to
+/// the paper text.
 fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
     use std::collections::HashMap;
     // TRACTOR totals (tests passed over the full corpus) and P01 sub-totals.
@@ -1207,9 +670,6 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
             p01_tests.insert(r.agent.as_str(), r.cases_passed);
         }
     }
-    let crust_tr = crust_pass_adjusted(repo_root, "CRUST");
-    let crust_bl = crust_pass_adjusted(repo_root, "CRUST-blind");
-
     let g = |m: &HashMap<&str, u32>, k: &str| m.get(k).copied().unwrap_or(0);
     let mut o = String::new();
     o.push_str("% GENERATED by `harvest-tools report`. Do not edit by hand.\n");
@@ -1228,28 +688,16 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
         o.push_str(&format!("\\newcommand{{\\TractorTotalLoc}}{{{}}}\n", fmt_commas(tractor_total_loc)));
         o.push_str(&format!("\\newcommand{{\\TractorMeanLoc}}{{{}}}\n", mean));
     }
-    // CRUST-Bench full-benchmark mean C LOC over all 100 projects (prose describes
-    // the whole benchmark before we restrict to the 87-project subset).
-    let crust_all = crust_bench_c_locs(repo_root, true);
-    if !crust_all.is_empty() {
-        let mean = (crust_all.iter().map(|&x| x as u64).sum::<u64>() as f64
-            / crust_all.len() as f64).round() as u32;
-        o.push_str(&format!("\\newcommand{{\\CrustBenchMeanLoc}}{{{}}}\n", fmt_commas(mean)));
-    }
-
     // ── ACTOR (Kiro) cost/time, derived from result.json credits at the Kiro
     //    Power add-on rate of $0.04/credit (translate + verify phases). Claude and
     //    Codex do not record credits, so their costs stay manual in the prose.
     const USD_PER_CREDIT: f64 = 0.04;
-    // Translated Rust LOC per benchmark (kiro), used as the per-kLOC denominator.
-    // TRACTOR: sum of the deduped per-battery Rust LOC in `rows`. CRUST: the
-    // self-generated (blind) kiro LOC. Both match the LOC the tables report.
+    // Translated Rust LOC (kiro), used as the per-kLOC denominator: the sum of
+    // the deduped per-battery Rust LOC in `rows`, matching what the tables report.
     let tractor_rust_loc: u32 = rows.iter().filter(|r| r.agent == "kiro").map(|r| r.total_loc).sum();
-    let (crust_rust_loc, _, _) = crust_loc_unsafe(repo_root, "CRUST-blind", "kiro");
     // (label, results dir, translated-Rust-kLOC denominator)
     let cost_rows: &[(&str, &str, u32)] = &[
         ("Tractor", "results/Test-Corpus/kiro", tractor_rust_loc),
-        ("Crust", "results/CRUST-blind/kiro", crust_rust_loc),
     ];
     for (name, base, rust_loc) in cost_rows {
         let (credits, verify_credits, secs) = kiro_cost(&repo_root.join(base));
@@ -1286,46 +734,9 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
     o.push_str(&format!("\\newcommand{{\\ActorKiroNoValidateTests}}{{{}/{}}}\n", g(&total_tests, "kiro-translate"), total_cases));
     o.push_str(&format!("\\newcommand{{\\ActorKiroPOneTests}}{{{}/128}}\n", g(&p01_tests, "kiro")));
     o.push_str(&format!("\\newcommand{{\\ActorKiroNoValidatePOneTests}}{{{}/128}}\n", g(&p01_tests, "kiro-translate")));
-    let (kiro_p, kiro_t) = crust_tr.get("kiro").copied().unwrap_or((0, 0));
-    o.push_str(&format!("\\newcommand{{\\CrustKiroTestRepair}}{{{}/{}}}\n", kiro_p, kiro_t));
-    // ACTOR (Kiro) self-generated (no test access) CRUST pass rate, for prose that
-    // contrasts it with test-repair. Same source as the tab:crust self-gen row.
-    let (kbp, kbt) = crust_bl.get("kiro").copied().unwrap_or((0, 0));
-    o.push_str(&format!("\\newcommand{{\\CrustKiroSelfGen}}{{{}/{}}}\n", kbp, kbt));
-
-    // ── Self-generated vs test-repair gap, for the "tests encode a specification
-    //    absent from the C" prose. The reported denominator and the count of
-    //    excluded suites come straight from the exclusions module (single source).
-    //    The gap SIZE is derived here (test-repair passes − self-gen passes for
-    //    kiro) so it can never disagree with the tab:crust cells; the split of
-    //    that gap into benchmark defects vs genuine bugs is a manual per-project
-    //    judgment read from manual_constants.toml, and an invariant below asserts
-    //    defects + bugs == gap so the manual split cannot drift from the data.
-    o.push_str(&format!("\\newcommand{{\\CrustReported}}{{{}}}\n",
-        crate::exclusions::CRUST_REPORTED));
-    o.push_str(&format!("\\newcommand{{\\CrustExcluded}}{{{}}}\n",
-        crate::exclusions::excluded_count()));
-    let gap = kiro_p.saturating_sub(kbp);
-    o.push_str(&format!("\\newcommand{{\\CrustGapProjects}}{{{}}}\n", gap));
-    let (gap_defects, gap_bugs) = crust_gap_split(repo_root);
-    o.push_str(&format!("\\newcommand{{\\CrustGapDefects}}{{{}}}\n", gap_defects));
-    o.push_str(&format!("\\newcommand{{\\CrustGapBugs}}{{{}}}\n", gap_bugs));
-    // Next-best test-blind system, to substantiate the ceiling claim. Derived from
-    // the SAME re-scored self-gen baseline path as the tab:crust GPT-5.4 row.
-    if let Some((_, gpt_pass, gpt_total)) = crust_baseline_selfgen_87(repo_root, "gpt54") {
-        o.push_str(&format!("\\newcommand{{\\CrustGptFourSelfGen}}{{{}/{}}}\n", gpt_pass, gpt_total));
-    }
-
     let (laertes_breaks, laertes_fixes) = laertes_vs_c2rust(repo_root);
     o.push_str(&format!("\\newcommand{{\\LaertesBreaks}}{{{}}}\n", laertes_breaks));
     o.push_str(&format!("\\newcommand{{\\LaertesFixes}}{{{}}}\n", laertes_fixes));
-
-    // NOTE: CRUST baseline numbers (GPT-5.4/Kimi/Gemini) are emitted ONLY as
-    // table rows in crust.tex, via the single `crust_baseline_87` path. We do not
-    // also emit them as prose macros here: two code paths for the same quantity is
-    // exactly the drift risk this generator exists to remove. If the prose ever
-    // needs a baseline number, add a macro that calls `crust_baseline_87` so it is
-    // by construction the same value as the table cell.
     o
 }
 

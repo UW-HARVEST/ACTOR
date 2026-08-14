@@ -5,7 +5,7 @@
 //! `translate` derived `results_dir.parent()` (the *dataset* dir) while `verify`
 //! derived `case_dir.ancestors().nth(2)`, which lands on the *agent* dir for
 //! Test-Corpus but the *dataset* dir for HarvestBench, because HB case dirs are
-//! one level shallower. The third (CRUST) wrote a bare `{}` — no policy at all.
+//! one level shallower. The third wrote a bare `{}` — no policy at all.
 //!
 //! More importantly, none of them denied the corpus, and the corpus is where the
 //! graded oracle lives: `test-corpus/Public-Tests/<battery>/<case>/test_vectors`

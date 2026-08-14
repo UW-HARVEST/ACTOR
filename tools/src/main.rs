@@ -3,7 +3,6 @@ mod battery;
 mod benchmark;
 mod cargo_toml;
 mod cli;
-mod exclusions;
 mod opencode;
 mod sandbox;
 mod report;
@@ -48,17 +47,15 @@ fn main() -> Result<()> {
             no_verify,
             include_regex,
             parallel,
-            limit,
-            blind,
         } => {
-            let dataset = Dataset::detect(target, blind);
+            let dataset = Dataset::detect(target);
             let paths = battery::Paths::new(&repo_root, agent, dataset, model);
             let inner = Dataset::strip_prefix(target);
             let bench = benchmark::for_dataset(dataset);
 
             // The ONE lifecycle: translate → [verify?] → enrich → score.
             // `verifies` folds the old nine-clause skip `if` into a property.
-            bench.translate(&paths, inner, include_regex.as_deref(), parallel, limit)?;
+            bench.translate(&paths, inner, include_regex.as_deref(), parallel)?;
             if !no_verify && bench.verifies(agent) {
                 bench.verify(&repo_root, &paths, inner, include_regex.as_deref(), false, parallel)?;
             }
@@ -70,23 +67,20 @@ fn main() -> Result<()> {
             ref target,
             include_regex,
             parallel,
-            limit,
-            blind,
         } => {
-            let dataset = Dataset::detect(target, blind);
+            let dataset = Dataset::detect(target);
             let paths = battery::Paths::new(&repo_root, agent, dataset, model);
             let inner = Dataset::strip_prefix(target);
             benchmark::for_dataset(dataset)
-                .translate(&paths, inner, include_regex.as_deref(), parallel, limit)?;
+                .translate(&paths, inner, include_regex.as_deref(), parallel)?;
         }
         Command::Verify {
             ref target,
             include_regex,
             force,
             parallel,
-            blind,
         } => {
-            let dataset = Dataset::detect(target, blind);
+            let dataset = Dataset::detect(target);
             let paths = battery::Paths::new(&repo_root, agent, dataset, model);
             let inner = Dataset::strip_prefix(target);
             benchmark::for_dataset(dataset)
@@ -96,10 +90,9 @@ fn main() -> Result<()> {
             ref target,
             update,
             check,
-            blind,
             allow_infra_failures,
         } => {
-            let dataset = Dataset::detect(target, blind);
+            let dataset = Dataset::detect(target);
             let paths = battery::Paths::new(&repo_root, agent, dataset, model);
             let inner = Dataset::strip_prefix(target);
             let mode = if update {
@@ -112,17 +105,14 @@ fn main() -> Result<()> {
 
             run_test(&repo_root, benchmark::for_dataset(dataset).as_ref(), &paths, inner, mode, allow_infra_failures)?;
         }
-        Command::Enrich { ref target, blind } => {
-            let dataset = Dataset::detect(target, blind);
+        Command::Enrich { ref target } => {
+            let dataset = Dataset::detect(target);
             let paths = battery::Paths::new(&repo_root, agent, dataset, model);
             let inner = Dataset::strip_prefix(target);
             benchmark::for_dataset(dataset).enrich(&paths, inner)?;
         }
         Command::Report => {
             report::generate(&repo_root)?;
-        }
-        Command::ScoreSelfgenBaselines => {
-            test::score_selfgen_baselines(&repo_root)?;
         }
     }
     Ok(())

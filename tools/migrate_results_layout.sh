@@ -3,15 +3,13 @@
 # migrate_results_layout.sh — one-shot migration of the results/ submodule to
 # the uniform per-case phase-dir layout.
 #
-#   OLD (four different shapes)                NEW (uniform)
+#   OLD (two different shapes)                 NEW (uniform)
 #   Test-Corpus/<a>/<bat>/<case>/              <case>/
 #     translated_rust_original/  (pre-verify)    translated/   (crate+result.json+logs)
 #     translated_rust/           (post-verify)    verified/     (iff a verify ran)
 #     result.json, logs/, summary.json@bat
 #   Test-Corpus/kiro-translate/  (pseudo-agent, pre-verify snapshot of kiro)
 #                                              -> folded into kiro/<case>/translated/, then DELETED
-#   CRUST/<a>/<proj>/            (crate AT proj root)   <proj>/translated/  (crate+result.json+logs)
-#   CRUST-blind/<a>/<proj>/translate/  + /verify/       <proj>/translated/  + /verified/
 #   HarvestBench/<a>/<case>/translated_rust/            <case>/translated/
 #
 # Design rules (match tools/src, which reads the NEW layout):
@@ -111,26 +109,6 @@ migrate_test_corpus_case() {
   run "rm -rf \"$case_dir/translated_rust_original\" \"$case_dir/logs\" \"$case_dir/result.json\""
 }
 
-migrate_crust_regular_proj() {
-  # CRUST-regular: the crate IS the project dir. Move everything except a
-  # possibly-already-present translated/ into translated/.
-  local proj="$1"
-  local translated="$proj/translated"
-  [[ -d "$translated" ]] && { say "  skip (migrated): $proj"; return 0; }
-  [[ -f "$proj/Cargo.toml" ]] || return 0
-  run "mkdir -p \"$translated\""
-  # Move all entries of proj/ into translated/ (Cargo.toml, src/, c_src/, logs/,
-  # result.json, translation.json, target/…). Use find to avoid globbing traps.
-  run "find \"$proj\" -mindepth 1 -maxdepth 1 ! -name translated -exec mv {} \"$translated\"/ \\;"
-}
-
-migrate_crust_blind_proj() {
-  local proj="$1"
-  # translate/ -> translated/, verify/ -> verified/
-  move_dir "$proj/translate" "$proj/translated"
-  move_dir "$proj/verify"    "$proj/verified"
-}
-
 migrate_harvest_bench_case() {
   local case_dir="$1"
   move_dir "$case_dir/translated_rust" "$case_dir/translated"
@@ -186,16 +164,6 @@ for agent in results/Test-Corpus/*/; do
   done
 done
 fold_kiro_translate
-
-say "== CRUST-regular =="
-for proj in results/CRUST/*/*/; do
-  [[ -d "$proj" ]] && migrate_crust_regular_proj "${proj%/}"
-done
-
-say "== CRUST-blind =="
-for proj in results/CRUST-blind/*/*/; do
-  [[ -d "$proj" ]] && migrate_crust_blind_proj "${proj%/}"
-done
 
 say "== HarvestBench =="
 for case_dir in results/HarvestBench/*/*/; do

@@ -35,15 +35,14 @@ pub trait Benchmark {
 
     /// Does a separate C-as-oracle verify phase run for this agent?
     ///
-    /// Replaces the nine-clause skip `if`. Datasets whose verification is
-    /// folded into the agentic translate prompt (CRUST, harvest-bench) return
-    /// `false`; ablation/combined agents that self-verify or skip verify by
-    /// design return `false` too (see [`agent_runs_separate_verify`]).
+    /// Replaces the nine-clause skip `if`. Ablation/combined agents that
+    /// self-verify or skip verify by design return `false` (see
+    /// [`agent_runs_separate_verify`]).
     fn verifies(&self, agent: Agent) -> bool;
 
     /// Translate the target. All discovery + parallelism is internal.
     fn translate(&self, paths: &Paths, target: &str, filter: Option<&str>,
-                 parallel: usize, limit: Option<usize>) -> Result<()>;
+                 parallel: usize) -> Result<()>;
 
     /// Run the verify phase. Only reached from `Run` when [`verifies`] is true;
     /// also invoked directly by the `verify` subcommand. Datasets with no
@@ -65,17 +64,15 @@ pub trait Benchmark {
 pub fn for_dataset(d: Dataset) -> Box<dyn Benchmark> {
     match d {
         Dataset::TestCorpus => Box::new(TestCorpus),
-        Dataset::Crust => Box::new(Crust),
-        Dataset::BlindCrust => Box::new(BlindCrust),
         Dataset::HarvestBench => Box::new(HarvestBench),
     }
 }
 
-/// The verify-skip predicate shared by TestCorpus and BlindCrust. These agents
-/// either merge translate+verify into one session (ClaudeCombined), skip verify
-/// by prompt-ablation design (the other Claude* variants), or run their own
-/// translate-then-verify pipeline in-harness (Codex). For all of them the
-/// separate ACTOR verify phase does not run.
+/// The verify-skip predicate shared by TestCorpus and harvest-bench. These
+/// agents either merge translate+verify into one session (ClaudeCombined),
+/// skip verify by prompt-ablation design (the other Claude* variants), or run
+/// their own translate-then-verify pipeline in-harness (Codex). For all of them
+/// the separate ACTOR verify phase does not run.
 fn agent_runs_separate_verify(agent: Agent) -> bool {
     !matches!(agent,
         Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter
@@ -90,15 +87,6 @@ fn resolve_batteries(corpus_dir: &Path, target: &str) -> Result<Vec<String>> {
         battery::all_batteries(corpus_dir)
     } else {
         Ok(vec![target.to_string()])
-    }
-}
-
-fn resolve_crust_projects(corpus_dir: &Path, target: &str, limit: Option<usize>)
-    -> Result<Vec<battery::CrustProject>> {
-    if target.eq_ignore_ascii_case("crust") || target == "all" {
-        battery::CrustProject::discover(corpus_dir, limit)
-    } else {
-        Ok(vec![battery::CrustProject::validated(corpus_dir, target)?])
     }
 }
 
@@ -130,7 +118,7 @@ impl Benchmark for TestCorpus {
     fn verifies(&self, agent: Agent) -> bool { agent_runs_separate_verify(agent) }
 
     fn translate(&self, paths: &Paths, target: &str, _filter: Option<&str>,
-                 parallel: usize, _limit: Option<usize>) -> Result<()> {
+                 parallel: usize) -> Result<()> {
         let batteries = resolve_batteries(&paths.corpus_dir, target)?;
 
         // Shared-source batteries must run single-threaded (the follower configs
@@ -219,66 +207,6 @@ impl Benchmark for TestCorpus {
     }
 }
 
-// ── CRUST ──────────────────────────────────────────────────────────────
-
-struct Crust;
-
-impl Benchmark for Crust {
-    fn name(&self) -> &'static str { "CRUST" }
-
-    // Verification is folded into the CRUST translate prompt (it iterates
-    // `cargo test` to green in one session), so no separate verify phase runs.
-    fn verifies(&self, _agent: Agent) -> bool { false }
-
-    fn translate(&self, paths: &Paths, target: &str, _filter: Option<&str>,
-                 parallel: usize, limit: Option<usize>) -> Result<()> {
-        let projects = resolve_crust_projects(&paths.corpus_dir, target, limit)?;
-        translate::run_crust(paths, &projects, parallel)
-    }
-
-    fn test(&self, paths: &Paths, target: &str, mode: TestMode) -> Result<TestOutcome> {
-        let projects = resolve_crust_projects(&paths.corpus_dir, target, None)?;
-        test::run_crust_test(paths, &projects, mode)
-    }
-
-    fn enrich(&self, paths: &Paths, target: &str) -> Result<()> {
-        let projects = resolve_crust_projects(&paths.corpus_dir, target, None)?;
-        test::enrich_crust(paths, &projects)
-    }
-}
-
-// ── CRUST blind ────────────────────────────────────────────────────────
-
-struct BlindCrust;
-
-impl Benchmark for BlindCrust {
-    fn name(&self) -> &'static str { "CRUST-blind" }
-
-    fn verifies(&self, agent: Agent) -> bool { agent_runs_separate_verify(agent) }
-
-    fn translate(&self, paths: &Paths, target: &str, _filter: Option<&str>,
-                 parallel: usize, limit: Option<usize>) -> Result<()> {
-        let projects = resolve_crust_projects(&paths.corpus_dir, target, limit)?;
-        translate::run_crust_blind(paths, &projects, parallel)
-    }
-
-    fn verify(&self, _repo_root: &Path, paths: &Paths, target: &str,
-              _filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
-        let projects = resolve_crust_projects(&paths.corpus_dir, target, None)?;
-        translate::verify_crust_blind(paths, &projects, parallel, force)
-    }
-
-    fn test(&self, paths: &Paths, target: &str, mode: TestMode) -> Result<TestOutcome> {
-        let projects = resolve_crust_projects(&paths.corpus_dir, target, None)?;
-        test::run_blind_crust_test(paths, &projects, mode)
-    }
-
-    fn enrich(&self, paths: &Paths, target: &str) -> Result<()> {
-        let projects = resolve_crust_projects(&paths.corpus_dir, target, None)?;
-        test::enrich_blind_crust(paths, &projects)
-    }
-}
-
 // ── harvest-bench ──────────────────────────────────────────────────────
 
 struct HarvestBench;
@@ -294,7 +222,7 @@ impl Benchmark for HarvestBench {
     fn verifies(&self, agent: Agent) -> bool { agent_runs_separate_verify(agent) }
 
     fn translate(&self, paths: &Paths, target: &str, _filter: Option<&str>,
-                 parallel: usize, _limit: Option<usize>) -> Result<()> {
+                 parallel: usize) -> Result<()> {
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
         translate::run_harvest_bench(paths, &projects, parallel)
     }

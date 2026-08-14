@@ -82,10 +82,6 @@ pub enum Agent {
 pub enum Dataset {
     /// HARVEST test-corpus (MIT runtests).
     TestCorpus,
-    /// CRUST-bench (cargo test).
-    Crust,
-    /// CRUST-bench blind mode (no ground-truth tests visible to agents).
-    BlindCrust,
     /// harvest-bench: real C libraries scored by their upstream GoogleTest
     /// suites, linked against the translated cdylib by ABI. Targets are
     /// `HB/<project>` (e.g. `HB/libsodium`) or `HB` for all.
@@ -93,24 +89,19 @@ pub enum Dataset {
 }
 
 impl Dataset {
-    /// Auto-detect from target name: "CRUST/<project>" or "CRUST" → Crust,
-    /// "HB/<project>" or "HB" → HarvestBench, else TestCorpus.
-    pub fn detect(target: &str, blind: bool) -> Self {
-        if target.eq_ignore_ascii_case("crust") || target.starts_with("CRUST/") {
-            if blind { Self::BlindCrust } else { Self::Crust }
-        } else if target.eq_ignore_ascii_case("hb") || target.starts_with("HB/") {
+    /// Auto-detect from target name: "HB/<project>" or "HB" → HarvestBench,
+    /// else TestCorpus.
+    pub fn detect(target: &str) -> Self {
+        if target.eq_ignore_ascii_case("hb") || target.starts_with("HB/") {
             Self::HarvestBench
         } else {
             Self::TestCorpus
         }
     }
 
-    /// Strip the "CRUST/" or "HB/" prefix if present, returning the inner target.
+    /// Strip the "HB/" prefix if present, returning the inner target.
     pub fn strip_prefix(target: &str) -> &str {
-        target
-            .strip_prefix("CRUST/")
-            .or_else(|| target.strip_prefix("HB/"))
-            .unwrap_or(target)
+        target.strip_prefix("HB/").unwrap_or(target)
     }
 }
 
@@ -148,12 +139,6 @@ pub enum Command {
         /// Max parallel translations
         #[arg(long, default_value_t = 1)]
         parallel: usize,
-        /// Max number of cases to process
-        #[arg(long)]
-        limit: Option<usize>,
-        /// CRUST blind mode: agents never see ground-truth tests
-        #[arg(long)]
-        blind: bool,
     },
     /// Translate C to Rust
     Translate {
@@ -162,12 +147,6 @@ pub enum Command {
         include_regex: Option<String>,
         #[arg(long, default_value_t = 1)]
         parallel: usize,
-        /// Max number of cases to process
-        #[arg(long)]
-        limit: Option<usize>,
-        /// CRUST blind mode: agent does not see ground-truth tests
-        #[arg(long)]
-        blind: bool,
     },
     /// C-as-oracle verification
     Verify {
@@ -179,9 +158,6 @@ pub enum Command {
         force: bool,
         #[arg(long, default_value_t = 1)]
         parallel: usize,
-        /// CRUST blind mode: agent generates tests without seeing ground truth
-        #[arg(long)]
-        blind: bool,
     },
     /// Run MIT runtests
     Test {
@@ -192,9 +168,6 @@ pub enum Command {
         /// CI mode: compare against stored summary.json, exit 1 on mismatch
         #[arg(long, conflicts_with = "update")]
         check: bool,
-        /// CRUST blind mode: run LLM tests then swap in real tests
-        #[arg(long)]
-        blind: bool,
         /// Score even though some agent runs died on infrastructure (expired
         /// credentials, rate limiting, a truncated log).
         ///
@@ -207,19 +180,9 @@ pub enum Command {
         allow_infra_failures: bool,
     },
     /// Backfill result.json with credits + unsafe counts (no tests, no LLM calls)
-    Enrich {
-        target: String,
-        #[arg(long)]
-        blind: bool,
-    },
+    Enrich { target: String },
     /// Generate markdown report tables from validated results into tables/
     Report,
-    /// Score the CRUST-Bench self-generated (no-test-access) baseline translations
-    /// against ground-truth tests, caching results in the baseline
-    /// `test_report_<N>.json` format so the report generator reads them exactly
-    /// like the test-repair baselines. One workspace per model under
-    /// `crust-bench/src/outputs/{gpt54,kimi_k25,gemini31pro}/`.
-    ScoreSelfgenBaselines,
 }
 
 // Execution is now driven by the `Benchmark` trait (see `benchmark.rs`): one
