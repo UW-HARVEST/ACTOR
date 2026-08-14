@@ -47,14 +47,29 @@ jobs:
           submodules: false
 
       - name: Install the pinned toolchain
-        # rust-toolchain.toml pins 1.94.0; rustup honours it on first invocation.
-        # RUSTUP_TOOLCHAIN in the environment would silently override that file, and
-        # cache::ToolchainId::detect refuses to run when it is set — so make sure
-        # nothing inherited one.
+        # Let rust-toolchain.toml drive BOTH the version and the components. An
+        # explicit `rustup toolchain install … --profile minimal` here was the
+        # original bug: it produced 1.94.0 *without* rust-src, and rustc then renders
+        # three fewer lines for a "required by a bound in `Command::current_dir`"
+        # note, so every compile-fail expectation failed on formatting alone.
+        #
+        # RUSTUP_TOOLCHAIN in the environment silently overrides the file — that is
+        # how the same expectations came to be recorded on 1.97.1 in the first place.
+        # `cache::ToolchainId::detect` already refuses to run a measurement when it is
+        # set; assert the same thing here so CI cannot drift from the pin either.
         run: |
-          rustup show active-toolchain || rustup toolchain install 1.94.0 --profile minimal
           echo "RUSTUP_TOOLCHAIN=" >> "$GITHUB_ENV"
+          rustup show active-toolchain
           rustc --version
+          want=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
+          got=$(rustc --version | cut -d' ' -f2)
+          if [ "$got" != "$want" ]; then
+            echo "::error::pinned $want but rustc is $got — expectations are toolchain-sensitive"
+            exit 1
+          fi
+          # rust-src must actually be present, or the compile-fail diffs are junk.
+          rustup component list --installed | grep -qx 'rust-src' \
+            || { echo "::error::rust-src missing; compile-fail expectations need std source"; exit 1; }
 
       - uses: Swatinem/rust-cache@v2
         with:
