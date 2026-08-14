@@ -993,75 +993,62 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
 /// RAII isolated working directory. Copies translated_rust/ into a temp dir,
 /// agent works there, `finish()` copies results back. Drop without finish
 /// discards the temp dir (safe on failure).
+/// The verify phase's working copy, expressed in terms of [`crate::artifact`].
+///
+/// Materialises `translated/` into disk-backed scratch, hands the agent a
+/// [`crate::artifact::WorkTree`] (the only artifact type that yields a path, hence
+/// the only one anything can execute in), and on `finish` requires PROOF that the
+/// agent completed before the result is allowed to reach `verified/`.
 pub struct IsolatedWorkDir {
-    tmp: tempfile::TempDir,
+    work: crate::artifact::WorkTree<crate::artifact::Verify>,
     dest: PathBuf,
-    finished: bool,
+    /// Digest of the C oracle as handed to the agent. Compared on `finish`: the C
+    /// side is the reference the translation is graded against, so a run that
+    /// modified it has not been verified against the original program. Nothing
+    /// checked this before, and `verify.md` still contains no rule forbidding it.
+    c_before: crate::artifact::TreeDigest,
 }
 
 impl IsolatedWorkDir {
     pub fn new(case_dir: &Path) -> Result<Self> {
-        let tmp = crate::workdir::tempdir("harvest-work-")
-            .context("creating isolated work dir")?;
-        let src = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
-        if src.is_dir() {
-            copy_dir_filtered(&src, &tmp.path().join(crate::battery::TRANSLATED_RUST), &["target"])?;
-        }
-        Ok(Self { tmp, dest: case_dir.to_owned(), finished: false })
+        let translated = crate::artifact::Sealed::<crate::artifact::Translate>::adopt(case_dir)
+            .context("adopting translated/ as a sealed artifact")?;
+        let scratch = crate::artifact::Scratch::new("harvest-work-")?;
+        let work = translated.materialise_into::<crate::artifact::Verify>(scratch)?;
+        let c_before = work.c().digest()?;
+        Ok(Self { work, dest: case_dir.to_owned(), c_before })
     }
 
     /// Path the agent should work in.
     pub fn translated_rust(&self) -> PathBuf {
-        self.tmp.path().join(crate::battery::TRANSLATED_RUST)
+        self.work.crate_dir()
     }
 
-    /// Path to the temp root (for setting current_dir).
+    /// Path to the scratch root (for setting current_dir, the sandbox policy and
+    /// the agent's TMPDIR).
     pub fn root(&self) -> &Path {
-        self.tmp.path()
+        self.work.path()
     }
 
-    /// Write the verified crate to the case's `verified/` phase dir. Consumes
-    /// self. Pure: `translated/` is never touched.
+    /// Seal the agent's output and write it to `verified/`. Consumes self.
     ///
-    /// `verified/` is seeded from `translated/` (so `c_src/` and any files the
-    /// agent didn't rewrite are present), then the agent's temp output is
-    /// overlaid on top. `target/` is skipped from both (build artifact).
-    pub fn finish(mut self) -> Result<()> {
-        let translated = crate::battery::phase_dir(&self.dest, crate::battery::TRANSLATED);
-        let dst = crate::battery::phase_dir(&self.dest, crate::battery::VERIFIED);
-        // Wipe verified/ EXCEPT logs/ — the caller writes verify.log into
-        // verified/logs/ live during the run, so preserve it across the reseed.
-        if dst.exists() {
-            for entry in std::fs::read_dir(&dst)? {
-                let entry = entry?;
-                if entry.file_name() == "logs" { continue; }
-                let p = entry.path();
-                if entry.file_type()?.is_dir() { std::fs::remove_dir_all(&p)?; }
-                else { std::fs::remove_file(&p)?; }
-            }
+    /// Requires `&Completed`, so an infra-failed run cannot publish — that is a
+    /// compile-time guarantee, not a check that can be forgotten. Publishing
+    /// preserves the previous semantics: `verified/` is seeded from `translated/`
+    /// (so `c_src/` and untouched files are present), then the agent's output is
+    /// overlaid, `target/` skipped from both, and `verified/logs/` survives because
+    /// verify.log is written into it live.
+    pub fn finish(self, proof: &crate::agent_health::Completed) -> Result<()> {
+        let scrubbed = self.work.scrub()?;
+        // Surface the scrub rather than doing it silently: a file that embedded the
+        // scratch path is a file whose content varied per run, which is worth
+        // knowing about. Measured 3 files across 345 cases in the current corpus.
+        for rel in scrubbed.rewritten() {
+            eprintln!("  scrubbed per-run path from {}", rel.as_path().display());
         }
-        // 1. Seed verified/ from the immutable translated/ crate (incl. c_src/),
-        //    skipping translated/'s own logs/ so the verify log isn't shadowed.
-        if translated.is_dir() {
-            copy_dir_filtered(&translated, &dst, &["target", "logs"])?;
-        }
-        // 2. Overlay the agent's temp output (its src/Cargo.toml edits), keeping
-        //    the seeded c_src/ and dropping build artifacts.
-        copy_dir_filtered(
-            &self.tmp.path().join(crate::battery::TRANSLATED_RUST),
-            &dst,
-            &["target", "c_src"],
-        )?;
-        self.finished = true;
-        Ok(())
-    }
-}
-
-impl Drop for IsolatedWorkDir {
-    fn drop(&mut self) {
-        if !self.finished {
-            // Agent failed — temp dir discarded, original untouched
-        }
+        let sealed = scrubbed.seal(proof, &self.c_before)?;
+        println!("  verified artifact {:?}", sealed.digest());
+        sealed.publish(&self.dest)
     }
 }
 

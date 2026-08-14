@@ -43,6 +43,15 @@ use std::path::{Path, PathBuf};
 /// its `result` field can carry several KB of final prose.
 const TAIL_BYTES: u64 = 16 * 1024;
 
+/// PROOF that an agent invocation ran to completion.
+///
+/// The unit field is private, so a `Completed` cannot be constructed outside this
+/// module: the only way to obtain one is [`Health::completed`], i.e. by passing a
+/// real log through [`classify_log`]. Anything that requires `&Completed` therefore
+/// cannot be reached for an infra-failed run — that is a compile error rather than
+/// a runtime check someone can forget. See `crate::artifact::Scrubbed::seal`.
+pub struct Completed(());
+
 /// Verdict for one agent invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
@@ -60,6 +69,12 @@ pub enum Health {
 }
 
 impl Health {
+    /// Proof of completion, if this run completed. The ONLY constructor of
+    /// [`Completed`].
+    pub fn completed(&self) -> Option<Completed> {
+        matches!(self, Health::Completed).then_some(Completed(()))
+    }
+
     pub fn is_infra(&self) -> bool {
         matches!(self, Health::Infra { .. })
     }

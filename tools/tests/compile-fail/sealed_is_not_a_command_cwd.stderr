@@ -1,0 +1,14 @@
+error[E0277]: the trait bound `Sealed<harvest_tools::artifact::Translate>: AsRef<Path>` is not satisfied
+ --> tests/compile-fail/sealed_is_not_a_command_cwd.rs:6:62
+  |
+6 |     let _ = std::process::Command::new("cargo").current_dir(&sealed);
+  |                                                 -----------  ^^^^^^ the trait `AsRef<Path>` is not implemented for `Sealed<harvest_tools::artifact::Translate>`
+  |                                                 |
+  |                                                 required by a bound introduced by this call
+  |
+  = note: required for `&Sealed<harvest_tools::artifact::Translate>` to implement `AsRef<Path>`
+note: required by a bound in `std::process::Command::current_dir`
+ --> $RUST/std/src/process.rs
+  |
+  |     pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Command {
+  |                           ^^^^^^^^^^^ required by this bound in `Command::current_dir`

@@ -5,3 +5,6 @@
 translating-c-to-rust.tgz
 Dockerfile.laertes
 *.res
+
+# trybuild scratch: new .stderr expectations land here for review
+tools/wip/
