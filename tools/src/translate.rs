@@ -596,23 +596,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
             copy_dir_all(input_test_case, &c_src)?;
 
             if matches!(paths.agent, Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt) {
-                let claude_dir = tmp.path().join(".claude");
-                std::fs::create_dir_all(&claude_dir)?;
-                let repo_root = paths.results_dir.parent().unwrap_or(Path::new("/"));
-                std::fs::write(
-                    claude_dir.join("settings.json"),
-                    serde_json::json!({
-                        "sandbox": {
-                            "enabled": true,
-                            "allowUnsandboxedCommands": false,
-                            "filesystem": {
-                                "denyRead": [repo_root.to_string_lossy()],
-                                "allowRead": [tmp.path().to_string_lossy()],
-                                "allowWrite": [tmp.path().to_string_lossy()]
-                            }
-                        }
-                    }).to_string(),
-                )?;
+                crate::sandbox::write_settings(&paths.repo_root, tmp.path(), tmp.path())?;
             }
 
             if matches!(paths.agent, Agent::OpenCode) {
@@ -1031,11 +1015,12 @@ fn invoke_agent(paths: &Paths, phase: crate::opencode::Phase, prompt: &str, log_
             record_agent_exit(status);
         }
         Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt => {
-            // Write a minimal settings.json so --settings can find one
-            let claude_dir = work.parent().unwrap_or(work).join(".claude");
-            std::fs::create_dir_all(&claude_dir)?;
-            let settings_path = claude_dir.join("settings.json");
-            std::fs::write(&settings_path, "{}")?;
+            // This wrote a bare `{}` — i.e. no sandbox policy at all — while the
+            // Test-Corpus paths did have one, so CRUST translate and CRUST verify
+            // ran entirely unrestricted. Same policy as everywhere else now.
+            let work_root = work.parent().unwrap_or(work);
+            let settings_path =
+                crate::sandbox::write_settings(&paths.repo_root, work_root, work_root)?;
             let status = Command::new("bash")
                 .arg("-lc")
                 .arg(r#"set -o pipefail; timeout 10800 claude -p "$1" --strict-mcp-config --disable-slash-commands --settings "$3" --agents "$4" --agent claude_plain --max-turns 1000 --permission-mode bypassPermissions --verbose --output-format stream-json < /dev/null 2>&1 | tee "$2""#)

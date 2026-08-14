@@ -3,6 +3,7 @@ pub mod cargo_toml;
 pub mod cli;
 pub mod exclusions;
 pub mod opencode;
+pub mod sandbox;
 pub mod scoring;
 pub mod test;
 pub mod translate;

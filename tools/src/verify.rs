@@ -10,19 +10,19 @@ use std::sync::Arc;
 /// claude verify invocation uses.
 const VERIFY_TIMEOUT_SECS: u64 = 10800;
 
-pub fn run(repo_root: &Path, paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
+pub fn run(paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
     let sem = Arc::new(Semaphore::new(parallel));
-    run_with_semaphore(repo_root, paths, battery_name, filter, force, &sem)
+    run_with_semaphore(paths, battery_name, filter, force, &sem)
 }
 
-pub fn run_all(repo_root: &Path, paths: &Paths, batteries: &[String], force: bool, parallel: usize) -> Result<()> {
+pub fn run_all(paths: &Paths, batteries: &[String], force: bool, parallel: usize) -> Result<()> {
     let sem = Arc::new(Semaphore::new(parallel));
 
     let errors: Vec<anyhow::Error> = std::thread::scope(|s| {
         let handles: Vec<_> = batteries.iter().map(|bat| {
             let sem = sem.clone();
             s.spawn(move || -> Result<()> {
-                run_with_semaphore(repo_root, paths, bat, None, force, &sem)
+                run_with_semaphore(paths, bat, None, force, &sem)
             })
         }).collect();
 
@@ -39,7 +39,7 @@ pub fn run_all(repo_root: &Path, paths: &Paths, batteries: &[String], force: boo
     Ok(())
 }
 
-fn run_with_semaphore(repo_root: &Path, paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, sem: &Arc<Semaphore>) -> Result<()> {
+fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, sem: &Arc<Semaphore>) -> Result<()> {
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
     let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))?;
@@ -227,26 +227,12 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
             crate::translate::record_agent_exit(status);
         }
         Agent::Claude => {
-            // Write sandbox settings in temp dir
-            let claude_dir = work.root().join(".claude");
-            std::fs::create_dir_all(&claude_dir)?;
-            let repo_root = case_dir.ancestors().nth(2).unwrap_or(Path::new("/"));
-            std::fs::write(
-                claude_dir.join("settings.json"),
-                serde_json::json!({
-                    "sandbox": {
-                        "enabled": true,
-                        "allowUnsandboxedCommands": false,
-                        "filesystem": {
-                            "denyRead": [repo_root.to_string_lossy()],
-                            "allowRead": [work.root().to_string_lossy()],
-                            "allowWrite": [work.root().to_string_lossy()]
-                        }
-                    }
-                }).to_string(),
-            )?;
-
-            let settings_path = claude_dir.join("settings.json");
+            // Deny the repo root (corpus = the graded oracle, plus results/) and
+            // the shared scratch base (sibling work dirs), then re-grant this
+            // run's own root. See crate::sandbox for why the previous
+            // `ancestors().nth(2)` was both inconsistent and too narrow.
+            let settings_path =
+                crate::sandbox::write_settings(&paths.repo_root, work.root(), work.root())?;
             let agent_tmp = crate::workdir::agent_tmp(work.root())?;
             let status = Command::new("bash")
                 .arg("-c")
