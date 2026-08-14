@@ -250,13 +250,17 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
             let agent_tmp = crate::workdir::agent_tmp(work.root())?;
             let status = Command::new("bash")
                 .arg("-c")
-                .arg("set -o pipefail; timeout 10800 claude -p \"$PROMPT\" \
+                .arg(format!(
+                    "ulimit -f {} -d {}; set -o pipefail; timeout 10800 claude -p \"$PROMPT\" \
                     --strict-mcp-config --disable-slash-commands --settings \"$SETTINGS\" \
                     --agents \"$AGENTS\" --agent claude_plain \
                     --max-turns 1000 --permission-mode bypassPermissions \
                     --verbose \
                     --output-format stream-json \
-                    < /dev/null 2>&1 | tee \"$LOG\"")
+                    < /dev/null 2>&1 | tee \"$LOG\"",
+                    crate::workdir::AGENT_FSIZE_BLOCKS,
+                    crate::workdir::AGENT_DATA_KB
+                ))
                 .env("PROMPT", &prompt)
                 .env("LOG", &log_path)
                 .env("SETTINGS", &settings_path)

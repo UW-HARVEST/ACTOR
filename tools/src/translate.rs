@@ -673,9 +673,18 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
             // with the case — rather than in the shared /tmp tmpfs, and no single
             // file the agent writes may exceed the cap. See crate::workdir.
             let agent_tmp = crate::workdir::agent_tmp(work_root)?;
+            let script = format!(
+                "ulimit -f {} -d {}; set -o pipefail; timeout 10800 claude -p \"$1\" \
+                 --strict-mcp-config --disable-slash-commands --settings \"$3\" \
+                 --agents \"$4\" --agent claude_plain --max-turns 1000 \
+                 --permission-mode bypassPermissions --verbose \
+                 --output-format stream-json < /dev/null 2>&1 | tee \"$2\"",
+                crate::workdir::AGENT_FSIZE_BLOCKS,
+                crate::workdir::AGENT_DATA_KB
+            );
             let status = Command::new("bash")
                 .arg("-lc")
-                .arg(r#"set -o pipefail; timeout 10800 claude -p "$1" --strict-mcp-config --disable-slash-commands --settings "$3" --agents "$4" --agent claude_plain --max-turns 1000 --permission-mode bypassPermissions --verbose --output-format stream-json < /dev/null 2>&1 | tee "$2""#)
+                .arg(&script)
                 .arg("--")
                 .arg(prompt)
                 .arg(&log_path)
