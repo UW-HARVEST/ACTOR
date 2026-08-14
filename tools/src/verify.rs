@@ -1,4 +1,5 @@
 use crate::battery::{self, Case, Paths};
+use crate::cache;
 use crate::cli::Agent;
 use crate::translate::{IsolatedWorkDir, Semaphore};
 use anyhow::{Context, Result};
@@ -8,7 +9,7 @@ use std::sync::Arc;
 
 /// Wall-clock cap on one verify session, matching the `timeout 10800` the
 /// claude verify invocation uses.
-const VERIFY_TIMEOUT_SECS: u64 = 10800;
+pub(crate) const VERIFY_TIMEOUT_SECS: u64 = 10800;
 
 pub fn run(paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
     let sem = Arc::new(Semaphore::new(parallel));
@@ -42,6 +43,7 @@ pub fn run_all(paths: &Paths, batteries: &[String], force: bool, parallel: usize
 fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, sem: &Arc<Semaphore>) -> Result<()> {
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
+    let store = cache::Store::open(&paths.repo_root, paths.cache_mode)?;
     let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))?;
 
     // Split into independent (parallelizable) and shared-source (sequential)
@@ -69,7 +71,7 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
                     return (c.name.clone(), None); // skipped
                 }
                 let cmake_flags = get_cmake_flags(paths, battery_name, &c.name);
-                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths)
+                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths, &store)
                     .unwrap_or(false);
                 (c.name.clone(), Some(ok))
             })
@@ -104,7 +106,7 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
             println!("[{current}/{total}] 🔬 {} (shared-source, {} configs)", group.real_case, group.configs.len());
             let cmake_flags = get_cmake_flags(paths, battery_name, &group.real_case);
             let configs_text = build_configs_text(paths, battery_name, group);
-            let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, paths)?;
+            let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, paths, &store)?;
 
             if ok { verified += 1; println!("[{current}/{total}] ✅ {} — verified", group.real_case); }
             else { failed += 1; println!("[{current}/{total}] ❌ {} — verification incomplete", group.real_case); }
@@ -137,6 +139,7 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
     let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))
         .context("reading verify.md")?;
 
+    let store = cache::Store::open(&paths.repo_root, paths.cache_mode)?;
     let total = projects.len();
     println!("=== Verifying harvest-bench ({total} projects) ===");
 
@@ -144,6 +147,7 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
         let handles: Vec<_> = projects.iter().map(|p| {
             let sem = sem.clone();
             let prompt = &prompt_template;
+            let store = &store;
             s.spawn(move || {
                 let _permit = sem.acquire();
                 let name = p.name().to_string();
@@ -154,7 +158,7 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
                 if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
                     return (name, None); // skip: already verified
                 }
-                let ok = verify_case(&case_dir, prompt, "", "", paths).unwrap_or(false);
+                let ok = verify_case(&case_dir, prompt, "", "", paths, store).unwrap_or(false);
                 (name, Some(ok))
             })
         }).collect();
@@ -174,8 +178,63 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
     Ok(())
 }
 
-fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, configs_text: &str, paths: &Paths) -> Result<bool> {
+/// Which CLI performs the verify phase for an agent, if any.
+///
+/// `None` is the answer for every agent that has no verify phase, and the *only*
+/// place that is decided. Returning a three-variant enum rather than a `bool` means
+/// the invocation `match` below is exhaustive over exactly the backends that exist,
+/// so there is no second list of agent names to keep in step with this one and no
+/// unreachable arm to reason about.
+///
+/// Consulted before the store, because an agent with no verify phase has no
+/// invocation to memoise and must not materialise a work tree only to discard it.
+#[derive(Copy, Clone, Debug)]
+enum Backend {
+    Kiro,
+    Claude,
+    OpenCode,
+}
+
+fn verify_backend(agent: Agent) -> Option<Backend> {
+    match agent {
+        Agent::Kiro => Some(Backend::Kiro),
+        Agent::Claude => Some(Backend::Claude),
+        Agent::OpenCode => Some(Backend::OpenCode),
+        // ClaudeCombined: the translate phase already verified.
+        // ClaudeMinimal: calibration baseline, no verify phase.
+        // ClaudeNoIter / NoFeatures / NoSubtask / CrossPrompt: prompt-sensitivity
+        //   ablations (E2/E3/E4/E6), each defined as translate-only.
+        // Codex: skipped deliberately — the agent over-fixates on irrelevant linker
+        //   symbols during C-as-oracle verification (model-specific behaviour).
+        // c2rust / laertes / c2saferrust / smartc2rust / kimi / oneshot: no verify
+        //   phase by design.
+        Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust
+        | Agent::Kimi | Agent::Oneshot | Agent::ClaudeCombined | Agent::ClaudeMinimal
+        | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask
+        | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 => None,
+    }
+}
+
+/// Verify one case.
+///
+/// The agent invocation is not called directly. It is handed to
+/// [`cache::Store::obtain`] as the work to do *if* no stored result matches, so a
+/// replayed verification and a freshly computed one leave this function by the same
+/// path — same assembly, same publish, same metrics. There is deliberately no
+/// "cached" branch to keep in step with an "uncached" one.
+fn verify_case(
+    case_dir: &Path,
+    prompt_template: &str,
+    cmake_flags: &str,
+    configs_text: &str,
+    paths: &Paths,
+    store: &cache::Store,
+) -> Result<bool> {
     let agent = paths.agent;
+    let Some(backend) = verify_backend(agent) else {
+        return Ok(true);
+    };
+
     // Verify is PURE: it reads the immutable `translated/` crate (via
     // IsolatedWorkDir), works in a temp dir, and writes the result to
     // `verified/`. It never mutates `translated/`, so no snapshot/restore is
@@ -183,16 +242,18 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
     let verified_logs = crate::battery::phase_dir(case_dir, crate::battery::VERIFIED).join("logs");
     std::fs::create_dir_all(&verified_logs)?;
     let log_path = verified_logs.join("verify.log");
-    let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
     // Work in an isolated temp dir seeded from translated/ — the agent sees no
     // config-specific path names, and C-as-oracle verification uses only the
     // crate's own c_src (test_vectors/runner never enter the temp workspace).
+    //
+    // Materialised before the store is consulted, because the prompt embeds this
+    // run's work-dir path and the prompt is part of the key. On a hit the copy is
+    // then thrown away unused — a second or two against a twenty-minute agent
+    // session, and it keeps the prompt the agent sees and the prompt that was
+    // hashed provably the same string.
     let work = IsolatedWorkDir::new(case_dir)?;
 
-    // Capture the verify agent's process exit exactly like translate does — no
-    // double standard. Cleared here so a skipped/absent CLI run records nothing.
-    crate::translate::clear_agent_exit();
     let start = std::time::Instant::now();
 
     let mut prompt = prompt_template
@@ -212,21 +273,110 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
     // about what prompt ran.
     let _ = std::fs::write(verified_logs.join("prompt.md"), &prompt);
 
-    match agent {
-        Agent::Kiro => {
+    let agent_key = format!("{agent:?}").to_lowercase();
+    let input_tree = work.input_digest().clone();
+    let model = crate::translate::claude_model()?;
+    let toolchain = cache::ToolchainId::detect()?;
+    let prompt_digest = cache::prompt_digest(&prompt, work.root(), &paths.repo_root);
+    let recipe = cache::Recipe::for_verify(paths, work.root()).digest();
+    let inputs = cache::KeyInputs {
+        phase: crate::battery::VERIFIED,
+        agent: &agent_key,
+        model: &model,
+        toolchain: &toolchain,
+        prompt: &prompt_digest,
+        recipe: &recipe,
+        input_tree: &input_tree,
+    };
+
+    let obtained = store.obtain(&inputs, || {
+        run_verify_agent(case_dir, backend, work, &prompt, &log_path, paths, &model)
+    })?;
+
+    let verified_dir = crate::battery::phase_dir(case_dir, crate::battery::VERIFIED);
+
+    let Some(obtained) = obtained else {
+        // The agent did not complete, or produced a crate that does not build.
+        // Nothing published, nothing stored. `verified/logs/verify.log` is still on
+        // disk (the invocation tees it there live), so the post-mortem survives and
+        // the "already verified" skip check behaves as it did before.
+        crate::translate::write_verification_metrics(
+            &verified_dir,
+            &serde_json::json!({
+                "agent": format!("{agent:?}").to_lowercase(),
+                "duration_secs": start.elapsed().as_secs(),
+                "success": false,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+            false,
+            None,
+        );
+        return Ok(false);
+    };
+
+    if obtained.replayed {
+        println!("  ♻️  replayed a stored verification ({:?})", obtained.sealed.digest());
+        // A fresh run tees its transcript to verified/logs/verify.log; a replay must
+        // leave the same file behind, or the skip check would not see this case as
+        // verified and the next sweep would pay for it again.
+        store.restore_log(&inputs, &obtained.key, &log_path)?;
+    }
+
+    // ONE publish, for a replay and a fresh run alike.
+    obtained.sealed.publish(case_dir)?;
+
+    // Reached only when an artifact exists, which — see `run_verify_agent` — means it
+    // compiled. Stored entries therefore hold compiling crates by construction, so a
+    // replay does not need to re-prove it.
+    crate::translate::write_verification_metrics(
+        &verified_dir,
+        &obtained.provenance,
+        obtained.replayed,
+        Some(obtained.key.as_str()),
+    );
+    Ok(true)
+}
+
+/// Invoke the verify agent and, if it completed and produced a building crate,
+/// return the sealed artifact.
+///
+/// `Ok(None)` means "nothing worth keeping": the agent hit an API error, was
+/// aborted, or left a crate that does not compile. The store treats that as
+/// nothing at all, which is the point — a transient failure must not be memoised
+/// into a permanent one.
+fn run_verify_agent(
+    case_dir: &Path,
+    backend: Backend,
+    work: IsolatedWorkDir,
+    prompt: &str,
+    log_path: &Path,
+    paths: &Paths,
+    model: &cache::ModelId,
+) -> Result<Option<cache::Produced<crate::artifact::Verify>>> {
+    let agent = paths.agent;
+    let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
+    let start = std::time::Instant::now();
+
+    // Capture the verify agent's process exit exactly like translate does — no
+    // double standard. Cleared here so a skipped/absent CLI run records nothing,
+    // and so a replay (which never reaches this function) reports no spend.
+    crate::translate::clear_agent_exit();
+
+    match backend {
+        Backend::Kiro => {
             let status = Command::new("bash")
                 .arg("-lc")
                 .arg(r#"timeout 2700 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
                 .arg("--")
-                .arg(&prompt)
-                .arg(&log_path)
+                .arg(prompt)
+                .arg(log_path)
                 .env("OPENSSL_DIR", &openssl_dir)
                 .current_dir(work.root())
                 .status()
                 .context("invoking kiro-cli for verification")?;
             crate::translate::record_agent_exit(status);
         }
-        Agent::Claude => {
+        Backend::Claude => {
             // Deny the repo root (corpus = the graded oracle, plus results/) and
             // the shared scratch base (sibling work dirs), then re-grant this
             // run's own root. See crate::sandbox for why the previous
@@ -241,17 +391,27 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                     --strict-mcp-config --disable-slash-commands --settings \"$SETTINGS\" \
                     --agents \"$AGENTS\" --agent claude_plain \
                     --max-turns 1000 --permission-mode bypassPermissions \
+                    --model \"$MODEL\" \
                     --verbose \
                     --output-format stream-json \
                     < /dev/null 2>&1 | tee \"$LOG\"",
                     crate::workdir::AGENT_FSIZE_BLOCKS,
                     crate::workdir::AGENT_DATA_KB
                 ))
-                .env("PROMPT", &prompt)
-                .env("LOG", &log_path)
+                .env("PROMPT", prompt)
+                .env("LOG", log_path)
                 .env("SETTINGS", &settings_path)
                 .env("AGENTS", crate::translate::CLAUDE_PLAIN_AGENT_JSON)
                 .env("OPENSSL_DIR", &openssl_dir)
+                // Pinned, and passed via the environment so the `[1m]` in the id is
+                // never seen by bash as a bracket glob. See
+                // `translate::CLAUDE_MODEL_DEFAULT` for why an unpinned model makes
+                // both the measurement and the cache key unsound.
+                .env("MODEL", model.as_str())
+                // verify.md delegates to subagents via Task; without this they would
+                // each pick their own model and the pin would cover only the
+                // top-level session.
+                .env("CLAUDE_CODE_SUBAGENT_MODEL", model.as_str())
                 // Agent scratch on disk inside the work root, not the /tmp tmpfs,
                 // plus a hard per-file cap. See crate::workdir.
                 .env("TMPDIR", &agent_tmp)
@@ -260,80 +420,74 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                 .status()
                 .context("invoking claude for verification")?;
             crate::translate::record_agent_exit(status);
+            crate::translate::assert_model_honoured(log_path, model)?;
         }
-        Agent::OpenCode => {
+        Backend::OpenCode => {
             // Same C-as-oracle verify prompt as Claude Code, different backend.
             // The compaction plugin restores SYMBOLS/ERRORS/CONFIGS.md, which
             // verify.md's Phases B/C are gated on.
-            let model = crate::opencode::parse_model(paths.model.as_deref().unwrap_or_default())?;
+            let oc_model = crate::opencode::parse_model(paths.model.as_deref().unwrap_or_default())?;
             crate::opencode::materialize_config(
-                work.root(), crate::opencode::Phase::Verify, &model,
+                work.root(), crate::opencode::Phase::Verify, &oc_model,
             )?;
             crate::opencode::invoke(
-                crate::opencode::Phase::Verify, &prompt, &log_path,
-                &work.translated_rust(), work.root(), &model, VERIFY_TIMEOUT_SECS,
+                crate::opencode::Phase::Verify, prompt, log_path,
+                &work.translated_rust(), work.root(), &oc_model, VERIFY_TIMEOUT_SECS,
             )?;
-        }
-        Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 => {
-            // ClaudeCombined: translate phase already did verify, skip this phase.
-            // ClaudeMinimal: no verify phase (calibration baseline).
-            // ClaudeNoIter: no verify phase (E3 prompt-sensitivity ablation).
-            // ClaudeNoFeatures: no verify phase (E2 prompt-sensitivity ablation).
-            // ClaudeNoSubtask: no verify phase (E6 prompt-sensitivity ablation).
-            // ClaudeCrossPrompt: no verify phase (E4 prompt-sensitivity ablation).
-            // Codex: skip verify; the agent over-fixates on irrelevant linker
-            // symbols during C-as-oracle verification (model-specific behavior).
-            // c2rust/laertes/kimi/oneshot: no verify phase by design.
-            return Ok(true);
         }
     }
 
-    // Copy verified results back — but only with PROOF the agent completed.
-    // `classify_log` is the same discriminator the scoring gate uses: an api_error
-    // run is not a measurement, and its output must not become `verified/`.
-    // Previously such a run published anyway and the compile gate below was the
-    // only thing standing between it and the scorer.
-    let health = crate::agent_health::classify_log(&log_path);
+    // Only with PROOF the agent completed. `classify_log` is the same discriminator
+    // the scoring gate uses: an api_error run is not a measurement, and its output
+    // must not become `verified/` — nor, now, a cache entry that would make one
+    // bad afternoon permanent.
+    let health = crate::agent_health::classify_log(log_path);
     let Some(proof) = health.completed() else {
         eprintln!(
             "  {} — not publishing verified/: the agent did not complete ({:?})",
             case_dir.display(),
             health
         );
-        return Ok(false);
+        return Ok(None);
     };
-    work.finish(&proof)?;
+    let sealed = work.finish(&proof)?;
 
     // ── Compile-gate: verify only counts as success if the crate still builds.
     // A mid-response API error can leave the crate half-written (missing symbols,
-    // unresolved imports). Recording such a broken crate as "verified" would then
-    // make the scorer build+score garbage. Better: detect the break, discard
-    // verified/, and let the scorer fall back to the (less complete but compilable)
-    // translated/ crate. The verify log is preserved for debugging.
-    let verified_dir = crate::battery::phase_dir(case_dir, crate::battery::VERIFIED);
+    // unresolved imports); recording such a crate as verified would make the scorer
+    // build and grade garbage.
+    //
+    // The gate runs on a THROWAWAY ASSEMBLED COPY, not in `verified/`. Two reasons,
+    // and the first is the one that matters:
+    //
+    //  * `cargo check` writes a `target/` directory. Running it in `verified/` meant
+    //    the act of checking an artifact mutated it — measurement changing the thing
+    //    measured, and a large part of the 1,702 MB of `target/` sitting in the
+    //    results tree. A copy assembled by `Sealed::assemble_into` is byte-identical
+    //    to what `verified/` would contain, so the verdict is unchanged.
+    //  * It lets the gate run BEFORE publication rather than after, which deletes the
+    //    old publish-then-delete-and-restore-the-logs rollback entirely. Nothing is
+    //    written to the results tree unless it already passed.
+    //
+    // Consequently every stored cache entry holds a crate that compiled, so a replay
+    // need not re-prove it.
+    let gate = crate::workdir::tempdir("harvest-verify-gate-")?;
+    sealed.assemble_into(case_dir, gate.path())?;
     let check = Command::new("timeout")
         .args(["120", "cargo", "check"])
-        .current_dir(&verified_dir)
+        .current_dir(gate.path())
         .output();
-    let compiles = check.map_or(false, |o| o.status.success());
-    if !compiles {
-        eprintln!("  ⚠️  verify produced a non-compiling crate — discarding verified/, scorer will use translated/");
-        // Keep the log for post-mortem; remove the broken crate so crate_dir() falls back.
-        let logs_backup = verified_dir.join("logs");
-        let logs_tmp = case_dir.join("_verify_logs_backup");
-        if logs_backup.is_dir() { let _ = std::fs::rename(&logs_backup, &logs_tmp); }
-        let _ = std::fs::remove_dir_all(&verified_dir);
-        // Restore just the logs dir under verified/ (so the log is still findable).
-        if logs_tmp.is_dir() {
-            let _ = std::fs::create_dir_all(&verified_dir);
-            let _ = std::fs::rename(&logs_tmp, &verified_dir.join("logs"));
-        }
+    if !check.map_or(false, |o| o.status.success()) {
+        eprintln!("  ⚠️  verify produced a non-compiling crate — not publishing; scorer will use translated/");
+        return Ok(None);
     }
+    println!("  verified artifact {:?}", sealed.digest());
 
-    // Record verify metrics (incl. agent process exit) alongside verify.log,
-    // mirroring translate's translation.json — no double standard.
-    crate::translate::write_verification_metrics(&verified_dir, agent, start.elapsed().as_secs(), compiles);
-    Ok(compiles)
+    Ok(Some(cache::Produced {
+        sealed,
+        log: log_path.to_path_buf(),
+        provenance: crate::translate::agent_provenance(agent, start.elapsed().as_secs()),
+    }))
 }
 
 /// Build a text block listing all distinct configurations for the verify prompt.

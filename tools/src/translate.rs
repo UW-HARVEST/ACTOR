@@ -13,6 +13,67 @@ use std::time::{Duration, Instant};
 // no skills/plugins/MCP, no extra system prompt.
 pub const CLAUDE_PLAIN_AGENT_JSON: &str = r#"{"claude_plain":{"description":"Bare-bones agent matching kiro_plain","prompt":"You are a coding assistant. Use the available tools to complete the user's task.","tools":["Bash","Edit","Read","Write","Task"]}}"#;
 
+/// The model every `--agent claude` invocation is pinned to.
+///
+/// Previously no `--model` was passed at all, so the model was whatever the CLI
+/// defaulted to that day — and the CLI auto-updates. Two things make that
+/// unacceptable rather than merely untidy:
+///
+/// * **The results are a measurement.** A number attributed to "claude" that was
+///   actually produced by three different models over three weeks is not a
+///   measurement of anything.
+/// * **The cache key must be knowable before the run.** The resolved model only
+///   appears in the transcript's `init` record, i.e. after the money is spent. A
+///   key that omitted it could hand back another model's output; a key that read it
+///   afterwards could not be used to decide whether to run.
+///
+/// This is exactly the value the existing results were produced with — every `init`
+/// record under `results/HarvestBench/claude/*/verified/logs/verify.log` reports
+/// `global.anthropic.claude-opus-5[1m]` — so pinning it changes no number. It is a
+/// Bedrock inference-profile id because `CLAUDE_CODE_USE_BEDROCK` is set;
+/// `HARVEST_CLAUDE_MODEL` overrides it for an environment routed differently.
+pub const CLAUDE_MODEL_DEFAULT: &str = "global.anthropic.claude-opus-5[1m]";
+
+/// The pinned model, validated. See [`CLAUDE_MODEL_DEFAULT`].
+pub fn claude_model() -> Result<crate::cache::ModelId> {
+    let raw = std::env::var("HARVEST_CLAUDE_MODEL")
+        .unwrap_or_else(|_| CLAUDE_MODEL_DEFAULT.to_string());
+    crate::cache::ModelId::new(raw)
+}
+
+/// Fail loudly if the CLI did not honour the pin.
+///
+/// `--model` is a request, not a guarantee: an unrecognised id could be silently
+/// substituted, and then a whole sweep would be attributed to the wrong model and
+/// cached under a key naming a model that never ran. The transcript's `init` record
+/// is the CLI's own report of what it resolved, so comparing against it closes the
+/// gap between "we asked for" and "we got".
+pub fn assert_model_honoured(log_path: &Path, want: &crate::cache::ModelId) -> Result<()> {
+    let text = match std::fs::read_to_string(log_path) {
+        Ok(t) => t,
+        // Absent or unreadable log is not this function's failure to report; the
+        // health classifier already treats it as a non-completion.
+        Err(_) => return Ok(()),
+    };
+    let Some(got) = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|r| r["type"] == "system" && r["subtype"] == "init")
+        .and_then(|r| r["model"].as_str().map(str::to_string))
+    else {
+        // Older transcripts predate the init record; nothing to compare against.
+        return Ok(());
+    };
+    anyhow::ensure!(
+        got == want.as_str(),
+        "the CLI resolved a different model than the pin: asked for {}, got {got}. \
+         Refusing to attribute this run to {}.",
+        want.as_str(),
+        want.as_str()
+    );
+    Ok(())
+}
+
 /// Wall-clock cap on one agentic translate/verify session, matching the
 /// `timeout 10800` already used by the claude and codex invocations.
 const TRANSLATE_TIMEOUT_SECS: u64 = 10800;
@@ -657,11 +718,15 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                 "ulimit -f {} -d {}; set -o pipefail; timeout 10800 claude -p \"$1\" \
                  --strict-mcp-config --disable-slash-commands --settings \"$3\" \
                  --agents \"$4\" --agent claude_plain --max-turns 1000 \
+                 --model \"$5\" \
                  --permission-mode bypassPermissions --verbose \
                  --output-format stream-json < /dev/null 2>&1 | tee \"$2\"",
                 crate::workdir::AGENT_FSIZE_BLOCKS,
                 crate::workdir::AGENT_DATA_KB
             );
+            // Passed positionally, never interpolated: the id contains `[1m]`, which
+            // bash would expand as a bracket glob inside the script text.
+            let model = claude_model()?;
             let status = Command::new("bash")
                 .arg("-lc")
                 .arg(&script)
@@ -670,9 +735,14 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                 .arg(&log_path)
                 .arg(&settings_path)
                 .arg(CLAUDE_PLAIN_AGENT_JSON)
+                .arg(model.as_str())
                 .env("OPENSSL_DIR", &openssl_dir)
                 .env("TMPDIR", &agent_tmp)
                 .env("CLAUDE_CODE_TMPDIR", &agent_tmp)
+                // `verify.md` and the translate prompt both delegate to subagents via
+                // Task; without this they would pick their own model and the pin would
+                // cover only the top-level session.
+                .env("CLAUDE_CODE_SUBAGENT_MODEL", model.as_str())
                 .current_dir(&work_dir)
                 .status()
                 .context("invoking claude")?;
@@ -898,17 +968,43 @@ fn write_translation_metrics(case_dir: &Path, agent: Agent, duration_secs: u64, 
     );
 }
 
+/// What one agent invocation cost and how it exited.
+///
+/// Built exactly once per invocation, because `merge_agent_exit` consumes the
+/// recorded exit — and then used for both `verification.json` and the cache entry,
+/// so the record beside the artifact and the record inside the store cannot
+/// disagree about the same run.
+pub fn agent_provenance(agent: Agent, duration_secs: u64) -> serde_json::Value {
+    let mut p = serde_json::json!({
+        "agent": format!("{agent:?}").to_lowercase(),
+        "duration_secs": duration_secs,
+        "success": true,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    merge_agent_exit(&mut p);
+    p
+}
+
 /// Verify-side sibling of [`write_translation_metrics`], writing
 /// `verification.json` with the same shape (incl. agent exit). No double
 /// standard: verify records agent process health exactly like translate.
-pub fn write_verification_metrics(case_dir: &Path, agent: Agent, duration_secs: u64, success: bool) {
-    let mut metrics = serde_json::json!({
-        "agent": format!("{agent:?}").to_lowercase(),
-        "duration_secs": duration_secs,
-        "success": success,
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-    });
-    merge_agent_exit(&mut metrics);
+///
+/// `provenance` describes the invocation that produced the artifact, which on a
+/// replay is the ORIGINAL one — its cost, its exit code, its timestamp. That is the
+/// honest thing to record next to the artifact, but it must not be mistaken for
+/// this run's spend, so `replayed` says so explicitly and `cache_key` names the
+/// entry it came from.
+pub fn write_verification_metrics(
+    case_dir: &Path,
+    provenance: &serde_json::Value,
+    replayed: bool,
+    cache_key: Option<&str>,
+) {
+    let mut metrics = provenance.clone();
+    metrics["replayed"] = serde_json::json!(replayed);
+    if let Some(k) = cache_key {
+        metrics["cache_key"] = serde_json::json!(k);
+    }
     let _ = std::fs::create_dir_all(case_dir);
     let _ = std::fs::write(
         case_dir.join("verification.json"),
@@ -1001,7 +1097,8 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
 /// agent completed before the result is allowed to reach `verified/`.
 pub struct IsolatedWorkDir {
     work: crate::artifact::WorkTree<crate::artifact::Verify>,
-    dest: PathBuf,
+    /// Digest of the `translated/` artifact this was materialised from.
+    input: crate::artifact::TreeDigest,
     /// Digest of the C oracle as handed to the agent. Compared on `finish`: the C
     /// side is the reference the translation is graded against, so a run that
     /// modified it has not been verified against the original program. Nothing
@@ -1014,9 +1111,10 @@ impl IsolatedWorkDir {
         let translated = crate::artifact::Sealed::<crate::artifact::Translate>::adopt(case_dir)
             .context("adopting translated/ as a sealed artifact")?;
         let scratch = crate::artifact::Scratch::new("harvest-work-")?;
+        let input = translated.digest().clone();
         let work = translated.materialise_into::<crate::artifact::Verify>(scratch)?;
         let c_before = work.c().digest()?;
-        Ok(Self { work, dest: case_dir.to_owned(), c_before })
+        Ok(Self { work, input, c_before })
     }
 
     /// Path the agent should work in.
@@ -1030,15 +1128,24 @@ impl IsolatedWorkDir {
         self.work.path()
     }
 
-    /// Seal the agent's output and write it to `verified/`. Consumes self.
+    /// Digest of the `translated/` artifact this work dir was materialised from —
+    /// the cache key's input component. Taken here rather than recomputed later
+    /// because it must describe what the agent was actually given.
+    pub fn input_digest(&self) -> &crate::artifact::TreeDigest {
+        &self.input
+    }
+
+    /// Seal the agent's output. Consumes self.
     ///
-    /// Requires `&Completed`, so an infra-failed run cannot publish — that is a
-    /// compile-time guarantee, not a check that can be forgotten. Publishing
-    /// preserves the previous semantics: `verified/` is seeded from `translated/`
-    /// (so `c_src/` and untouched files are present), then the agent's output is
-    /// overlaid, `target/` skipped from both, and `verified/logs/` survives because
-    /// verify.log is written into it live.
-    pub fn finish(self, proof: &crate::agent_health::Completed) -> Result<()> {
+    /// Requires `&Completed`, so an infra-failed run cannot be sealed — a
+    /// compile-time guarantee, not a check that can be forgotten. Returns the
+    /// artifact rather than publishing it: publication now happens once, on the
+    /// far side of the cache, so a replayed result and a fresh one travel the same
+    /// path and cannot diverge.
+    pub fn finish(
+        self,
+        proof: &crate::agent_health::Completed,
+    ) -> Result<crate::artifact::Sealed<crate::artifact::Verify>> {
         let scrubbed = self.work.scrub()?;
         // Surface the scrub rather than doing it silently: a file that embedded the
         // scratch path is a file whose content varied per run, which is worth
@@ -1046,9 +1153,7 @@ impl IsolatedWorkDir {
         for rel in scrubbed.rewritten() {
             eprintln!("  scrubbed per-run path from {}", rel.as_path().display());
         }
-        let sealed = scrubbed.seal(proof, &self.c_before)?;
-        println!("  verified artifact {:?}", sealed.digest());
-        sealed.publish(&self.dest)
+        scrubbed.seal(proof, &self.c_before)
     }
 }
 

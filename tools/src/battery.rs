@@ -689,10 +689,22 @@ pub struct Paths {
     pub prompts_dir: PathBuf,
     pub agent: Agent,
     pub model: Option<String>,
+    /// How the agent-invocation cache behaves for this run. Lives here, beside
+    /// `agent` and `model`, because it is the same kind of thing: run-wide
+    /// configuration chosen once on the command line. A required parameter of
+    /// `new` rather than a default, so the compiler names every construction site
+    /// that would otherwise silently get read-write caching.
+    pub cache_mode: crate::cache::Mode,
 }
 
 impl Paths {
-    pub fn new(repo_root: &Path, agent: Agent, dataset: Dataset, model: Option<&str>) -> Self {
+    pub fn new(
+        repo_root: &Path,
+        agent: Agent,
+        dataset: Dataset,
+        model: Option<&str>,
+        cache_mode: crate::cache::Mode,
+    ) -> Self {
         // OpenCode's results dir is derived from --model (like Agent::Oneshot),
         // so each evaluated model gets its own directory. Owned because the slug
         // is computed, not a literal; the match below borrows from it.
@@ -752,6 +764,7 @@ impl Paths {
             repo_root: repo_root.to_path_buf(),
             corpus_dir,
             results_dir,
+            cache_mode,
             prompts_dir,
             agent,
             model: model.map(String::from),

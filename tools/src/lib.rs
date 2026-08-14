@@ -1,5 +1,6 @@
 pub mod agent_health;
 pub mod artifact;
+pub mod cache;
 pub mod battery;
 pub mod cargo_toml;
 pub mod cli;

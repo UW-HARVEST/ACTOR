@@ -31,7 +31,7 @@ pub fn denied_read_roots(repo_root: &Path) -> Result<Vec<PathBuf>> {
 
 /// The whole `--settings` document for one agent invocation: deny everything
 /// above, then re-grant this run's own work root for read and write.
-pub fn settings_json(repo_root: &Path, work_root: &Path) -> Result<serde_json::Value> {
+pub(crate) fn settings_json(repo_root: &Path, work_root: &Path) -> Result<serde_json::Value> {
     let deny: Vec<String> = denied_read_roots(repo_root)?
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
