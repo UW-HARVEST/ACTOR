@@ -179,15 +179,18 @@ impl Benchmark for TestCorpus {
         Ok(())
     }
 
-    fn verify(&self, repo_root: &Path, paths: &Paths, target: &str,
+    // `_repo_root` joins the other three impls in being unused: the real repo
+    // root now travels on `Paths` (see crate::sandbox), so the trait parameter is
+    // dead everywhere and could be dropped from the trait as a follow-up.
+    fn verify(&self, _repo_root: &Path, paths: &Paths, target: &str,
               _filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
         let batteries = resolve_batteries(&paths.corpus_dir, target)?;
         if batteries.len() > 1 {
-            verify::run_all(repo_root, paths, &batteries, force, parallel)
+            verify::run_all(paths, &batteries, force, parallel)
         } else {
             for bat in &batteries {
                 let (name, filter) = parse_target(bat);
-                verify::run(repo_root, paths, &name, filter.as_deref(), force, parallel)?;
+                verify::run(paths, &name, filter.as_deref(), force, parallel)?;
             }
             Ok(())
         }

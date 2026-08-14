@@ -4,6 +4,7 @@ mod cargo_toml;
 mod cli;
 mod exclusions;
 mod opencode;
+mod sandbox;
 mod report;
 mod scoring;
 mod test;

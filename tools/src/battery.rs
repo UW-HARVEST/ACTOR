@@ -607,6 +607,11 @@ impl<'ast> syn::visit::Visit<'ast> for UnsafeVisitor {
 }
 
 pub struct Paths {
+    /// The actual repository root. Needed for the sandbox deny list, which must
+    /// cover the corpus (the graded oracle) and not just a results subdirectory —
+    /// see `crate::sandbox`. Do not confuse with the locals formerly named
+    /// `repo_root` at the old settings-JSON sites, which were dataset/agent dirs.
+    pub repo_root: PathBuf,
     pub corpus_dir: PathBuf,
     pub results_dir: PathBuf,
     pub prompts_dir: PathBuf,
@@ -681,7 +686,14 @@ impl Paths {
                 Dataset::Crust | Dataset::BlindCrust => repo_root.join("prompts/kiro/crust"),
             },
         };
-        Self { corpus_dir, results_dir, prompts_dir, agent, model: model.map(String::from) }
+        Self {
+            repo_root: repo_root.to_path_buf(),
+            corpus_dir,
+            results_dir,
+            prompts_dir,
+            agent,
+            model: model.map(String::from),
+        }
     }
 
     pub fn input_dir(&self, battery: &str) -> PathBuf {
