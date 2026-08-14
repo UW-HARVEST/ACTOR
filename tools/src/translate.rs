@@ -588,9 +588,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
 
     let (work_dir, _tmp_guard) = match paths.agent {
         Agent::Kiro | Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::OpenCode | Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot => {
-            let tmp = tempfile::Builder::new()
-                .prefix("harvest-translate-")
-                .tempdir()
+            let tmp = crate::workdir::tempdir("harvest-translate-")
                 .context("creating isolated temp dir")?;
             let work = tmp.path().join(crate::battery::TRANSLATED_RUST);
             let c_src = work.join("c_src");
@@ -669,7 +667,12 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
             record_agent_exit(status);
         }
         Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt => {
-            let settings_path = work_dir.parent().unwrap().join(".claude/settings.json");
+            let work_root = work_dir.parent().unwrap();
+            let settings_path = work_root.join(".claude/settings.json");
+            // Agent scratch lands inside the work root — on disk, and discarded
+            // with the case — rather than in the shared /tmp tmpfs, and no single
+            // file the agent writes may exceed the cap. See crate::workdir.
+            let agent_tmp = crate::workdir::agent_tmp(work_root)?;
             let status = Command::new("bash")
                 .arg("-lc")
                 .arg(r#"set -o pipefail; timeout 10800 claude -p "$1" --strict-mcp-config --disable-slash-commands --settings "$3" --agents "$4" --agent claude_plain --max-turns 1000 --permission-mode bypassPermissions --verbose --output-format stream-json < /dev/null 2>&1 | tee "$2""#)
@@ -679,6 +682,8 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                 .arg(&settings_path)
                 .arg(CLAUDE_PLAIN_AGENT_JSON)
                 .env("OPENSSL_DIR", &openssl_dir)
+                .env("TMPDIR", &agent_tmp)
+                .env("CLAUDE_CODE_TMPDIR", &agent_tmp)
                 .current_dir(&work_dir)
                 .status()
                 .context("invoking claude")?;
@@ -951,9 +956,7 @@ fn prepare_crust_workspace(
     std::fs::create_dir_all(log_dir)?;
     let log_path = log_dir.join(log_name);
 
-    let tmp = tempfile::Builder::new()
-        .prefix("harvest-crust-")
-        .tempdir()
+    let tmp = crate::workdir::tempdir("harvest-crust-")
         .context("creating temp dir for CRUST")?;
     let work = tmp.path().join("project");
 
@@ -1271,9 +1274,7 @@ fn verify_one_crust_blind_inner(paths: &Paths, project: &battery::CrustProject, 
     }
 
     // Set up temp workspace from the immutable translation
-    let tmp = tempfile::Builder::new()
-        .prefix("harvest-crust-verify-")
-        .tempdir()
+    let tmp = crate::workdir::tempdir("harvest-crust-verify-")
         .context("creating temp dir for CRUST verify")?;
     let work = tmp.path().join("project");
     copy_dir_filtered(translate.as_ref(), &work, &["target", "logs"])?;
@@ -1401,9 +1402,7 @@ pub struct IsolatedWorkDir {
 
 impl IsolatedWorkDir {
     pub fn new(case_dir: &Path) -> Result<Self> {
-        let tmp = tempfile::Builder::new()
-            .prefix("harvest-work-")
-            .tempdir()
+        let tmp = crate::workdir::tempdir("harvest-work-")
             .context("creating isolated work dir")?;
         let src = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
         if src.is_dir() {
@@ -2048,9 +2047,7 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
 
     // Isolated workspace we bind-mount into the container. The tool reshapes
     // <work>/rust and writes <work>/rust_WIP.
-    let tmp = tempfile::Builder::new()
-        .prefix("harvest-c2sr-")
-        .tempdir()
+    let tmp = crate::workdir::tempdir("harvest-c2sr-")
         .context("creating c2saferrust temp workspace")?;
     let work_rust = tmp.path().join("rust");
     // Copy c2rust output as the tool's input (skip build artifacts + bundled C).

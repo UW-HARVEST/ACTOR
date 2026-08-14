@@ -247,6 +247,7 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
             )?;
 
             let settings_path = claude_dir.join("settings.json");
+            let agent_tmp = crate::workdir::agent_tmp(work.root())?;
             let status = Command::new("bash")
                 .arg("-c")
                 .arg("set -o pipefail; timeout 10800 claude -p \"$PROMPT\" \
@@ -261,6 +262,10 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
                 .env("SETTINGS", &settings_path)
                 .env("AGENTS", crate::translate::CLAUDE_PLAIN_AGENT_JSON)
                 .env("OPENSSL_DIR", &openssl_dir)
+                // Agent scratch on disk inside the work root, not the /tmp tmpfs,
+                // plus a hard per-file cap. See crate::workdir.
+                .env("TMPDIR", &agent_tmp)
+                .env("CLAUDE_CODE_TMPDIR", &agent_tmp)
                 .current_dir(work.translated_rust())
                 .status()
                 .context("invoking claude for verification")?;
