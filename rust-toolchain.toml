@@ -1,2 +1,14 @@
 [toolchain]
 channel = "1.94.0"
+# Pinned here rather than in a workflow file so local and CI cannot diverge.
+#
+# rust-src is LOAD-BEARING for tools/tests/compile-fail/*.stderr. Those expectations
+# contain the snippet of std's source that rustc renders for a "required by a bound
+# in `Command::current_dir`" note, and rustc can only render it when std's source is
+# present. A CI runner installed with `--profile minimal` produces three fewer lines
+# and every case fails on a pure formatting difference — which is exactly how this
+# was discovered.
+#
+# rustfmt and clippy are listed so the lint and format gates cannot silently run on
+# a differently-componented toolchain either.
+components = ["rust-src", "rustfmt", "clippy"]

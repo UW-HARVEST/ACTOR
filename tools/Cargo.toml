@@ -28,3 +28,6 @@ toml_edit = "0.22"
 tempfile = "3"
 trybuild = "1"
 
+[build-dependencies]
+vergen-gitcl = { version = "9.1.0", features = ["build", "cargo", "rustc"] }
+

@@ -1,6 +1,7 @@
 mod agent_health;
 mod artifact;
 mod cache;
+mod provenance;
 mod battery;
 mod benchmark;
 mod cargo_toml;
@@ -23,6 +24,14 @@ fn main() -> Result<()> {
     let agent = cli.agent;
     let model = cli.model.as_deref();
     let cache = cli.cache;
+
+    // Refuse, in the first second, to produce a measurement whose code cannot be
+    // identified. On 2026-08-14 a twelve-hour $625 sweep ran a binary built seven
+    // commits behind main, containing none of the gates it was meant to exercise;
+    // nothing noticed, because nothing compared the binary to the checkout.
+    if cli.command.produces_artifacts() {
+        provenance::require_reproducible(cli.allow_dirty)?;
+    }
 
     // Two agents pick their model at runtime: `oneshot` (an OpenRouter model id)
     // and `opencode` (an OpenCode `provider/model` id). Every other agent has its

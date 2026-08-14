@@ -106,6 +106,8 @@ impl Dataset {
 }
 
 #[derive(Parser)]
+// `version` is a function call, so it cannot be a derive attribute literal; it is
+// applied in `parse_args` instead. See `Cli::parse_args`.
 #[command(name = "harvest-tools", about = "C-to-Rust translation pipeline")]
 pub struct Cli {
     /// Which LLM agent to use for translation
@@ -123,6 +125,15 @@ pub struct Cli {
     /// How to use the agent-invocation cache.
     #[arg(long, value_enum, default_value_t = CacheMode::On)]
     pub cache: CacheMode,
+
+    /// Produce artifacts even though the code cannot be identified — an
+    /// uncommitted tree, or a binary built from a different commit.
+    ///
+    /// Legitimate while iterating locally. The reason is printed and every artifact
+    /// is stamped `<sha>-dirty`, so a run made this way cannot later be mistaken for
+    /// a reproducible one. See `crate::provenance`.
+    #[arg(long, global = true)]
+    pub allow_dirty: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -226,8 +237,19 @@ pub enum Command {
 // per phase. The old TranslatePlan / VerifyPlan / TestPlan enums are gone.
 
 impl Cli {
+    /// Parse argv, with `--version` reporting the commit, compiler and target.
+    ///
+    /// Built at run time rather than as a `#[command(version)]` literal, because the
+    /// string is assembled from several `vergen` stamps. `--version` is how you audit
+    /// a binary you did not build yourself, and it is the ecosystem's normal answer
+    /// to "which code is this?" — the refusal in `crate::provenance` is the stricter,
+    /// repo-specific half.
     pub fn parse_args() -> Self {
-        Self::parse()
+        use clap::{CommandFactory, FromArgMatches};
+        let matches = Self::command()
+            .version(crate::provenance::version_string())
+            .get_matches();
+        Self::from_arg_matches(&matches).expect("clap derive produces a valid parser")
     }
 }
 
@@ -235,4 +257,25 @@ impl Cli {
 pub enum CacheAction {
     /// Entry count and size on disk.
     Stats,
+}
+
+impl Command {
+    /// Whether this command writes an artifact that a paper number could rest on.
+    ///
+    /// The single source of truth for the provenance preflight. Exhaustive on
+    /// purpose: a new subcommand cannot be added without deciding which side it is
+    /// on, rather than defaulting to unchecked.
+    pub fn produces_artifacts(&self) -> bool {
+        match self {
+            // Write into results/ or tables/.
+            Command::Run { .. }
+            | Command::Translate { .. }
+            | Command::Verify { .. }
+            | Command::Test { .. }
+            | Command::Enrich { .. }
+            | Command::Report => true,
+            // Read-only introspection.
+            Command::Cache { .. } => false,
+        }
+    }
 }

@@ -191,6 +191,10 @@ pub struct Recipe {
     pub agents_json: &'static str,
     /// Shape of the sandbox policy with paths tokenised.
     pub sandbox_shape: String,
+    /// Agent-runtime environment (retries, request timeouts). Previously set by the
+    /// shell driver, so the key could not see it: two sweeps with different retry
+    /// policy shared an entry. See [`crate::translate::AGENT_ENV`].
+    pub agent_env: &'static [(&'static str, &'static str)],
 }
 
 impl Recipe {
@@ -210,6 +214,7 @@ impl Recipe {
             // would be one more thing to keep in step. What can change the agent's
             // behaviour is the set of deny/allow decisions; the literal directory
             // names are this machine's business and must not enter the key.
+            agent_env: crate::translate::AGENT_ENV,
             sandbox_shape: normalise(
                 &crate::sandbox::settings_json(&paths.repo_root, work_root)
                     .map(|v| v.to_string())
@@ -230,6 +235,13 @@ impl Recipe {
         feed(&mut h, &self.ulimit_data_kb.to_le_bytes());
         feed(&mut h, self.agents_json.as_bytes());
         feed(&mut h, self.sandbox_shape.as_bytes());
+        // Sorted, so a reordering of the constant is not a different recipe.
+        let mut env: Vec<_> = self.agent_env.to_vec();
+        env.sort_unstable();
+        for (k, v) in env {
+            feed(&mut h, k.as_bytes());
+            feed(&mut h, v.as_bytes());
+        }
         RecipeDigest(format!("sha256:{:x}", h.finalize()))
     }
 }
@@ -280,6 +292,14 @@ impl KeyInputs<'_> {
             "prompt": self.prompt.as_str(),
             "recipe": self.recipe.as_str(),
             "input_tree": self.input_tree.as_str(),
+            // Recorded for audit, and deliberately NOT part of the key nor of the
+            // fields `load` re-compares. Keying on it would invalidate every entry
+            // on each harness commit — including commits that cannot affect an
+            // artifact, like a doc change — which would leave the cache permanently
+            // empty and worthless. When a change genuinely alters what an artifact
+            // IS, bump SCHEMA by hand. That is a deliberate judgement call, and the
+            // stamp is here so a wrong call is at least diagnosable after the fact.
+            "harness": crate::provenance::harness_id(),
         })
     }
 }
@@ -606,6 +626,7 @@ mod tests {
                 ulimit_data_kb: 6 * 1024 * 1024,
                 agents_json: "{}",
                 sandbox_shape: "deny=$REPO,$WORKBASE allow=$WORK".into(),
+                agent_env: &[("CLAUDE_CODE_MAX_RETRIES", "20")],
             }
             .digest(),
         )
@@ -698,6 +719,7 @@ mod tests {
             ulimit_data_kb: 2 * 1024 * 1024, // a different heap cap
             agents_json: "{}",
             sandbox_shape: "deny=$REPO,$WORKBASE allow=$WORK".into(),
+            agent_env: &[("CLAUDE_CODE_MAX_RETRIES", "20")],
         }
         .digest();
         assert_ne!(base, changed, "a different cap can change what the agent produces");
@@ -1039,6 +1061,62 @@ mod tests {
             "the store must not be reachable from the per-agent results dir: {walked:?}"
         );
         assert!(f.repo.join("results/.cache").is_dir(), "it lives two levels above instead");
+    }
+
+    fn recipe_with_env(env: &'static [(&'static str, &'static str)]) -> RecipeDigest {
+        Recipe {
+            max_turns: 1000,
+            permission_mode: "bypassPermissions",
+            timeout_secs: 10_800,
+            ulimit_fsize_blocks: 4 * 1024 * 1024,
+            ulimit_data_kb: 6 * 1024 * 1024,
+            agents_json: "{}",
+            sandbox_shape: "s".into(),
+            agent_env: env,
+        }
+        .digest()
+    }
+
+    #[test]
+    fn recipe_digest_covers_the_agent_runtime_env() {
+        // The defect being closed: these settings lived in a shell driver as bare
+        // `export` lines, so two sweeps with different retry policy shared a cache
+        // entry. Retry count changes how a throttled session ends, so it changes
+        // what the agent produces.
+        let twenty = recipe_with_env(&[("CLAUDE_CODE_MAX_RETRIES", "20")]);
+        let one = recipe_with_env(&[("CLAUDE_CODE_MAX_RETRIES", "1")]);
+        assert_ne!(twenty, one, "retry policy must change the key");
+
+        let extra = recipe_with_env(&[("CLAUDE_CODE_MAX_RETRIES", "20"), ("API_TIMEOUT_MS", "5")]);
+        assert_ne!(twenty, extra, "adding a setting must change the key");
+    }
+
+    #[test]
+    fn recipe_digest_is_insensitive_to_env_ordering() {
+        // Reordering the constant is not a different experiment; if it were, a
+        // cosmetic edit would silently invalidate every stored entry.
+        let a = recipe_with_env(&[("A", "1"), ("B", "2")]);
+        let b = recipe_with_env(&[("B", "2"), ("A", "1")]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn harness_stamp_is_recorded_but_not_keyed() {
+        // Recorded so a result is traceable to code; NOT keyed, or every harness
+        // commit would empty the cache. Both halves matter, so both are asserted.
+        let (m, t, r) = fixtures();
+        let p = PromptDigest("sha256:p".into());
+        let i = TreeDigest::for_test("sha256:i");
+        let ki = inputs(&m, &t, &p, &r, &i);
+        let meta = ki.meta(&ki.key());
+        assert!(
+            meta.get("harness").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()),
+            "the producing commit must be recorded: {meta:?}"
+        );
+        // `load` re-compares this exact list; `harness` must not be on it.
+        for k in ["schema", "phase", "agent", "model", "toolchain", "prompt", "recipe", "input_tree"] {
+            assert!(meta.get(k).is_some(), "{k} must be recorded");
+        }
     }
 
     #[test]
