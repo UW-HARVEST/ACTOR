@@ -195,6 +195,16 @@ pub enum Command {
         /// CRUST blind mode: run LLM tests then swap in real tests
         #[arg(long)]
         blind: bool,
+        /// Score even though some agent runs died on infrastructure (expired
+        /// credentials, rate limiting, a truncated log).
+        ///
+        /// Scoring refuses by default, because a case whose agent never ran has
+        /// no measurement and reporting one is how 7 harvest-bench projects
+        /// became "3/5 pass" on 2026-08-14. Pass this only when you know why the
+        /// runs died and want the numbers anyway; the affected cases are listed
+        /// and written to `INFRA_FAILURES.json` beside the results.
+        #[arg(long)]
+        allow_infra_failures: bool,
     },
     /// Backfill result.json with credits + unsafe counts (no tests, no LLM calls)
     Enrich {

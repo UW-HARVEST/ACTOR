@@ -1,3 +1,4 @@
+mod agent_health;
 mod battery;
 mod benchmark;
 mod cargo_toml;
@@ -63,7 +64,7 @@ fn main() -> Result<()> {
             }
             // `test --update` folds enrichment in; it is never a separate step,
             // and run_test regenerates the tables so they never drift.
-            run_test(&repo_root, bench.as_ref(), &paths, inner, test::TestMode::Update)?;
+            run_test(&repo_root, bench.as_ref(), &paths, inner, test::TestMode::Update, false)?;
         }
         Command::Translate {
             ref target,
@@ -96,6 +97,7 @@ fn main() -> Result<()> {
             update,
             check,
             blind,
+            allow_infra_failures,
         } => {
             let dataset = Dataset::detect(target, blind);
             let paths = battery::Paths::new(&repo_root, agent, dataset, model);
@@ -108,7 +110,7 @@ fn main() -> Result<()> {
                 test::TestMode::Run
             };
 
-            run_test(&repo_root, benchmark::for_dataset(dataset).as_ref(), &paths, inner, mode)?;
+            run_test(&repo_root, benchmark::for_dataset(dataset).as_ref(), &paths, inner, mode, allow_infra_failures)?;
         }
         Command::Enrich { ref target, blind } => {
             let dataset = Dataset::detect(target, blind);
@@ -139,7 +141,32 @@ fn run_test(
     paths: &battery::Paths,
     target: &str,
     mode: test::TestMode,
+    allow_infra_failures: bool,
 ) -> Result<()> {
+    // Gate BEFORE scoring, not after: `bench.test` writes result.json and
+    // `report::generate` rewrites every file in tables/, so by the time a
+    // warning printed the damage would already be on disk. This is the only
+    // path into either, which is why the check lives here rather than in each
+    // dataset's scorer.
+    let audit = agent_health::audit(&paths.results_dir)?;
+    if let Some(report) = agent_health::describe_infra_failures(&audit) {
+        agent_health::record_infra_failures(&paths.results_dir, &audit)?;
+        if !allow_infra_failures {
+            anyhow::bail!(
+                "{report}\n\
+                 Refusing to score. An infrastructure failure is not a result.\n\
+                 Re-run those cases (`verify <target> --force` after fixing the cause), \
+                 or pass --allow-infra-failures to score anyway.\n\
+                 Details written to {}/INFRA_FAILURES.json",
+                paths.results_dir.display()
+            );
+        }
+        eprintln!(
+            "⚠️  --allow-infra-failures: scoring despite dead agent runs.\n{report}\
+             These cases have no measurement; treat any number derived from them as unsupported."
+        );
+    }
+
     let outcome = bench.test(paths, target, mode)?;
     if matches!(mode, test::TestMode::Update) {
         // Regenerate tables from the current on-disk state. The tables are a
