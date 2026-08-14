@@ -52,6 +52,15 @@ const TAIL_BYTES: u64 = 16 * 1024;
 /// a runtime check someone can forget. See `crate::artifact::Scrubbed::seal`.
 pub struct Completed(());
 
+impl Completed {
+    /// Test-only constructor. `#[cfg(test)]` so production code still cannot forge
+    /// a proof, while the crate's own tests can exercise the seal path.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self(())
+    }
+}
+
 /// Verdict for one agent invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {

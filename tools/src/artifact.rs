@@ -542,6 +542,100 @@ mod tests {
         assert_eq!(digest_tree(a.path()).unwrap(), digest_tree(b.path()).unwrap());
     }
 
+    /// The whole lifecycle, with a fake case dir instead of an agent. This is the
+    /// test that would have caught a mistake in the plumbing: the 91 unit tests
+    /// cover digest/classify in isolation, and `verify_case` cannot be unit-tested
+    /// because it spawns an agent, so without this the refactor was unverified.
+    #[test]
+    fn lifecycle_round_trips_from_translated_to_verified() {
+        let case = tempfile::tempdir().unwrap();
+        let translated = case.path().join(crate::battery::TRANSLATED);
+        tree(
+            &translated,
+            &[
+                ("Cargo.toml", "[package]\nname=\"x\""),
+                ("src/lib.rs", "pub fn a() {}"),
+                ("c_src/src/lib.c", "int a(void){return 0;}"),
+                ("logs/translation.log", "agent transcript"),
+                ("target/debug/junk", "build output"),
+            ],
+        );
+
+        // 1. adopt translated/ as a sealed artifact
+        let sealed = Sealed::<Translate>::adopt(case.path()).expect("adopt");
+
+        // 2. materialise a writable copy
+        let scratch = Scratch::new("test-work-").unwrap();
+        let work: WorkTree<Verify> = sealed.materialise_into(scratch).expect("materialise");
+        let crate_dir = work.crate_dir();
+        assert!(crate_dir.join("src/lib.rs").is_file(), "source must be copied");
+        assert!(crate_dir.join("c_src/src/lib.c").is_file(), "C oracle must be copied");
+        assert!(
+            crate_dir.join("logs/translation.log").is_file(),
+            "logs must still reach the agent — parity with the previous behaviour"
+        );
+        assert!(!crate_dir.join("target").exists(), "build output must NOT be copied");
+
+        // 3. the agent edits the Rust, and leaves its scratch path in a note
+        let c_before = work.c().digest().unwrap();
+        std::fs::write(crate_dir.join("src/lib.rs"), "pub fn a() { /* verified */ }").unwrap();
+        std::fs::write(
+            crate_dir.join("SYMBOLS.md"),
+            format!("built in {}\n", crate_dir.display()),
+        )
+        .unwrap();
+
+        // 4. scrub, and confirm the per-run path was caught
+        let scrubbed = work.scrub().expect("scrub");
+        assert!(
+            scrubbed.rewritten().iter().any(|r| r.as_path().ends_with("SYMBOLS.md")),
+            "the embedded scratch path must be rewritten, else the digest varies per run"
+        );
+
+        // 5. seal with proof, then publish
+        let verified = scrubbed
+            .seal(&crate::agent_health::Completed::for_test(), &c_before)
+            .expect("seal");
+        verified.publish(case.path()).expect("publish");
+
+        let out = case.path().join(crate::battery::VERIFIED);
+        assert_eq!(
+            std::fs::read_to_string(out.join("src/lib.rs")).unwrap(),
+            "pub fn a() { /* verified */ }",
+            "the agent's edit must reach verified/"
+        );
+        assert!(out.join("c_src/src/lib.c").is_file(), "c_src must be seeded from translated/");
+        assert!(!out.join("target").exists(), "build output must not be published");
+        assert_eq!(
+            std::fs::read_to_string(translated.join("src/lib.rs")).unwrap(),
+            "pub fn a() {}",
+            "translated/ must be left untouched — verify is pure"
+        );
+    }
+
+    #[test]
+    fn seal_refuses_when_the_agent_modified_the_c_oracle() {
+        let case = tempfile::tempdir().unwrap();
+        tree(
+            &case.path().join(crate::battery::TRANSLATED),
+            &[("Cargo.toml", "[package]"), ("c_src/src/lib.c", "int a(void){return 0;}")],
+        );
+        let sealed = Sealed::<Translate>::adopt(case.path()).unwrap();
+        let work: WorkTree<Verify> = sealed.materialise_into(Scratch::new("t-").unwrap()).unwrap();
+        let c_before = work.c().digest().unwrap();
+
+        // The agent "fixes" the reference implementation to match its translation.
+        std::fs::write(work.crate_dir().join("c_src/src/lib.c"), "int a(void){return 1;}").unwrap();
+
+        let err = work
+            .scrub()
+            .unwrap()
+            .seal(&crate::agent_health::Completed::for_test(), &c_before)
+            .expect_err("modifying the oracle must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("modified the C oracle"), "{msg}");
+    }
+
     #[test]
     fn debug_on_sealed_reveals_the_digest_not_the_location() {
         // Formatting must not be a way to recover a path and run something there.
