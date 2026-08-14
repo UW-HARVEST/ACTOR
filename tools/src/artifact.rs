@@ -386,10 +386,16 @@ impl<P: Phase> Sealed<P> {
     #[must_use = "materialising and dropping the copy does nothing"]
     pub fn materialise_into<Q: Phase>(&self, scratch: Scratch) -> Result<WorkTree<Q>> {
         let root = scratch.dir.path().to_path_buf();
+        // Skip ONLY `target`, matching the previous IsolatedWorkDir::new exactly.
+        // `translated/logs/` therefore still reaches the agent's work dir, as it
+        // always has — the agent's visible input must not change in this PR.
+        // (Whether verify SHOULD see the translate log is a real question, since it
+        // also drags result.json in; that is a separate change with its own
+        // evaluation, not a side effect of a type refactor.)
         crate::translate::copy_dir_filtered(
             &self.root,
             &root.join(crate::battery::TRANSLATED_RUST),
-            &["target", "logs"],
+            &["target"],
         )?;
         Ok(WorkTree { root, _scratch: Some(scratch), _phase: PhantomData })
     }
