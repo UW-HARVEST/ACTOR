@@ -2092,7 +2092,11 @@ fn scan_opencode_log_for_transient_error(log_path: &Path) -> Option<String> {
 /// Bedrock throttles and 5xx responses are transient and can leave the CLI
 /// exiting 0 with nothing written; without this a throttle is indistinguishable
 /// from a genuine translation failure.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors invoke_codex_with_retry's signature deliberately; grouping these \
+              into a struct would obscure that the two retry paths take the same inputs"
+)]
 fn invoke_opencode_with_retry(
     phase: crate::opencode::Phase,
     prompt: &str,

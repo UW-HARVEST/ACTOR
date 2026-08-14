@@ -2,6 +2,10 @@
 name = "harvest-tools"
 version = "0.1.0"
 edition = "2021"
+# The repo ships an MIT LICENSE, but the package declared none. Any dependency-policy
+# tool treats a package with no `license` key as unlicensed and errors on it -- so
+# this one line is what makes our own crate pass the check we would apply to others.
+license = "MIT"
 
 [lib]
 name = "harvest_tools"
@@ -31,3 +35,42 @@ trybuild = "1"
 [build-dependencies]
 vergen-gitcl = { version = "9.1.0", features = ["build", "cargo", "rustc"] }
 
+# Lints denied at the PACKAGE level, so every target inherits them and a newly added
+# target cannot escape by omission -- which a `#![deny]` in a crate root would allow,
+# since this package has two roots (lib.rs and main.rs, 13 modules in common).
+#
+# ONLY LINTS MEASURED AT ZERO ACROSS `--all-targets` ARE HERE. `-D warnings` is
+# deliberately absent: main carries ~20 lib warnings, and a permanently-red gate
+# teaches everyone to ignore CI. Naming lints individually gets a genuinely strict
+# gate today with no cleanup, and each addition is a deliberate, reviewable step.
+#
+# Notably NOT here: clippy::panic. It is clean in production but fires 6 times in test
+# modules (agent_health.rs, battery.rs, cache.rs) where `panic!` is the correct way to
+# assert a branch is unreachable -- e.g. cache.rs asserts the agent is never invoked on
+# a cache hit. A `[lints]` entry would cover those targets too, so panic is denied on
+# the command line scoped to `--lib --bins` instead. See .github/workflows/type-safety.yaml.
+[lints.rust]
+unused_extern_crates = "deny"
+
+[lints.clippy]
+# Placeholder and debug residue -- the classic leftovers of an interrupted edit.
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+# LINT LAUNDERING -- the load-bearing entry. Without it, every lint above can be
+# silenced by adding one `#[allow]` line, so the gate would be only as strong as the
+# discipline it exists to replace. With it, a suppression must carry a written reason,
+# so each widening is a sentence in the diff that a reviewer actually sees.
+#
+# `clippy::allow_attributes` (which would additionally force `#[expect]` over
+# `#[allow]`) is deliberately NOT denied. `#[expect]` is the better tool -- it
+# self-warns once a suppression stops being necessary -- but it cannot be used here:
+# this package has TWO crate roots sharing 13 modules, so a lint can fire in the bin
+# and not in the lib. `dead_code` on `scoring::Row::built` does exactly that, and an
+# `#[expect]` is then unfulfilled in one of the two builds, which is itself a warning.
+# Requiring `expect` everywhere would trade a silenced lint for a permanent warning.
+# Measured, not assumed: the conversion was attempted and rejected on that evidence.
+#
+# Known hole: this does not fire on an attribute attached to a trait method
+# declaration, so benchmark.rs:33 escapes it. Clippy limitation, not a policy choice.
+allow_attributes_without_reason = "deny"

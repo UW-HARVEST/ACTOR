@@ -39,7 +39,17 @@ impl ProjectOutcome {
     /// Whether the crate compiled (the "Builds" column). Distinct from
     /// [`passed`](Self::passed) on purpose: "compiles" and "is correct" are
     /// separate measurements and a report must never conflate them.
-    #[allow(dead_code)] // reported per-dataset today; the rule lives here.
+    // `allow`, not `expect`: `dead_code` fires for this method in the BIN target (where
+    // `scoring` is a private module) but not in the LIB target (where `built` is `pub` and
+    // reachable from the crate root). An `expect` is therefore unfulfilled in one of the
+    // two builds, and an unfulfilled expectation is itself a warning. A reason is still
+    // mandatory -- see `allow_attributes_without_reason` in Cargo.toml.
+    #[allow(
+        dead_code,
+        reason = "the Builds column is reported per-dataset today, but the rule that \
+                  compiling and passing are separate measurements belongs with the type \
+                  owning both fields, not at each reporting site"
+    )]
     pub fn built(&self) -> bool {
         self.built
     }
