@@ -144,6 +144,36 @@ pub fn agent_tmp(work_root: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// `ulimit -f` argument capping any single file the agent writes. A backstop for
+/// the case where the agent hardcodes `/tmp` (30 files in the current corpus do)
+/// so `TMPDIR` cannot help: the write dies with SIGXFSZ and that one case fails,
+/// rather than the sweep or the host.
+///
+/// Unit is **1024-byte blocks**: POSIX specifies 512 for `-f`, but bash uses
+/// 1024 outside POSIX mode, and bash is what we invoke. Verified against
+/// `/proc/<pid>/limits` on a live agent — assuming 512 here silently doubled the
+/// cap to 8 GiB.
+pub const AGENT_FSIZE_BLOCKS: u64 = 4 * 1024 * 1024;
+
+/// `ulimit -d` argument, in KB, capping the heap of *each* process under the
+/// agent (RLIMIT_DATA is per-process and covers anonymous mmap since Linux 4.7).
+///
+/// Motivated by a generated test binary that reached 13.44 GB of anon RSS
+/// (`phase_b_engine-`, 2026-08-14 01:19) and took the whole sweep's cgroup with
+/// it. Without a cap the failure mode is a cgroup OOM — no result recorded, and
+/// with `Restart=on-failure` the sweep re-enters the same case forever. With
+/// one, the allocation fails inside the test, which is a *recorded* outcome.
+///
+/// Sized at 6 GiB from three constraints: above the largest legitimate test
+/// binaries observed (the `driver` cases at 4.4–4.7 GB), below the 13.44 GB
+/// runaway, and small enough that two concurrent cases plus the agent, cargo and
+/// rust-analyzer overhead stay inside a 16 GiB `MemoryMax` (2×6 + ~2 = 14 GiB).
+///
+/// NOTE: a case that fails *at* this cap needs review, not silent scoring — an
+/// allocation this large may itself be a translation-fidelity signal (cf. the
+/// huge-array cases) rather than a bug in the harness.
+pub const AGENT_DATA_KB: u64 = 6 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,4 +285,39 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
         assert!(dir.is_dir());
     }
 
+    #[test]
+    fn fsize_cap_is_four_gib_in_bashs_1024_byte_blocks() {
+        // bash's ulimit -f block size, not POSIX's 512. Confirmed against
+        // /proc/<pid>/limits: "Max file size = 8589934592" when this was 4 GiB/512.
+        assert_eq!(AGENT_FSIZE_BLOCKS * 1024, 4 * 1024u64.pow(3));
+    }
+
+    #[test]
+    fn fsize_cap_still_refuses_the_runaway_log_that_motivated_it() {
+        // /tmp/driver-difftest/cfg26.log, 2026-08-13 22:26.
+        let runaway_bytes = 12_888_260_608u64;
+        assert!(AGENT_FSIZE_BLOCKS * 1024 < runaway_bytes);
+    }
+
+    #[test]
+    fn data_cap_is_six_gib_and_two_of_them_fit_a_16_gib_cgroup() {
+        assert_eq!(AGENT_DATA_KB * 1024, 6 * 1024u64.pow(3));
+        // parallel 2 must leave room for the agent, cargo and rust-analyzer.
+        let two_cases = 2 * AGENT_DATA_KB * 1024;
+        let cgroup_max = 16 * 1024u64.pow(3);
+        assert!(
+            cgroup_max - two_cases >= 2 * 1024u64.pow(3),
+            "two capped cases must leave >=2 GiB headroom in a 16 GiB cgroup"
+        );
+    }
+
+    #[test]
+    fn data_cap_admits_the_largest_legitimate_test_binary_seen() {
+        // The `driver` binaries in the 2026-08-13 incident peaked at 4.67 GB and
+        // are real cases; only the 13.44 GB outlier should be refused.
+        let legit_peak_kb = 4_896_256; // anon-rss from the kernel OOM report
+        let runaway_kb = 14_091_264;
+        assert!(AGENT_DATA_KB > legit_peak_kb, "must not break the 4.67 GB cases");
+        assert!(AGENT_DATA_KB < runaway_kb, "must refuse the 13.44 GB runaway");
+    }
 }
