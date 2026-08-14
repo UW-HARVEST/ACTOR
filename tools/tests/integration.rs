@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Find the repo root by walking up from the test binary's location.
 fn repo_root() -> PathBuf {

@@ -92,7 +92,7 @@ pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
 
     let mut batteries: Vec<String> = std::fs::read_dir(&public_tests)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     batteries.sort();
@@ -102,7 +102,7 @@ pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
 /// Quick check: does this battery contain shared-source groups (symlinked test_case)?
 pub fn has_shared_source_groups(corpus_dir: &Path, battery_name: &str) -> bool {
     let dir = corpus_dir.join("Public-Tests").join(battery_name);
-    std::fs::read_dir(&dir).ok().map_or(false, |entries| {
+    std::fs::read_dir(&dir).ok().is_some_and(|entries| {
         entries.filter_map(|e| e.ok()).any(|e| e.path().join("test_case").is_symlink())
     })
 }
@@ -140,7 +140,7 @@ impl HarvestBenchProject {
         anyhow::ensure!(tests_dir.is_dir(), "harvest-bench tests dir not found: {} (did you `git submodule update --init`?)", tests_dir.display());
         let mut names: Vec<String> = std::fs::read_dir(tests_dir)?
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
             .filter(|e| e.path().join("test_case").is_dir() && e.path().join("gtest_suite").is_dir())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
@@ -153,7 +153,7 @@ pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> 
     let input_dir = corpus_dir.join("Public-Tests").join(battery_name);
     anyhow::ensure!(input_dir.is_dir(), "Battery not found: {}", input_dir.display());
 
-    let filter_re = filter.map(|f| Regex::new(f)).transpose()?;
+    let filter_re = filter.map(Regex::new).transpose()?;
 
     // Phase 1: scan all cases, resolve symlinks
     let mut symlink_map: HashMap<String, String> = HashMap::new(); // symlinked_name -> real_name
@@ -569,10 +569,6 @@ pub struct UnsafeCounts {
     pub impls: usize,
     /// Total lines inside unsafe blocks/fns/impls
     pub lines: usize,
-}
-
-impl UnsafeCounts {
-    pub fn total(&self) -> usize { self.blocks + self.fns + self.impls }
 }
 
 /// Count unsafe constructs in `*.rs` files under `src_dir`, excluding `bin/` and `tests/`.

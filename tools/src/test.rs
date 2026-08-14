@@ -73,7 +73,7 @@ pub fn run_test_corpus(paths: &Paths, target: &str, mode: TestMode) -> Result<Te
     let mut check_rows: Vec<CheckRow> = Vec::new();
 
     for battery in &batteries {
-        let result = run_battery(&paths, battery, mode, &mut check_rows)?;
+        let result = run_battery(paths, battery, mode, &mut check_rows)?;
         if let TestOutcome::Failed(ref mm) = result {
             all_mismatches.extend(mm.iter().map(|m| BatteryMismatch {
                 battery: m.battery.clone(),
@@ -88,7 +88,7 @@ pub fn run_test_corpus(paths: &Paths, target: &str, mode: TestMode) -> Result<Te
         println!("========================================");
         println!("  Check Summary");
         println!("========================================");
-        println!("  {:<25} {:>15} {:>15}  {}", "Battery", "Stored", "Actual", "Status");
+        println!("  {:<25} {:>15} {:>15}  Status", "Battery", "Stored", "Actual");
         println!("  {}", "─".repeat(75));
         for row in &check_rows {
             let stored = format!("{}/{} ({}v)", row.expected.cases_passed, row.expected.cases_tested,
@@ -1070,7 +1070,7 @@ mod tests {
 
         let rj = tmp.path().join("result.json");
         let mut json = serde_json::json!({});
-        let missing = tmp.path().join("nope.log");
+        let _missing = tmp.path().join("nope.log");
         Enrichment::compute(&src, &[]).merge_into(&mut json);
         json["unsafe"]["blocks"] = serde_json::json!(99); // tamper
         fs::write(&rj, serde_json::to_string_pretty(&json).unwrap()).unwrap();

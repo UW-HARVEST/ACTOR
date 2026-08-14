@@ -36,41 +36,41 @@ trybuild = "1"
 vergen-gitcl = { version = "9.1.0", features = ["build", "cargo", "rustc"] }
 
 # Lints denied at the PACKAGE level, so every target inherits them and a newly added
-# target cannot escape by omission -- which a `#![deny]` in a crate root would allow,
-# since this package has two roots (lib.rs and main.rs, 13 modules in common).
+# target cannot escape by omission -- which a `#![deny]` in a crate root would allow.
 #
-# ONLY LINTS MEASURED AT ZERO ACROSS `--all-targets` ARE HERE. `-D warnings` is
-# deliberately absent: main carries ~20 lib warnings, and a permanently-red gate
-# teaches everyone to ignore CI. Naming lints individually gets a genuinely strict
-# gate today with no cleanup, and each addition is a deliberate, reviewable step.
+# `warnings = "deny"` is the real gate, and it is only reachable because the tree is at
+# ZERO warnings across `--all-targets`. It was previously thought unreachable: the count
+# looked like ~357 and the cleanup like a large project. Both were wrong. ~338 of those
+# were the SAME 19 issues counted repeatedly, because `main.rs` re-declared 14 of the
+# lib's modules and every line compiled 2-4 times; 16 of the 19 were auto-fixable by
+# `cargo clippy --fix`; and the four "dead code" items were phantoms of that same
+# duplication -- `all_case_names` and `defined_features` have real callers in
+# tests/integration.rs. Making the bin consume the lib (see lib.rs) plus one
+# `--fix` pass plus deleting two genuinely-unused functions took it to zero.
 #
-# Notably NOT here: clippy::panic. It is clean in production but fires 6 times in test
-# modules (agent_health.rs, battery.rs, cache.rs) where `panic!` is the correct way to
-# assert a branch is unreachable -- e.g. cache.rs asserts the agent is never invoked on
-# a cache hit. A `[lints]` entry would cover those targets too, so panic is denied on
-# the command line scoped to `--lib --bins` instead. See .github/workflows/type-safety.yaml.
+# So there is no allowlist here and no ratchet. Any new warning is an error.
 [lints.rust]
+warnings = "deny"
+# Allow-by-default, so `warnings` does not reach it and it must be named.
 unused_extern_crates = "deny"
 
 [lints.clippy]
-# Placeholder and debug residue -- the classic leftovers of an interrupted edit.
+# All allow-by-default (clippy's `restriction`/`pedantic` groups), so `-D warnings`
+# does NOT enable them; each must be named explicitly.
+#
+# Placeholder and debug residue -- the leftovers of an interrupted edit.
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
-# LINT LAUNDERING -- the load-bearing entry. Without it, every lint above can be
-# silenced by adding one `#[allow]` line, so the gate would be only as strong as the
+# LINT LAUNDERING -- the entry that makes everything above hold. Without it, every
+# lint here is defeated by one `#[allow]` line and the gate is only as strong as the
 # discipline it exists to replace. With it, a suppression must carry a written reason,
-# so each widening is a sentence in the diff that a reviewer actually sees.
+# so each widening is a sentence in the diff that a reviewer sees.
 #
-# `clippy::allow_attributes` (which would additionally force `#[expect]` over
-# `#[allow]`) is deliberately NOT denied. `#[expect]` is the better tool -- it
-# self-warns once a suppression stops being necessary -- but it cannot be used here:
-# this package has TWO crate roots sharing 13 modules, so a lint can fire in the bin
-# and not in the lib. `dead_code` on `scoring::Row::built` does exactly that, and an
-# `#[expect]` is then unfulfilled in one of the two builds, which is itself a warning.
-# Requiring `expect` everywhere would trade a silenced lint for a permanent warning.
-# Measured, not assumed: the conversion was attempted and rejected on that evidence.
-#
-# Known hole: this does not fire on an attribute attached to a trait method
-# declaration, so benchmark.rs:33 escapes it. Clippy limitation, not a policy choice.
+# `clippy::allow_attributes` (forcing `#[expect]` over `#[allow]`) is not denied:
+# `#[expect]` is unusable for a lint that fires in one target and not another, and an
+# unfulfilled expectation is itself a warning -- which `warnings = "deny"` now makes an
+# error. Measured, not assumed: the conversion was attempted and reverted on that
+# evidence. Known hole: neither lint fires on an attribute on a trait method
+# declaration.
 allow_attributes_without_reason = "deny"
