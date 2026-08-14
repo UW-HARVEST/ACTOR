@@ -95,6 +95,20 @@ jobs:
         # by the compiler.
         run: cargo test --manifest-path tools/Cargo.toml --test compile_fail
 
+      - name: Lint
+        # The policy lives in tools/Cargo.toml's [lints] table, which cargo applies to
+        # every target of the package -- so a newly added target cannot escape it by
+        # omission, which a `#![deny]` in a crate root would allow (this package has two
+        # roots). `warnings = "deny"` is in that table, so this step needs no flags.
+        #
+        # `clippy::panic` is the one exception: clean in production but correct in test
+        # modules, where `panic!` asserts an unreachable branch -- cache.rs uses it to
+        # assert the agent is never invoked on a cache hit. Denied here scoped to
+        # `--lib --bins`, where cfg(test) is false and those panics do not exist.
+        run: |
+          cargo clippy --manifest-path tools/Cargo.toml --all-targets
+          cargo clippy --manifest-path tools/Cargo.toml --lib --bins -- -D clippy::panic
+
       - name: Show the recorded stderr of each invariant
         # On failure, trybuild prints a diff; on success the expectations are what
         # future readers need to see. Cheap, and it makes the invariants legible in

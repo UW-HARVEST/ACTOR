@@ -478,7 +478,7 @@ fn run_verify_agent(
         .args(["120", "cargo", "check"])
         .current_dir(gate.path())
         .output();
-    if !check.map_or(false, |o| o.status.success()) {
+    if !check.is_ok_and(|o| o.status.success()) {
         eprintln!("  ⚠️  verify produced a non-compiling crate — not publishing; scorer will use translated/");
         return Ok(None);
     }
@@ -501,7 +501,7 @@ fn build_configs_text(paths: &Paths, battery: &str, group: &battery::SharedSourc
     let real_flags = get_cmake_flags(paths, battery, &group.real_case);
     let real_presets = paths.input_dir(battery).join(&group.real_case).join("CMakePresets.json");
     let real_features = battery::extract_features_from_path(&real_presets).unwrap_or_default();
-    let real_key: Vec<String> = real_features.iter().cloned().collect();
+    let real_key: Vec<String> = real_features.to_vec();
     if seen.insert(real_key) && !real_flags.is_empty() {
         lines.push(format!(
             "  cmake: {}  →  cargo features: {}",

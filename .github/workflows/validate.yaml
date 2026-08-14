@@ -25,7 +25,11 @@ jobs:
           rustup default 1.94.0
 
       - name: Build harvest-tools
-        run: cargo build --release --manifest-path tools/Cargo.toml
+        # --locked: fail rather than silently mutate Cargo.lock in the runner. An agent
+        # that edits Cargo.toml without regenerating the lock is a real pattern; all five
+        # manifest-touching commits in this repo's history co-updated the lock, so this
+        # has never blocked legitimate work. Costs zero seconds -- same build, one flag.
+        run: cargo build --release --locked --manifest-path tools/Cargo.toml
 
       - name: Cache workspace
         uses: actions/cache/save@v4

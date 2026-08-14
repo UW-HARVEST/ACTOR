@@ -82,15 +82,6 @@ impl CargoToml {
         }
     }
 
-    /// Check if a feature name is defined in [features].
-    pub fn has_feature(&self, name: &str) -> bool {
-        self.doc
-            .get("features")
-            .and_then(|f| f.as_table())
-            .map(|t| t.contains_key(name))
-            .unwrap_or(false)
-    }
-
     /// Get all defined feature names (excluding "default").
     pub fn defined_features(&self) -> Vec<String> {
         self.doc

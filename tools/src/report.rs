@@ -365,7 +365,7 @@ fn fmt_commas(n: u32) -> String {
     let mut out = String::new();
     let len = bytes.len();
     for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*b as char);
@@ -806,7 +806,7 @@ fn generate_tractor_tex(rows: &[BatteryRow]) -> String {
     // Total case count = sum of the batteries shown in the table (derived from
     // the data, not hardcoded, so it stays correct if the corpus changes).
     let total_cases: u32 = TRACTOR_BATTERIES.iter()
-        .filter_map(|(_, _, d)| (!d.is_empty()).then(|| battery_size.get(d).copied().unwrap_or(0)))
+        .filter(|&(_, _, d)| !d.is_empty() ).map(|(_, _, d)| battery_size.get(d).copied().unwrap_or(0))
         .sum();
 
     // For each (agent, battery-or-Total) produce built/tested/tests_pass/loc/unsafe,

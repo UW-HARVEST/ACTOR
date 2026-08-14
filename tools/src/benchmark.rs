@@ -30,7 +30,11 @@ pub trait Benchmark {
     /// Human-readable label, for diagnostics. Part of the trait's public
     /// surface so callers can identify a `Box<dyn Benchmark>`; not all call
     /// sites use it today.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "part of the trait's public surface so a caller holding a \
+                  Box<dyn Benchmark> can identify it; not every call site needs it yet"
+    )]
     fn name(&self) -> &'static str;
 
     /// Does a separate C-as-oracle verify phase run for this agent?

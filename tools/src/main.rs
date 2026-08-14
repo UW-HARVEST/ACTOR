@@ -1,22 +1,11 @@
-mod agent_health;
-mod artifact;
-mod cache;
-mod provenance;
-mod battery;
-mod benchmark;
-mod cargo_toml;
-mod cli;
-mod opencode;
-mod sandbox;
-mod report;
-mod scoring;
-mod test;
-mod translate;
-mod verify;
-mod workdir;
 
 use anyhow::Result;
-use cli::{Cli, Command, Dataset};
+// The binary is a thin shell over the library; see the note in lib.rs for why it must
+// not re-declare these with `mod`.
+use harvest_tools::{
+    agent_health, battery, benchmark, cache, cli, opencode, provenance, report, test,
+};
+use harvest_tools::cli::{Cli, Command, Dataset};
 
 fn main() -> Result<()> {
     let cli = Cli::parse_args();

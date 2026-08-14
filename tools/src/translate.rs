@@ -211,7 +211,7 @@ pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, 
         let handles: Vec<_> = independent.iter().map(|c| {
             s.spawn(|| {
                 let _permit = sem.acquire();
-                translate_one_independent(&paths, &output_dir, battery_name, c)
+                translate_one_independent(paths, &output_dir, battery_name, c)
             })
         }).collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -239,7 +239,7 @@ pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, 
     // ── Sequential: shared-source groups ───────────────────────────────
     for group in &shared {
         current += 1;
-        let r = translate_one_shared(&paths, &output_dir, battery_name, group);
+        let r = translate_one_shared(paths, &output_dir, battery_name, group);
 
         if r.skipped {
             translated += 1;
@@ -262,7 +262,7 @@ pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, 
                 println!("[{current}/{total}] ⏭️  {} (already done)", cfg.name);
                 continue;
             }
-            match propagate_config(&paths, battery_name, &group.real_case, cfg) {
+            match propagate_config(paths, battery_name, &group.real_case, cfg) {
                 Ok(()) => {
                     translated += 1;
                     println!("[{current}/{total}] 🔗 {} → {}", cfg.name, group.real_case);
@@ -658,7 +658,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
     // inside it (translated/logs/translation.log). Created before the agent runs
     // so `tee` can write there live; the crate copy-back below merges into this
     // dir without clobbering logs.
-    let translated_dir = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
+    let translated_dir = crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED);
     let logs_dir = translated_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
 
@@ -781,14 +781,30 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                 _ => unreachable!(),
             };
             invoke_codex_with_retry(
-                prompt, &log_path, &work_dir, model, region, &openssl_dir, "translate",
+                RetrySession {
+                    prompt,
+                    log_path: &log_path,
+                    work_dir: &work_dir,
+                    context_label: "translate",
+                },
+                model,
+                region,
+                &openssl_dir,
             )?;
         }
         Agent::OpenCode => {
             let tmp_root = work_dir.parent().unwrap_or(&work_dir).to_path_buf();
             invoke_opencode_with_retry(
-                crate::opencode::Phase::Translate, prompt, &log_path, &work_dir,
-                &tmp_root, &opencode_model(paths)?, TRANSLATE_TIMEOUT_SECS, "translate",
+                RetrySession {
+                    prompt,
+                    log_path: &log_path,
+                    work_dir: &work_dir,
+                    context_label: "translate",
+                },
+                crate::opencode::Phase::Translate,
+                &tmp_root,
+                &opencode_model(paths)?,
+                TRANSLATE_TIMEOUT_SECS,
             )?;
         }
         Agent::C2rust => {
@@ -1231,7 +1247,7 @@ fn c2rust_translate(work_dir: &Path, log_path: &Path) -> Result<()> {
         let re = regex::Regex::new(r#"name = "translated_rust[^"]*""#).unwrap();
         cargo = re.replace_all(&cargo, r#"name = "driver""#).into_owned();
         for entry in walkdir(work_dir)? {
-            if entry.extension().map_or(false, |e| e == "rs") {
+            if entry.extension().is_some_and(|e| e == "rs") {
                 let content = std::fs::read_to_string(&entry)?;
                 if content.contains("translated_rust") {
                     std::fs::write(&entry, content.replace("translated_rust", "driver"))?;
@@ -1408,7 +1424,7 @@ fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) ->
          === SYSTEM PROMPT ===\n{system_prompt}\n\n\
          === USER MESSAGE (first 2000 chars) ===\n{}\n\n\
          === STDERR ===\n{stderr}",
-        &user_message[..user_message.len().min(2000)]
+        truncated(user_message, 2000)
     );
     let _ = std::fs::write(log_path, &log_content);
 
@@ -1418,7 +1434,7 @@ fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) ->
 
     // Parse full response
     let resp: serde_json::Value = serde_json::from_str(&stdout)
-        .with_context(|| format!("failed to parse Bedrock response: {}", &stdout[..stdout.len().min(500)]))?;
+        .with_context(|| format!("failed to parse Bedrock response: {}", truncated(&stdout, 500)))?;
 
     let content = resp["output"]["message"]["content"][0]["text"]
         .as_str()
@@ -1472,8 +1488,8 @@ fn openrouter_converse(model: &str, system_prompt: &str, user_message: &str, log
          === SYSTEM PROMPT ===\n{system_prompt}\n\n\
          === USER MESSAGE (first 2000 chars) ===\n{}\n\n\
          === RAW RESPONSE (first 2000 chars) ===\n{}",
-        &user_message[..user_message.len().min(2000)],
-        &stdout[..stdout.len().min(2000)]
+        truncated(user_message, 2000),
+        truncated(&stdout, 2000)
     );
     let _ = std::fs::write(log_path, &log_content);
 
@@ -1483,7 +1499,7 @@ fn openrouter_converse(model: &str, system_prompt: &str, user_message: &str, log
 
     // Parse OpenAI-compatible response
     let resp: serde_json::Value = serde_json::from_str(&stdout)
-        .with_context(|| format!("failed to parse OpenRouter response: {}", &stdout[..stdout.len().min(500)]))?;
+        .with_context(|| format!("failed to parse OpenRouter response: {}", truncated(&stdout, 500)))?;
 
     if let Some(err) = resp.get("error") {
         anyhow::bail!("OpenRouter error: {err}");
@@ -1498,6 +1514,24 @@ fn openrouter_converse(model: &str, system_prompt: &str, user_message: &str, log
     let output_tokens = resp["usage"]["completion_tokens"].as_u64().unwrap_or(0);
 
     Ok(LlmResponse { content, input_tokens, output_tokens })
+}
+
+/// Truncate to at most `max` **bytes**, ending on a UTF-8 character boundary.
+///
+/// `&s[..s.len().min(max)]` panics when byte `max` lands inside a multi-byte character.
+/// Every call site below is building an error message about a failed parse, so the
+/// panic would replace the very diagnostic it was trying to print — and the strings
+/// involved are LLM responses and prompts, which routinely contain non-ASCII.
+/// `str::floor_char_boundary` would do this directly but is still unstable.
+fn truncated(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Parse a JSON response `{"files": [{"path": "...", "contents": "..."}]}` and write files.
@@ -1526,7 +1560,7 @@ fn write_llm_files(json_response: &str, output_dir: &Path) -> Result<()> {
     };
 
     let payload: FilesPayload = serde_json::from_str(json_str)
-        .with_context(|| format!("failed to parse LLM JSON response: {}", &json_str[..json_str.len().min(500)]))?;
+        .with_context(|| format!("failed to parse LLM JSON response: {}", truncated(json_str, 500)))?;
 
     for file in &payload.files {
         let dest = output_dir.join(&file.path);
@@ -1672,9 +1706,11 @@ static BEDROCK_TOKEN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 const BEDROCK_TOKEN_REFRESH_AFTER: Duration = Duration::from_secs(6 * 3600);
 
 /// Return a valid Bedrock bearer token. Precedence:
-///   1. BEDROCK_API_KEY / AWS_BEARER_TOKEN_BEDROCK env (CI / manual injection)
-///   2. process cache, if the cached token is younger than the refresh window
-///   3. a freshly minted token from the host (aws_bedrock_token_generator)
+///
+/// 1. `BEDROCK_API_KEY` / `AWS_BEARER_TOKEN_BEDROCK` env (CI / manual injection)
+/// 2. process cache, if the cached token is younger than the refresh window
+/// 3. a freshly minted token from the host (`aws_bedrock_token_generator`)
+///
 /// Minting strips AWS_PROFILE/AWS_DEFAULT_PROFILE so the token is issued for the
 /// operator's `default` (ada) profile, not any session profile that Claude Code
 /// or other tooling may have exported (a real bug we hit: wrong-account 401s).
@@ -1825,7 +1861,7 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
     // Remove any leftover .old rollback files.
     if let Ok(entries) = std::fs::read_dir(&translated) {
         for e in entries.flatten() {
-            if e.path().extension().map_or(false, |x| x == "old") {
+            if e.path().extension().is_some_and(|x| x == "old") {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -1885,7 +1921,7 @@ unsafe fn libc_getgid() -> u32 { getgid() }
 /// Adapt c2rust output for Laertes' nightly-2020-10-15 toolchain.
 fn laertes_preprocess(work_dir: &Path) -> Result<()> {
     for path in walkdir(work_dir)? {
-        if path.extension().map_or(true, |e| e != "rs") { continue; }
+        if path.extension().is_none_or(|e| e != "rs") { continue; }
         let mut src = std::fs::read_to_string(&path)?;
         let changed = src.contains("::core::ffi::") || src.contains("::core::ptr") || src.contains("::core::mem");
         if !changed && !path.ends_with("lib.rs") { continue; }
@@ -1925,7 +1961,7 @@ fn laertes_preprocess(work_dir: &Path) -> Result<()> {
 fn laertes_postprocess(work_dir: &Path) -> Result<()> {
     let libc_internal = regex::Regex::new(r"libc::(?:[a-z_0-9]+::)+([a-z_0-9]+)").unwrap();
     for path in walkdir(work_dir)? {
-        if path.extension().map_or(true, |e| e != "rs") { continue; }
+        if path.extension().is_none_or(|e| e != "rs") { continue; }
         let src = std::fs::read_to_string(&path)?;
         let mut out = src.replace("extern crate libc;\n", "");
         out = libc_internal.replace_all(&out, "libc::$1").into_owned();
@@ -1973,15 +2009,27 @@ fn walkdir(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
 /// up to MAX_RETRIES times if a transient error is detected. Each retry
 /// clears the log (codex's `tee` overwrites anyway) and gets a fresh
 /// invocation so any partial state is discarded.
+/// What every retrying agent invocation needs, regardless of backend.
+///
+/// Extracted because both retry paths take these four and then diverge. An earlier
+/// version suppressed `clippy::too_many_arguments` with a note claiming a struct
+/// "would obscure that the two paths take the same inputs" — the opposite is true:
+/// naming the shared part is what makes the parallel visible, and the lint was right.
+struct RetrySession<'a> {
+    prompt: &'a str,
+    log_path: &'a Path,
+    work_dir: &'a Path,
+    /// Identifies the case in retry/abort diagnostics.
+    context_label: &'a str,
+}
+
 fn invoke_codex_with_retry(
-    prompt: &str,
-    log_path: &Path,
-    work_dir: &Path,
+    session: RetrySession<'_>,
     model: &str,
     region: &str,
     openssl_dir: &str,
-    context_label: &str,
 ) -> Result<()> {
+    let RetrySession { prompt, log_path, work_dir, context_label } = session;
     const MAX_RETRIES: u32 = 3;
     const RETRY_BACKOFF_SECS: u64 = 30;
 
@@ -2092,17 +2140,14 @@ fn scan_opencode_log_for_transient_error(log_path: &Path) -> Option<String> {
 /// Bedrock throttles and 5xx responses are transient and can leave the CLI
 /// exiting 0 with nothing written; without this a throttle is indistinguishable
 /// from a genuine translation failure.
-#[allow(clippy::too_many_arguments)]
 fn invoke_opencode_with_retry(
+    session: RetrySession<'_>,
     phase: crate::opencode::Phase,
-    prompt: &str,
-    log_path: &Path,
-    work_dir: &Path,
     tmp_root: &Path,
     model: &crate::opencode::Model,
     timeout_secs: u64,
-    context_label: &str,
 ) -> Result<()> {
+    let RetrySession { prompt, log_path, work_dir, context_label } = session;
     const MAX_RETRIES: u32 = 3;
     const RETRY_BACKOFF_SECS: u64 = 30;
 
@@ -2138,6 +2183,26 @@ mod tests {
     /// A real ExitStatus from `sh -c "exit N"`, for testing exit capture.
     fn exit_status(code: i32) -> std::process::ExitStatus {
         Command::new("sh").arg("-c").arg(format!("exit {code}")).status().unwrap()
+    }
+
+    #[test]
+    fn truncated_never_splits_a_character() {
+        // The bug: `&s[..s.len().min(2000)]` panics when byte 2000 lands inside a
+        // multi-byte character. Every call site is formatting an error message about a
+        // failed parse, so the panic would replace the diagnostic it was printing —
+        // and the inputs are LLM responses, which routinely contain non-ASCII.
+        let s = "é".repeat(10); // 20 bytes, 10 chars; every odd byte index is mid-char
+        for max in 0..=s.len() {
+            let t = truncated(&s, max); // must not panic for ANY cut point
+            assert!(t.len() <= max);
+            assert!(s.starts_with(t), "must be a prefix: {t:?}");
+        }
+        // A cut landing mid-character steps back to the boundary, losing that char.
+        assert_eq!(truncated(&s, 3), "é");
+        // Shorter than the cap is returned whole, untouched.
+        assert_eq!(truncated("ok", 500), "ok");
+        // And the exact-boundary case is not off by one.
+        assert_eq!(truncated(&s, 4), "éé");
     }
 
     #[test]
