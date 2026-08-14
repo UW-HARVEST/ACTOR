@@ -4,9 +4,6 @@
 [submodule "results"]
 	path = results
 	url = https://github.com/UW-HARVEST/harvest-agentic-translate-results.git
-[submodule "crust-bench"]
-	path = crust-bench
-	url = https://github.com/anirudhkhatry/CRUST-bench.git
 [submodule "c2saferrust"]
 	path = c2saferrust
 	url = https://github.com/benedikt-schesch/c2saferrust.git

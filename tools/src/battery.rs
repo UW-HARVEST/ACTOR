@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 // `logs/`. Reading a case's "current" score uses [`crate_dir`]: verified/ if
 // it exists, else translated/. This replaces the old asymmetric layout
 // (`translated_rust/` crate + `translated_rust_original/` snapshot + a
-// case-root result.json/logs, plus blind-CRUST's `translate/`+`verify/`).
+// case-root result.json/logs).
 
 /// Pre-verify phase dir: exactly what translation produced. Always present.
 pub const TRANSLATED: &str = "translated";
@@ -105,74 +105,6 @@ pub fn has_shared_source_groups(corpus_dir: &Path, battery_name: &str) -> bool {
     std::fs::read_dir(&dir).ok().map_or(false, |entries| {
         entries.filter_map(|e| e.ok()).any(|e| e.path().join("test_case").is_symlink())
     })
-}
-
-// ── CRUST-bench project (validated newtype) ────────────────────────────
-
-/// A validated CRUST project. Can only be constructed through `discover()` or
-/// `validated()`, which enforce the skip list and resolve paths.
-#[derive(Debug, Clone)]
-pub struct CrustProject {
-    name: String,
-    scaffold: PathBuf,
-    c_source: PathBuf,
-}
-
-impl CrustProject {
-    pub fn name(&self) -> &str { &self.name }
-    pub fn scaffold(&self) -> &Path { &self.scaffold }
-    pub fn c_source(&self) -> &Path { &self.c_source }
-
-    /// Discover all valid CRUST projects, applying skip list and optional limit.
-    pub fn discover(datasets_dir: &Path, limit: Option<usize>) -> Result<Vec<Self>> {
-        let rbench = datasets_dir.join("RBench");
-        anyhow::ensure!(rbench.is_dir(), "RBench not found: {}", rbench.display());
-
-        let mut names: Vec<String> = std::fs::read_dir(&rbench)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| !crate::exclusions::is_not_run(n))
-            .collect();
-        names.sort();
-        if let Some(n) = limit { names.truncate(n); }
-
-        names.into_iter()
-            .map(|name| Self::resolve(datasets_dir, name))
-            .collect()
-    }
-
-    /// Validate a single project name against the skip list and resolve paths.
-    pub fn validated(datasets_dir: &Path, name: &str) -> Result<Self> {
-        anyhow::ensure!(
-            !crate::exclusions::is_not_run(name),
-            "{name} is in the CRUST skip list"
-        );
-        Self::resolve(datasets_dir, name.to_string())
-    }
-
-    fn resolve(datasets_dir: &Path, name: String) -> Result<Self> {
-        let scaffold = datasets_dir.join("RBench").join(&name);
-        anyhow::ensure!(scaffold.is_dir(), "RBench scaffold not found: {}", scaffold.display());
-
-        let c_source = Self::find_cbench(datasets_dir, &name)
-            .with_context(|| format!("CBench source not found for {name}"))?;
-
-        Ok(Self { name, scaffold, c_source })
-    }
-
-    fn find_cbench(datasets_dir: &Path, project: &str) -> Option<PathBuf> {
-        let cbench = datasets_dir.join("CBench");
-        for candidate in [
-            project.to_string(),
-            project.replace('_', "-"),
-            project.strip_prefix("proj_").unwrap_or(project).replace('_', "-"),
-        ] {
-            let p = cbench.join(&candidate);
-            if p.is_dir() { return Some(p); }
-        }
-        None
-    }
 }
 
 // ── harvest-bench project ──────────────────────────────────────────────
@@ -427,31 +359,6 @@ pub fn all_case_names(battery: &Battery) -> Vec<String> {
     }
     names
 }
-
-/// Paths helper.
-/// Immutable translation output directory. Created once by translate, never modified after.
-#[derive(Debug, Clone)]
-pub struct TranslateDir(PathBuf);
-
-/// Mutable verify workspace. Can be wiped and recreated from a [`TranslateDir`].
-#[derive(Debug, Clone)]
-pub struct VerifyDir(PathBuf);
-
-macro_rules! impl_dir_newtype {
-    ($T:ty) => {
-        impl $T {
-            pub fn join(&self, path: impl AsRef<Path>) -> PathBuf { self.0.join(path) }
-            pub fn exists(&self) -> bool { self.0.exists() }
-            pub fn is_dir(&self) -> bool { self.0.is_dir() }
-        }
-        impl AsRef<Path> for $T {
-            fn as_ref(&self) -> &Path { &self.0 }
-        }
-    };
-}
-
-impl_dir_newtype!(TranslateDir);
-impl_dir_newtype!(VerifyDir);
 
 /// LLM API credits consumed by a single agent invocation.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
@@ -824,14 +731,6 @@ impl Paths {
                 repo_root.join("test-corpus"),
                 repo_root.join("results/Test-Corpus").join(agent_name),
             ),
-            Dataset::Crust => (
-                repo_root.join("crust-bench/datasets"),
-                repo_root.join("results/CRUST").join(agent_name),
-            ),
-            Dataset::BlindCrust => (
-                repo_root.join("crust-bench/datasets"),
-                repo_root.join("results/CRUST-blind").join(agent_name),
-            ),
             Dataset::HarvestBench => (
                 repo_root.join("harvest-bench/tests"),
                 repo_root.join("results/HarvestBench").join(agent_name),
@@ -843,12 +742,10 @@ impl Paths {
                 // dispatching prompts the test-corpus path uses (they handle the
                 // shared-library / cdylib case).
                 Dataset::TestCorpus | Dataset::HarvestBench => repo_root.join("prompts/claude"),
-                Dataset::Crust | Dataset::BlindCrust => repo_root.join("prompts/claude/crust"),
             },
             Agent::Kimi | Agent::Oneshot => repo_root.join("prompts/oneshot"),
             _ => match dataset {
                 Dataset::TestCorpus | Dataset::HarvestBench => repo_root.join("prompts/kiro/test-corpus"),
-                Dataset::Crust | Dataset::BlindCrust => repo_root.join("prompts/kiro/crust"),
             },
         };
         Self {
@@ -867,18 +764,6 @@ impl Paths {
 
     pub fn output_dir(&self, name: &str) -> PathBuf {
         self.results_dir.join(name)
-    }
-
-    /// Blind CRUST: immutable translation output. This is the case's
-    /// `translated/` phase dir (the uniform pre-verify location).
-    pub fn translate_dir(&self, name: &str) -> TranslateDir {
-        TranslateDir(self.results_dir.join(name).join(TRANSLATED))
-    }
-
-    /// Blind CRUST: mutable verify workspace (tests + possible src fixes).
-    /// This is the case's `verified/` phase dir.
-    pub fn verify_dir(&self, name: &str) -> VerifyDir {
-        VerifyDir(self.results_dir.join(name).join(VERIFIED))
     }
 
     pub fn case_dir(&self, battery: &str, case: &str) -> PathBuf {
@@ -1013,46 +898,6 @@ mod tests {
         } else {
             panic!("expected Independent");
         }
-    }
-
-    #[test]
-    fn translate_and_verify_dirs_are_distinct_newtypes() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join("crust-bench/datasets")).unwrap();
-        fs::create_dir_all(tmp.path().join("results/CRUST-blind/kiro")).unwrap();
-        fs::create_dir_all(tmp.path().join("prompts/kiro/test-corpus")).unwrap();
-
-        let paths = Paths::new(tmp.path(), crate::cli::Agent::Kiro, crate::cli::Dataset::BlindCrust, None);
-
-        let t = paths.translate_dir("vec");
-        let v = paths.verify_dir("vec");
-
-        assert_ne!(t.as_ref(), v.as_ref());
-        assert!(t.as_ref().ends_with("vec/translated"));
-        assert!(v.as_ref().ends_with("vec/verified"));
-        assert_eq!(t.as_ref().parent(), v.as_ref().parent());
-    }
-
-    #[test]
-    fn verify_wipe_preserves_translate() {
-        let tmp = tempfile::tempdir().unwrap();
-        let project = tmp.path().join("myproj");
-        let translate = project.join("translate");
-        let verify = project.join("verify");
-
-        fs::create_dir_all(translate.join("src")).unwrap();
-        fs::write(translate.join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
-        fs::write(translate.join("src/lib.rs"), "pub fn f() {}").unwrap();
-
-        fs::create_dir_all(verify.join("src/bin")).unwrap();
-        fs::write(verify.join("src/bin/test_f.rs"), "#[test] fn t() {}").unwrap();
-
-        // Wipe verify (simulates --force)
-        fs::remove_dir_all(&verify).unwrap();
-
-        // Translate is untouched
-        assert!(translate.join("Cargo.toml").exists());
-        assert_eq!(fs::read_to_string(translate.join("src/lib.rs")).unwrap(), "pub fn f() {}");
     }
 }
 

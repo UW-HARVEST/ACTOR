@@ -16,10 +16,7 @@ jobs:
       - name: Check out submodules
         run: |
           git config --global url."https://x-access-token:${{ secrets.SUBMODULE_PAT }}@github.com/".insteadOf "https://github.com/"
-          git submodule update --init --depth=1 results test-corpus crust-bench
-
-      - name: Unzip CRUST-bench datasets
-        run: cd crust-bench/datasets && unzip -q CRUST_bench.zip
+          git submodule update --init --depth=1 results test-corpus
 
       - name: Set up Rust
         run: |
@@ -45,51 +42,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: CRUST kiro
-            guard: results/CRUST/kiro
-            cmd: ./tools/target/release/harvest-tools --agent kiro test CRUST --check
-            needs_openssl: true
-            needs_crust: true
-          - name: CRUST-blind kiro
-            guard: results/CRUST-blind/kiro
-            cmd: ./tools/target/release/harvest-tools --agent kiro test CRUST --blind --check
-            needs_openssl: true
-            needs_crust: true
           - name: Test-Corpus kiro
             guard: results/Test-Corpus/kiro
             cmd: ./tools/target/release/harvest-tools --agent kiro test all --check
             needs_openssl: false
-            needs_crust: false
           - name: Test-Corpus c2rust
             guard: results/Test-Corpus/c2rust
             cmd: ./tools/target/release/harvest-tools --agent c2rust test all --check
             needs_openssl: false
-            needs_crust: false
           - name: Test-Corpus claude
             guard: results/Test-Corpus/claude
             cmd: ./tools/target/release/harvest-tools --agent claude test all --check
             needs_openssl: false
-            needs_crust: false
           - name: Test-Corpus laertes
             guard: results/Test-Corpus/laertes
             cmd: ./tools/target/release/harvest-tools --agent laertes test all --check
             needs_openssl: false
-            needs_crust: false
           - name: Test-Corpus kimi
             guard: results/Test-Corpus/kimi
             cmd: ./tools/target/release/harvest-tools --agent kimi test all --check
             needs_openssl: false
-            needs_crust: false
           - name: Test-Corpus gpt-5.4
             guard: results/Test-Corpus/gpt-5.4
             cmd: ./tools/target/release/harvest-tools --agent oneshot --model openai/gpt-5.4 test all --check
             needs_openssl: false
-            needs_crust: false
           - name: Test-Corpus gemini-3.1-pro-preview
             guard: results/Test-Corpus/gemini-3.1-pro-preview
             cmd: ./tools/target/release/harvest-tools --agent oneshot --model google/gemini-3.1-pro-preview test all --check
             needs_openssl: false
-            needs_crust: false
     name: ${{ matrix.name }}
     steps:
       - name: Restore workspace
@@ -126,12 +106,6 @@ jobs:
           pkg-config --modversion openssl 2>&1 || echo "pkg-config not available"
           echo "openssl version:"
           openssl version 2>&1 || echo "openssl not found"
-          echo "VaultSync .vsync check:"
-          ls -la results/CRUST/kiro/VaultSync/translated/.vsync 2>/dev/null && echo "WARNING: .vsync exists!" || echo ".vsync not present (good)"
-          echo "c_blind_rsa result.json:"
-          cat results/CRUST/kiro/c_blind_rsa_signatures/translated/result.json 2>/dev/null || echo "not found"
-          echo "VaultSync result.json:"
-          cat results/CRUST/kiro/VaultSync/translated/result.json 2>/dev/null || echo "not found"
           echo "::endgroup::"
           if [ -d "${{ matrix.guard }}" ]; then
             for attempt in 1 2 3; do

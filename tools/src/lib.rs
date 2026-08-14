@@ -2,7 +2,6 @@ pub mod agent_health;
 pub mod battery;
 pub mod cargo_toml;
 pub mod cli;
-pub mod exclusions;
 pub mod opencode;
 pub mod sandbox;
 pub mod scoring;
