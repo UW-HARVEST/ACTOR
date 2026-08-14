@@ -457,21 +457,186 @@ impl_dir_newtype!(VerifyDir);
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct Credits(pub f64);
 
-/// Metadata extracted from an agent run log (kiro-cli / claude).
+/// Token counts for one agent invocation. Every field is what the provider
+/// reported; none is derived.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Tokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_creation: u64,
+    pub cache_read: u64,
+}
+
+/// Provenance for ONE agent CLI invocation: what ran, on what, at what cost.
+///
+/// All of this was previously recoverable only by grepping a 10 MB stream-json
+/// log, so no result.json and no table said which model produced a number. That
+/// matters here specifically: `--agent claude` passes no `--model`, so the model
+/// is whatever the CLI defaulted to at invocation time, and the CLI auto-updates
+/// mid-sweep.
+///
+/// EVERY OPTIONAL FIELD MUST SERIALIZE AS ABSENT WHEN UNKNOWN, never as zero.
+/// kiro-cli reports "Credits" and no dollar cost; claude reports dollars and no
+/// credits. Writing `total_cost_usd: 0.0` for a kiro run records a measurement
+/// nobody made, and it would silently average into any cost table.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AgentRunMeta {
+    // ── kiro-cli fields, unchanged: existing result.json files carry them and
+    //    `check_enrichment` still requires credits for Agent::Kiro.
     pub credits: Credits,
     pub wall_secs: u64,
+
+    // ── identity ────────────────────────────────────────────────────────────
+    /// Model the CLI was asked for, from the `system`/`init` record, e.g.
+    /// `global.anthropic.claude-opus-5[1m]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Agent CLI version, from the same record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_version: Option<String>,
+    /// Every model that actually billed tokens (`modelUsage` keys). May be a
+    /// SUPERSET of `model`: `Task` subagents can run a different one, and a
+    /// verify session spawns many.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models_billed: Vec<String>,
+
+    // ── how it ended ────────────────────────────────────────────────────────
+    /// `completed` | `api_error`. See [`crate::agent_health`]: this is the
+    /// discriminator, and `subtype` reads "success" even on a 403.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_error_status: Option<i64>,
+    /// Process exit status, from the sibling `verification.json` / `translation.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+
+    // ── effort and cost ─────────────────────────────────────────────────────
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_turns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<Tokens>,
 }
 
 /// Parse the last `▸ Credits: X.XX • Time: Xm Xs` line from an agent log.
+/// Extract provenance from an agent run log, whichever CLI wrote it.
+///
+/// kiro-cli writes prose; claude writes stream-json. A log in neither format
+/// yields `None` rather than a zero-filled record.
 pub fn extract_agent_meta(log_path: &Path) -> Option<AgentRunMeta> {
-    let data = std::fs::read_to_string(log_path).ok()?;
+    extract_kiro_meta(log_path).or_else(|| extract_stream_json_meta(log_path))
+}
+
+/// The original kiro-cli path. Now reads only the tail — the `Credits:` line is
+/// last, and this is called once per case over logs that reach 10+ MB.
+fn extract_kiro_meta(log_path: &Path) -> Option<AgentRunMeta> {
+    let data = crate::agent_health::read_tail(log_path).ok()?;
     let re = Regex::new(r"Credits:\s*([0-9.]+).*?Time:\s*(.+)").ok()?;
     let caps = re.captures_iter(&data).last()?;
     let credits = Credits(caps[1].parse().ok()?);
     let wall_secs = parse_duration(&caps[2]);
-    Some(AgentRunMeta { credits, wall_secs })
+    Some(AgentRunMeta { credits, wall_secs, ..Default::default() })
+}
+
+/// claude stream-json: identity from the `system`/`init` record at the head,
+/// cost and effort from the terminal `result` record at the tail.
+///
+/// Scans line-wise and ignores non-JSON lines — the harness pipes the agent
+/// through `2>&1 | tee`, so stderr is interleaved into the same stream and a
+/// whole-file parse dies on the first such line.
+fn extract_stream_json_meta(log_path: &Path) -> Option<AgentRunMeta> {
+    let mut m = AgentRunMeta::default();
+    let mut found = false;
+
+    let head = read_head(log_path).unwrap_or_default();
+    if let Some(init) = find_record(&head, false, |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("system")
+            && v.get("subtype").and_then(|t| t.as_str()) == Some("init")
+    }) {
+        m.model = init.get("model").and_then(|v| v.as_str()).map(str::to_owned);
+        m.cli_version = init.get("claude_code_version").and_then(|v| v.as_str()).map(str::to_owned);
+        found = true;
+    }
+
+    let tail = crate::agent_health::read_tail(log_path).unwrap_or_default();
+    if let Some(t) = find_record(&tail, true, |v| {
+        v.get("type").and_then(|x| x.as_str()) == Some("result")
+    }) {
+        found = true;
+        m.terminal_reason = t.get("terminal_reason").and_then(|v| v.as_str()).map(str::to_owned);
+        // `api_error_status` is present-but-null on success, so as_i64 correctly
+        // yields None rather than 0.
+        m.api_error_status = t.get("api_error_status").and_then(|v| v.as_i64());
+        m.num_turns = t.get("num_turns").and_then(|v| v.as_u64());
+        m.duration_ms = t.get("duration_ms").and_then(|v| v.as_u64());
+        m.total_cost_usd = t.get("total_cost_usd").and_then(|v| v.as_f64());
+        if let Some(mu) = t.get("modelUsage").and_then(|v| v.as_object()) {
+            m.models_billed = mu.keys().cloned().collect();
+            m.models_billed.sort();
+        }
+        if let Some(u) = t.get("usage").and_then(|v| v.as_object()) {
+            let g = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            let tk = Tokens {
+                input: g("input_tokens"),
+                output: g("output_tokens"),
+                cache_creation: g("cache_creation_input_tokens"),
+                cache_read: g("cache_read_input_tokens"),
+            };
+            // All-zero means the provider reported nothing usable; do not invent
+            // a measurement.
+            if tk != Tokens::default() {
+                m.tokens = Some(tk);
+            }
+        }
+        if let Some(ms) = m.duration_ms {
+            m.wall_secs = ms / 1000;
+        }
+    }
+
+    // Process exit status lives beside the log, already written by
+    // write_verification_metrics / write_translation_metrics — and previously
+    // read by nothing at all.
+    m.exit_code = log_path
+        .parent()
+        .and_then(|logs| logs.parent())
+        .and_then(|phase| {
+            ["verification.json", "translation.json"]
+                .iter()
+                .map(|f| phase.join(f))
+                .find(|p| p.is_file())
+        })
+        .and_then(|p| crate::agent_health::exit_code(&p));
+
+    if found { Some(m) } else { None }
+}
+
+/// First 256 KB. The `init` record is near the top, but a SessionStart hook can
+/// emit several sizeable records ahead of it.
+fn read_head(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let n = f.read(&mut buf)?;
+    buf.truncate(n);
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// First (or, with `last`, final) JSON line satisfying `pred`.
+fn find_record(
+    hay: &str,
+    last: bool,
+    pred: impl Fn(&serde_json::Value) -> bool,
+) -> Option<serde_json::Value> {
+    let parse = |l: &str| serde_json::from_str::<serde_json::Value>(l).ok();
+    if last {
+        hay.lines().rev().filter(|l| l.starts_with('{')).filter_map(parse).find(|v| pred(v))
+    } else {
+        hay.lines().filter(|l| l.starts_with('{')).filter_map(parse).find(|v| pred(v))
+    }
 }
 
 fn parse_duration(s: &str) -> u64 {
@@ -888,5 +1053,133 @@ mod tests {
         // Translate is untouched
         assert!(translate.join("Cargo.toml").exists());
         assert_eq!(fs::read_to_string(translate.join("src/lib.rs")).unwrap(), "pub fn f() {}");
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    const INIT: &str = r#"{"type":"system","subtype":"init","cwd":"/w","session_id":"s1","tools":["Bash"],"model":"global.anthropic.claude-opus-5[1m]","permissionMode":"bypassPermissions","claude_code_version":"2.1.231.653"}"#;
+    const DONE: &str = r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","api_error_status":null,"duration_ms":1029979,"num_turns":56,"total_cost_usd":4.12094025,"usage":{"input_tokens":669,"output_tokens":40232,"cache_creation_input_tokens":111263,"cache_read_input_tokens":9004512},"modelUsage":{"global.anthropic.claude-opus-5[1m]":{"inputTokens":669}},"session_id":"s1"}"#;
+    const DEAD: &str = r#"{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":403,"duration_ms":4569000,"num_turns":193,"total_cost_usd":90.00792925,"result":"Failed to authenticate. API Error: 403 ... expired"}"#;
+
+    fn log(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let logs = dir.join("verified/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let p = logs.join("verify.log");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn records_the_model_and_cli_version_from_the_init_record() {
+        // The gap this closes: no result.json said which model produced a number.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = log(tmp.path(), &format!("{INIT}\n{DONE}\n"));
+        let m = extract_agent_meta(&p).expect("stream-json is recognised");
+        assert_eq!(m.model.as_deref(), Some("global.anthropic.claude-opus-5[1m]"));
+        assert_eq!(m.cli_version.as_deref(), Some("2.1.231.653"));
+    }
+
+    #[test]
+    fn records_cost_turns_and_tokens_from_the_terminal_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = log(tmp.path(), &format!("{INIT}\n{DONE}\n"));
+        let m = extract_agent_meta(&p).unwrap();
+        assert_eq!(m.num_turns, Some(56));
+        assert_eq!(m.duration_ms, Some(1029979));
+        assert_eq!(m.wall_secs, 1029, "derived from duration_ms");
+        assert!((m.total_cost_usd.unwrap() - 4.12094025).abs() < 1e-9);
+        let t = m.tokens.expect("token counts present");
+        assert_eq!((t.input, t.output), (669, 40232));
+        assert_eq!((t.cache_creation, t.cache_read), (111263, 9004512));
+    }
+
+    #[test]
+    fn models_billed_comes_from_model_usage_not_the_requested_model() {
+        // Task subagents can bill a different model than init asked for, so the
+        // billed set is the honest answer to "what produced this number".
+        let tmp = tempfile::tempdir().unwrap();
+        let two = DONE.replace(
+            r#""modelUsage":{"global.anthropic.claude-opus-5[1m]":{"inputTokens":669}}"#,
+            r#""modelUsage":{"global.anthropic.claude-opus-5[1m]":{"inputTokens":1},"claude-haiku-4-5":{"inputTokens":2}}"#,
+        );
+        let p = log(tmp.path(), &format!("{INIT}\n{two}\n"));
+        let m = extract_agent_meta(&p).unwrap();
+        assert_eq!(m.models_billed, vec!["claude-haiku-4-5", "global.anthropic.claude-opus-5[1m]"]);
+        assert_eq!(m.model.as_deref(), Some("global.anthropic.claude-opus-5[1m]"), "requested stays distinct");
+    }
+
+    #[test]
+    fn absent_is_absent_never_zero() {
+        // A kiro run has credits and no dollar cost. Serialising 0.0 would record
+        // a measurement nobody made and would average into a cost table.
+        let tmp = tempfile::tempdir().unwrap();
+        // Verbatim shape from a real kiro log: credits and time on ONE line.
+        // (Splitting them across two lines does not match, because Rust's `.`
+        // does not cross a newline — my first fixture got this wrong.)
+        let p = log(tmp.path(), "▸ Credits: 1.25 • Time: 3m 4s\n");
+        let m = extract_agent_meta(&p).expect("kiro log is recognised");
+        assert_eq!(m.credits.0, 1.25);
+        assert_eq!(m.wall_secs, 184);
+        assert!(m.total_cost_usd.is_none(), "no dollar cost for kiro");
+        assert!(m.model.is_none());
+        assert!(m.tokens.is_none());
+        let json = serde_json::to_string(&m).unwrap();
+        for k in ["total_cost_usd", "model", "tokens", "num_turns", "exit_code"] {
+            assert!(!json.contains(k), "{k} must be omitted, not zero-valued: {json}");
+        }
+    }
+
+    #[test]
+    fn api_error_status_null_on_success_is_none_not_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = log(tmp.path(), &format!("{INIT}\n{DONE}\n"));
+        let m = extract_agent_meta(&p).unwrap();
+        assert!(m.api_error_status.is_none(), "present-but-null must not become 0");
+        assert_eq!(m.terminal_reason.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn a_dead_run_records_its_cost_and_its_reason() {
+        // jansson burned $90 over 193 turns and then died on a 403. Both facts
+        // belong in the record: the cost was real, the result was not.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = log(tmp.path(), &format!("{INIT}\n{DEAD}\n"));
+        let m = extract_agent_meta(&p).unwrap();
+        assert_eq!(m.terminal_reason.as_deref(), Some("api_error"));
+        assert_eq!(m.api_error_status, Some(403));
+        assert!((m.total_cost_usd.unwrap() - 90.00792925).abs() < 1e-9);
+        assert_eq!(m.num_turns, Some(193));
+    }
+
+    #[test]
+    fn exit_code_is_read_from_the_sibling_metrics_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = log(tmp.path(), &format!("{INIT}\n{DEAD}\n"));
+        std::fs::write(
+            tmp.path().join("verified/verification.json"),
+            r#"{"exit_code":1,"success":true,"duration_secs":4569}"#,
+        ).unwrap();
+        let m = extract_agent_meta(&p).unwrap();
+        assert_eq!(m.exit_code, Some(1), "already on disk, previously read by nothing");
+    }
+
+    #[test]
+    fn interleaved_stderr_does_not_defeat_extraction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = format!("warning: bwrap not installed\n{INIT}\nnote: noise\n{DONE}\n");
+        let p = log(tmp.path(), &body);
+        let m = extract_agent_meta(&p).unwrap();
+        assert_eq!(m.model.as_deref(), Some("global.anthropic.claude-opus-5[1m]"));
+        assert_eq!(m.num_turns, Some(56));
+    }
+
+    #[test]
+    fn a_log_in_neither_format_yields_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = log(tmp.path(), "just some prose, no credits, no json\n");
+        assert!(extract_agent_meta(&p).is_none(), "must not fabricate a zero record");
     }
 }
