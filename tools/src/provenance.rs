@@ -27,9 +27,56 @@
 
 use anyhow::{Context, Result};
 
-/// The commit this binary was compiled from, stamped by `build.rs`, or `unknown`
-/// when built outside a git tree.
-pub const BUILT_FROM: &str = env!("HARVEST_GIT_SHA");
+/// The commit this binary was compiled from, stamped by `build.rs` via `vergen`.
+///
+/// Outside a git tree vergen emits its placeholder rather than failing the build, so
+/// callers must go through [`built_from`], which normalises that to `"unknown"`.
+const VERGEN_SHA: &str = env!("VERGEN_GIT_SHA");
+
+/// vergen's stand-in for a value it could not determine. Matching on it here rather
+/// than anywhere else keeps the placeholder an implementation detail of this module.
+const VERGEN_PLACEHOLDER: &str = "VERGEN_IDEMPOTENT_OUTPUT";
+
+/// The commit this binary was compiled from, or `"unknown"`.
+pub fn built_from() -> &'static str {
+    if VERGEN_SHA.is_empty() || VERGEN_SHA == VERGEN_PLACEHOLDER {
+        "unknown"
+    } else {
+        VERGEN_SHA
+    }
+}
+
+/// Whether the tree was dirty when this binary was *built*.
+///
+/// Distinct from the runtime check in [`require_reproducible`], which is
+/// authoritative because the tree can be edited after a build. This one matters for
+/// `--version`: a binary handed to someone else still reports that it came from an
+/// uncommitted tree.
+pub fn built_dirty() -> bool {
+    env!("VERGEN_GIT_DIRTY") == "true"
+}
+
+/// Full identity for `--version`: commit, compiler and target.
+///
+/// The compiler is here for the same reason it is in the cache key — `build_ok` is a
+/// function of it — and the target triple because a result is not portable across
+/// architectures.
+/// Returns `&'static str` rather than `String` because that is what
+/// `clap::Command::version` accepts. Backed by a `OnceLock` instead of leaking a
+/// `Box`, so the allocation is bounded and obvious.
+pub fn version_string() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        format!(
+            "{} ({}{}, rustc {}, {})",
+            env!("CARGO_PKG_VERSION"),
+            built_from(),
+            if built_dirty() { " dirty" } else { "" },
+            env!("VERGEN_RUSTC_SEMVER"),
+            env!("VERGEN_CARGO_TARGET_TRIPLE"),
+        )
+    })
+}
 
 /// Why a tree is not fit to produce a measurement.
 #[derive(Debug, PartialEq, Eq)]
@@ -80,8 +127,9 @@ pub fn assess(built_from: &str, head: Option<&str>, dirty_files: usize) -> Optio
         return Some(Unreproducible::DirtyTree { files: dirty_files });
     }
     match head {
-        // Compare on the stamped prefix: `build.rs` records --short=12 while
-        // `rev-parse HEAD` is full-length, so equality has to be prefix equality.
+        // Prefix equality, not equality: the stamp is git's *short* SHA while
+        // `rev-parse HEAD` is the full 40 chars. Comparing them directly would
+        // reject every single run as stale.
         Some(h) if !h.starts_with(built_from) => Some(Unreproducible::StaleBinary {
             built_from: built_from.to_string(),
             head: h.chars().take(12).collect(),
@@ -96,8 +144,8 @@ pub fn assess(built_from: &str, head: Option<&str>, dirty_files: usize) -> Optio
 /// `abc123def456-dirty` when the tree has uncommitted changes.
 pub fn harness_id() -> String {
     match dirty_file_count() {
-        Ok(n) if n > 0 => format!("{BUILT_FROM}-dirty"),
-        _ => BUILT_FROM.to_string(),
+        Ok(n) if n > 0 => format!("{}-dirty", built_from()),
+        _ => built_from().to_string(),
     }
 }
 
@@ -110,7 +158,7 @@ pub fn harness_id() -> String {
 pub fn require_reproducible(allow_dirty: bool) -> Result<()> {
     let head = head_sha();
     let dirty = dirty_file_count().unwrap_or(0);
-    match assess(BUILT_FROM, head.as_deref(), dirty) {
+    match assess(built_from(), head.as_deref(), dirty) {
         None => Ok(()),
         Some(problem) => {
             if allow_dirty {
@@ -210,7 +258,12 @@ mod tests {
     fn the_binary_under_test_carries_a_real_stamp() {
         // Guards build.rs itself: if the stamp silently became empty, every check
         // above would still pass while proving nothing about this binary.
-        assert!(!BUILT_FROM.is_empty());
-        assert_ne!(BUILT_FROM, "unknown", "built inside the repo, so a SHA must be stamped");
+        assert!(!built_from().is_empty());
+        assert_ne!(built_from(), "unknown", "built inside the repo, so a SHA must be stamped");
+        // vergen's placeholder must never leak out as if it were a commit.
+        assert_ne!(built_from(), VERGEN_PLACEHOLDER);
+        // And --version must render something a human can act on.
+        let v = version_string();
+        assert!(v.contains(built_from()) && v.contains("rustc"), "{v}");
     }
 }
