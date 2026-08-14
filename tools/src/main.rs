@@ -9,6 +9,7 @@ mod scoring;
 mod test;
 mod translate;
 mod verify;
+mod workdir;
 
 use anyhow::Result;
 use cli::{Cli, Command, Dataset};
