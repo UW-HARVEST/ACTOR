@@ -120,8 +120,39 @@ pub struct Cli {
     #[arg(long)]
     pub model: Option<String>,
 
+    /// How to use the agent-invocation cache.
+    #[arg(long, value_enum, default_value_t = CacheMode::On)]
+    pub cache: CacheMode,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// The user-facing spelling of [`crate::cache::Mode`].
+///
+/// Kept separate from the internal enum so the CLI vocabulary and the store's
+/// behaviour can be documented in their own terms, and so `clap` derives stay out
+/// of the cache module.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub enum CacheMode {
+    /// Reuse a stored result when every key input matches; store new ones.
+    On,
+    /// Ignore the cache entirely — neither read nor write. For sampling how much an
+    /// agent varies between runs, which memoising would defeat.
+    Off,
+    /// Re-run even when a result is stored, and replace what was there. For when the
+    /// stored artifact is suspect: leaving it in place would keep serving it.
+    Refresh,
+}
+
+impl From<CacheMode> for crate::cache::Mode {
+    fn from(m: CacheMode) -> Self {
+        match m {
+            CacheMode::On => crate::cache::Mode::ReadWrite,
+            CacheMode::Off => crate::cache::Mode::Bypass,
+            CacheMode::Refresh => crate::cache::Mode::Refresh,
+        }
+    }
 }
 
 #[derive(clap::Subcommand)]
@@ -159,6 +190,11 @@ pub enum Command {
         #[arg(long, default_value_t = 1)]
         parallel: usize,
     },
+    /// Inspect the agent-invocation cache
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
     /// Run MIT runtests
     Test {
         target: String,
@@ -193,4 +229,10 @@ impl Cli {
     pub fn parse_args() -> Self {
         Self::parse()
     }
+}
+
+#[derive(clap::Subcommand)]
+pub enum CacheAction {
+    /// Entry count and size on disk.
+    Stats,
 }

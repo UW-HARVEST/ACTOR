@@ -73,6 +73,13 @@ impl TreeDigest {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Test-only constructor. There is deliberately no `From<String>`: outside
+    /// tests, the only way to obtain a `TreeDigest` is to hash a real tree.
+    #[cfg(test)]
+    pub(crate) fn for_test(s: &str) -> Self {
+        Self(s.to_string())
+    }
 }
 
 impl fmt::Debug for TreeDigest {
@@ -107,6 +114,147 @@ impl RelPath {
 }
 
 // ── Disposition: store vs hash vs ignore ───────────────────────────────────
+
+/// What a copy carries, named by **purpose** rather than by exclusion list.
+///
+/// Every copy in the artifact lifecycle used to pass its own `&[&str]` of names to
+/// skip. Two of those lists have to agree — the one writing a cache entry and the
+/// one overlaying an artifact into the results tree — and they were kept in
+/// agreement only by a comment saying so. That is not enforcement: while writing
+/// this module I gave them different lists, which would have made a replayed
+/// `verified/` differ from a freshly computed one in a way no test would catch.
+///
+/// Now the lists live here, once, defined against each other. A caller names the
+/// purpose and cannot name the exclusions, so the two cannot drift apart.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Carry {
+    /// Into an agent's work tree. `logs/` travels, because that is what the verify
+    /// agent has always been able to see and narrowing it would silently change the
+    /// experiment.
+    ///
+    /// Build output does not, and that IS a change: the previous name-based filter
+    /// excluded a top-level `target/` but carried nested build trees, so three
+    /// harvest-bench projects handed the verify agent a `c_src/build/CMakeCache.txt`
+    /// recording a `/tmp/harvest-translate-*` directory that no longer exists. cmake
+    /// refuses a cache whose `CMAKE_CACHEFILE_DIR` does not match where it now sits,
+    /// so those files could only ever have broken a build the agent attempted in
+    /// them. Dropping them removes 3.8 MB, and removes the only files that made
+    /// [`WorkTree::scrub`] load-bearing.
+    IntoWorkTree,
+    /// Out of a sealed artifact — into the cache store, and out of the store into
+    /// the results tree. ONE variant for both, deliberately: a replay re-assembles
+    /// from the stored copy, so anything the store dropped that the results tree
+    /// would have kept becomes a difference between a hit and a miss.
+    ///
+    /// It must exclude **nothing that [`classify`] hashes**, or a stored copy cannot
+    /// re-derive the digest recorded beside it and every cache read fails its
+    /// integrity check — a cache that looks enabled and never hits. An earlier draft
+    /// of this dropped `c_src` here, on the reasoning that the assembly re-seeds it
+    /// anyway; `a_digest_survives_the_round_trip_through_the_store` rejected it, and
+    /// `from_artifact_keeps_everything_the_digest_covers` now pins the rule.
+    ///
+    /// The consequence is that the results-tree overlay also carries `c_src` over
+    /// the copy seeded from the previous phase. That is a no-op in content, not a
+    /// leniency: [`Scrubbed::seal`] refuses an artifact whose C oracle differs from
+    /// the one the agent was given, so the two are byte-identical by the time
+    /// anything is copied.
+    FromArtifact,
+    /// Seeding a tree from the preceding phase, so files the agent never touched
+    /// are present. `logs/` stays behind: it is harness output, and the current
+    /// phase's own log is being written live.
+    FromPreviousPhase,
+}
+
+impl Carry {
+    /// Whether a copy of this purpose carries a file of this disposition.
+    ///
+    /// This is the whole policy, and it is expressed against [`Disposition`] rather
+    /// than as a list of directory names — which is what makes the failure mode
+    /// unrepresentable rather than merely tested. Note that `StoreAndHash` has no
+    /// arm returning `false`: **no copy can drop a file the digest covers**, so
+    /// "export without `c_src`" is not a bug one can write here.
+    fn admits(self, d: Disposition) -> bool {
+        match d {
+            // The invariant. Do not add a condition to this arm: an artifact whose
+            // stored copy omits a hashed file cannot re-derive its own digest, so
+            // every cache read fails validation and the cache silently never hits.
+            Disposition::StoreAndHash => true,
+            // Regenerable, nine times the bytes, and where per-run paths get baked
+            // in. Dropped from every copy, including into the work tree — see the
+            // note on `IntoWorkTree`.
+            Disposition::BuildOutput => false,
+            // Harness bookkeeping. Travels with the artifact so a work tree and a
+            // stored entry keep the transcript, but is not re-seeded from the
+            // previous phase, whose logs belong to that phase.
+            Disposition::Ignore => self != Carry::FromPreviousPhase,
+        }
+    }
+}
+
+/// Copy the files `carry` admits, deciding with [`classify`] — the same policy the
+/// digest uses.
+fn copy_carrying(src: &Path, dest: &Path, carry: Carry) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    visit(src, src, false, &|d| carry.admits(d), &mut |rel, abs| {
+        let to = dest.join(rel.as_path());
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(abs, &to)
+            .with_context(|| format!("copying {} to {}", abs.display(), to.display()))?;
+        Ok(())
+    })
+    .with_context(|| format!("copying {} to {}", src.display(), dest.display()))?;
+    // `std::fs::copy` carries the source's mode bits. Cache entries are stored
+    // read-only on purpose (see `set_read_only`), so without this a replay would
+    // publish a read-only crate into the results tree and every later `cargo build`
+    // would fail with EACCES — the protection leaking out of the place it protects.
+    // Every `Carry` variant copies into somewhere that must be usable afterwards,
+    // so this belongs here, at the single funnel, rather than at three call sites
+    // where one would eventually be missed.
+    set_read_only(dest, false)
+}
+
+/// Make a tree read-only, or writable again.
+///
+/// Types stop *this crate* from executing in a stored artifact, and the cache
+/// store's placement stops a tree-walker from finding one. This is the third layer,
+/// and the only one that also binds what the types cannot see: a shell-out, a stray
+/// `cargo build --manifest-path`, a future refactor that has not read the comments.
+/// With `0o555`/`0o444` a build inside a stored entry fails with `EACCES` instead of
+/// quietly filling the store with `target/` directories and mutating the very
+/// artifact it was reading.
+pub(crate) fn set_read_only(root: &Path, ro: bool) -> Result<()> {
+    fn perms(mode: u32) -> std::fs::Permissions {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::Permissions::from_mode(mode)
+    }
+    fn walk(p: &Path, ro: bool) -> Result<()> {
+        let meta = std::fs::symlink_metadata(p)?;
+        if meta.is_dir() {
+            // Unlock a directory before touching its children, and lock it only
+            // after: a `0o555` directory cannot have entries added or removed, so
+            // the order is what makes this reversible.
+            if !ro {
+                std::fs::set_permissions(p, perms(0o755))?;
+            }
+            for e in std::fs::read_dir(p)? {
+                walk(&e?.path(), ro)?;
+            }
+            if ro {
+                std::fs::set_permissions(p, perms(0o555))?;
+            }
+        } else if !meta.file_type().is_symlink() {
+            // Symlinks skipped: chmod follows them, so locking one would lock its
+            // target, which may lie outside this tree.
+            std::fs::set_permissions(p, perms(if ro { 0o444 } else { 0o644 }))?;
+        }
+        Ok(())
+    }
+    walk(root, ro).with_context(|| {
+        format!("making {} {}writable", root.display(), if ro { "non-" } else { "" })
+    })
+}
 
 /// What a file contributes to. Storage and hashing are different questions: the
 /// agent's build output is legitimately its work, but it is regenerable, it is 9x
@@ -188,8 +336,11 @@ fn feed(h: &mut Sha256, bytes: &[u8]) {
 /// artifacts whose targets are per-run paths.
 fn digest_tree(root: &Path) -> Result<TreeDigest> {
     let mut files: std::collections::BTreeMap<RelPath, PathBuf> = Default::default();
-    collect(root, root, false, &mut files)
-        .with_context(|| format!("walking {} for a digest", root.display()))?;
+    visit(root, root, false, &|d| d == Disposition::StoreAndHash, &mut |rel, abs| {
+        files.insert(rel.clone(), abs.to_path_buf());
+        Ok(())
+    })
+    .with_context(|| format!("walking {} for a digest", root.display()))?;
 
     let mut h = Sha256::new();
     feed(&mut h, b"harvest-tree-v1");
@@ -201,27 +352,41 @@ fn digest_tree(root: &Path) -> Result<TreeDigest> {
     Ok(TreeDigest(format!("sha256:{:x}", h.finalize())))
 }
 
-fn collect(
+/// **The** traversal of an artifact tree.
+///
+/// Hashing and copying both go through this, so "which files are part of this
+/// artifact" has exactly one answer. Before, the digest walked with [`classify`] —
+/// three-way, with a content sniff that catches a cmake build tree whatever it is
+/// called — while copies walked a list of top-level directory names. Two policies
+/// that had to agree, and twice did not: once dropping `c_src` from stored entries
+/// so no entry could validate, once carrying `logs/` into a work tree and silently
+/// changing what the agent saw.
+///
+/// `admits` decides both which files are emitted and which directories are
+/// descended into, so a directory the caller does not want is not merely filtered
+/// out file by file — it is never opened.
+fn visit(
     root: &Path,
     dir: &Path,
     in_build_dir: bool,
-    out: &mut std::collections::BTreeMap<RelPath, PathBuf>,
+    admits: &dyn Fn(Disposition) -> bool,
+    emit: &mut dyn FnMut(&RelPath, &Path) -> Result<()>,
 ) -> Result<()> {
+    // The sniff has to happen per directory, on the way down: `c_src/build` is
+    // nested, so a check against top-level names walks straight past it.
     let build_here = in_build_dir || is_cmake_build_dir(dir);
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let Ok(rel) = path.strip_prefix(root).map(RelPath::new) else { continue };
-        let Ok(rel) = rel else { continue };
+        let Ok(Ok(rel)) = path.strip_prefix(root).map(RelPath::new) else { continue };
 
-        if path.is_dir() {
-            if classify(&rel, build_here) == Disposition::StoreAndHash {
-                collect(root, &path, build_here, out)?;
-            }
+        if !admits(classify(&rel, build_here)) {
             continue;
         }
-        if classify(&rel, build_here) == Disposition::StoreAndHash {
-            out.insert(rel, path);
+        if path.is_dir() {
+            visit(root, &path, build_here, admits, emit)?;
+        } else {
+            emit(&rel, &path)?;
         }
     }
     Ok(())
@@ -279,10 +444,10 @@ impl<P: Phase> WorkTree<P> {
         let mut rewritten = Vec::new();
 
         let artifact = self.crate_dir();
-        let mut files: std::collections::BTreeMap<RelPath, PathBuf> = Default::default();
-        collect(&artifact, &artifact, false, &mut files)?;
-        for (rel, abs) in &files {
-            let Ok(text) = std::fs::read_to_string(abs) else { continue }; // binary: skip
+        // Scrub exactly the files that will be hashed — the same traversal, so a
+        // file cannot be hashed without having been offered for scrubbing.
+        visit(&artifact, &artifact, false, &|d| d == Disposition::StoreAndHash, &mut |rel, abs| {
+            let Ok(text) = std::fs::read_to_string(abs) else { return Ok(()) }; // binary: skip
             let mut out = text.clone();
             for n in &needles {
                 if !n.is_empty() {
@@ -293,7 +458,8 @@ impl<P: Phase> WorkTree<P> {
                 std::fs::write(abs, out).with_context(|| format!("scrubbing {}", abs.display()))?;
                 rewritten.push(rel.clone());
             }
-        }
+            Ok(())
+        })?;
         Ok(Scrubbed { root: artifact, _scratch: self._scratch, rewritten, _phase: PhantomData })
     }
 }
@@ -378,8 +544,32 @@ impl<P: Phase> Sealed<P> {
         Ok(Self { root, _scratch: None, digest, _phase: PhantomData })
     }
 
+    /// Re-adopt a tree the cache stored earlier.
+    ///
+    /// `pub(crate)` and named for its one caller: this is the only constructor that
+    /// does not start from a phase dir, and widening it would be a way to
+    /// manufacture a `Sealed` without a `Completed` proof, defeating I3.
+    pub(crate) fn from_cache(code_dir: &Path) -> Result<Self> {
+        anyhow::ensure!(code_dir.is_dir(), "cache entry has no code/ at {}", code_dir.display());
+        let digest = digest_tree(code_dir)?;
+        Ok(Self { root: code_dir.to_path_buf(), _scratch: None, digest, _phase: PhantomData })
+    }
+
     pub fn digest(&self) -> &TreeDigest {
         &self.digest
+    }
+
+    /// Copy the artifact's contents into `dest`, for the cache to store.
+    ///
+    /// Takes a destination and returns nothing, so it does not widen I1: there is
+    /// still no expression that yields a path *to* a sealed artifact.
+    ///
+    /// Uses [`Carry::FromArtifact`], the same variant the results-tree overlay
+    /// uses, so what a replay reproduces cannot differ from what a fresh run
+    /// produces. Nothing here can affect *identity* — `digest_tree` filters
+    /// independently, via [`classify`] — only what a replay can reconstruct.
+    pub fn export_into(&self, dest: &Path) -> Result<()> {
+        copy_carrying(&self.root, dest, Carry::FromArtifact)
     }
 
     /// The only way to obtain something runnable: a writable copy elsewhere.
@@ -392,11 +582,7 @@ impl<P: Phase> Sealed<P> {
         // (Whether verify SHOULD see the translate log is a real question, since it
         // also drags result.json in; that is a separate change with its own
         // evaluation, not a side effect of a type refactor.)
-        crate::translate::copy_dir_filtered(
-            &self.root,
-            &root.join(crate::battery::TRANSLATED_RUST),
-            &["target"],
-        )?;
+        copy_carrying(&self.root, &root.join(crate::battery::TRANSLATED_RUST), Carry::IntoWorkTree)?;
         Ok(WorkTree { root, _scratch: Some(scratch), _phase: PhantomData })
     }
 
@@ -421,12 +607,21 @@ impl<P: Phase> Sealed<P> {
                 }
             }
         }
+        self.assemble_into(case_dir, &dst)
+    }
+
+    /// Seed from the previous phase, then overlay this artifact.
+    ///
+    /// Factored out of [`Self::publish`] so the assembly exists once. It is the
+    /// definition of "what this phase's tree contains", and anything that needs
+    /// such a tree — publishing it, or building a throwaway copy to compile-check
+    /// — must get the same answer. Two implementations would be two answers.
+    pub fn assemble_into(&self, case_dir: &Path, dst: &Path) -> Result<()> {
         let translated = crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED);
         if translated.is_dir() && P::DIR != crate::battery::TRANSLATED {
-            crate::translate::copy_dir_filtered(&translated, &dst, &["target", "logs"])?;
+            copy_carrying(&translated, dst, Carry::FromPreviousPhase)?;
         }
-        crate::translate::copy_dir_filtered(&self.root, &dst, &["target", "c_src"])?;
-        Ok(())
+        copy_carrying(&self.root, dst, Carry::FromArtifact)
     }
 }
 
@@ -436,6 +631,92 @@ mod tests {
 
     fn rel(s: &str) -> RelPath {
         RelPath::new(s).unwrap()
+    }
+
+    /// `Carry::FromArtifact` may not drop anything the digest covers.
+    ///
+    /// Stated as a property over a fixture rather than as a comparison of the two
+    /// lists, because the lists are written in different vocabularies: `classify`
+    /// decides per file, `Carry` names top-level directories. Comparing them
+    /// directly would only restate the code; walking a tree asks the question that
+    /// actually matters — after an export, is every hashed file still there?
+    ///
+    /// If this ever fails, the cache does not misbehave subtly: no entry can
+    /// validate, so it silently never hits.
+    #[test]
+    fn from_artifact_keeps_everything_the_digest_covers() {
+        let src = tempfile::tempdir().unwrap();
+        tree(
+            src.path(),
+            &[
+                ("Cargo.toml", "[package]"),
+                ("src/lib.rs", "pub fn a() {}"),
+                (".cargo/config.toml", "[build]"),      // a real build input
+                ("c_src/src/lib.c", "int a(void){0;}"), // the oracle: hashed, so carried
+                ("build.rs", "fn main() {}"),
+                ("logs/verify.log", "transcript"),      // Ignore: need not survive
+                ("target/debug/junk", "build output"),  // BuildOutput: must not survive
+            ],
+        );
+        let dest = tempfile::tempdir().unwrap();
+        let out = dest.path().join("code");
+        copy_carrying(src.path(), &out, Carry::FromArtifact).unwrap();
+
+        for hashed in ["Cargo.toml", "src/lib.rs", ".cargo/config.toml", "c_src/src/lib.c", "build.rs"] {
+            assert_eq!(
+                classify(&rel(hashed), false),
+                Disposition::StoreAndHash,
+                "fixture assumption for {hashed}"
+            );
+            assert!(
+                out.join(hashed).is_file(),
+                "{hashed} is hashed, so an export that drops it makes the digest unverifiable"
+            );
+        }
+        assert!(!out.join("target").exists(), "build output must not be stored");
+
+        // And the whole point: the digest is the same on both sides.
+        assert_eq!(
+            digest_tree(src.path()).unwrap(),
+            digest_tree(&out).unwrap(),
+            "an exported artifact must hash identically to the artifact it came from"
+        );
+    }
+
+    /// A stale cmake cache must not reach the agent.
+    ///
+    /// Measured in the live tree: 3 of 7 harvest-bench projects carry a
+    /// `translated/c_src/build/CMakeCache.txt` whose `CMAKE_CACHEFILE_DIR` points at
+    /// a `/tmp/harvest-translate-*` scratch dir that no longer exists. cmake refuses
+    /// such a cache, so copying it into the work tree could only break a build the
+    /// agent tried there. The old top-level name filter carried it because it is
+    /// nested; deciding by `Disposition` catches it via the content sniff.
+    #[test]
+    fn a_stale_cmake_cache_does_not_reach_the_agent() {
+        let src = tempfile::tempdir().unwrap();
+        tree(
+            src.path(),
+            &[
+                ("Cargo.toml", "[package]"),
+                ("c_src/src/lib.c", "int a(void){return 0;}"),
+                ("c_src/build/CMakeCache.txt", "CMAKE_CACHEFILE_DIR:INTERNAL=/tmp/harvest-translate-w1nAAq/x"),
+                ("c_src/build/CMakeFiles/junk", "cmake internals"),
+                ("logs/translate.log", "transcript"),
+            ],
+        );
+        let dest = tempfile::tempdir().unwrap();
+        let out = dest.path().join("work");
+        copy_carrying(src.path(), &out, Carry::IntoWorkTree).unwrap();
+
+        assert!(out.join("c_src/src/lib.c").is_file(), "the C oracle must travel");
+        assert!(
+            out.join("logs/translate.log").is_file(),
+            "logs must still travel — the agent has always been able to read them"
+        );
+        assert!(
+            !out.join("c_src/build").exists(),
+            "a nested cmake build tree must NOT travel: its cache names a dead scratch dir"
+        );
     }
 
     #[test]

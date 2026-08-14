@@ -1,5 +1,6 @@
 mod agent_health;
 mod artifact;
+mod cache;
 mod battery;
 mod benchmark;
 mod cargo_toml;
@@ -21,6 +22,7 @@ fn main() -> Result<()> {
     let repo_root = find_repo_root()?;
     let agent = cli.agent;
     let model = cli.model.as_deref();
+    let cache = cli.cache;
 
     // Two agents pick their model at runtime: `oneshot` (an OpenRouter model id)
     // and `opencode` (an OpenCode `provider/model` id). Every other agent has its
@@ -50,7 +52,7 @@ fn main() -> Result<()> {
             parallel,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model);
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into());
             let inner = Dataset::strip_prefix(target);
             let bench = benchmark::for_dataset(dataset);
 
@@ -70,7 +72,7 @@ fn main() -> Result<()> {
             parallel,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model);
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into());
             let inner = Dataset::strip_prefix(target);
             benchmark::for_dataset(dataset)
                 .translate(&paths, inner, include_regex.as_deref(), parallel)?;
@@ -82,11 +84,23 @@ fn main() -> Result<()> {
             parallel,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model);
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into());
             let inner = Dataset::strip_prefix(target);
             benchmark::for_dataset(dataset)
                 .verify(&repo_root, &paths, inner, include_regex.as_deref(), force, parallel)?;
         }
+        Command::Cache { action } => match action {
+            cli::CacheAction::Stats => {
+                // Bypass: `cache stats` must never create or mutate an entry.
+                let store = cache::Store::open(&repo_root, cache::Mode::Bypass)?;
+                let (entries, bytes) = store.stats()?;
+                println!(
+                    "{entries} entries, {:.1} MB at {}/results/.cache",
+                    bytes as f64 / 1_048_576.0,
+                    repo_root.display()
+                );
+            }
+        },
         Command::Test {
             ref target,
             update,
@@ -94,7 +108,7 @@ fn main() -> Result<()> {
             allow_infra_failures,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model);
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into());
             let inner = Dataset::strip_prefix(target);
             let mode = if update {
                 test::TestMode::Update
@@ -108,7 +122,7 @@ fn main() -> Result<()> {
         }
         Command::Enrich { ref target } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model);
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into());
             let inner = Dataset::strip_prefix(target);
             benchmark::for_dataset(dataset).enrich(&paths, inner)?;
         }
