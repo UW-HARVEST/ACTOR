@@ -5,3 +5,7 @@
 translating-c-to-rust.tgz
 Dockerfile.laertes
 *.res
+
+# cargo-mutants run output (build artifacts + per-mutant logs)
+tools/mutants.out/
+tools/mutants.out.old/

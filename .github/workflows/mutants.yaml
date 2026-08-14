@@ -1,0 +1,102 @@
+name: mutation coverage
+
+# Catch code whose behaviour no test depends on.
+#
+# WHY, concretely: `verify.rs` substituted an `ALL_CONFIGURATIONS` placeholder
+# that had been removed from every prompt file. `str::replace` on a missing needle
+# is a silent no-op, so a 40-line function read one CMakePresets.json per
+# configuration (128 of them for P01) and its output was discarded for months.
+# rustc's dead_code lint cannot see this — the function is called, its result is
+# used, it just has no effect. Coverage tools are worse than useless: they mark
+# every line as covered, because it all runs.
+#
+# `cargo mutants` is the tool that does see it. It changes a function's behaviour
+# and asks whether any test notices. Mutating that function to `String::new()`
+# broke nothing, which is the signal.
+#
+# SCOPED TO THE DIFF, deliberately. The crate has 1,718 mutants and most survive
+# legitimately (agent invocation, file I/O, report generation — none unit-testable
+# without a live LLM). A repo-wide gate would never pass. `--in-diff` asks only
+# that code a PR adds or changes be covered, so existing debt is not blocking and
+# new debt cannot be added silently.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutants-in-diff:
+    runs-on: ubuntu-24.04
+    # Generous: each mutant costs a rebuild. A typical PR yields a handful.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the merge base to diff against.
+          fetch-depth: 0
+          # `prompts/` and the corpus live outside tools/, and the placeholder
+          # parity test reads them. Submodules are NOT needed: that test skips
+          # gracefully when a file is absent, and mutation runs use --lib only.
+          submodules: false
+
+      - name: Install pinned toolchain
+        run: |
+          rustup toolchain install 1.94.0 --profile default
+          rustup default 1.94.0
+          # RUSTUP_TOOLCHAIN in the environment silently overrides
+          # rust-toolchain.toml. Make sure nothing inherited one.
+          echo "RUSTUP_TOOLCHAIN=" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked --version ^27
+
+      - name: Diff against the merge base
+        working-directory: tools
+        # --relative is load-bearing. `git diff` emits repo-relative paths
+        # (`tools/src/verify.rs`), but cargo-mutants runs inside `tools/` and
+        # matches against `src/verify.rs`. Without it, --in-diff silently matches
+        # NOTHING, logs "No mutants to filter", and exits 0 — a green check that
+        # tests nothing. Which is exactly the bug class this workflow exists to
+        # catch, so: verified locally that the corrected diff yields mutants.
+        run: |
+          git diff --relative "origin/${{ github.base_ref }}"...HEAD -- . > /tmp/pr.diff
+          echo "--- diff paths (must start with src/, not tools/src/) ---"
+          grep '^+++' /tmp/pr.diff || true
+          echo "--- added lines ---"
+          grep -c '^+' /tmp/pr.diff || true
+
+      - name: Mutation-test only the changed lines
+        working-directory: tools
+        # --in-place: `prompts/` is outside this crate, so a sandboxed copy of
+        #   tools/ would not contain it and the parity test would skip. In CI the
+        #   checkout is disposable, so mutating it in place is safe and faster.
+        # -- --lib: the integration tests need the results and test-corpus
+        #   submodules, which this job deliberately does not fetch.
+        run: |
+          if ! grep -q '^+' /tmp/pr.diff; then
+            echo "No changes under tools/src — nothing to mutation-test."
+            exit 0
+          fi
+          # Exits 2 if any mutant survives, which fails the job. Exclusions live
+          # in tools/.cargo/mutants.toml (NOT tools/mutants.toml — cargo-mutants
+          # only reads the .cargo/ path).
+          cargo mutants \
+            --in-place \
+            --in-diff /tmp/pr.diff \
+            --colors never \
+            -- --lib
+
+      - name: Publish the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-report
+          path: tools/mutants.out/
+          if-no-files-found: ignore

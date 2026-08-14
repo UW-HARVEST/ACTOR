@@ -69,7 +69,7 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
                     return (c.name.clone(), None); // skipped
                 }
                 let cmake_flags = get_cmake_flags(paths, battery_name, &c.name);
-                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths)
+                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, paths)
                     .unwrap_or(false);
                 (c.name.clone(), Some(ok))
             })
@@ -103,8 +103,7 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
         } else {
             println!("[{current}/{total}] 🔬 {} (shared-source, {} configs)", group.real_case, group.configs.len());
             let cmake_flags = get_cmake_flags(paths, battery_name, &group.real_case);
-            let configs_text = build_configs_text(paths, battery_name, group);
-            let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, paths)?;
+            let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, paths)?;
 
             if ok { verified += 1; println!("[{current}/{total}] ✅ {} — verified", group.real_case); }
             else { failed += 1; println!("[{current}/{total}] ❌ {} — verification incomplete", group.real_case); }
@@ -154,7 +153,7 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
                 if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
                     return (name, None); // skip: already verified
                 }
-                let ok = verify_case(&case_dir, prompt, "", "", paths).unwrap_or(false);
+                let ok = verify_case(&case_dir, prompt, "", paths).unwrap_or(false);
                 (name, Some(ok))
             })
         }).collect();
@@ -174,7 +173,7 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
     Ok(())
 }
 
-fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, configs_text: &str, paths: &Paths) -> Result<bool> {
+fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, paths: &Paths) -> Result<bool> {
     let agent = paths.agent;
     // Verify is PURE: it reads the immutable `translated/` crate (via
     // IsolatedWorkDir), works in a temp dir, and writes the result to
@@ -195,10 +194,15 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
     crate::translate::clear_agent_exit();
     let start = std::time::Instant::now();
 
-    let mut prompt = prompt_template
-        .replace("CASE_DIR_PLACEHOLDER", &work.root().to_string_lossy())
-        .replace("CMAKE_BUILD_FLAGS", cmake_flags)
-        .replace("ALL_CONFIGURATIONS", configs_text);
+    // `substitute_required`, not `str::replace`: a missing placeholder must be an
+    // error, not a silent no-op. `ALL_CONFIGURATIONS` was substituted here for
+    // months against a prompt that no longer contained it (removed by f7a4c5d,
+    // "no config names leak to agent"), so a 40-line function read 128
+    // CMakePresets.json files per shared-source group and had its output
+    // discarded. Nothing failed, nothing warned.
+    let mut prompt = prompt_template.to_string();
+    substitute_required(&mut prompt, "CASE_DIR_PLACEHOLDER", &work.root().to_string_lossy())?;
+    substitute_required(&mut prompt, "CMAKE_BUILD_FLAGS", cmake_flags)?;
 
     // OpenCode needs its filesystem-boundary contract and output-cap warning
     // appended (empty for every other agent, so no other prompt changes).
@@ -323,46 +327,27 @@ fn verify_case(case_dir: &Path, prompt_template: &str, cmake_flags: &str, config
     Ok(compiles)
 }
 
-/// Build a text block listing all distinct configurations for the verify prompt.
-fn build_configs_text(paths: &Paths, battery: &str, group: &battery::SharedSourceGroup) -> String {
-    // Collect unique feature sets (deduplicate configs that share the same features)
-    let mut seen = std::collections::HashSet::new();
-    let mut lines = Vec::new();
-
-    // Include the real case first
-    let real_flags = get_cmake_flags(paths, battery, &group.real_case);
-    let real_presets = paths.input_dir(battery).join(&group.real_case).join("CMakePresets.json");
-    let real_features = battery::extract_features_from_path(&real_presets).unwrap_or_default();
-    let real_key: Vec<String> = real_features.iter().cloned().collect();
-    if seen.insert(real_key) && !real_flags.is_empty() {
-        lines.push(format!(
-            "  cmake: {}  →  cargo features: {}",
-            real_flags,
-            real_features.join(","),
-        ));
-    }
-
-    for cfg in &group.configs {
-        let key: Vec<String> = cfg.features.clone();
-        if !seen.insert(key) {
-            continue; // skip duplicate feature sets
-        }
-        let cmake_flags = get_cmake_flags(paths, battery, &cfg.name);
-        if cmake_flags.is_empty() {
-            continue;
-        }
-        lines.push(format!(
-            "  cmake: {}  →  cargo features: {}",
-            cmake_flags,
-            cfg.features.join(","),
-        ));
-    }
-
-    if lines.is_empty() {
-        String::new()
-    } else {
-        format!("Configurations to test:\n{}", lines.join("\n"))
-    }
+/// Substitute a REQUIRED prompt placeholder, erroring if it is absent.
+///
+/// `str::replace` returns the haystack unchanged when the needle is missing, so a
+/// prompt that stops containing a placeholder silently discards whatever the
+/// harness computed for it. That is not hypothetical: `ALL_CONFIGURATIONS` was
+/// removed from `verify.md` by f7a4c5d ("no config names leak to agent") while the
+/// substitution stayed, so for months a 40-line function read one
+/// `CMakePresets.json` per configuration — 128 of them for P01 — and its output
+/// went nowhere. Nothing failed and nothing warned.
+///
+/// Fail loudly instead. A prompt/harness mismatch is a bug in the experiment
+/// setup, and the only safe time to learn about it is before the agent runs.
+fn substitute_required(prompt: &mut String, placeholder: &str, value: &str) -> Result<()> {
+    anyhow::ensure!(
+        prompt.contains(placeholder),
+        "prompt is missing the required placeholder {placeholder}: the harness computed a \
+         value for it that would be silently discarded. Either restore {placeholder} to the \
+         prompt or stop substituting it."
+    );
+    *prompt = prompt.replace(placeholder, value);
+    Ok(())
 }
 
 fn get_cmake_flags(paths: &Paths, battery: &str, case_name: &str) -> String {
@@ -384,4 +369,73 @@ fn get_cmake_flags(paths: &Paths, battery: &str, case_name: &str) -> String {
         .map(|(k, v)| format!("-D{}={}", k, v.as_str().unwrap_or("")))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod prompt_substitution_tests {
+    use super::*;
+
+    #[test]
+    fn substitutes_when_the_placeholder_is_present() {
+        let mut p = String::from("build with FLAGS_HERE and go");
+        substitute_required(&mut p, "FLAGS_HERE", "-DOP=add").expect("present placeholder");
+        assert_eq!(p, "build with -DOP=add and go");
+    }
+
+    #[test]
+    fn substitutes_every_occurrence() {
+        let mut p = String::from("X then X");
+        substitute_required(&mut p, "X", "y").unwrap();
+        assert_eq!(p, "y then y");
+    }
+
+    #[test]
+    fn errors_when_the_placeholder_is_absent() {
+        // THE regression this guards: a silent no-op becomes a loud failure.
+        let mut p = String::from("a prompt that no longer mentions the token");
+        let err = substitute_required(&mut p, "ALL_CONFIGURATIONS", "some computed value")
+            .expect_err("absent placeholder must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ALL_CONFIGURATIONS"), "names the placeholder: {msg}");
+        assert!(msg.contains("silently discarded"), "explains the consequence: {msg}");
+    }
+
+    #[test]
+    fn an_empty_value_is_still_a_valid_substitution() {
+        // 207 of 338 cases have no CMakePresets.json, so cmake_flags is "" — that
+        // must succeed (the placeholder exists), not be mistaken for absence.
+        let mut p = String::from("cmake .. CMAKE_BUILD_FLAGS && build");
+        substitute_required(&mut p, "CMAKE_BUILD_FLAGS", "").unwrap();
+        assert_eq!(p, "cmake ..  && build");
+    }
+
+    /// Every placeholder the harness substitutes must exist in the verify prompt
+    /// of every agent that uses it. This is the check that would have caught the
+    /// ALL_CONFIGURATIONS drift the day it happened.
+    ///
+    /// `prompts/` lives OUTSIDE this crate, so a tool that copies only `tools/`
+    /// into a sandbox (cargo-mutants without `--in-place`) will not have it. In
+    /// that case the check skips rather than failing on its own fixtures — it is a
+    /// prompt/harness parity guarantee, not a code-coverage one. CI runs
+    /// cargo-mutants with `--in-place` precisely so this stays meaningful there.
+    #[test]
+    fn every_required_placeholder_exists_in_every_verify_prompt() {
+        const REQUIRED: &[&str] = &["CASE_DIR_PLACEHOLDER", "CMAKE_BUILD_FLAGS"];
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("tools/ has a parent");
+        for rel in ["prompts/claude/verify.md", "prompts/kiro/test-corpus/verify.md"] {
+            let path = repo.join(rel);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue; // prompts not in this tree; see doc comment
+            };
+            for ph in REQUIRED {
+                assert!(
+                    text.contains(ph),
+                    "{rel} is missing required placeholder {ph} — the harness substitutes it, \
+                     so its value would be silently discarded"
+                );
+            }
+        }
+    }
 }

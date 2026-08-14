@@ -1,0 +1,39 @@
+# cargo-mutants configuration.
+#
+# The CI gate (.github/workflows/mutants.yaml) is diff-scoped: code a PR adds or
+# changes must be covered by a test that would notice if its behaviour changed.
+#
+# These exclusions are the functions that CANNOT be unit-tested, because their
+# behaviour is "spawn an agent CLI and wait" or "walk the real results tree".
+# Mutating them to `Ok(())` is indistinguishable from success without a live LLM
+# and a populated corpus, so they would always survive and would make the gate
+# fail for legitimate changes — training everyone to ignore it.
+#
+# This list is deliberately explicit and small. Adding to it is a reviewable act:
+# if you need a new entry, say in the PR why the function cannot be tested. Do NOT
+# add a function merely because writing the test is inconvenient — that is the
+# debt this gate exists to stop accumulating.
+#
+# Note these are excluded from MUTATION only. They are still compiled, still
+# clippy'd, and still exercised end-to-end by real sweeps.
+
+exclude_re = [
+    # ── verify.rs: each spawns `bash -lc … claude -p …` and blocks on an agent.
+    "verify_case",           # one agent session per case; verdict comes from the LLM
+    "run_with_semaphore",    # fans verify_case across a battery
+    "run_harvest_bench",     # same, for harvest-bench projects
+    "verify::run",           # thin entry point around run_with_semaphore
+    "verify::run_all",       # ditto, across batteries
+
+    # ── translate.rs: same shape — agent invocation and workspace assembly.
+    "translate_case",
+    "run_and_record",
+    "dispatch_translate",
+    "propagate_config",      # copies a real case's crate to N config followers
+
+    # ── report.rs / test.rs: read the real results tree and shell out to
+    #    MIT runtests; there is no fixture corpus to test them against.
+    "report::generate",
+    "run_runtests",
+    "run_harvest_bench_test",
+]
