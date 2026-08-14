@@ -240,7 +240,7 @@ pub fn record_infra_failures(results_dir: &Path, audit: &[CaseHealth]) -> Result
 // (the harness merges the agent's stderr into the same stream via `2>&1 | tee`),
 // so a line-by-line `from_str` would fail on the first non-JSON line.
 
-fn read_tail(path: &Path) -> Result<String> {
+pub(crate) fn read_tail(path: &Path) -> Result<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path)?;
     let len = f.metadata()?.len();
