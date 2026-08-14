@@ -1,0 +1,92 @@
+name: type safety
+
+# Run the tests that the repo already has.
+#
+# WHY THIS DID NOT EXIST, AND WHY THAT MATTERED: `validate.yaml` is the only other
+# workflow, and its sole cargo command is `cargo build --release`. It then scores
+# stored results via `harvest-tools test all --check`. There is no `cargo test`
+# anywhere in CI. So the 4 trybuild compile-fail cases added in #73 — whose entire
+# job is to assert that `Sealed<P>` can never yield a filesystem path, that a
+# `Completed` proof cannot be forged, and that phases are not interchangeable — have
+# never executed in CI, nor have the unit tests added in #67, #70, #73 and #74.
+#
+# Those invariants are enforced by ABSENCE: no `AsRef<Path>`, no `path()`, no public
+# constructor. Absence is exactly what a refactor deletes silently. Until this file
+# existed, the only thing standing between a refactor and a silently broken invariant
+# was whether someone remembered to run `cargo test` locally.
+#
+# DELIBERATELY NOT `--all-targets`: `tools/tests/integration.rs` needs the
+# `test-corpus` and `results` submodules, so it cannot pass here. This job takes no
+# submodules and needs no PAT, which is what keeps it fast and fork-safe.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: type-safety-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # `.git` must be present: build.rs stamps the commit via `git rev-parse`,
+          # and `provenance::tests::the_binary_under_test_carries_a_real_stamp`
+          # asserts the stamp is not "unknown". A shallow clone is fine — only HEAD
+          # is read — but a source export with no `.git` would fail that test, which
+          # is the correct outcome rather than a false pass.
+          submodules: false
+
+      - name: Install the pinned toolchain
+        # rust-toolchain.toml pins 1.94.0; rustup honours it on first invocation.
+        # RUSTUP_TOOLCHAIN in the environment would silently override that file, and
+        # cache::ToolchainId::detect refuses to run when it is set — so make sure
+        # nothing inherited one.
+        run: |
+          rustup show active-toolchain || rustup toolchain install 1.94.0 --profile minimal
+          echo "RUSTUP_TOOLCHAIN=" >> "$GITHUB_ENV"
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools
+          # Cache dependencies ONLY, never this crate's own artifacts.
+          #
+          # `validate.yaml` caches the whole workspace with `path: .`, which includes
+          # `tools/target`. Restoring that here would let cargo report harvest-tools
+          # as fresh, run zero tests' worth of new compilation, and pass having
+          # analysed nothing — the same shape of silent no-op as a `--in-diff` filter
+          # that matches no paths and exits 0.
+          cache-targets: false
+
+      - name: Unit tests (lib + bin)
+        # `--bin harvest-tools` is load-bearing: `report.rs` (990 lines) and
+        # `benchmark.rs` are declared only in main.rs, so a bare `--lib` would never
+        # compile or run anything in them.
+        run: cargo test --manifest-path tools/Cargo.toml --lib --bin harvest-tools
+
+      - name: Compile-fail tests (the type invariants)
+        # These assert that unsafe designs DO NOT COMPILE. A green run here means an
+        # expression like `Command::new("x").current_dir(&sealed)` is still rejected
+        # by the compiler.
+        run: cargo test --manifest-path tools/Cargo.toml --test compile_fail
+
+      - name: Show the recorded stderr of each invariant
+        # On failure, trybuild prints a diff; on success the expectations are what
+        # future readers need to see. Cheap, and it makes the invariants legible in
+        # the log rather than only in the repo.
+        if: always()
+        run: |
+          for f in tools/tests/compile-fail/*.stderr; do
+            echo "── $(basename "$f")"
+            head -4 "$f"
+          done

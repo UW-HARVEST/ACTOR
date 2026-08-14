@@ -412,6 +412,7 @@ fn run_verify_agent(
                 // each pick their own model and the pin would cover only the
                 // top-level session.
                 .env("CLAUDE_CODE_SUBAGENT_MODEL", model.as_str())
+                .envs(crate::translate::AGENT_ENV.iter().copied())
                 // Agent scratch on disk inside the work root, not the /tmp tmpfs,
                 // plus a hard per-file cap. See crate::workdir.
                 .env("TMPDIR", &agent_tmp)

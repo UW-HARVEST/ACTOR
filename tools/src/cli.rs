@@ -124,6 +124,15 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = CacheMode::On)]
     pub cache: CacheMode,
 
+    /// Produce artifacts even though the code cannot be identified — an
+    /// uncommitted tree, or a binary built from a different commit.
+    ///
+    /// Legitimate while iterating locally. The reason is printed and every artifact
+    /// is stamped `<sha>-dirty`, so a run made this way cannot later be mistaken for
+    /// a reproducible one. See `crate::provenance`.
+    #[arg(long, global = true)]
+    pub allow_dirty: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -235,4 +244,25 @@ impl Cli {
 pub enum CacheAction {
     /// Entry count and size on disk.
     Stats,
+}
+
+impl Command {
+    /// Whether this command writes an artifact that a paper number could rest on.
+    ///
+    /// The single source of truth for the provenance preflight. Exhaustive on
+    /// purpose: a new subcommand cannot be added without deciding which side it is
+    /// on, rather than defaulting to unchecked.
+    pub fn produces_artifacts(&self) -> bool {
+        match self {
+            // Write into results/ or tables/.
+            Command::Run { .. }
+            | Command::Translate { .. }
+            | Command::Verify { .. }
+            | Command::Test { .. }
+            | Command::Enrich { .. }
+            | Command::Report => true,
+            // Read-only introspection.
+            Command::Cache { .. } => false,
+        }
+    }
 }

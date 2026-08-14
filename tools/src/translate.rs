@@ -13,6 +13,28 @@ use std::time::{Duration, Instant};
 // no skills/plugins/MCP, no extra system prompt.
 pub const CLAUDE_PLAIN_AGENT_JSON: &str = r#"{"claude_plain":{"description":"Bare-bones agent matching kiro_plain","prompt":"You are a coding assistant. Use the available tools to complete the user's task.","tools":["Bash","Edit","Read","Write","Task"]}}"#;
 
+/// Agent-runtime settings that materially change how a session behaves, and how
+/// long it takes.
+///
+/// These lived in the shell driver (`hb-rerun.sh`) as bare `export` lines, which
+/// made them invisible to the cache key: two sweeps with different retry policy
+/// would have shared an entry. They belong here, where [`crate::cache::Recipe`]
+/// hashes them by construction and a forgotten `export` cannot silently change the
+/// experiment.
+///
+/// Values are the ones the 2026-08-14 sweep actually ran with, so behaviour is
+/// unchanged — only its location and its visibility to the key.
+pub const AGENT_ENV: &[(&str, &str)] = &[
+    // A single request may legitimately take a long time on a large project; the
+    // per-session wall clock is bounded separately by `timeout`.
+    ("API_TIMEOUT_MS", "1200000"),
+    ("API_FORCE_IDLE_TIMEOUT", "0"),
+    // Bedrock throttles under concurrency. Without generous retries a throttle
+    // becomes a dead case, which #67 then correctly refuses to score.
+    ("CLAUDE_CODE_MAX_RETRIES", "20"),
+    ("CLAUDE_CODE_RETRY_WATCHDOG", "1"),
+];
+
 /// The model every `--agent claude` invocation is pinned to.
 ///
 /// Previously no `--model` was passed at all, so the model was whatever the CLI
@@ -743,6 +765,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                 // Task; without this they would pick their own model and the pin would
                 // cover only the top-level session.
                 .env("CLAUDE_CODE_SUBAGENT_MODEL", model.as_str())
+                .envs(AGENT_ENV.iter().copied())
                 .current_dir(&work_dir)
                 .status()
                 .context("invoking claude")?;
@@ -980,6 +1003,9 @@ pub fn agent_provenance(agent: Agent, duration_secs: u64) -> serde_json::Value {
         "duration_secs": duration_secs,
         "success": true,
         "timestamp": chrono::Utc::now().to_rfc3339(),
+        // WHICH CODE produced this. The 2026-08-14 sweep could not answer that
+        // question afterwards, which is why it went unnoticed for twelve hours.
+        "harness": crate::provenance::harness_id(),
     });
     merge_agent_exit(&mut p);
     p
