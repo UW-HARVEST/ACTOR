@@ -47,6 +47,43 @@ impl Refusal {
     }
 }
 
+/// Refusals seen this sweep. A refusal is not a case failure: the checks that raise one
+/// exist to stop a bad measurement, so the sweep finishes (surviving cases are not
+/// wasted) and then the command fails.
+static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Fold a case's outcome into a pass/fail, remembering any refusal.
+pub fn record(case: &str, outcome: anyhow::Result<bool>) -> bool {
+    match outcome {
+        Ok(ok) => ok,
+        Err(e) => {
+            if let Some(r) = e.downcast_ref::<Refusal>() {
+                eprintln!("  ⛔ {case}: {r}");
+                if let Ok(mut g) = SEEN.lock() {
+                    g.push(format!("{case}: {r}"));
+                }
+            } else {
+                eprintln!("  {case}: {e:#}");
+            }
+            false
+        }
+    }
+}
+
+/// Fail the command if anything refused.
+pub fn bail_if_any() -> anyhow::Result<()> {
+    let seen = SEEN.lock().map(|g| g.clone()).unwrap_or_default();
+    anyhow::ensure!(
+        seen.is_empty(),
+        "{} case(s) refused rather than failed: {}\n  \
+         A refusal means the measurement is invalid, not that the translation is bad — \
+         fix the cause and re-run before scoring.",
+        seen.len(),
+        seen.join("; ")
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,3 +109,4 @@ mod tests {
         assert!(Refusal::in_chain(&anyhow::anyhow!("no Cargo.toml produced")).is_none());
     }
 }
+

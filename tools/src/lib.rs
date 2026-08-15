@@ -16,6 +16,7 @@ pub mod cli;
 pub mod opencode;
 pub mod sandbox;
 pub mod scoring;
+pub mod session;
 pub mod test;
 pub mod translate;
 pub mod verify;

@@ -14,11 +14,66 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+/// Binaries Claude Code needs before it will sandbox anything on Linux.
+///
+/// Without them it prints a fail-open banner and runs UNSANDBOXED. Measured before
+/// they were installed: the banner appears in 1899 of 1902 Claude-arm agent logs, so
+/// every one of those runs had the policy written and none had it applied.
+const SANDBOX_BINARIES: &[&str] = &["bwrap", "socat"];
+
+/// Refuse to hand an agent a policy that cannot be applied.
+///
+/// The deny list was correct and inert for 164 runs. `enabled: true` is a request;
+/// enforcement needs `bwrap`, whose mechanism is a tmpfs overmount inside a mount
+/// namespace. Harness and agent share a uid, so no `chmod` scheme substitutes.
+pub fn require_enforceable() -> Result<()> {
+    let missing: Vec<&str> = SANDBOX_BINARIES
+        .iter()
+        .copied()
+        .filter(|b| which(b).is_none())
+        .collect();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "the agent sandbox cannot be enforced: {} not on PATH.\n           Claude Code would print a fail-open banner and run unsandboxed, so the graded \
+         oracle and every sibling work dir would be readable.\n           Install them (Amazon Linux 2023: `sudo dnf install -y bubblewrap socat`), or pass \
+         --allow-unsandboxed to proceed with artifacts stamped as unsandboxed.",
+        missing.join(" and ")
+    );
+    Ok(())
+}
+
+/// Whether the sandbox is enforceable, for the provenance record.
+pub fn is_enforceable() -> bool {
+    SANDBOX_BINARIES.iter().all(|b| which(b).is_some())
+}
+
+fn which(bin: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join(bin))
+            .find(|p| p.is_file())
+    })
+}
+
 /// The scratch base is the non-obvious entry: sibling per-case work dirs live
 /// under it and reads are default-allow *outside* `denyRead`, so it is denied
 /// wholesale and this run's own root re-granted by `allowRead`, which wins.
+/// Roots are canonicalised because `$HOME` is a symlink into `/local` while work dirs
+/// are addressed as `/local/...`; an uncanonicalised deny root simply would not match
+/// the path the agent uses.
+///
+/// The repo's PARENT is denied too. Reads are default-allow *outside* `denyRead`, so a
+/// stale sibling results tree was readable — and one audited log did exactly that,
+/// reading a third run's translated output.
 pub fn denied_read_roots(repo_root: &Path) -> Result<Vec<PathBuf>> {
-    Ok(vec![repo_root.to_path_buf(), crate::workdir::base()?])
+    let mut roots = vec![repo_root.to_path_buf(), crate::workdir::base()?];
+    if let Some(parent) = repo_root.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    Ok(roots
+        .into_iter()
+        .map(|p| p.canonicalize().unwrap_or(p))
+        .collect())
 }
 
 pub(crate) fn settings_json(repo_root: &Path, work_root: &Path) -> Result<serde_json::Value> {
@@ -30,6 +85,9 @@ pub(crate) fn settings_json(repo_root: &Path, work_root: &Path) -> Result<serde_
         "sandbox": {
             "enabled": true,
             "allowUnsandboxedCommands": false,
+            // Without this the CLI degrades to unsandboxed with a banner, which is how
+            // the policy stayed inert for 164 runs.
+            "failIfUnavailable": true,
             "filesystem": {
                 "denyRead": deny,
                 "allowRead": [work_root.to_string_lossy()],
@@ -41,7 +99,25 @@ pub(crate) fn settings_json(repo_root: &Path, work_root: &Path) -> Result<serde_
 
 /// `parent` is the directory the agent is launched *next to* — the work root for
 /// verify, the temp root for translate — not the agent's cwd.
-pub fn write_settings(repo_root: &Path, work_root: &Path, parent: &Path) -> Result<PathBuf> {
+pub fn write_settings(
+    repo_root: &Path,
+    work_root: &Path,
+    parent: &Path,
+    allow_unsandboxed: bool,
+) -> Result<PathBuf> {
+    // Scoped here rather than at startup: only the agents that receive a policy reach
+    // this function, so c2rust/laertes/c2saferrust are not refused for lacking a shell.
+    if allow_unsandboxed {
+        if !is_enforceable() {
+            eprintln!(
+                "⚠️  --allow-unsandboxed: {:?} missing, so the agent runs with the graded \
+                 oracle readable. Artifacts are stamped unsandboxed.",
+                SANDBOX_BINARIES
+            );
+        }
+    } else {
+        require_enforceable()?;
+    }
     let dir = parent.join(".claude");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("settings.json");
@@ -126,13 +202,54 @@ mod tests {
         let parent = tmp.path().join("root");
         std::fs::create_dir_all(&parent).unwrap();
         // The real function, not `policy`: base() needs HOME, which tests have.
-        let p = write_settings(Path::new("/repo"), &parent, &parent).expect("writes policy");
+        // true: the test asserts the policy's CONTENT, and must not depend on whether the
+        // machine running it has bwrap installed.
+        let p = write_settings(Path::new("/repo"), &parent, &parent, true).expect("writes policy");
         assert_eq!(p, parent.join(".claude/settings.json"));
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(v["sandbox"]["enabled"], true);
         let deny = v["sandbox"]["filesystem"]["denyRead"].as_array().unwrap();
         assert!(deny.iter().any(|d| d == "/repo"));
-        assert_eq!(deny.len(), 2, "repo root + scratch base");
+        // repo root + its parent + the scratch base. The parent is here because reads
+        // are default-allow outside denyRead, so a stale sibling results tree was
+        // readable; one audited log read a third run's translated output.
+        assert_eq!(deny.len(), 3, "repo root + repo parent + scratch base");
+        assert!(deny.iter().any(|d| d == "/"), "the parent of /repo is /");
+    }
+
+    #[test]
+    fn a_policy_that_cannot_be_enforced_is_refused() {
+        // The defect this PR closes: for 164 runs `enabled: true` was written while
+        // nothing applied it, because bwrap was absent and the CLI fails open. Whether
+        // this machine can enforce is environmental, so assert the two directions
+        // against the same predicate rather than hardcoding an expectation.
+        let parent = tempfile::tempdir().unwrap();
+        let refused = write_settings(Path::new("/repo"), parent.path(), parent.path(), false);
+        assert_eq!(
+            refused.is_ok(),
+            is_enforceable(),
+            "without --allow-unsandboxed, write_settings must succeed exactly when the \
+             sandbox is enforceable"
+        );
+        if let Err(e) = refused {
+            let msg = format!("{e:#}");
+            assert!(msg.contains("cannot be enforced"), "{msg}");
+            assert!(msg.contains("--allow-unsandboxed"), "must name the escape hatch: {msg}");
+        }
+        // The escape hatch always proceeds, so an operator is never blocked outright.
+        assert!(write_settings(Path::new("/repo"), parent.path(), parent.path(), true).is_ok());
+    }
+
+    #[test]
+    fn the_deny_list_covers_the_repos_parent() {
+        // Reads are default-allow OUTSIDE denyRead, so a stale sibling results tree was
+        // readable — and one audited log read a third run's translated output.
+        let roots = denied_read_roots(Path::new("/local/home/x/research/ACTOR")).unwrap();
+        let strs: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
+        assert!(
+            strs.iter().any(|s| s.ends_with("/research")),
+            "the repo's parent must be denied: {strs:?}"
+        );
     }
 }
