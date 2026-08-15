@@ -14,6 +14,10 @@ fn src(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name)
 }
 
+fn file_name(path: &Path) -> String {
+    path.file_name().unwrap_or_default().to_string_lossy().into_owned()
+}
+
 fn parse(path: &Path) -> syn::File {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     syn::parse_file(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
@@ -79,20 +83,6 @@ fn is_public(vis: &syn::Visibility) -> bool {
     matches!(vis, syn::Visibility::Public(_) | syn::Visibility::Restricted(_))
 }
 
-/// The type an `impl` block is for, by its last path segment. The rules below scan every
-/// module because the orphan rule permits the impl to live in any of them — and outside
-/// the defining module it must be spelled `crate::cache::CacheKey`, which no comparison
-/// against `"CacheKey"` would ever match.
-fn impl_target(ty: &syn::Type) -> String {
-    match ty {
-        syn::Type::Path(p) => {
-            p.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default()
-        }
-        syn::Type::Reference(r) => impl_target(&r.elem),
-        _ => String::new(),
-    }
-}
-
 // ── A1 ─────────────────────────────────────────────────────────────────────
 
 /// `Sealed<P>` may implement nothing that yields a path, directly or by deref.
@@ -107,7 +97,7 @@ fn sealed_implements_only_debug() {
     for path in rust_sources() {
         for item in parse(&path).items {
             let syn::Item::Impl(imp) = item else { continue };
-            if impl_target(&imp.self_ty) != "Sealed" {
+            if type_name(&imp.self_ty) != "Sealed" {
                 continue;
             }
             let name = match &imp.trait_ {
@@ -156,7 +146,7 @@ fn no_public_path_escapes_the_artifact_modules() {
         for item in parse(&path).items {
             match item {
                 syn::Item::Impl(imp) => {
-                    let self_ty = impl_target(&imp.self_ty);
+                    let self_ty = type_name(&imp.self_ty);
                     for it in imp.items {
                         let syn::ImplItem::Fn(f) = it else { continue };
                         if !is_public(&f.vis) {
@@ -193,21 +183,23 @@ fn no_public_path_escapes_the_artifact_modules() {
 
 // ── A3 ─────────────────────────────────────────────────────────────────────
 
-/// Digest newtypes must be unforgeable: private field, no `From<String>`.
+/// Digest and identity newtypes must be unforgeable: private field, no `From<String>`.
 ///
 /// A digest that can be constructed from an arbitrary string is a digest that can
 /// be wrong, and the cache compares them to decide whether to reuse an artifact.
-///
-/// Scans every module for the same reason A1 does: the orphan rule permits
-/// `impl From<String> for CacheKey` in any file of the crate.
+/// `AgentKey` and `CliVersion` are the same hazard from the other side: they name WHAT
+/// ran, so a caller able to spell one without deriving it from `--agent`, or from the
+/// CLI itself, is how a key comes to name something that did not run.
 #[test]
 fn digests_cannot_be_fabricated() {
-    const GUARDED: &[&str] = &["TreeDigest", "PromptDigest", "RecipeDigest", "CacheKey", "ToolchainId"];
+    const GUARDED: &[&str] = &[
+        "TreeDigest", "PromptDigest", "RecipeDigest", "CacheKey", "ToolchainId",
+        "AgentKey", "CliVersion",
+    ];
     let mut bad: Vec<String> = Vec::new();
 
-    for path in rust_sources() {
-        let module = path.file_name().unwrap().to_string_lossy().into_owned();
-        for item in parse(&path).items {
+    for module in ["artifact.rs", "cache.rs"] {
+        for item in parse(&src(module)).items {
             match &item {
                 syn::Item::Struct(s) if GUARDED.contains(&s.ident.to_string().as_str()) => {
                     for f in &s.fields {
@@ -219,7 +211,7 @@ fn digests_cannot_be_fabricated() {
                 syn::Item::Impl(imp) => {
                     let Some((_, tr, _)) = &imp.trait_ else { continue };
                     let is_from = tr.segments.last().is_some_and(|s| s.ident == "From");
-                    let target = impl_target(&imp.self_ty);
+                    let target = type_name(&imp.self_ty);
                     if is_from && GUARDED.contains(&target.as_str()) {
                         bad.push(format!("{module}: impl From<..> for {target}"));
                     }
@@ -253,6 +245,7 @@ fn compile_fail_cases_still_assert_what_they_were_written_for() {
         ("worktree_cannot_be_used_after_scrub", "E0382"), // scrub() consumed it
         ("phase_cannot_be_implemented_downstream", "E0277"), // sealed supertrait
         ("sealed_does_not_display", "E0277"),            // no Display impl
+        ("materialise_at_refuses_a_results_tree_path", "E0308"), // not a ScratchPath
     ]
     .into_iter()
     .collect();
@@ -292,14 +285,16 @@ fn compile_fail_cases_still_assert_what_they_were_written_for() {
 
 /// Nothing new may execute inside the results tree.
 ///
-/// Four sites do today, all in the test phase: scoring builds in the canonical
-/// phase dir and writes `target/` into it, so measuring an artifact mutates it.
-/// Fixing that needs the `c/`+`rust/` layout split, which is deliberately not in
-/// this change — so this is a ratchet on the count, not a clean gate. The
-/// allowlist is the to-do list.
+/// A ratchet, not a gate. It matches two sites, and only `build_harvest_bench_lib`
+/// is really in `results/`; the other reaches scratch through `translated_rust()`.
+/// It is also blind to the builds that matter most, which are spawned with a
+/// `--root` or `--target-dir` argument rather than a `current_dir` (MIT `runtests`,
+/// the gtest suite). A `Cwd` newtype only scratch can construct is the real fix.
+/// The `c/`+`rust/` layout split this comment used to demand is not (see
+/// `artifact.rs`): `runtests` pins the build output inside the case either way.
 #[test]
 fn nothing_new_runs_inside_the_results_tree() {
-    const KNOWN: usize = 4;
+    const KNOWN: usize = 2;
 
     struct V {
         current_fn: String,
@@ -353,114 +348,186 @@ fn nothing_new_runs_inside_the_results_tree() {
 
 // ── A6 ─────────────────────────────────────────────────────────────────────
 
-/// Every function that composes a cache key must open by destructuring `Self`
-/// exhaustively, and must contain nothing that can ignore a binding.
+/// An agent's identity may never be spelled with `Debug`.
 ///
-/// That shape is what delegates the work to rustc: a field added to the struct is E0027
-/// at the pattern, and a field bound but never hashed is `unused_variables`, denied at
-/// package level. Each form rejected below quietly reopens the hole — `..` and
-/// `field: _` skip the field, an `_`-prefixed name suppresses the lint, `let _ = x` and
-/// `_ = x;` consume the binding without hashing it, and `#[allow]`/`#[expect]` switch
-/// the lint off. A key that ignores an input silently serves one invocation's artifact
-/// for another's — the failure the agent runtime env had while it lived in a shell
-/// driver the key could not see.
+/// `format!("{agent:?}").to_lowercase()` was at once the cache key component, the entry
+/// directory, the field `load` re-validates, and the `"agent"` of every result file — so
+/// renaming a variant silently renamed the identity of a run, and `Debug` is not a
+/// serialization contract. It has already happened: 208 files under `codex-gpt55/`
+/// record `"agent": "codex"`, which no `--agent` value has spelled since. `AgentKey`,
+/// derived from clap's `ValueEnum` name, is the one spelling.
+///
+/// Matched on tokens rather than raw text, so the word "agent" inside a message and a
+/// `{:?}` for something else in the same macro are not a false positive.
 #[test]
-fn the_key_functions_cannot_forget_a_field() {
-    const REQUIRED: &[(&str, &str)] =
-        &[("Recipe", "digest"), ("KeyInputs", "key"), ("KeyInputs", "meta")];
+fn an_agents_identity_is_never_its_debug_output() {
+    fn debugs_an_agent(tokens: proc_macro2::TokenStream) -> bool {
+        let mut names_agent = false;
+        let mut debug_placeholder = false;
+        for t in tokens {
+            match t {
+                proc_macro2::TokenTree::Ident(i) => names_agent |= i == "agent",
+                proc_macro2::TokenTree::Literal(l) => {
+                    let s = l.to_string();
+                    // The inline form needs no separate argument to be the giveaway.
+                    if s.contains("{agent:?}") {
+                        return true;
+                    }
+                    debug_placeholder |= s.contains("{:?}");
+                }
+                proc_macro2::TokenTree::Group(g) => {
+                    if debugs_an_agent(g.stream()) {
+                        return true;
+                    }
+                }
+                proc_macro2::TokenTree::Punct(_) => {}
+            }
+        }
+        names_agent && debug_placeholder
+    }
 
-    /// Rejects everything that makes a binding ignorable.
-    struct Escapes(Vec<String>);
-    impl<'ast> Visit<'ast> for Escapes {
-        fn visit_local(&mut self, l: &'ast syn::Local) {
-            if matches!(l.pat, syn::Pat::Wild(_)) {
-                self.0.push("`let _ = ...`".into());
+    struct V(Vec<String>);
+    impl<'ast> Visit<'ast> for V {
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            if debugs_an_agent(m.tokens.clone()) {
+                let name = m.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+                self.0.push(format!("{name}!"));
             }
-            syn::visit::visit_local(self, l);
+            syn::visit::visit_macro(self, m);
         }
-        fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
-            if matches!(*a.left, syn::Expr::Infer(_)) {
-                self.0.push("`_ = ...`".into());
-            }
-            syn::visit::visit_expr_assign(self, a);
-        }
-        fn visit_attribute(&mut self, a: &'ast syn::Attribute) {
-            for lint in ["allow", "expect"] {
-                if a.path().is_ident(lint) {
-                    self.0.push(format!("#[{lint}(..)]"));
+    }
+
+    let mut found: Vec<String> = Vec::new();
+    for path in rust_sources() {
+        let mut v = V(Vec::new());
+        v.visit_file(&parse(&path));
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        found.extend(v.0.into_iter().map(|m| format!("{file}: {m}")));
+    }
+    assert!(
+        found.is_empty(),
+        "an agent is being formatted with Debug: {found:#?}\n\
+         Use `cache::AgentKey` (and `Paths::agent_key`), which is clap's own name for the\n\
+         variant and is what the results tree and the store are already keyed by."
+    );
+}
+
+/// "Did this phase produce a crate?" has exactly one spelling: `battery::has_crate`.
+///
+/// It had two — `crate_dir`'s `is_dir()` and its callers' `verified/Cargo.toml` — and
+/// pcre2 satisfied one and not the other, so it left the harvest-bench denominator
+/// instead of counting as a failure. Nothing else would catch a third spelling.
+#[test]
+fn only_battery_defines_the_has_crate_predicate() {
+    struct V {
+        file: String,
+        hits: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
+            if matches!(c.method.to_string().as_str(), "exists" | "is_file") {
+                if let syn::Expr::MethodCall(inner) = &*c.receiver {
+                    let joins_manifest = inner.method == "join"
+                        && inner.args.iter().any(|a| matches!(a,
+                            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. })
+                                if s.value() == "Cargo.toml"));
+                    if joins_manifest {
+                        self.hits.push(format!("{}: .join(\"Cargo.toml\").{}()", self.file, c.method));
+                    }
                 }
             }
-            syn::visit::visit_attribute(self, a);
+            syn::visit::visit_expr_method_call(self, c);
         }
     }
 
-    /// The opening statement must bind every field of `Self` to a usable name.
-    fn opens_exhaustively(stmt: Option<&syn::Stmt>) -> Result<(), String> {
-        let Some(syn::Stmt::Local(local)) = stmt else {
-            return Err("does not open with a `let` destructuring".into());
-        };
-        let syn::Pat::Struct(pat) = &local.pat else {
-            return Err("opens with a `let` that does not destructure a struct".into());
-        };
-        if !pat.path.is_ident("Self") {
-            let spelled: Vec<String> =
-                pat.path.segments.iter().map(|s| s.ident.to_string()).collect();
-            return Err(format!("destructures `{}` rather than `Self`", spelled.join("::")));
+    let mut hits: Vec<String> = Vec::new();
+    for path in rust_sources() {
+        if file_name(&path) == "battery.rs" {
+            continue;
         }
-        if pat.rest.is_some() {
-            return Err("uses `..`, so a field added later is silently skipped".into());
-        }
-        for field in &pat.fields {
-            let name = match &field.member {
-                syn::Member::Named(i) => i.to_string(),
-                syn::Member::Unnamed(i) => i.index.to_string(),
-            };
-            match &*field.pat {
-                syn::Pat::Ident(id) if !id.ident.to_string().starts_with('_') => {}
-                _ => return Err(format!("field `{name}` is not bound to a name that must be used")),
-            }
-        }
-        Ok(())
+        let mut v = V { file: file_name(&path), hits: Vec::new() };
+        v.visit_file(&parse(&path));
+        hits.extend(v.hits);
     }
+    assert!(
+        hits.is_empty(),
+        "the phase predicate is spelled out again outside battery.rs: {hits:#?}\n\
+         Call `battery::has_crate(dir)`. Two spellings of \"this phase produced a crate\"\n\
+         is how a project vanished from a published denominator."
+    );
+    let battery = std::fs::read_to_string(src("battery.rs")).expect("battery.rs");
+    assert!(
+        battery.contains(r#"phase_dir.join("Cargo.toml").is_file()"#),
+        "battery::has_crate must still BE the predicate this rule redirects callers to"
+    );
+}
 
-    let path = src("cache.rs");
-    let mut seen: Vec<(&str, &str)> = Vec::new();
+/// The three key-deriving functions must keep their exhaustive patterns.
+///
+/// `Recipe::digest`, `KeyInputs::key` and `KeyInputs::meta` open with a full destructuring
+/// pattern precisely so adding a field fails to compile (E0027) rather than silently
+/// leaving the cache key unchanged, which would let two different invocations share an
+/// entry. Each escape below restores that silence: `..` and `field: _` skip a field,
+/// `let _ = x` and the bare `_ = x` consume a binding without hashing it (the latter is
+/// destructuring assignment, and compiles with no `let` at all), and
+/// `#[allow(unused_variables)]` disables the other half of the guarantee.
+#[test]
+fn the_key_deriving_functions_keep_their_exhaustive_patterns() {
+    const GUARDED: &[&str] = &["digest", "key", "meta"];
+    let text = std::fs::read_to_string(src("cache.rs")).expect("cache.rs");
+    let file = syn::parse_file(&text).expect("cache.rs parses");
     let mut bad: Vec<String> = Vec::new();
 
-    for item in parse(&path).items {
+    for item in file.items {
         let syn::Item::Impl(imp) = item else { continue };
-        let self_ty = impl_target(&imp.self_ty);
+        let owner = type_name(&imp.self_ty);
+        if owner != "Recipe" && owner != "KeyInputs" {
+            continue;
+        }
         for it in imp.items {
             let syn::ImplItem::Fn(f) = it else { continue };
             let name = f.sig.ident.to_string();
-            let Some(&which) = REQUIRED.iter().find(|(t, n)| *t == self_ty && *n == name) else {
+            if !GUARDED.contains(&name.as_str()) {
                 continue;
-            };
-            seen.push(which);
-            if let Err(why) = opens_exhaustively(f.block.stmts.first()) {
-                bad.push(format!("{self_ty}::{name} {why}"));
             }
-            let mut escapes = Escapes(Vec::new());
-            escapes.visit_impl_item_fn(&f);
-            for e in escapes.0 {
-                bad.push(format!("{self_ty}::{name} contains {e}"));
+            let mut note = |what: &str| bad.push(format!("{owner}::{name}: {what}"));
+            if f.attrs.iter().any(|a| {
+                let p = a.path().segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>().join("::");
+                let t = a.meta.require_list().map(|l| l.tokens.to_string()).unwrap_or_default();
+                p.contains("allow") && t.contains("unused_variables")
+            }) {
+                note("#[allow(unused_variables)]");
+            }
+            for st in &f.block.stmts {
+                match st {
+                    syn::Stmt::Local(l) => {
+                        if let syn::Pat::Struct(ps) = &l.pat {
+                            if ps.rest.is_some() {
+                                note("`..` in the destructuring pattern");
+                            }
+                            if ps.fields.iter().any(|fp| matches!(&*fp.pat, syn::Pat::Wild(_))) {
+                                note("a field bound to `_`");
+                            }
+                        }
+                        if matches!(&l.pat, syn::Pat::Wild(_)) {
+                            note("`let _ =` discards a binding");
+                        }
+                    }
+                    // bare `_ = x;` is destructuring assignment: no `let`, compiles clean
+                    syn::Stmt::Expr(syn::Expr::Assign(a), _) => {
+                        if matches!(&*a.left, syn::Expr::Infer(_)) {
+                            note("bare `_ =` discards a binding");
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     }
-
-    for want in REQUIRED {
-        assert!(
-            seen.contains(want),
-            "{}::{} is gone, so nothing checks its shape any more. If it was renamed,\n\
-             update REQUIRED here deliberately; if it was deleted, so was this rule.",
-            want.0,
-            want.1
-        );
-    }
     assert!(
         bad.is_empty(),
-        "a cache-key function can now ignore one of its inputs: {bad:#?}\n\
-         Feed every binding instead. The whole point of the exhaustive pattern is that\n\
-         rustc, not a reviewer, notices the field nobody hashed."
+        "a key-deriving function can now skip a field silently: {bad:#?}\n\
+         Keep the pattern exhaustive and feed every binding, so a new field is a compile\n\
+         error rather than two invocations quietly sharing a cache entry."
     );
 }
