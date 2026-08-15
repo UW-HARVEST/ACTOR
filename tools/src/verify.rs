@@ -56,9 +56,9 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
     let total = independent.len() + shared.len();
     println!("=== Verifying {battery_name} ({total} cases) ===");
 
-    let ind_results: Vec<(String, Option<bool>)> = std::thread::scope(|s| {
+    let ind_results: Vec<(String, Option<bool>, bool)> = std::thread::scope(|s| {
         let handles: Vec<_> = independent.iter().map(|c| {
-            s.spawn(|| {
+            let handle = s.spawn(|| {
                 let _permit = sem.acquire();
                 let case_dir = output_dir.join(&c.name);
                 if !crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
@@ -71,15 +71,27 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
                 let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths, &store)
                     .unwrap_or(false);
                 (c.name.clone(), Some(ok))
-            })
+            });
+            (c.name.clone(), handle)
         }).collect();
-        handles.into_iter().map(|h| h.join().expect("verify thread panicked")).collect()
+        // A panicking worker is that one case's failure, not the sweep's: the name is kept
+        // outside the thread so the remaining cases still report. The panic is collected
+        // rather than swallowed — see the bail below.
+        handles.into_iter().map(|(name, h)| match h.join() {
+            Ok((n, r)) => (n, r, false),
+            Err(_) => {
+                eprintln!("  ⚠️  {name}: verify thread panicked — counting as failed");
+                (name, Some(false), true)
+            }
+        }).collect()
     });
+    let panicked: Vec<&str> =
+        ind_results.iter().filter(|(_, _, p)| *p).map(|(n, _, _)| n.as_str()).collect();
 
     let mut verified = 0usize;
     let mut failed = 0usize;
     let mut current = 0usize;
-    for (name, result) in &ind_results {
+    for (name, result, _) in &ind_results {
         current += 1;
         match result {
             None => println!("[{current}/{total}] ⏭️  {name} (skipped)"),
@@ -121,6 +133,17 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
 
     println!();
     println!("Verified: {verified}, Failed: {failed} (of {total})");
+    // A worker panic is an infrastructure failure, not a measurement, and #67's rule is
+    // that scoring must refuse one. Reporting it only on stdout while exiting 0 would let
+    // a panic that hit every worker produce a plausible-looking verify rate that was never
+    // measured. The sweep still finishes first, so the surviving cases are not wasted.
+    anyhow::ensure!(
+        panicked.is_empty(),
+        "{} verify worker(s) panicked: {}. Their cases are recorded as failed, but a panic \
+         is not a measurement — re-run them before scoring.",
+        panicked.len(),
+        panicked.join(", ")
+    );
     Ok(())
 }
 
@@ -136,30 +159,44 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
     let total = projects.len();
     println!("=== Verifying harvest-bench ({total} projects) ===");
 
-    let results: Vec<(String, Option<bool>)> = std::thread::scope(|s| {
+    let results: Vec<(String, Option<bool>, bool)> = std::thread::scope(|s| {
         let handles: Vec<_> = projects.iter().map(|p| {
             let sem = sem.clone();
             let prompt = &prompt_template;
             let store = &store;
-            s.spawn(move || {
-                let _permit = sem.acquire();
-                let name = p.name().to_string();
-                let case_dir = paths.output_dir(&name);
-                if !crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
-                    return (name, None);
+            let name = p.name().to_string();
+            let handle = s.spawn({
+                let name = name.clone();
+                move || {
+                    let _permit = sem.acquire();
+                    let case_dir = paths.output_dir(&name);
+                    if !crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
+                        return (name, None);
+                    }
+                    if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
+                        return (name, None);
+                    }
+                    let ok = verify_case(&case_dir, prompt, "", "", paths, store).unwrap_or(false);
+                    (name, Some(ok))
                 }
-                if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
-                    return (name, None);
-                }
-                let ok = verify_case(&case_dir, prompt, "", "", paths, store).unwrap_or(false);
-                (name, Some(ok))
-            })
+            });
+            (name, handle)
         }).collect();
-        handles.into_iter().map(|h| h.join().expect("verify thread panicked")).collect()
+        // A panicking worker is that one project's failure, not the sweep's: the name is
+        // kept outside the thread so the remaining projects still report.
+        handles.into_iter().map(|(name, h)| match h.join() {
+            Ok((n, r)) => (n, r, false),
+            Err(_) => {
+                eprintln!("  ⚠️  {name}: verify thread panicked — counting as failed");
+                (name, Some(false), true)
+            }
+        }).collect()
     });
+    let panicked: Vec<&str> =
+        results.iter().filter(|(_, _, p)| *p).map(|(n, _, _)| n.as_str()).collect();
 
     let (mut verified, mut failed) = (0usize, 0usize);
-    for (i, (name, result)) in results.iter().enumerate() {
+    for (i, (name, result, _)) in results.iter().enumerate() {
         let n = i + 1;
         match result {
             None => println!("[{n}/{total}] ⏭️  {name} (skipped: no translated/ or already verified)"),
@@ -168,6 +205,13 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
         }
     }
     println!("\nHB verify: {verified}/{total} verified, {failed} failed");
+    // See run_with_semaphore: a panic is an infrastructure failure, not a result.
+    anyhow::ensure!(
+        panicked.is_empty(),
+        "{} verify worker(s) panicked: {}. Re-run them before scoring.",
+        panicked.len(),
+        panicked.join(", ")
+    );
     Ok(())
 }
 

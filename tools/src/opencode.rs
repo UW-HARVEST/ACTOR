@@ -214,6 +214,12 @@ fn project_config(tmp_root: &Path, m: &Model) -> String {
 }
 
 /// Avoids a map type, which would reorder keys (see [`project_config`]).
+///
+/// Infallible, hence no `Result`: serialising a `&str` can only fail through the
+/// serializer's writer, and the writer here is serde_json's in-memory `Vec<u8>`,
+/// whose writes never return an error. A `str` is UTF-8 by construction, so
+/// there is no encoding failure either. Returning a `Result` would give every
+/// caller a branch that cannot be taken.
 fn json_str(s: &str) -> String {
     serde_json::to_string(s).expect("string serializes to JSON")
 }

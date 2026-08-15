@@ -163,32 +163,15 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
 
     // Order matters: the LAST phase scored becomes the headline summary, so
     // verified/ must follow translated/. Each pass stages `translated_rust` at
-    // its phase dir so unmodified runtests scores that crate.
-    let mut phases: Vec<&str> = vec![crate::battery::TRANSLATED];
-    if has_verified { phases.push(crate::battery::VERIFIED); }
-
-    let mut headline: Option<(Summary, HashMap<String, serde_json::Value>)> = None;
-    for phase in &phases {
-        stage_phase_for_runtests(&output_dir, phase)?;
-        clean_targets(&output_dir)?;
-        let (summary, per_case) = run_runtests(paths, battery, mode)?;
-        unstage_phase(&output_dir)?;
-
-        let vt = summary.vectors_passed + summary.vectors_failed;
-        let pct = if vt > 0 {
-            format!("{:.1}%", 100.0 * summary.vectors_passed as f64 / vt as f64)
-        } else { "N/A".to_string() };
-        println!("  {battery} [{phase}]: {}/{} cases, {}/{vt} vectors ({pct})",
-            summary.cases_passed, summary.cases_tested, summary.vectors_passed);
-
-        if matches!(mode, TestMode::Update) {
-            write_results(&output_dir, phase, &summary, &per_case)?;
-        }
-        headline = Some((summary, per_case)); // last phase (verified if present) is headline
+    // its phase dir so unmodified runtests scores that crate. translated/ is
+    // scored unconditionally, which is what makes the headline unconditional.
+    let mut headline = score_phase(paths, battery, &output_dir, crate::battery::TRANSLATED, mode)?;
+    if has_verified {
+        headline = score_phase(paths, battery, &output_dir, crate::battery::VERIFIED, mode)?;
     }
     println!("========================================");
 
-    let (summary, per_case) = headline.expect("at least the translated phase is scored");
+    let (summary, per_case) = headline;
 
     match mode {
         TestMode::Update => {
@@ -236,6 +219,34 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
             Ok(TestOutcome::Ok)
         }
     }
+}
+
+/// Scores ONE phase's crate and, under `--update`, writes that phase's results.
+/// Returning the summary by value (rather than accumulating an `Option` across a
+/// phase loop) is what lets `run_battery` name its headline without unwrapping.
+fn score_phase(
+    paths: &Paths,
+    battery: &str,
+    output_dir: &Path,
+    phase: &str,
+    mode: TestMode,
+) -> Result<(Summary, HashMap<String, serde_json::Value>)> {
+    stage_phase_for_runtests(output_dir, phase)?;
+    clean_targets(output_dir)?;
+    let (summary, per_case) = run_runtests(paths, battery, mode)?;
+    unstage_phase(output_dir)?;
+
+    let vt = summary.vectors_passed + summary.vectors_failed;
+    let pct = if vt > 0 {
+        format!("{:.1}%", 100.0 * summary.vectors_passed as f64 / vt as f64)
+    } else { "N/A".to_string() };
+    println!("  {battery} [{phase}]: {}/{} cases, {}/{vt} vectors ({pct})",
+        summary.cases_passed, summary.cases_tested, summary.vectors_passed);
+
+    if matches!(mode, TestMode::Update) {
+        write_results(output_dir, phase, &summary, &per_case)?;
+    }
+    Ok((summary, per_case))
 }
 
 // ── runtests phase staging ─────────────────────────────────────────────
@@ -648,6 +659,16 @@ impl Enrichment {
         }
     }
 
+    /// `json` must be an object, or a null (which serde_json promotes to an empty
+    /// object): assigning through `json[key]` panics on any other value. Both
+    /// in-process callers build their object here from a struct or a `json!`
+    /// literal; the one caller that reads a `Value` off disk checks first, in
+    /// [`Self::enrich_file`].
+    ///
+    /// The `to_value` calls cannot fail: every field of `UnsafeCounts`,
+    /// `LocCounts` and `AgentRunMeta` is a derived-`Serialize` struct of integers,
+    /// floats, strings and `Option`/`Vec` thereof, so there is no map with
+    /// non-string keys and no hand-written `Serialize` to return an error.
     pub fn merge_into(&self, json: &mut serde_json::Value) {
         json["unsafe"] = serde_json::to_value(&self.unsafe_).unwrap();
         json["loc"] = serde_json::to_value(&self.loc).unwrap();
@@ -659,6 +680,15 @@ impl Enrichment {
     fn enrich_file(rj: &Path, src_dir: &Path, logs: &[(&str, &Path)]) -> Result<bool> {
         if !rj.exists() { return Ok(false); }
         let mut json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(rj)?)?;
+        // The only [`Self::merge_into`] caller whose value comes off disk, so the
+        // only one that can hand it a scalar or an array — which `json[key] = ..`
+        // panics on. A result.json that parses but is not an object is corrupt
+        // input for one case; report it with the path instead of panicking.
+        anyhow::ensure!(
+            matches!(json, serde_json::Value::Object(_) | serde_json::Value::Null),
+            "{}: result.json must hold a JSON object",
+            rj.display(),
+        );
         Self::compute(src_dir, logs).merge_into(&mut json);
         std::fs::write(rj, serde_json::to_string_pretty(&json)? + "\n")?;
         Ok(true)
