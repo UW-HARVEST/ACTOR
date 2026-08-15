@@ -46,7 +46,7 @@ fn main() -> Result<()> {
             parallel,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into());
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into())?;
             let inner = Dataset::strip_prefix(target);
             let bench = benchmark::for_dataset(dataset);
 
@@ -63,7 +63,7 @@ fn main() -> Result<()> {
             parallel,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into());
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into())?;
             let inner = Dataset::strip_prefix(target);
             benchmark::for_dataset(dataset)
                 .translate(&paths, inner, include_regex.as_deref(), parallel)?;
@@ -75,7 +75,7 @@ fn main() -> Result<()> {
             parallel,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into());
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into())?;
             let inner = Dataset::strip_prefix(target);
             benchmark::for_dataset(dataset)
                 .verify(&repo_root, &paths, inner, include_regex.as_deref(), force, parallel)?;
@@ -99,7 +99,7 @@ fn main() -> Result<()> {
             allow_infra_failures,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into());
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into())?;
             let inner = Dataset::strip_prefix(target);
             let mode = if update {
                 test::TestMode::Update
@@ -113,7 +113,7 @@ fn main() -> Result<()> {
         }
         Command::Enrich { ref target } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into());
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into())?;
             let inner = Dataset::strip_prefix(target);
             benchmark::for_dataset(dataset).enrich(&paths, inner)?;
         }

@@ -100,10 +100,13 @@ impl Semaphore {
     pub fn new(max: usize) -> Self {
         Self { state: Mutex::new(0), cvar: Condvar::new(), max }
     }
+    /// Poison is recovered, not propagated: a `usize` is never half-updated and the
+    /// panicking worker's guard still ran, so the count is sound — while propagating
+    /// would panic every sibling worker that next acquires.
     pub fn acquire(&self) -> SemaphoreGuard<'_> {
-        let mut count = self.state.lock().unwrap();
+        let mut count = self.state.lock().unwrap_or_else(|e| e.into_inner());
         while *count >= self.max {
-            count = self.cvar.wait(count).unwrap();
+            count = self.cvar.wait(count).unwrap_or_else(|e| e.into_inner());
         }
         *count += 1;
         SemaphoreGuard(self)
@@ -114,7 +117,8 @@ pub struct SemaphoreGuard<'a>(&'a Semaphore);
 
 impl Drop for SemaphoreGuard<'_> {
     fn drop(&mut self) {
-        *self.0.state.lock().unwrap() -= 1;
+        // Runs while unwinding, where a second panic aborts the process; see `acquire`.
+        *self.0.state.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
         self.0.cvar.notify_one();
     }
 }
@@ -127,6 +131,32 @@ struct CaseResult {
     success: bool,
     error: Option<String>,
     skipped: bool,
+}
+
+impl CaseResult {
+    /// A worker that unwound rather than returned: `run_and_record` already maps `Err` to
+    /// a failed case, so this is an outright panic, and it must fail only its own case
+    /// instead of escaping `thread::scope` and discarding every sibling's hours of work.
+    /// `case_dir` is taken so the panic is recorded on disk too. Every other failure
+    /// path writes `translation.json` via `run_and_record`; without this, a panicked case
+    /// is the only one that leaves no trace and so reads as never attempted.
+    fn panicked(name: String, case_dir: &Path, agent: Agent, payload: Box<dyn std::any::Any + Send>) -> Self {
+        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_owned()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "panic with a non-string payload".to_owned()
+        };
+        write_translation_metrics(case_dir, agent, 0, false);
+        CaseResult {
+            name,
+            elapsed_secs: 0,
+            success: false,
+            error: Some(format!("worker thread panicked: {msg}")),
+            skipped: false,
+        }
+    }
 }
 
 // ── Public entry point ─────────────────────────────────────────────────
@@ -182,13 +212,19 @@ pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, 
     // ── Parallel: independent cases ────────────────────────────────────
     let sem = Semaphore::new(parallel);
     let ind_results: Vec<CaseResult> = std::thread::scope(|s| {
-        let handles: Vec<_> = independent.iter().map(|c| {
-            s.spawn(|| {
+        let handles: Vec<(String, _)> = independent.iter().map(|c| {
+            // Paired with the handle so a panicked join still names its case.
+            (c.name.clone(), s.spawn(|| {
                 let _permit = sem.acquire();
                 translate_one_independent(paths, &output_dir, battery_name, c)
-            })
+            }))
         }).collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        handles.into_iter()
+            .map(|(name, h)| {
+                let case_dir = output_dir.join(&name);
+                h.join().unwrap_or_else(|e| CaseResult::panicked(name, &case_dir, paths.agent, e))
+            })
+            .collect()
     });
 
     let mut translated = 0usize;
@@ -470,15 +506,21 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
     let sem = Semaphore::new(parallel);
 
     let results: Vec<CaseResult> = std::thread::scope(|s| {
-        let handles: Vec<_> = projects.iter().map(|p| {
+        let handles: Vec<(String, _)> = projects.iter().map(|p| {
             let prompt = &prompt;
             let sem = &sem;
-            s.spawn(move || {
+            let name = p.name().to_owned(); // see run_test_corpus
+            (name, s.spawn(move || {
                 let _permit = sem.acquire();
                 translate_one_harvest_bench(paths, p, prompt)
-            })
+            }))
         }).collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        handles.into_iter()
+            .map(|(name, h)| {
+                let case_dir = paths.output_dir(&name);
+                h.join().unwrap_or_else(|e| CaseResult::panicked(name, &case_dir, paths.agent, e))
+            })
+            .collect()
     });
 
     let mut translated = 0usize;
@@ -616,7 +658,10 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
     let log_path = logs_dir.join("translation.log");
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
-    let (work_dir, _tmp_guard) = match paths.agent {
+    // The sandbox, settings path and OpenCode contract are all rooted at the temp dir, so
+    // it leaves the match directly: recovering it as `work_dir.parent()` turned a known
+    // root into an `Option` that three call sites below then had to guess at.
+    let (work_root, work_dir, _tmp_guard) = match paths.agent {
         Agent::Kiro | Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::OpenCode | Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot => {
             let tmp = crate::workdir::tempdir("harvest-translate-")
                 .context("creating isolated temp dir")?;
@@ -638,17 +683,14 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                 )?;
             }
 
-            (work, Some(tmp))
+            (tmp.path().to_path_buf(), work, Some(tmp))
         }
     };
 
     // OpenCode's appended filesystem-boundary contract names the temp dir, so the
     // final prompt is only known once the workspace exists.
     let prompt: &str = &match paths.agent {
-        Agent::OpenCode => {
-            let tmp_root = work_dir.parent().unwrap_or(&work_dir);
-            format!("{prompt}{}", crate::opencode::prompt_suffix(tmp_root))
-        }
+        Agent::OpenCode => format!("{prompt}{}", crate::opencode::prompt_suffix(&work_root)),
         _ => prompt.to_string(),
     };
 
@@ -674,11 +716,10 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
             record_agent_exit(status);
         }
         Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt => {
-            let work_root = work_dir.parent().unwrap();
             let settings_path = work_root.join(".claude/settings.json");
             // Agent scratch must land on disk inside the work root, not in the shared
             // /tmp tmpfs. See crate::workdir.
-            let agent_tmp = crate::workdir::agent_tmp(work_root)?;
+            let agent_tmp = crate::workdir::agent_tmp(&work_root)?;
             let script = format!(
                 "ulimit -f {} -d {}; set -o pipefail; timeout 10800 claude -p \"$1\" \
                  --strict-mcp-config --disable-slash-commands --settings \"$3\" \
@@ -734,7 +775,6 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
             )?;
         }
         Agent::OpenCode => {
-            let tmp_root = work_dir.parent().unwrap_or(&work_dir).to_path_buf();
             invoke_opencode_with_retry(
                 RetrySession {
                     prompt,
@@ -743,7 +783,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                     context_label: "translate",
                 },
                 crate::opencode::Phase::Translate,
-                &tmp_root,
+                &work_root,
                 &opencode_model(paths)?,
                 TRANSLATE_TIMEOUT_SECS,
             )?;
@@ -1111,6 +1151,12 @@ impl IsolatedWorkDir {
 
 // ── c2rust ─────────────────────────────────────────────────────────────
 
+/// c2rust names the crate after the dir it transpiled (`translated_rust*`); the harness
+/// expects `driver`. `static` so the literal pattern compiles once, not once per case.
+static C2RUST_CRATE_NAME_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"name = "translated_rust[^"]*""#).expect("literal pattern")
+});
+
 fn c2rust_translate(work_dir: &Path, log_path: &Path) -> Result<()> {
     let c_src = work_dir.join("c_src");
     let build_dir = c_src.join("build");
@@ -1153,8 +1199,7 @@ fn c2rust_translate(work_dir: &Path, log_path: &Path) -> Result<()> {
         let mut cargo = std::fs::read_to_string(&cargo_path)?;
         cargo = cargo.replace("name = \"main\"", "name = \"driver\"");
         cargo = cargo.replace("name = \"rust_out\"", "name = \"driver\"");
-        let re = regex::Regex::new(r#"name = "translated_rust[^"]*""#).unwrap();
-        cargo = re.replace_all(&cargo, r#"name = "driver""#).into_owned();
+        cargo = C2RUST_CRATE_NAME_RE.replace_all(&cargo, r#"name = "driver""#).into_owned();
         for entry in walkdir(work_dir)? {
             if entry.extension().is_some_and(|e| e == "rs") {
                 let content = std::fs::read_to_string(&entry)?;
@@ -1204,7 +1249,11 @@ fn kimi_translate_case(paths: &Paths, battery: &str, name: &str, is_lib_hint: bo
 }
 
 fn oneshot_translate_case(paths: &Paths, battery: &str, name: &str, is_lib_hint: bool) -> Result<()> {
-    let model = paths.model.as_deref().expect("--model required for oneshot");
+    // As in `opencode_model`: main rejects a missing --model, but this runs per case.
+    let model = paths.model.as_deref().context(
+        "--agent oneshot requires --model <provider>/<model-id> (should have been \
+         rejected at startup)",
+    )?;
     oneshot_llm_translate(paths, battery, name, is_lib_hint, Some(model), |sys, usr, log| {
         openrouter_converse(model, sys, usr, log)
     })
@@ -1316,7 +1365,9 @@ fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) ->
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    let response_file = log_path.parent().unwrap().join("translation.response.json");
+    // Sibling of the log, as `with_extension` above, and total where
+    // `parent().unwrap().join()` panics on a `log_path` with no directory component.
+    let response_file = log_path.with_file_name("translation.response.json");
     let _ = std::fs::write(&response_file, &stdout);
 
     let log_content = format!(
@@ -1376,7 +1427,7 @@ fn openrouter_converse(model: &str, system_prompt: &str, user_message: &str, log
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-    let response_file = log_path.parent().unwrap().join("translation.response.json");
+    let response_file = log_path.with_file_name("translation.response.json"); // see bedrock_converse
     let _ = std::fs::write(&response_file, &stdout);
 
     let log_content = format!(
@@ -1598,7 +1649,9 @@ fn bedrock_token(region: &str) -> Result<String> {
         if !t.trim().is_empty() { return Ok(t); }
     }
 
-    let mut guard = BEDROCK_TOKEN.lock().unwrap();
+    // Replaced only wholesale, so no panic can leave it half-written; propagating the
+    // poison would instead fail every remaining case while holding a valid token.
+    let mut guard = BEDROCK_TOKEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((tok, born)) = guard.as_ref() {
         if born.elapsed() < BEDROCK_TOKEN_REFRESH_AFTER {
             return Ok(tok.clone());
@@ -1744,15 +1797,20 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
     Ok(())
 }
 
+/// Whatever `crate-type` c2rust emitted, replaced wholesale. `static`: as
+/// [`C2RUST_CRATE_NAME_RE`].
+static CRATE_TYPE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"crate-type\s*=\s*\[[^\]]*\]"#).expect("literal pattern")
+});
+
 /// Reshape a c2rust crate so the C2SaferRust slicer can build it as a library.
 fn c2saferrust_preprocess(work_dir: &Path) -> Result<()> {
     // The slicer needs an rlib; c2rust emits cdylib for _lib cases.
     let cargo = work_dir.join("Cargo.toml");
     if cargo.exists() {
         let mut s = std::fs::read_to_string(&cargo)?;
-        let re = regex::Regex::new(r#"crate-type\s*=\s*\[[^\]]*\]"#).unwrap();
-        if re.is_match(&s) {
-            s = re.replace(&s, r#"crate-type = ["staticlib","rlib"]"#).into_owned();
+        if CRATE_TYPE_RE.is_match(&s) {
+            s = CRATE_TYPE_RE.replace(&s, r#"crate-type = ["staticlib","rlib"]"#).into_owned();
         }
         std::fs::write(&cargo, s)?;
     }
@@ -1819,14 +1877,20 @@ fn laertes_preprocess(work_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Collapses `libc::unix::linux_like::open` to `libc::open`: Laertes' 2020 nightly
+/// resolves internal module paths modern libc does not expose. `static`: applied per
+/// file, so recompiling it per call was the costliest of the three.
+static LIBC_INTERNAL_PATH_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"libc::(?:[a-z_0-9]+::)+([a-z_0-9]+)").expect("literal pattern")
+});
+
 /// Restore modern-toolchain compatibility after Laertes rewrites.
 fn laertes_postprocess(work_dir: &Path) -> Result<()> {
-    let libc_internal = regex::Regex::new(r"libc::(?:[a-z_0-9]+::)+([a-z_0-9]+)").unwrap();
     for path in walkdir(work_dir)? {
         if path.extension().is_none_or(|e| e != "rs") { continue; }
         let src = std::fs::read_to_string(&path)?;
         let mut out = src.replace("extern crate libc;\n", "");
-        out = libc_internal.replace_all(&out, "libc::$1").into_owned();
+        out = LIBC_INTERNAL_PATH_RE.replace_all(&out, "libc::$1").into_owned();
         if out != src { std::fs::write(&path, out)?; }
     }
 

@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 // ── Per-case phase directories: ONE source of truth ────────────────────
 //
@@ -266,11 +267,14 @@ fn extract_features(input_dir: &Path, case_name: &str) -> Result<Vec<String>> {
     extract_features_from_path(&input_dir.join(case_name).join("CMakePresets.json"))
 }
 
+static LIB_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"library:\s*"([^"]+)""#).expect("literal pattern"));
+
 pub fn extract_lib_name(input_dir: &Path, case_name: &str) -> Option<String> {
     let runner_main = input_dir.join(case_name).join("runner/src/main.rs");
     let content = std::fs::read_to_string(&runner_main).ok()?;
-    let re = Regex::new(r#"library:\s*"([^"]+)""#).ok()?;
-    re.captures(&content)
+    LIB_NAME_RE
+        .captures(&content)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
 }
@@ -397,12 +401,15 @@ pub fn extract_agent_meta(log_path: &Path) -> Option<AgentRunMeta> {
     extract_kiro_meta(log_path).or_else(|| extract_stream_json_meta(log_path))
 }
 
+static KIRO_CREDITS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"Credits:\s*([0-9.]+).*?Time:\s*(.+)").expect("literal pattern")
+});
+
 /// Tail-only: the `Credits:` line is last, and this runs once per case over
 /// logs that reach 10+ MB.
 fn extract_kiro_meta(log_path: &Path) -> Option<AgentRunMeta> {
     let data = crate::agent_health::read_tail(log_path).ok()?;
-    let re = Regex::new(r"Credits:\s*([0-9.]+).*?Time:\s*(.+)").ok()?;
-    let caps = re.captures_iter(&data).last()?;
+    let caps = KIRO_CREDITS_RE.captures_iter(&data).last()?;
     let credits = Credits(caps[1].parse().ok()?);
     let wall_secs = parse_duration(&caps[2]);
     Some(AgentRunMeta { credits, wall_secs, ..Default::default() })
@@ -644,18 +651,18 @@ impl Paths {
         dataset: Dataset,
         model: Option<&str>,
         cache_mode: crate::cache::Mode,
-    ) -> Self {
+    ) -> Result<Self> {
         // Derived from --model (like Agent::Oneshot) so each evaluated model gets
         // its own dir. Owned because the match below borrows from it.
-        let opencode_slug = matches!(agent, Agent::OpenCode)
-            .then(|| {
-                let m = crate::opencode::parse_model(
-                    model.expect("--model required for --agent opencode (checked in main)"),
-                )
-                .expect("--model already validated in main");
-                crate::opencode::results_slug(&m)
-            })
-            .unwrap_or_default();
+        let opencode_slug = match agent {
+            Agent::OpenCode => {
+                let raw = model.context(
+                    "--agent opencode needs --model <provider>/<model-id>: it names the results dir",
+                )?;
+                crate::opencode::results_slug(&crate::opencode::parse_model(raw)?)
+            }
+            _ => String::new(),
+        };
         let agent_name: &str = match agent {
             Agent::Kiro => "kiro",
             Agent::Claude => "claude",
@@ -674,8 +681,10 @@ impl Paths {
             Agent::SmartC2Rust => "smartc2rust",
             Agent::Kimi => "kimi",
             Agent::Oneshot => model
-                .and_then(|m| m.rsplit('/').next())
-                .expect("--model required for --agent oneshot"),
+                .map(|m| m.rsplit_once('/').map_or(m, |(_, last)| last))
+                .context(
+                    "--agent oneshot needs --model <provider>/<model-id>: it names the results dir",
+                )?,
         };
         let (corpus_dir, results_dir) = match dataset {
             Dataset::TestCorpus => (
@@ -698,7 +707,7 @@ impl Paths {
                 Dataset::TestCorpus | Dataset::HarvestBench => repo_root.join("prompts/kiro/test-corpus"),
             },
         };
-        Self {
+        Ok(Self {
             repo_root: repo_root.to_path_buf(),
             corpus_dir,
             results_dir,
@@ -706,7 +715,7 @@ impl Paths {
             prompts_dir,
             agent,
             model: model.map(String::from),
-        }
+        })
     }
 
     pub fn input_dir(&self, battery: &str) -> PathBuf {

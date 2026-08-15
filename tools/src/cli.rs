@@ -244,6 +244,17 @@ impl Cli {
     /// a binary you did not build yourself, and it is the ecosystem's normal answer
     /// to "which code is this?" — the refusal in `crate::provenance` is the stricter,
     /// repo-specific half.
+    ///
+    /// The `expect` cannot fire, so this returns `Self` rather than a `Result`.
+    /// `get_matches()` has already diagnosed and exited on every user-input error
+    /// (unknown flag, bad value, and — because the non-`Option` `command` field
+    /// makes the derive set `subcommand_required`/`arg_required_else_help` — a
+    /// missing subcommand). What reaches `from_arg_matches` is therefore the
+    /// derive's own `Command` matched against itself, with only `.version(..)`
+    /// added, which does not touch the arg structure. It is that pairing the
+    /// message records: a future `Self::command()` that dropped an arg or relaxed
+    /// `subcommand_required` would be the bug, and it belongs at the top of a
+    /// backtrace here rather than behind an error type `main` could not act on.
     pub fn parse_args() -> Self {
         use clap::{CommandFactory, FromArgMatches};
         let matches = Self::command()
