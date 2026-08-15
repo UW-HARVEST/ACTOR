@@ -10,7 +10,25 @@ cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" || exit 1
 
 # Toolchain: cmake 3.28 (HB needs >=3.24), python 3.12 (runtests match syntax),
 # cargo, claude. Order matters — these must precede system paths.
-export PATH="/tmp/cmake-3.28.6-linux-x86_64/bin:$HOME/.local/share/mise/installs/python/3.12.13/bin:$HOME/.cargo/bin:$HOME/.nix-profile/bin:$HOME/.local/bin:$PATH"
+#
+# cmake lives under $HOME, not /tmp: the 2026-08-15 restart found
+# /tmp/cmake-3.28.6-linux-x86_64 gone (tmpfs is cleared on reboot) while the system
+# cmake is 3.22.2. Nothing checked, so a twelve-hour sweep would have built no gtest
+# suite and scored every project zero.
+export PATH="$HOME/.local/opt/cmake-3.28.6-linux-x86_64/bin:$HOME/.local/share/mise/installs/python/3.12.13/bin:$HOME/.cargo/bin:$HOME/.nix-profile/bin:$HOME/.local/bin:$PATH"
+
+# Refuse before the money, not after: a too-old cmake or a missing runner is an infra
+# failure that scores as a legitimate zero.
+require_version() {  # name  minimum  actual
+  printf '%s\n%s\n' "$2" "$3" | sort -V -C || {
+    echo "::error::$1 $3 is older than the required $2" >&2
+    exit 1
+  }
+}
+command -v cmake >/dev/null || { echo "cmake not on PATH" >&2; exit 1; }
+require_version cmake 3.24 "$(cmake --version | head -1 | grep -oE '[0-9]+(\.[0-9]+)+')"
+require_version python 3.10 "$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+command -v claude >/dev/null || { echo "claude not on PATH" >&2; exit 1; }
 
 # The agent-runtime settings are deliberately NOT exported here: translate::AGENT_ENV
 # applies them, and the cache key can only hash them from there. See its doc comment.
