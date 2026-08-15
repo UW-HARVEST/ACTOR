@@ -42,7 +42,7 @@ THE GATES (all must pass; run from ${WT}/tools unless noted):
   cargo clippy --locked --all-targets
   cargo clippy --locked --lib --bins -- -D clippy::panic
   cargo doc   --locked --no-deps
-  python3 tools/comment_budget.py --max 13     (from ${WT})
+  python3 tools/comment_budget.py --max 14     (from ${WT}; must match type-safety.yaml)
   python3 tools/check_paths.py                 (from ${WT})
 
 COMMENT BUDGET TRAP: comment_budget.py reads git ls-files, so it does NOT see untracked
