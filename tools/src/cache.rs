@@ -13,12 +13,14 @@
 //! decided in the test phase, and the test phase is not cached.
 
 use crate::artifact::{Phase, Sealed, TreeDigest};
+use crate::cli::Agent;
+use crate::session::Session;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Bump to invalidate every entry, e.g. if the key composition changes.
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 macro_rules! digest_newtype {
     ($(#[$m:meta])* $name:ident) => {
@@ -67,7 +69,7 @@ impl ModelId {
     pub fn new(s: impl Into<String>) -> Result<Self> {
         let s = s.into();
         anyhow::ensure!(!s.trim().is_empty(), "model id must not be empty");
-        // It reaches a `bash -lc` command line single-quoted (`[1m]` is a bracket
+        // It reaches a `bash -c` command line double-quoted (`[1m]` is a bracket
         // glob), so refuse anything that could break out of those quotes.
         anyhow::ensure!(
             !s.contains('\'') && !s.contains('`') && !s.contains('$') && !s.contains('\n'),
@@ -77,6 +79,128 @@ impl ModelId {
     }
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Which agent produced an artifact, as the results tree, the cache and the recorded
+/// provenance all spell it.
+///
+/// Never `format!("{agent:?}")`: `Debug` is not a serialization contract, and the
+/// failure has already happened — 208 files under `results/*/codex-gpt55/` record
+/// `"agent": "codex"`, a variant that no longer exists, and 418 record
+/// `"agent": "oneshot"` for two different models. clap's `ValueEnum` name is the one
+/// spelling that cannot drift from what `--agent` accepts.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AgentKey(String);
+
+impl AgentKey {
+    /// `model` is required for the variants where one agent covers many models, since
+    /// there the model is part of the identity rather than a parameter of it.
+    pub fn new(agent: Agent, model: Option<&str>) -> Result<Self> {
+        let name = match agent {
+            Agent::OpenCode => {
+                let raw = model.context(
+                    "--agent opencode needs --model <provider>/<model-id>: it names the results dir",
+                )?;
+                crate::opencode::results_slug(&crate::opencode::parse_model(raw)?)
+            }
+            Agent::Oneshot => model
+                .map(|m| m.rsplit_once('/').map_or(m, |(_, last)| last).to_string())
+                .context(
+                    "--agent oneshot needs --model <provider>/<model-id>: it names the results dir",
+                )?,
+            // Listed rather than `_`, so a new backend has to decide whether its model
+            // is part of its identity instead of defaulting to "no".
+            Agent::Kiro
+            | Agent::Claude
+            | Agent::ClaudeCombined
+            | Agent::ClaudeMinimal
+            | Agent::ClaudeNoIter
+            | Agent::ClaudeNoFeatures
+            | Agent::ClaudeNoSubtask
+            | Agent::ClaudeCrossPrompt
+            | Agent::CodexGpt55
+            | Agent::CodexGpt54
+            | Agent::C2rust
+            | Agent::Laertes
+            | Agent::C2SaferRust
+            | Agent::SmartC2Rust
+            | Agent::Kimi => crate::cli::cli_name(agent)?,
+        };
+        // It names a directory under `results/` and under the store, and for the two
+        // model-derived variants it comes from `--model`.
+        anyhow::ensure!(
+            !name.is_empty()
+                && name != "."
+                && name != ".."
+                && !name.contains('/')
+                && !name.starts_with('-'),
+            "agent key must be a single path component, got {name:?}"
+        );
+        Ok(Self(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The agent CLI build that will run, from `<program> --version`.
+///
+/// Keyed because the CLIs auto-update through a shim: two claude builds (2.1.231.653
+/// and 2.1.232.657) are installed under `~/.toolbox/tools/claude-code/` on this
+/// machine, so without this one entry spans two binaries. It cannot be read from the
+/// transcript, which reports it only after the money is spent.
+///
+/// Probed per case rather than memoised, so an upgrade part-way through a sweep is
+/// caught before the next case is attributed to the old build.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CliVersion(String);
+
+/// States the build when the CLI is not installed — replaying a stored cache without
+/// one. The build must still be NAMED, so the key stays as specific as before, and
+/// [`crate::translate::assert_pins_honoured`] still checks it against what the
+/// transcript reports.
+pub const ENV_CLI_VERSION: &str = "HARVEST_CLI_VERSION";
+
+impl CliVersion {
+    pub fn probe(program: &str) -> Result<Self> {
+        Self::resolve(program, std::env::var(ENV_CLI_VERSION).ok())
+    }
+
+    /// The override is a parameter, not a read: mutating process env in a test races
+    /// across test threads (see `crate::workdir::resolve_from`).
+    fn resolve(program: &str, stated: Option<String>) -> Result<Self> {
+        if let Some(v) = stated {
+            let v = v.trim();
+            anyhow::ensure!(!v.is_empty(), "{ENV_CLI_VERSION} is set but names no build");
+            return Ok(Self(v.to_string()));
+        }
+        let out = std::process::Command::new(program)
+            .arg("--version")
+            .output()
+            .with_context(|| format!("running `{program} --version`"))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text.lines().next().unwrap_or_default().trim();
+        anyhow::ensure!(
+            out.status.success() && !line.is_empty(),
+            "`{program} --version` reported no build ({}), so the cache key cannot name \
+             the one that would run and this run would be indistinguishable from a run \
+             made by another. Install {program}, or set {ENV_CLI_VERSION} to replay a \
+             stored cache without it.",
+            out.status
+        );
+        Ok(Self(line.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether the version the CLI reported in its own transcript is the one probed.
+    /// A containment test because `--version` prints the number plus a product name.
+    pub fn covers(&self, reported: &str) -> bool {
+        self.0.contains(reported)
     }
 }
 
@@ -148,63 +272,39 @@ pub fn prompt_digest(prompt: &str, work_root: &Path, repo_root: &Path) -> Prompt
     PromptDigest(format!("sha256:{:x}", h.finalize()))
 }
 
-/// How the agent is invoked. An explicit struct rather than the raw argv, because argv
-/// contains the scratch path — a nonce — and hashing it would make every key unique.
-pub struct Recipe {
-    pub max_turns: u32,
-    pub permission_mode: &'static str,
-    pub timeout_secs: u64,
-    pub ulimit_fsize_blocks: u64,
-    pub ulimit_data_kb: u64,
-    pub agents_json: &'static str,
-    /// Shape of the sandbox policy with paths tokenised.
-    pub sandbox_shape: String,
-    /// Agent-runtime environment (retries, request timeouts). Keyed because retry
-    /// policy changes how a throttled session ends. See [`crate::translate::AGENT_ENV`].
-    pub agent_env: &'static [(&'static str, &'static str)],
+/// How the agent was invoked, per backend.
+///
+/// Borrows the [`Session`] that renders the actual command instead of restating its
+/// values, so raising a cap or the turn limit changes the key rather than silently
+/// reusing output produced under the old limits — and so the recipe cannot describe a
+/// run that did not happen, which it did for every backend but claude.
+///
+/// Not the raw argv, which contains the scratch path — a nonce that would make every
+/// key unique.
+pub struct Recipe<'a> {
+    session: &'a Session,
+    /// The sandbox policy actually applied, paths tokenised. `None` where the backend
+    /// applies none: kiro-cli runs `--trust-all-tools` with no policy file at all.
+    policy_shape: Option<String>,
 }
 
-impl Recipe {
-    /// Reads the same constants the invocation uses rather than restating them, so
-    /// raising a resource cap or the turn limit changes the key instead of silently
-    /// reusing output produced under the old limits.
-    pub fn for_verify(paths: &crate::battery::Paths, work_root: &Path) -> Result<Self> {
-        Ok(Self {
-            max_turns: 1000,
-            permission_mode: "bypassPermissions",
-            timeout_secs: crate::verify::VERIFY_TIMEOUT_SECS,
-            ulimit_fsize_blocks: crate::workdir::AGENT_FSIZE_BLOCKS,
-            ulimit_data_kb: crate::workdir::AGENT_DATA_KB,
-            agents_json: crate::translate::CLAUDE_PLAIN_AGENT_JSON,
-            agent_env: crate::translate::AGENT_ENV,
-            // The real policy, tokenised: a hand-written summary would drift, and the
-            // literal directory names are machine-specific and must not enter the key.
-            // Propagated, not defaulted: "could not be computed" must not hash the same as
-            // "there is no policy", which would share an entry with an unsandboxed run.
-            sandbox_shape: normalise(
-                &crate::sandbox::settings_json(&paths.repo_root, work_root)?.to_string(),
-                work_root,
-                &paths.repo_root,
-            ),
-        })
+impl<'a> Recipe<'a> {
+    pub fn new(session: &'a Session, policy_shape: Option<String>) -> Result<Self> {
+        session.assert_declares()?;
+        Ok(Self { session, policy_shape })
     }
 
     pub fn digest(&self) -> RecipeDigest {
         let mut h = Sha256::new();
-        feed(&mut h, b"recipe-v1");
-        feed(&mut h, &self.max_turns.to_le_bytes());
-        feed(&mut h, self.permission_mode.as_bytes());
-        feed(&mut h, &self.timeout_secs.to_le_bytes());
-        feed(&mut h, &self.ulimit_fsize_blocks.to_le_bytes());
-        feed(&mut h, &self.ulimit_data_kb.to_le_bytes());
-        feed(&mut h, self.agents_json.as_bytes());
-        feed(&mut h, self.sandbox_shape.as_bytes());
-        // Sorted, so a reordering of the constant is not a different recipe.
-        let mut env: Vec<_> = self.agent_env.to_vec();
-        env.sort_unstable();
-        for (k, v) in env {
-            feed(&mut h, k.as_bytes());
-            feed(&mut h, v.as_bytes());
+        feed(&mut h, b"recipe-v2");
+        feed(&mut h, self.session.shape().as_bytes());
+        // Tagged, so "no policy" cannot hash the same as an empty one.
+        match &self.policy_shape {
+            Some(p) => {
+                feed(&mut h, b"policy");
+                feed(&mut h, p.as_bytes());
+            }
+            None => feed(&mut h, b"no-policy"),
         }
         RecipeDigest(format!("sha256:{:x}", h.finalize()))
     }
@@ -215,8 +315,12 @@ impl Recipe {
 /// an entry, which is silent corruption rather than a visible failure.
 pub struct KeyInputs<'a> {
     pub phase: &'static str,
-    pub agent: &'a str,
+    pub agent: &'a AgentKey,
+    /// The model the backend named in this run will actually be asked for — resolved
+    /// per backend, because a key naming claude's model for an opencode run makes two
+    /// sweeps at different `--model` values share an entry.
     pub model: &'a ModelId,
+    pub cli: &'a CliVersion,
     pub toolchain: &'a ToolchainId,
     pub prompt: &'a PromptDigest,
     pub recipe: &'a RecipeDigest,
@@ -230,8 +334,9 @@ impl KeyInputs<'_> {
         feed(&mut h, &SCHEMA.to_le_bytes());
         for part in [
             self.phase,
-            self.agent,
+            self.agent.as_str(),
             self.model.as_str(),
+            self.cli.as_str(),
             self.toolchain.as_str(),
             self.prompt.as_str(),
             self.recipe.as_str(),
@@ -247,8 +352,9 @@ impl KeyInputs<'_> {
             "schema": SCHEMA,
             "key": key.as_str(),
             "phase": self.phase,
-            "agent": self.agent,
+            "agent": self.agent.as_str(),
             "model": self.model.as_str(),
+            "cli": self.cli.as_str(),
             "toolchain": self.toolchain.as_str(),
             "prompt": self.prompt.as_str(),
             "recipe": self.recipe.as_str(),
@@ -337,7 +443,7 @@ impl Store {
         self.root
             .join(SCHEMA.to_string())
             .join(inputs.phase)
-            .join(inputs.agent)
+            .join(inputs.agent.as_str())
             .join(key.as_str())
     }
 
@@ -433,7 +539,7 @@ impl Store {
             serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json"))?)
                 .context("parsing meta.json")?;
         let want = inputs.meta(key);
-        for k in ["schema", "phase", "agent", "model", "toolchain", "prompt", "recipe", "input_tree"] {
+        for k in ["schema", "phase", "agent", "model", "cli", "toolchain", "prompt", "recipe", "input_tree"] {
             anyhow::ensure!(
                 meta.get(k) == want.get(k),
                 "meta.json disagrees on {k}: stored {:?}, computed {:?}",
@@ -595,32 +701,149 @@ impl Store {
 mod tests {
     use super::*;
 
-    fn inputs<'a>(
-        m: &'a ModelId,
-        t: &'a ToolchainId,
-        p: &'a PromptDigest,
-        r: &'a RecipeDigest,
-        i: &'a TreeDigest,
-    ) -> KeyInputs<'a> {
-        KeyInputs { phase: "verify", agent: "claude", model: m, toolchain: t, prompt: p, recipe: r, input_tree: i }
+    fn recipe(session: &Session, policy: Option<&str>) -> RecipeDigest {
+        Recipe::new(session, policy.map(str::to_string)).unwrap().digest()
     }
 
-    fn fixtures() -> (ModelId, ToolchainId, RecipeDigest) {
-        (
-            ModelId::new("claude-opus-5[1m]").unwrap(),
-            ToolchainId("1.94.0 x86_64-unknown-linux-gnu".into()),
-            Recipe {
-                max_turns: 1000,
-                permission_mode: "bypassPermissions",
-                timeout_secs: 10_800,
-                ulimit_fsize_blocks: 4 * 1024 * 1024,
-                ulimit_data_kb: 6 * 1024 * 1024,
-                agents_json: "{}",
-                sandbox_shape: "deny=$REPO,$WORKBASE allow=$WORK".into(),
-                agent_env: &[("CLAUDE_CODE_MAX_RETRIES", "20")],
+    /// Owns every key component, so a test can vary exactly one and borrow a
+    /// [`KeyInputs`] from the result.
+    struct Inputs {
+        phase: &'static str,
+        agent: AgentKey,
+        model: ModelId,
+        cli: CliVersion,
+        toolchain: ToolchainId,
+        prompt: PromptDigest,
+        recipe: RecipeDigest,
+        tree: TreeDigest,
+    }
+
+    impl Inputs {
+        fn new() -> Self {
+            Self {
+                phase: crate::battery::VERIFIED,
+                agent: AgentKey::new(Agent::Claude, None).unwrap(),
+                model: ModelId::new("claude-opus-5[1m]").unwrap(),
+                cli: CliVersion("2.1.231.653 (Claude Code)".into()),
+                toolchain: ToolchainId("1.94.0 x86_64-unknown-linux-gnu".into()),
+                prompt: PromptDigest("sha256:p".into()),
+                recipe: recipe(&Session::claude(10_800), Some("deny=$REPO allow=$WORK")),
+                tree: TreeDigest::for_test("sha256:in"),
             }
-            .digest(),
-        )
+        }
+
+        fn key_inputs(&self) -> KeyInputs<'_> {
+            KeyInputs {
+                phase: self.phase,
+                agent: &self.agent,
+                model: &self.model,
+                cli: &self.cli,
+                toolchain: &self.toolchain,
+                prompt: &self.prompt,
+                recipe: &self.recipe,
+                input_tree: &self.tree,
+            }
+        }
+
+        fn key(&self) -> CacheKey {
+            self.key_inputs().key()
+        }
+    }
+
+    #[test]
+    fn the_agent_key_is_the_cli_spelling_not_the_debug_spelling() {
+        // `format!("{agent:?}").to_lowercase()` produced "claudenosubtask" and
+        // "codexgpt55" — and, for the renamed variant, "codex", which no `--agent`
+        // value has spelled since. These are also the published results dir names.
+        for (agent, want) in [
+            (Agent::Kiro, "kiro"),
+            (Agent::Claude, "claude"),
+            (Agent::ClaudeCombined, "claude-combined"),
+            (Agent::ClaudeMinimal, "claude-minimal"),
+            (Agent::ClaudeNoIter, "claude-no-iter"),
+            (Agent::ClaudeNoFeatures, "claude-no-features"),
+            (Agent::ClaudeNoSubtask, "claude-no-subtask"),
+            (Agent::ClaudeCrossPrompt, "claude-cross-prompt"),
+            (Agent::CodexGpt55, "codex-gpt55"),
+            (Agent::CodexGpt54, "codex-gpt54"),
+            (Agent::C2rust, "c2rust"),
+            (Agent::Laertes, "laertes"),
+            (Agent::C2SaferRust, "c2saferrust"),
+            (Agent::SmartC2Rust, "smartc2rust"),
+            (Agent::Kimi, "kimi"),
+        ] {
+            assert_eq!(AgentKey::new(agent, None).unwrap().as_str(), want);
+        }
+    }
+
+    #[test]
+    fn the_agent_key_distinguishes_models_where_one_variant_covers_many() {
+        // 418 files record `"agent": "oneshot"` for two different models, and every
+        // opencode run would record plain "opencode".
+        let gpt = AgentKey::new(Agent::Oneshot, Some("openai/gpt-5.4")).unwrap();
+        let gemini = AgentKey::new(Agent::Oneshot, Some("google/gemini-3.1-pro-preview")).unwrap();
+        assert_eq!(gpt.as_str(), "gpt-5.4");
+        assert_eq!(gemini.as_str(), "gemini-3.1-pro-preview");
+        assert_ne!(gpt, gemini);
+
+        let oc = AgentKey::new(Agent::OpenCode, Some("amazon-bedrock/us.anthropic.claude-sonnet-5"));
+        assert_eq!(oc.unwrap().as_str(), "opencode-claude-sonnet-5");
+    }
+
+    #[test]
+    fn the_agent_key_refuses_a_model_that_would_name_another_directory() {
+        // It is a directory component under `results/` and under the store, and for
+        // these two variants it comes straight from `--model`.
+        assert!(AgentKey::new(Agent::Oneshot, Some("openai/..")).is_err());
+        assert!(AgentKey::new(Agent::Oneshot, Some("openai/")).is_err());
+        assert!(AgentKey::new(Agent::Oneshot, None).is_err());
+        assert!(AgentKey::new(Agent::OpenCode, None).is_err());
+    }
+
+    /// A stand-in for an agent CLI, so the probe is exercised without running one.
+    fn fake_cli(dir: &Path, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_cli_version_must_be_observed_rather_than_assumed() {
+        let d = tempfile::tempdir().unwrap();
+        let ok = fake_cli(d.path(), "ok", "echo '2.1.232.657 (Claude Code)'; echo 'trailing note'");
+        assert_eq!(
+            CliVersion::probe(&ok).unwrap().as_str(),
+            "2.1.232.657 (Claude Code)",
+            "the first line only, so a changelog banner is not the version"
+        );
+
+        assert!(CliVersion::probe("harvest-no-such-program").is_err(), "a missing CLI must refuse");
+        let broken = fake_cli(d.path(), "broken", "echo 1.0; exit 3");
+        assert!(CliVersion::probe(&broken).is_err(), "a failing probe must refuse");
+        let mute = fake_cli(d.path(), "mute", "exit 0");
+        assert!(CliVersion::probe(&mute).is_err(), "an unreportable version must refuse");
+    }
+
+    #[test]
+    fn a_stated_cli_version_replaces_the_probe_but_not_the_naming() {
+        // For replaying a stored cache without the CLI installed. It must still name one
+        // build, so a hit is as specific as it was when the entry was written.
+        let stated = CliVersion::resolve("harvest-no-such-program", Some(" 2.1.231.653 ".into()))
+            .expect("a stated build needs no CLI");
+        assert_eq!(stated.as_str(), "2.1.231.653");
+        assert!(
+            CliVersion::resolve("harvest-no-such-program", Some("  ".into())).is_err(),
+            "a blank statement is not a build name"
+        );
+    }
+
+    #[test]
+    fn a_cli_version_covers_the_build_the_transcript_reports() {
+        let probed = CliVersion("2.1.232.657 (Claude Code)".into());
+        assert!(probed.covers("2.1.232.657"));
+        assert!(!probed.covers("2.1.231.653"), "the other build on this machine");
     }
 
     #[test]
@@ -676,51 +899,93 @@ mod tests {
 
     #[test]
     fn key_changes_with_every_component() {
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:i");
-        let base = inputs(&m, &t, &p, &r, &i).key();
+        let base = Inputs::new().key();
 
-        let m2 = ModelId::new("claude-sonnet-5").unwrap();
-        assert_ne!(base, inputs(&m2, &t, &p, &r, &i).key(), "model must matter");
+        let mut v = Inputs::new();
+        v.model = ModelId::new("claude-sonnet-5").unwrap();
+        assert_ne!(base, v.key(), "model must matter");
 
-        let t2 = ToolchainId("1.97.1 x86_64-unknown-linux-gnu".into());
-        assert_ne!(base, inputs(&m, &t2, &p, &r, &i).key(), "toolchain must matter");
+        let mut v = Inputs::new();
+        v.agent = AgentKey::new(Agent::Kiro, None).unwrap();
+        assert_ne!(base, v.key(), "agent must matter");
 
-        let p2 = PromptDigest("sha256:p2".into());
-        assert_ne!(base, inputs(&m, &t, &p2, &r, &i).key(), "prompt must matter");
+        let mut v = Inputs::new();
+        v.cli = CliVersion("2.1.232.657 (Claude Code)".into());
+        assert_ne!(base, v.key(), "the CLI build must matter");
 
-        let i2 = TreeDigest::for_test("sha256:i2");
-        assert_ne!(base, inputs(&m, &t, &p, &r, &i2).key(), "input tree must matter");
+        let mut v = Inputs::new();
+        v.toolchain = ToolchainId("1.97.1 x86_64-unknown-linux-gnu".into());
+        assert_ne!(base, v.key(), "toolchain must matter");
 
-        let mut ki = inputs(&m, &t, &p, &r, &i);
-        ki.phase = "translate";
-        assert_ne!(base, ki.key(), "phase must matter");
+        let mut v = Inputs::new();
+        v.prompt = PromptDigest("sha256:p2".into());
+        assert_ne!(base, v.key(), "prompt must matter");
+
+        let mut v = Inputs::new();
+        v.recipe = recipe(&Session::kiro(2_700), None);
+        assert_ne!(base, v.key(), "recipe must matter");
+
+        let mut v = Inputs::new();
+        v.tree = TreeDigest::for_test("sha256:i2");
+        assert_ne!(base, v.key(), "input tree must matter");
+
+        let mut v = Inputs::new();
+        v.phase = "translate";
+        assert_ne!(base, v.key(), "phase must matter");
     }
 
     #[test]
     fn key_is_stable_for_identical_inputs() {
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:i");
-        assert_eq!(inputs(&m, &t, &p, &r, &i).key(), inputs(&m, &t, &p, &r, &i).key());
+        assert_eq!(Inputs::new().key(), Inputs::new().key());
+    }
+
+    #[test]
+    fn two_opencode_sweeps_at_different_models_do_not_share_an_entry() {
+        // THE defect: the key took claude's model for every backend, so two opencode
+        // sweeps computed an identical key and the second published the first's
+        // artifact, stamped `replayed: true`, with every log and check agreeing.
+        let mut sonnet = Inputs::new();
+        sonnet.agent = AgentKey::new(Agent::OpenCode, Some("amazon-bedrock/us.anthropic.claude-sonnet-5")).unwrap();
+        sonnet.model = ModelId::new("amazon-bedrock/us.anthropic.claude-sonnet-5").unwrap();
+
+        let mut gpt = Inputs::new();
+        gpt.agent = AgentKey::new(Agent::OpenCode, Some("amazon-bedrock/openai.gpt-5.5")).unwrap();
+        gpt.model = ModelId::new("amazon-bedrock/openai.gpt-5.5").unwrap();
+
+        assert_ne!(sonnet.key(), gpt.key());
     }
 
     #[test]
     fn recipe_digest_changes_with_the_resource_caps() {
-        let (_, _, base) = fixtures();
-        let changed = Recipe {
-            max_turns: 1000,
-            permission_mode: "bypassPermissions",
-            timeout_secs: 10_800,
-            ulimit_fsize_blocks: 4 * 1024 * 1024,
-            ulimit_data_kb: 2 * 1024 * 1024, // a different heap cap
-            agents_json: "{}",
-            sandbox_shape: "deny=$REPO,$WORKBASE allow=$WORK".into(),
-            agent_env: &[("CLAUDE_CODE_MAX_RETRIES", "20")],
-        }
-        .digest();
-        assert_ne!(base, changed, "a different cap can change what the agent produces");
+        // A different cap can change what the agent produces. The `ulimit` caps are
+        // constants of the session, so `Session::shape` is what proves the digest reads
+        // them (session.rs); the wall clock is the one this layer can vary.
+        let base = recipe(&Session::claude(10_800), None);
+        assert_ne!(base, recipe(&Session::claude(2_700), None));
+    }
+
+    #[test]
+    fn a_recipe_names_the_backend_that_actually_ran() {
+        // It used to record claude's 10800s / 1000-turn / bypassPermissions invocation
+        // for kiro, which really runs `timeout 2700` with no turn limit.
+        let claude = recipe(&Session::claude(10_800), Some("deny=$REPO allow=$WORK"));
+        let kiro = recipe(&Session::kiro(2_700), None);
+        let oc = recipe(&Session::opencode(crate::opencode::Phase::Verify, 10_800), Some("allow=$WORK"));
+        assert_ne!(claude, kiro);
+        assert_ne!(claude, oc);
+        assert_ne!(kiro, oc);
+    }
+
+    #[test]
+    fn recipe_digest_covers_the_sandbox_policy() {
+        let narrow = recipe(&Session::claude(10_800), Some("allow=$WORK"));
+        let wide = recipe(&Session::claude(10_800), Some("allow=$WORK,$REPO"));
+        assert_ne!(narrow, wide, "a wider sandbox can change what the agent produces");
+        assert_ne!(
+            recipe(&Session::claude(10_800), None),
+            recipe(&Session::claude(10_800), Some("")),
+            "no policy must not hash the same as an empty one"
+        );
     }
 
     // These need a real `Sealed<Verify>`, which needs a `Completed` proof, so the
@@ -774,24 +1039,6 @@ mod tests {
         }
     }
 
-    fn key_inputs<'a>(
-        m: &'a ModelId,
-        t: &'a ToolchainId,
-        p: &'a PromptDigest,
-        r: &'a RecipeDigest,
-        i: &'a TreeDigest,
-    ) -> KeyInputs<'a> {
-        KeyInputs {
-            phase: crate::battery::VERIFIED,
-            agent: "claude",
-            model: m,
-            toolchain: t,
-            prompt: p,
-            recipe: r,
-            input_tree: i,
-        }
-    }
-
     /// THE load-bearing property: if the recorded digest and the one recomputed from the
     /// exported copy disagree, every hit fails validation, gets quarantined, and the cache
     /// silently never works while looking like it is enabled.
@@ -799,13 +1046,11 @@ mod tests {
     fn a_digest_survives_the_round_trip_through_the_store() {
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
         let sealed = seal_verify(&f.case, "pub fn a() { /* fixed */ }");
         let want = sealed.digest().clone();
 
-        let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let owned = Inputs::new();
+        let inputs = owned.key_inputs();
         let key = inputs.key();
         store
             .store(
@@ -835,10 +1080,8 @@ mod tests {
     fn obtain_computes_once_and_replays_thereafter() {
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let owned = Inputs::new();
+        let inputs = owned.key_inputs();
 
         let mut runs = 0;
         let first = store
@@ -873,10 +1116,8 @@ mod tests {
         // would make one bad afternoon a permanent, silent, identical failure.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let owned = Inputs::new();
+        let inputs = owned.key_inputs();
 
         let out = store.obtain::<Verify>(&inputs, || Ok(None)).unwrap();
         assert!(out.is_none());
@@ -896,10 +1137,8 @@ mod tests {
     #[test]
     fn bypass_neither_reads_nor_writes() {
         let f = fixture();
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let owned = Inputs::new();
+        let inputs = owned.key_inputs();
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
@@ -922,10 +1161,8 @@ mod tests {
     #[test]
     fn refresh_ignores_the_stored_entry_and_replaces_it() {
         let f = fixture();
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let owned = Inputs::new();
+        let inputs = owned.key_inputs();
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let old = rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() { /* old */ }"))))
@@ -954,10 +1191,10 @@ mod tests {
         // which makes it the evidence: deleting it destroys the only copy of the thing
         // being disputed.
         let f = fixture();
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        // Ported onto this branch's `Inputs` builder, which replaced the free
+        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
+        let held = Inputs::new();
+        let inputs = held.key_inputs();
         let key = inputs.key();
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
@@ -999,10 +1236,10 @@ mod tests {
     #[test]
     fn a_quarantined_entry_is_read_only_and_uncounted() {
         let f = fixture();
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        // Ported onto this branch's `Inputs` builder, which replaced the free
+        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
+        let held = Inputs::new();
+        let inputs = held.key_inputs();
         let key = inputs.key();
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
@@ -1033,10 +1270,10 @@ mod tests {
         // the results tree and then failed EACCES on the next replay of the same case.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        // Ported onto this branch's `Inputs` builder, which replaced the free
+        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
+        let held = Inputs::new();
+        let inputs = held.key_inputs();
         let key = inputs.key();
 
         let log = f.repo.join("live-run.log");
@@ -1068,10 +1305,10 @@ mod tests {
         // no cost, which reads as an agent invocation that cost nothing.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        // Ported onto this branch's `Inputs` builder, which replaced the free
+        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
+        let held = Inputs::new();
+        let inputs = held.key_inputs();
         let key = inputs.key();
         store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
 
@@ -1098,10 +1335,10 @@ mod tests {
         // orphan, and entries inside a 0o555 directory cannot be removed.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        // Ported onto this branch's `Inputs` builder, which replaced the free
+        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
+        let held = Inputs::new();
+        let inputs = held.key_inputs();
         let key = inputs.key();
 
         let staging =
@@ -1123,10 +1360,8 @@ mod tests {
         // --manifest-path`, a future refactor.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let owned = Inputs::new();
+        let inputs = owned.key_inputs();
         let key = inputs.key();
         store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
 
@@ -1147,10 +1382,8 @@ mod tests {
         // scoring builds there, and a 0o444 Cargo.toml would fail with EACCES.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let owned = Inputs::new();
+        let inputs = owned.key_inputs();
         store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
 
         let replay = store.obtain::<Verify>(&inputs, || panic!("must hit")).unwrap().unwrap();
@@ -1166,10 +1399,8 @@ mod tests {
     fn a_tampered_entry_is_a_miss_rather_than_a_lie() {
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let owned = Inputs::new();
+        let inputs = owned.key_inputs();
         let key = inputs.key();
         store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
 
@@ -1204,10 +1435,8 @@ mod tests {
         // battery, so a store living under it could be graded as if it were a case.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let owned = Inputs::new();
+        let inputs = owned.key_inputs();
         store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
 
         let per_agent = f.repo.join("results/Test-Corpus/claude");
@@ -1223,56 +1452,19 @@ mod tests {
         assert!(f.repo.join("results/.cache").is_dir(), "it lives two levels above instead");
     }
 
-    fn recipe_with_env(env: &'static [(&'static str, &'static str)]) -> RecipeDigest {
-        Recipe {
-            max_turns: 1000,
-            permission_mode: "bypassPermissions",
-            timeout_secs: 10_800,
-            ulimit_fsize_blocks: 4 * 1024 * 1024,
-            ulimit_data_kb: 6 * 1024 * 1024,
-            agents_json: "{}",
-            sandbox_shape: "s".into(),
-            agent_env: env,
-        }
-        .digest()
-    }
-
-    #[test]
-    fn recipe_digest_covers_the_agent_runtime_env() {
-        // Retry count changes how a throttled session ends, so it changes what the agent
-        // produces; these once lived in a shell driver where the key could not see them.
-        let twenty = recipe_with_env(&[("CLAUDE_CODE_MAX_RETRIES", "20")]);
-        let one = recipe_with_env(&[("CLAUDE_CODE_MAX_RETRIES", "1")]);
-        assert_ne!(twenty, one, "retry policy must change the key");
-
-        let extra = recipe_with_env(&[("CLAUDE_CODE_MAX_RETRIES", "20"), ("API_TIMEOUT_MS", "5")]);
-        assert_ne!(twenty, extra, "adding a setting must change the key");
-    }
-
-    #[test]
-    fn recipe_digest_is_insensitive_to_env_ordering() {
-        // If reordering the constant were a different key, a cosmetic edit would
-        // silently invalidate every stored entry.
-        let a = recipe_with_env(&[("A", "1"), ("B", "2")]);
-        let b = recipe_with_env(&[("B", "2"), ("A", "1")]);
-        assert_eq!(a, b);
-    }
-
     #[test]
     fn harness_stamp_is_recorded_but_not_keyed() {
         // Recorded so a result is traceable to code, but NOT keyed, or every harness
         // commit would empty the cache.
-        let (m, t, r) = fixtures();
-        let p = PromptDigest("sha256:p".into());
-        let i = TreeDigest::for_test("sha256:i");
-        let ki = inputs(&m, &t, &p, &r, &i);
+        let owned = Inputs::new();
+        let ki = owned.key_inputs();
         let meta = ki.meta(&ki.key());
         assert!(
             meta.get("harness").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()),
             "the producing commit must be recorded: {meta:?}"
         );
         // `load` re-compares this exact list; `harness` must not be on it.
-        for k in ["schema", "phase", "agent", "model", "toolchain", "prompt", "recipe", "input_tree"] {
+        for k in ["schema", "phase", "agent", "model", "cli", "toolchain", "prompt", "recipe", "input_tree"] {
             assert!(meta.get(k).is_some(), "{k} must be recorded");
         }
     }

@@ -1,14 +1,18 @@
 use crate::battery::{self, Case, Paths};
-use crate::cache;
+use crate::cache::{self, CliVersion, ModelId};
 use crate::cli::Agent;
+use crate::session::{ClaudeRun, Session};
 use crate::translate::{IsolatedWorkDir, Semaphore};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-/// Must stay equal to the `timeout 10800` hard-coded in the claude invocation below.
+/// Wall-clock cap on one verify session. Reaches the command through
+/// [`Session`], which is also what the cache key records, so the two cannot diverge.
 pub(crate) const VERIFY_TIMEOUT_SECS: u64 = 10800;
+
+const KIRO_VERIFY_TIMEOUT_SECS: u64 = 2700;
 
 pub fn run(paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
     let sem = Arc::new(Semaphore::new(parallel));
@@ -215,22 +219,57 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
     Ok(())
 }
 
-/// The only place a per-agent verify phase is decided; `None` means no verify phase.
-/// An enum rather than a `bool` keeps the invocation `match` below exhaustive over the
-/// backends that exist, with no second list of agent names to keep in step. Consulted
-/// before the store so a verify-less agent never materialises a work tree to discard.
-#[derive(Copy, Clone, Debug)]
+/// Which CLI runs the verify phase. An enum rather than a `bool` keeps the invocation
+/// `match` below exhaustive over the backends that exist, with no second list of agent
+/// names to keep in step. OpenCode carries its own parsed model, so its arm cannot reach
+/// for another backend's — which is how claude's model came to be keyed for all three.
 enum Backend {
     Kiro,
     Claude,
-    OpenCode,
+    OpenCode(crate::opencode::Model),
 }
 
-fn verify_backend(agent: Agent) -> Option<Backend> {
-    match agent {
-        Agent::Kiro => Some(Backend::Kiro),
-        Agent::Claude => Some(Backend::Claude),
-        Agent::OpenCode => Some(Backend::OpenCode),
+/// Everything about the run the key must name, resolved per backend and BEFORE the agent
+/// starts: the model that will actually be asked for, the CLI build that will ask for it,
+/// and the exact command.
+struct Invocation {
+    backend: Backend,
+    model: ModelId,
+    cli: CliVersion,
+    session: Session,
+}
+
+/// kiro-cli takes no `--model` and reports none in its prose transcript, so no honest
+/// model id exists to key. Named as unpinned rather than filled in with a plausible
+/// one, which is what the claude default used to do here.
+const KIRO_UNPINNED_MODEL: &str = "unpinned:kiro-cli-default";
+
+/// The only place a per-agent verify phase is decided; `None` means no verify phase.
+/// Consulted before the store so a verify-less agent never materialises a work tree to
+/// discard.
+fn verify_invocation(paths: &Paths) -> Result<Option<Invocation>> {
+    let inv = match paths.agent {
+        Agent::Kiro => Invocation {
+            backend: Backend::Kiro,
+            model: ModelId::new(KIRO_UNPINNED_MODEL)?,
+            cli: CliVersion::probe("kiro-cli")?,
+            session: Session::kiro(KIRO_VERIFY_TIMEOUT_SECS),
+        },
+        Agent::Claude => Invocation {
+            backend: Backend::Claude,
+            model: crate::translate::claude_model()?,
+            cli: CliVersion::probe("claude")?,
+            session: Session::claude(VERIFY_TIMEOUT_SECS),
+        },
+        Agent::OpenCode => {
+            let model = crate::opencode::parse_model(paths.model.as_deref().unwrap_or_default())?;
+            Invocation {
+                model: ModelId::new(model.as_arg())?,
+                backend: Backend::OpenCode(model),
+                cli: CliVersion::probe("opencode")?,
+                session: Session::opencode(crate::opencode::Phase::Verify, VERIFY_TIMEOUT_SECS),
+            }
+        }
         // ClaudeCombined verifies inside translate; ClaudeMinimal and the
         // prompt-sensitivity ablations (E2/E3/E4/E6) are translate-only by design;
         // Codex is excluded because it over-fixates on irrelevant linker symbols
@@ -238,7 +277,27 @@ fn verify_backend(agent: Agent) -> Option<Backend> {
         Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust
         | Agent::Kimi | Agent::Oneshot | Agent::ClaudeCombined | Agent::ClaudeMinimal
         | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask
-        | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 => None,
+        | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 => return Ok(None),
+    };
+    Ok(Some(inv))
+}
+
+impl Backend {
+    /// The filesystem policy this backend actually applies, paths tokenised. A
+    /// hand-written summary would drift, and the literal directory names are
+    /// machine-specific and must not enter the key.
+    fn policy_shape(&self, paths: &Paths, work_root: &Path) -> Result<Option<String>> {
+        let tokenise = |s: String| crate::cache::normalise(&s, work_root, &paths.repo_root);
+        Ok(match self {
+            // `--trust-all-tools` and no policy file: there is nothing to record.
+            Backend::Kiro => None,
+            Backend::Claude => Some(tokenise(
+                crate::sandbox::settings_json(&paths.repo_root, work_root)?.to_string(),
+            )),
+            Backend::OpenCode(_) => {
+                Some(tokenise(crate::opencode::permission_shape(work_root)))
+            }
+        })
     }
 }
 
@@ -254,8 +313,7 @@ fn verify_case(
     paths: &Paths,
     store: &cache::Store,
 ) -> Result<bool> {
-    let agent = paths.agent;
-    let Some(backend) = verify_backend(agent) else {
+    let Some(inv) = verify_invocation(paths)? else {
         return Ok(true);
     };
 
@@ -278,22 +336,22 @@ fn verify_case(
         .replace("CMAKE_BUILD_FLAGS", cmake_flags)
         .replace("ALL_CONFIGURATIONS", configs_text);
 
-    if matches!(agent, Agent::OpenCode) {
+    if matches!(inv.backend, Backend::OpenCode(_)) {
         prompt.push_str(&crate::opencode::prompt_suffix(work.root()));
     }
 
     let _ = std::fs::write(verified_logs.join("prompt.md"), &prompt);
 
-    let agent_key = format!("{agent:?}").to_lowercase();
     let input_tree = work.input_digest().clone();
-    let model = crate::translate::claude_model()?;
     let toolchain = cache::ToolchainId::detect()?;
     let prompt_digest = cache::prompt_digest(&prompt, work.root(), &paths.repo_root);
-    let recipe = cache::Recipe::for_verify(paths, work.root())?.digest();
+    let policy = inv.backend.policy_shape(paths, work.root())?;
+    let recipe = cache::Recipe::new(&inv.session, policy)?.digest();
     let inputs = cache::KeyInputs {
         phase: crate::battery::VERIFIED,
-        agent: &agent_key,
-        model: &model,
+        agent: &paths.agent_key,
+        model: &inv.model,
+        cli: &inv.cli,
         toolchain: &toolchain,
         prompt: &prompt_digest,
         recipe: &recipe,
@@ -301,7 +359,7 @@ fn verify_case(
     };
 
     let obtained = store.obtain(&inputs, || {
-        run_verify_agent(case_dir, backend, work, &prompt, &log_path, paths, &model)
+        run_verify_agent(case_dir, &inv, work, &prompt, &log_path, paths)
     })?;
 
     let verified_dir = crate::battery::phase_dir(case_dir, crate::battery::VERIFIED);
@@ -313,7 +371,7 @@ fn verify_case(
         crate::translate::write_verification_metrics(
             &verified_dir,
             &serde_json::json!({
-                "agent": format!("{agent:?}").to_lowercase(),
+                "agent": paths.agent_key.as_str(),
                 "duration_secs": start.elapsed().as_secs(),
                 "success": false,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -349,31 +407,23 @@ fn verify_case(
 /// into a permanent one.
 fn run_verify_agent(
     case_dir: &Path,
-    backend: Backend,
+    inv: &Invocation,
     work: IsolatedWorkDir,
     prompt: &str,
     log_path: &Path,
     paths: &Paths,
-    model: &cache::ModelId,
 ) -> Result<Option<cache::Produced<crate::artifact::Verify>>> {
-    let agent = paths.agent;
-    let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
     let start = std::time::Instant::now();
 
     // Cleared so a skipped or absent CLI run records no spend, and so a replay
     // (which never reaches this function) reports none either.
     crate::translate::clear_agent_exit();
 
-    match backend {
+    match &inv.backend {
         Backend::Kiro => {
-            let status = Command::new("bash")
-                .arg("-lc")
-                .arg(r#"timeout 2700 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
-                .arg("--")
-                .arg(prompt)
-                .arg(log_path)
-                .env("OPENSSL_DIR", &openssl_dir)
-                .current_dir(work.root())
+            let status = inv
+                .session
+                .kiro_command(work.root(), prompt, log_path)
                 .status()
                 .context("invoking kiro-cli for verification")?;
             crate::translate::record_agent_exit(status);
@@ -382,54 +432,36 @@ fn run_verify_agent(
             // Denies the repo root (the graded oracle, plus results/) and the shared
             // scratch base holding sibling work dirs, then re-grants this run's own root.
             let settings_path =
-                crate::sandbox::write_settings(&paths.repo_root, work.root(), work.root(), paths.allow_unsandboxed)?;
-            let agent_tmp = crate::workdir::agent_tmp(work.root())?;
-            let status = Command::new("bash")
-                .arg("-c")
-                .arg(format!(
-                    "ulimit -f {} -d {}; set -o pipefail; timeout 10800 claude -p \"$PROMPT\" \
-                    --strict-mcp-config --disable-slash-commands --settings \"$SETTINGS\" \
-                    --agents \"$AGENTS\" --agent claude_plain \
-                    --max-turns 1000 --permission-mode bypassPermissions \
-                    --model \"$MODEL\" \
-                    --verbose \
-                    --output-format stream-json \
-                    < /dev/null 2>&1 | tee \"$LOG\"",
-                    crate::workdir::AGENT_FSIZE_BLOCKS,
-                    crate::workdir::AGENT_DATA_KB
-                ))
-                .env("PROMPT", prompt)
-                .env("LOG", log_path)
-                .env("SETTINGS", &settings_path)
-                .env("AGENTS", crate::translate::CLAUDE_PLAIN_AGENT_JSON)
-                .env("OPENSSL_DIR", &openssl_dir)
-                // Passed via the environment so bash never sees the `[1m]` in the id as
-                // a bracket glob; pinned because an unpinned model makes both the
-                // measurement and the cache key unsound (`translate::CLAUDE_MODEL_DEFAULT`).
-                .env("MODEL", model.as_str())
-                // verify.md delegates to subagents via Task; without this each picks its
-                // own model and the pin covers only the top-level session.
-                .env("CLAUDE_CODE_SUBAGENT_MODEL", model.as_str())
-                .envs(crate::translate::AGENT_ENV.iter().copied())
-                // Scratch on disk inside the work root, not the /tmp tmpfs (crate::workdir).
-                .env("TMPDIR", &agent_tmp)
-                .env("CLAUDE_CODE_TMPDIR", &agent_tmp)
-                .current_dir(work.translated_rust())
+                crate::sandbox::write_settings(
+                    &paths.repo_root,
+                    work.root(),
+                    work.root(),
+                    paths.allow_unsandboxed,
+                )?;
+            let status = inv
+                .session
+                .claude_command(&ClaudeRun {
+                    cwd: &work.translated_rust(),
+                    prompt,
+                    log: log_path,
+                    settings: &settings_path,
+                    agent_tmp: &crate::workdir::agent_tmp(work.root())?,
+                    model: &inv.model,
+                })
                 .status()
                 .context("invoking claude for verification")?;
             crate::translate::record_agent_exit(status);
-            crate::translate::assert_model_honoured(log_path, model)?;
+            crate::translate::assert_pins_honoured(log_path, &inv.model, &inv.cli)?;
         }
-        Backend::OpenCode => {
+        Backend::OpenCode(oc_model) => {
             // The compaction plugin restores SYMBOLS/ERRORS/CONFIGS.md, which
             // verify.md's Phases B/C are gated on.
-            let oc_model = crate::opencode::parse_model(paths.model.as_deref().unwrap_or_default())?;
             crate::opencode::materialize_config(
-                work.root(), crate::opencode::Phase::Verify, &oc_model,
+                work.root(), crate::opencode::Phase::Verify, oc_model,
             )?;
             crate::opencode::invoke(
-                crate::opencode::Phase::Verify, prompt, log_path,
-                &work.translated_rust(), work.root(), &oc_model, VERIFY_TIMEOUT_SECS,
+                &inv.session, prompt, log_path,
+                &work.translated_rust(), work.root(), oc_model,
             )?;
         }
     }
@@ -467,7 +499,7 @@ fn run_verify_agent(
     Ok(Some(cache::Produced::new(
         sealed,
         log_path.to_path_buf(),
-        crate::translate::agent_provenance(agent, start.elapsed().as_secs()),
+        crate::translate::agent_provenance(&paths.agent_key, start.elapsed().as_secs()),
     )))
 }
 
@@ -529,4 +561,62 @@ fn get_cmake_flags(paths: &Paths, battery: &str, case_name: &str) -> String {
         .map(|(k, v)| format!("-D{}={}", k, v.as_str().unwrap_or("")))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_verify_less_agent_resolves_before_any_cli_is_probed() {
+        // The order matters: resolving the backend is what stops a verify-less agent
+        // materialising a work tree, and now also what stops it probing a CLI it will
+        // never run.
+        let paths = Paths::new(
+            Path::new("/nonexistent"),
+            Agent::Oneshot,
+            crate::cli::Dataset::TestCorpus,
+            Some("openai/gpt-5.4"),
+            cache::Mode::Bypass,
+            // true so the test asserts policy content rather than whether this machine
+            // happens to have bwrap installed.
+            true,
+        )
+        .unwrap();
+        assert!(verify_invocation(&paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn each_backend_records_the_policy_it_actually_applies() {
+        // Every backend's recipe used to carry claude's sandbox settings, including the
+        // two that never read that file.
+        let repo = tempfile::tempdir().unwrap();
+        let paths = Paths::new(
+            repo.path(),
+            Agent::Claude,
+            crate::cli::Dataset::TestCorpus,
+            None,
+            cache::Mode::Bypass,
+            // true so the test asserts policy content rather than whether this machine
+            // happens to have bwrap installed.
+            true,
+        )
+        .unwrap();
+        let work = repo.path().join("work");
+
+        let claude = Backend::Claude.policy_shape(&paths, &work).unwrap();
+        assert!(claude.as_deref().is_some_and(|p| p.contains("denyRead")), "{claude:?}");
+        assert!(
+            claude.as_deref().is_some_and(|p| !p.contains(&*repo.path().to_string_lossy())),
+            "the literal paths must be tokenised or no key is portable: {claude:?}"
+        );
+
+        assert_eq!(Backend::Kiro.policy_shape(&paths, &work).unwrap(), None);
+
+        let oc = Backend::OpenCode(crate::opencode::parse_model("p/m").unwrap())
+            .policy_shape(&paths, &work)
+            .unwrap();
+        assert!(oc.as_deref().is_some_and(|p| p.contains("external_directory")), "{oc:?}");
+        assert_ne!(oc, claude);
+    }
 }

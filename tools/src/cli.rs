@@ -1,4 +1,19 @@
+use anyhow::{Context, Result};
 use clap::Parser;
+
+/// The name `--agent` accepts, from clap's derived `ValueEnum` mapping.
+///
+/// The ONE spelling of an agent, so a hint, a results dir and a cache key cannot
+/// disagree about it. Fallible only because `ValueEnum` permits a `#[value(skip)]`
+/// variant with no name; none of these are.
+pub fn cli_name(agent: Agent) -> Result<String> {
+    use clap::ValueEnum;
+    Ok(agent
+        .to_possible_value()
+        .context("agent variant has no --agent name")?
+        .get_name()
+        .to_string())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Agent {
