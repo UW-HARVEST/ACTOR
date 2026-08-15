@@ -637,6 +637,9 @@ pub struct Paths {
     pub results_dir: PathBuf,
     pub prompts_dir: PathBuf,
     pub agent: Agent,
+    /// How this run is spelled in the results tree, the cache key and the recorded
+    /// provenance — one value, so the three cannot disagree.
+    pub agent_key: crate::cache::AgentKey,
     pub model: Option<String>,
     /// A required parameter of `new` rather than a default, so the compiler names
     /// every construction site that would otherwise silently get read-write
@@ -652,48 +655,18 @@ impl Paths {
         model: Option<&str>,
         cache_mode: crate::cache::Mode,
     ) -> Result<Self> {
-        // Derived from --model (like Agent::Oneshot) so each evaluated model gets
-        // its own dir. Owned because the match below borrows from it.
-        let opencode_slug = match agent {
-            Agent::OpenCode => {
-                let raw = model.context(
-                    "--agent opencode needs --model <provider>/<model-id>: it names the results dir",
-                )?;
-                crate::opencode::results_slug(&crate::opencode::parse_model(raw)?)
-            }
-            _ => String::new(),
-        };
-        let agent_name: &str = match agent {
-            Agent::Kiro => "kiro",
-            Agent::Claude => "claude",
-            Agent::ClaudeCombined => "claude-combined",
-            Agent::ClaudeMinimal => "claude-minimal",
-            Agent::ClaudeNoIter => "claude-no-iter",
-            Agent::ClaudeNoFeatures => "claude-no-features",
-            Agent::ClaudeNoSubtask => "claude-no-subtask",
-            Agent::ClaudeCrossPrompt => "claude-cross-prompt",
-            Agent::CodexGpt55 => "codex-gpt55",
-            Agent::CodexGpt54 => "codex-gpt54",
-            Agent::OpenCode => &opencode_slug,
-            Agent::C2rust => "c2rust",
-            Agent::Laertes => "laertes",
-            Agent::C2SaferRust => "c2saferrust",
-            Agent::SmartC2Rust => "smartc2rust",
-            Agent::Kimi => "kimi",
-            Agent::Oneshot => model
-                .map(|m| m.rsplit_once('/').map_or(m, |(_, last)| last))
-                .context(
-                    "--agent oneshot needs --model <provider>/<model-id>: it names the results dir",
-                )?,
-        };
+        // The same value the cache key and every `"agent"` field use: a second table
+        // here is what let 208 result files record an agent name no `--agent` value
+        // spells, under a `codex-gpt55/` directory.
+        let agent_key = crate::cache::AgentKey::new(agent, model)?;
         let (corpus_dir, results_dir) = match dataset {
             Dataset::TestCorpus => (
                 repo_root.join("test-corpus"),
-                repo_root.join("results/Test-Corpus").join(agent_name),
+                repo_root.join("results/Test-Corpus").join(agent_key.as_str()),
             ),
             Dataset::HarvestBench => (
                 repo_root.join("harvest-bench/tests"),
-                repo_root.join("results/HarvestBench").join(agent_name),
+                repo_root.join("results/HarvestBench").join(agent_key.as_str()),
             ),
         };
         let prompts_dir = match agent {
@@ -714,6 +687,7 @@ impl Paths {
             cache_mode,
             prompts_dir,
             agent,
+            agent_key,
             model: model.map(String::from),
         })
     }

@@ -179,13 +179,19 @@ fn no_public_path_escapes_the_artifact_modules() {
 
 // ── A3 ─────────────────────────────────────────────────────────────────────
 
-/// Digest newtypes must be unforgeable: private field, no `From<String>`.
+/// Digest and identity newtypes must be unforgeable: private field, no `From<String>`.
 ///
 /// A digest that can be constructed from an arbitrary string is a digest that can
 /// be wrong, and the cache compares them to decide whether to reuse an artifact.
+/// `AgentKey` and `CliVersion` are the same hazard from the other side: they name WHAT
+/// ran, so a caller able to spell one without deriving it from `--agent`, or from the
+/// CLI itself, is how a key comes to name something that did not run.
 #[test]
 fn digests_cannot_be_fabricated() {
-    const GUARDED: &[&str] = &["TreeDigest", "PromptDigest", "RecipeDigest", "CacheKey", "ToolchainId"];
+    const GUARDED: &[&str] = &[
+        "TreeDigest", "PromptDigest", "RecipeDigest", "CacheKey", "ToolchainId",
+        "AgentKey", "CliVersion",
+    ];
     let mut bad: Vec<String> = Vec::new();
 
     for module in ["artifact.rs", "cache.rs"] {
@@ -330,5 +336,71 @@ fn nothing_new_runs_inside_the_results_tree() {
          Build in a scratch copy instead — measuring an artifact must not mutate it.",
         v.hits.len(),
         v.hits
+    );
+}
+
+// ── A6 ─────────────────────────────────────────────────────────────────────
+
+/// An agent's identity may never be spelled with `Debug`.
+///
+/// `format!("{agent:?}").to_lowercase()` was at once the cache key component, the entry
+/// directory, the field `load` re-validates, and the `"agent"` of every result file — so
+/// renaming a variant silently renamed the identity of a run, and `Debug` is not a
+/// serialization contract. It has already happened: 208 files under `codex-gpt55/`
+/// record `"agent": "codex"`, which no `--agent` value has spelled since. `AgentKey`,
+/// derived from clap's `ValueEnum` name, is the one spelling.
+///
+/// Matched on tokens rather than raw text, so the word "agent" inside a message and a
+/// `{:?}` for something else in the same macro are not a false positive.
+#[test]
+fn an_agents_identity_is_never_its_debug_output() {
+    fn debugs_an_agent(tokens: proc_macro2::TokenStream) -> bool {
+        let mut names_agent = false;
+        let mut debug_placeholder = false;
+        for t in tokens {
+            match t {
+                proc_macro2::TokenTree::Ident(i) => names_agent |= i == "agent",
+                proc_macro2::TokenTree::Literal(l) => {
+                    let s = l.to_string();
+                    // The inline form needs no separate argument to be the giveaway.
+                    if s.contains("{agent:?}") {
+                        return true;
+                    }
+                    debug_placeholder |= s.contains("{:?}");
+                }
+                proc_macro2::TokenTree::Group(g) => {
+                    if debugs_an_agent(g.stream()) {
+                        return true;
+                    }
+                }
+                proc_macro2::TokenTree::Punct(_) => {}
+            }
+        }
+        names_agent && debug_placeholder
+    }
+
+    struct V(Vec<String>);
+    impl<'ast> Visit<'ast> for V {
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            if debugs_an_agent(m.tokens.clone()) {
+                let name = m.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+                self.0.push(format!("{name}!"));
+            }
+            syn::visit::visit_macro(self, m);
+        }
+    }
+
+    let mut found: Vec<String> = Vec::new();
+    for path in rust_sources() {
+        let mut v = V(Vec::new());
+        v.visit_file(&parse(&path));
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        found.extend(v.0.into_iter().map(|m| format!("{file}: {m}")));
+    }
+    assert!(
+        found.is_empty(),
+        "an agent is being formatted with Debug: {found:#?}\n\
+         Use `cache::AgentKey` (and `Paths::agent_key`), which is clap's own name for the\n\
+         variant and is what the results tree and the store are already keyed by."
     );
 }
