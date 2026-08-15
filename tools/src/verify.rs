@@ -289,7 +289,7 @@ fn verify_case(
     let model = crate::translate::claude_model()?;
     let toolchain = cache::ToolchainId::detect()?;
     let prompt_digest = cache::prompt_digest(&prompt, work.root(), &paths.repo_root);
-    let recipe = cache::Recipe::for_verify(paths, work.root()).digest();
+    let recipe = cache::Recipe::for_verify(paths, work.root())?.digest();
     let inputs = cache::KeyInputs {
         phase: crate::battery::VERIFIED,
         agent: &agent_key,

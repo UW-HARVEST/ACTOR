@@ -152,7 +152,9 @@ pub enum CacheMode {
     /// agent varies between runs, which memoising would defeat.
     Off,
     /// Re-run even when a result is stored, and replace what was there. For when the
-    /// stored artifact is suspect: leaving it in place would keep serving it.
+    /// stored artifact is suspect: leaving it in place would keep serving it. The
+    /// replaced entry is kept under `results/.cache/quarantine/`, since it is the
+    /// artifact being disputed.
     Refresh,
 }
 
