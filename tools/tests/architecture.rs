@@ -6,12 +6,17 @@
 //! impl tomorrow — at which point the trybuild case starts failing for a reason a
 //! reader may well "fix" by re-recording it. These rules assert the shape instead.
 
-use std::collections::BTreeMap;
+use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 
+fn src_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
 fn src(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name)
+    src_dir().join(name)
 }
 
 fn file_name(path: &Path) -> String {
@@ -21,20 +26,49 @@ fn file_name(path: &Path) -> String {
         .into_owned()
 }
 
+fn read(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
 fn parse(path: &Path) -> syn::File {
-    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    syn::parse_file(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    syn::parse_file(&read(path)).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 fn rust_sources() -> Vec<PathBuf> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut out: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("src/")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-        .collect();
+    rust_sources_under(&src_dir())
+}
+
+fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+            let path = entry.expect("src/ entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
     out.sort();
     out
+}
+
+fn count_rust_files(dir: &Path, depth: usize) -> (usize, usize) {
+    let (mut total, mut nested) = (0, 0);
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+        let path = entry.expect("src/ entry").path();
+        if path.is_dir() {
+            let (t, n) = count_rust_files(&path, depth + 1);
+            total += t;
+            nested += n;
+        } else if path.extension().is_some_and(|x| x == "rs") {
+            total += 1;
+            nested += usize::from(depth > 1);
+        }
+    }
+    (total, nested)
 }
 
 fn type_name(ty: &syn::Type) -> String {
@@ -89,6 +123,67 @@ fn is_public(vis: &syn::Visibility) -> bool {
         vis,
         syn::Visibility::Public(_) | syn::Visibility::Restricted(_)
     )
+}
+
+/// Every rule here iterates `rust_sources()` and none assert they found anything: while it
+/// was a flat `read_dir`, the first module to become a directory would have dropped out of
+/// all of them, `sealed_implements_only_debug` included, and each would still report green.
+#[test]
+fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
+    // 20 files today: 18 modules plus lib.rs and main.rs; the margin is for a merge, not a break.
+    const MIN_FILES: usize = 18;
+    const REQUIRED: &[&str] = &["Sealed", "WorkTree", "Scrubbed", "Corpus", "TreeDigest"];
+
+    let found = rust_sources();
+    assert!(
+        found.len() >= MIN_FILES,
+        "rust_sources() found {} files, below the {MIN_FILES} the rules expect to inspect: \
+         {found:#?}",
+        found.len()
+    );
+
+    struct Declared(BTreeSet<String>);
+    impl<'ast> Visit<'ast> for Declared {
+        fn visit_item_struct(&mut self, s: &'ast syn::ItemStruct) {
+            self.0.insert(s.ident.to_string());
+            syn::visit::visit_item_struct(self, s);
+        }
+        fn visit_item_enum(&mut self, e: &'ast syn::ItemEnum) {
+            self.0.insert(e.ident.to_string());
+            syn::visit::visit_item_enum(self, e);
+        }
+    }
+    let mut declared = Declared(BTreeSet::new());
+    for path in &found {
+        declared.visit_file(&parse(path));
+    }
+    let missing: Vec<&str> = REQUIRED
+        .iter()
+        .copied()
+        .filter(|t| !declared.0.contains(*t))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the rules are written about {missing:?}, and nothing rust_sources() returned \
+         declares them: either they were renamed, or the traversal no longer reaches the \
+         file that holds them."
+    );
+
+    let dir = src_dir();
+    let depth = |p: &Path| {
+        p.strip_prefix(&dir)
+            .expect("under src/")
+            .components()
+            .count()
+    };
+    let nested = found.iter().filter(|p| depth(p) > 1).count();
+    assert_eq!(
+        (found.len(), nested),
+        count_rust_files(&dir, 1),
+        "rust_sources() and an independent walk of src/ disagree on (total, nested). The \
+         nested half is 0 == 0 today and goes live with the first module that becomes a \
+         directory."
+    );
 }
 
 // ── A1 ─────────────────────────────────────────────────────────────────────
@@ -861,5 +956,344 @@ fn typestates_have_private_fields_and_consuming_transitions() {
         "these forward transitions do not consume self: {borrowing:#?}\n\
          Taking `&self` lets the source state be used again after the transition, so the\n\
          digest and the published tree can describe different states."
+    );
+}
+
+/// Measured: `src/` is one strongly connected component of these ten modules. Shrink-only —
+/// a cut makes the rule fail as stale, and the list is then edited DOWN to what it reports.
+const CYCLE_BASELINE: &[&str] = &[
+    "agent_health",
+    "artifact",
+    "battery",
+    "cache",
+    "cargo_toml",
+    "cli",
+    "opencode",
+    "session",
+    "translate",
+    "verify",
+];
+
+fn top_level_module(root: &Path, file: &Path) -> Option<String> {
+    let rel = file.strip_prefix(root).ok()?;
+    let head = rel.components().next()?.as_os_str().to_string_lossy();
+    let name = head.strip_suffix(".rs").unwrap_or(&head).to_owned();
+    (name != "lib" && name != "main").then_some(name)
+}
+
+/// How many `super`s reach the crate root from this file's own module: one from `src/m.rs`
+/// and `src/m/mod.rs`, two from `src/m/x.rs`. `None` for the crate roots themselves.
+fn supers_to_crate_root(root: &Path, file: &Path) -> Option<usize> {
+    top_level_module(root, file)?;
+    let mut comps: Vec<String> = file
+        .strip_prefix(root)
+        .ok()?
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let last = comps.pop()?;
+    Some(comps.len() + usize::from(last != "mod.rs"))
+}
+
+/// `::` lexes as two `Punct`s, so the separator is skipped rather than matched.
+fn after_path_sep(tokens: &[TokenTree], i: usize) -> Option<(usize, &TokenTree)> {
+    let mut j = i + 1;
+    while matches!(tokens.get(j), Some(TokenTree::Punct(p)) if p.as_char() == ':') {
+        j += 1;
+    }
+    if j == i + 1 {
+        return None;
+    }
+    Some((j, tokens.get(j)?))
+}
+
+/// The names a path tail introduces: `foo` from `::foo`, `b` and `c` from `::{b, c}`.
+fn head_names(tail: &TokenTree, out: &mut BTreeSet<String>) {
+    match tail {
+        TokenTree::Ident(m) => {
+            out.insert(m.to_string());
+        }
+        TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => {
+            let mut head = true;
+            for token in g.stream() {
+                match token {
+                    TokenTree::Ident(m) if head => {
+                        out.insert(m.to_string());
+                        head = false;
+                    }
+                    TokenTree::Punct(p) if p.as_char() == ',' => head = true,
+                    _ => head = false,
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every `crate::<name>`, the grouped `use crate::{a, b}` included. Lexed, not searched for
+/// as text: raw strings hold shell and JSON, and doc comments link modules nothing depends on.
+fn crate_refs(text: &str) -> BTreeSet<String> {
+    fn walk(stream: TokenStream, out: &mut BTreeSet<String>) {
+        let tokens: Vec<TokenTree> = stream.into_iter().collect();
+        for (i, token) in tokens.iter().enumerate() {
+            if let TokenTree::Group(g) = token {
+                walk(g.stream(), out);
+            }
+            let TokenTree::Ident(id) = token else {
+                continue;
+            };
+            if id != "crate" {
+                continue;
+            }
+            if let Some((_, tail)) = after_path_sep(&tokens, i) {
+                head_names(tail, out);
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(text.parse().expect("src/ lexes as Rust tokens"), &mut out);
+    out
+}
+
+/// Every `super::<name>` whose run of `super`s is long enough to land on the crate root,
+/// where it names exactly what `crate::<name>` names. `super::*` is not one: it introduces
+/// no name to read an edge from. An inline `mod` only ever makes a run reach less far than
+/// `supers`, so counting from the file is the direction that refuses rather than misses.
+///
+/// Every `super` starts a run, including the second of `super::super`: a shorter run inside
+/// a longer one ends at the same name, so it can only repeat a refusal, never invent one.
+/// Skipping it would need to tell `::super` from the `:` of `let x: super::Foo`.
+fn root_super_refs(text: &str, supers_to_root: usize) -> BTreeSet<String> {
+    fn walk(stream: TokenStream, supers_to_root: usize, out: &mut BTreeSet<String>) {
+        let tokens: Vec<TokenTree> = stream.into_iter().collect();
+        for (i, token) in tokens.iter().enumerate() {
+            if let TokenTree::Group(g) = token {
+                walk(g.stream(), supers_to_root, out);
+            }
+            let TokenTree::Ident(id) = token else {
+                continue;
+            };
+            if id != "super" {
+                continue;
+            }
+            let mut at = i;
+            let mut supers = 0;
+            let tail = loop {
+                match after_path_sep(&tokens, at) {
+                    None => break None,
+                    Some((j, next)) => {
+                        supers += 1;
+                        match next {
+                            TokenTree::Ident(m) if m == "super" => at = j,
+                            _ => break Some(next),
+                        }
+                    }
+                }
+            };
+            match tail {
+                Some(tail) if supers >= supers_to_root => head_names(tail, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(
+        text.parse().expect("src/ lexes as Rust tokens"),
+        supers_to_root,
+        &mut out,
+    );
+    out
+}
+
+/// The module graph, and the paths that would hide an edge from it.
+struct ModuleGraph {
+    edges: BTreeMap<String, BTreeSet<String>>,
+    invisible: Vec<String>,
+}
+
+/// From `src/<m>.rs`, `super::X` IS `crate::X`, so an edge spelled that way is invisible to
+/// `crate_refs`: a whole cycle can hide behind it, and respelling one module's refs is enough
+/// to make it look like it left the cycle. Collected to be refused, not rewritten — inside
+/// `src/scoring.rs`, `mod tests { use super::translate; }` means `crate::scoring::translate`,
+/// so rewriting would invent an edge that is not there.
+fn module_graph(root: &Path) -> ModuleGraph {
+    let sources: Vec<(PathBuf, String, String)> = rust_sources_under(root)
+        .into_iter()
+        .filter_map(|p| top_level_module(root, &p).map(|m| (p.clone(), m, read(&p))))
+        .collect();
+    let mut edges: BTreeMap<String, BTreeSet<String>> = sources
+        .iter()
+        .map(|(_, m, _)| (m.clone(), BTreeSet::new()))
+        .collect();
+    let mut invisible = Vec::new();
+    for (path, module, text) in &sources {
+        let refs: Vec<String> = crate_refs(text)
+            .into_iter()
+            .filter(|r| r != module && edges.contains_key(r))
+            .collect();
+        edges.get_mut(module).expect("keyed above").extend(refs);
+        let rel = path.strip_prefix(root).unwrap_or(path).display();
+        let supers = supers_to_crate_root(root, path).expect("a module, so not a crate root");
+        invisible.extend(
+            root_super_refs(text, supers)
+                .into_iter()
+                .map(|r| format!("{rel}: super::{r}")),
+        );
+    }
+    ModuleGraph { edges, invisible }
+}
+
+/// Components with more than one member. Takes an edge map, so a planted cycle can test it.
+fn cycles(edges: &BTreeMap<String, BTreeSet<String>>) -> Vec<Vec<String>> {
+    let nodes: Vec<&String> = edges.keys().collect();
+    let n = nodes.len();
+    let index: BTreeMap<&String, usize> = nodes.iter().enumerate().map(|(i, m)| (*m, i)).collect();
+    let mut reaches = vec![vec![false; n]; n];
+    for (from, tos) in edges {
+        for to in tos {
+            if let Some(&j) = index.get(to) {
+                reaches[index[from]][j] = true;
+            }
+        }
+    }
+    for k in 0..n {
+        let via = reaches[k].clone();
+        for row in reaches.iter_mut() {
+            if row[k] {
+                for (r, v) in row.iter_mut().zip(&via) {
+                    *r |= *v;
+                }
+            }
+        }
+    }
+    let mut seen = vec![false; n];
+    let mut out = Vec::new();
+    for i in 0..n {
+        if seen[i] {
+            continue;
+        }
+        let members: Vec<usize> = (i..n).filter(|&j| reaches[i][j] && reaches[j][i]).collect();
+        for &j in &members {
+            seen[j] = true;
+        }
+        if members.len() > 1 {
+            out.push(members.iter().map(|&j| nodes[j].clone()).collect());
+        }
+    }
+    out
+}
+
+/// A shrunken cycle is not a violation; a baseline naming a module that has left one is.
+fn cycle_violations(edges: &BTreeMap<String, BTreeSet<String>>, baseline: &[&str]) -> Vec<String> {
+    let found = cycles(edges);
+    let members: BTreeSet<&str> = found.iter().flatten().map(String::as_str).collect();
+    let mut out = Vec::new();
+    let largest = found.iter().map(Vec::len).max().unwrap_or(0);
+    if largest > baseline.len() {
+        out.push(format!(
+            "the largest cycle has {largest} modules; the baseline records {}",
+            baseline.len()
+        ));
+    }
+    out.extend(
+        members
+            .iter()
+            .filter(|m| !baseline.contains(m))
+            .map(|m| format!("{m} is in a cycle the baseline does not record")),
+    );
+    out.extend(
+        baseline
+            .iter()
+            .filter(|m| !members.contains(*m))
+            .map(|m| format!("{m} is in no cycle any more: shrink CYCLE_BASELINE past it")),
+    );
+    out
+}
+
+/// A cyclic split is a nominal one: the file names promise a layering nothing enforced.
+#[test]
+fn a_module_cycle_may_only_shrink() {
+    let graph = module_graph(&src_dir());
+    assert!(
+        graph.invisible.is_empty(),
+        "these paths hide a module edge from the graph: {:#?}\n\
+         From a module root `super::X` is `crate::X`, and the graph is built by looking for\n\
+         `crate::`. Spell it `crate::<mod>` so the module graph can see the edge.",
+        graph.invisible
+    );
+    let violations = cycle_violations(&graph.edges, CYCLE_BASELINE);
+    assert!(
+        violations.is_empty(),
+        "{violations:#?}\ncycles now: {:#?}\n\
+         Cut the edge the new member adds, or shrink CYCLE_BASELINE to exactly what this\n\
+         message reports.",
+        cycles(&graph.edges)
+    );
+
+    // A ring of eleven is the one violation no plantable src/ tree reaches cheaply.
+    let ring: Vec<&str> = CYCLE_BASELINE.iter().copied().chain(["scoring"]).collect();
+    let planted: BTreeMap<String, BTreeSet<String>> = ring
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            (
+                (*m).to_owned(),
+                BTreeSet::from([ring[(i + 1) % ring.len()].to_owned()]),
+            )
+        })
+        .collect();
+    let caught = cycle_violations(&planted, CYCLE_BASELINE);
+    assert!(
+        caught
+            .iter()
+            .any(|v| v == "the largest cycle has 11 modules; the baseline records 10"),
+        "a planted eleven-module ring did not read as bigger than the ten the baseline\n\
+         records: {caught:#?}"
+    );
+
+    // Driven through the real extraction, not a synthetic edge map: the hole this rule
+    // shipped with was in `crate_refs`, a layer a synthetic map never reaches.
+    let tree = tempfile::tempdir().expect("tempdir");
+    let src = tree.path().join("src");
+    let write = |name: &str, text: &str| {
+        let path = src.join(name);
+        std::fs::create_dir_all(path.parent().expect("under src/")).expect("mkdir");
+        std::fs::write(&path, text).expect("write");
+    };
+    write("lib.rs", "pub mod report;\npub mod scoring;\n");
+    write("report.rs", "use crate::scoring;\n");
+    write("scoring.rs", "use crate::report;\n");
+    let extracted = module_graph(&src);
+    let caught = cycle_violations(&extracted.edges, CYCLE_BASELINE);
+    for module in ["report", "scoring"] {
+        assert!(
+            caught.contains(&format!(
+                "{module} is in a cycle the baseline does not record"
+            )),
+            "extraction over a planted src/ tree missed the report <-> scoring cycle it\n\
+             holds: {caught:#?} from {:#?}",
+            extracted.edges
+        );
+    }
+
+    write(
+        "scoring.rs",
+        "use super::report;\nfn f(_: super::report::T) {}\nmod tests {\n    use super::*;\n}\n",
+    );
+    let respelt = module_graph(&src);
+    assert!(
+        cycles(&respelt.edges).is_empty(),
+        "respelling the edge `super::` was supposed to make it invisible to the extraction,\n\
+         and the cycle is still visible: {:#?}\n\
+         If `crate_refs` now reads `super::` too, this rule can compare graphs instead of\n\
+         refusing the spelling.",
+        respelt.edges
+    );
+    assert_eq!(
+        respelt.invisible,
+        ["scoring.rs: super::report"],
+        "the invisible edge was not refused, so the rule would report the cycle shrank past\n\
+         a module that is still in it. `use super::*` in the same file must stay allowed: it\n\
+         introduces no name an edge can be read from."
     );
 }
