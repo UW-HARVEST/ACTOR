@@ -1,36 +1,26 @@
 //! The filesystem policy handed to an agent as `--settings`.
 //!
-//! This existed inline at three call sites and was wrong three different ways.
-//! Two of them bound a local called `repo_root` that was never the repo root —
-//! `translate` derived `results_dir.parent()` (the *dataset* dir) while `verify`
-//! derived `case_dir.ancestors().nth(2)`, which lands on the *agent* dir for
-//! Test-Corpus but the *dataset* dir for HarvestBench, because HB case dirs are
-//! one level shallower. The third wrote a bare `{}` — no policy at all.
+//! The repo must be denied on two counts: the graded oracle, and `results/` — other
+//! agents' and other cases' finished translations. Narrowing the deny roots to
+//! `test-corpus/` + `harvest-bench/` would still leak the latter.
 //!
-//! More importantly, none of them denied the corpus, and the corpus is where the
-//! graded oracle lives: `test-corpus/Public-Tests/<battery>/<case>/test_vectors`
-//! and `harvest-bench/tests/<name>/gtest_suite`. Only `test_case/` is ever copied
-//! into an agent's work dir, so everything the agent is being graded against was
-//! readable.
+//! It holds the graded oracle
+//! (`test-corpus/Public-Tests/<battery>/<case>/test_vectors`,
+//! `harvest-bench/tests/<name>/gtest_suite`) while only `test_case/` is ever
+//! copied into an agent's work dir. Derive the deny roots from the repo root, not
+//! from the case dir: HB case dirs are one level shallower than Test-Corpus ones,
+//! so any `ancestors().nth(n)` walk lands somewhere different per dataset.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-/// Every root an agent must not read, for any dataset or phase.
-///
-/// Two entries, and the second is the non-obvious one:
-///
-/// * `repo_root` — covers the corpus (the graded oracle, above) and `results/`
-///   (other agents' and other cases' outputs).
-/// * the scratch base — sibling per-case work dirs live next to this one under
-///   the same base, and reads are default-allow *outside* `denyRead`. The agent's
-///   own root is re-exposed by `allowRead`, which takes precedence.
+/// The scratch base is the non-obvious entry: sibling per-case work dirs live
+/// under it and reads are default-allow *outside* `denyRead`, so it is denied
+/// wholesale and this run's own root re-granted by `allowRead`, which wins.
 pub fn denied_read_roots(repo_root: &Path) -> Result<Vec<PathBuf>> {
     Ok(vec![repo_root.to_path_buf(), crate::workdir::base()?])
 }
 
-/// The whole `--settings` document for one agent invocation: deny everything
-/// above, then re-grant this run's own work root for read and write.
 pub(crate) fn settings_json(repo_root: &Path, work_root: &Path) -> Result<serde_json::Value> {
     let deny: Vec<String> = denied_read_roots(repo_root)?
         .iter()
@@ -49,8 +39,6 @@ pub(crate) fn settings_json(repo_root: &Path, work_root: &Path) -> Result<serde_
     }))
 }
 
-/// Write the policy to `<parent>/.claude/settings.json` and return its path.
-///
 /// `parent` is the directory the agent is launched *next to* — the work root for
 /// verify, the temp root for translate — not the agent's cwd.
 pub fn write_settings(repo_root: &Path, work_root: &Path, parent: &Path) -> Result<PathBuf> {
@@ -66,8 +54,8 @@ mod tests {
     use super::*;
 
     fn policy(repo: &str, work: &str) -> serde_json::Value {
-        // base() reads real env; drive settings_json's shape via a fixed deny list
-        // so the test does not depend on $HOME.
+        // Mirrors settings_json's shape with a fixed deny list: the real one calls
+        // base(), which reads $HOME.
         let deny = vec![repo.to_string(), "/scratch/base".to_string()];
         serde_json::json!({
             "sandbox": {
@@ -84,8 +72,7 @@ mod tests {
 
     #[test]
     fn deny_list_covers_the_repo_root_not_a_results_subdirectory() {
-        // The bug: both old sites denied something *under* results/, so the
-        // corpus — where the graded oracle lives — stayed readable.
+        // Denying something *under* results/ leaves the corpus readable.
         let p = policy("/repo", "/scratch/base/harvest-work-x");
         let deny = p["sandbox"]["filesystem"]["denyRead"].as_array().unwrap();
         assert!(deny.iter().any(|d| d == "/repo"), "repo root must be denied: {deny:?}");
@@ -97,8 +84,8 @@ mod tests {
 
     #[test]
     fn deny_list_covers_the_shared_scratch_base_so_siblings_are_not_readable() {
-        // Sibling work dirs share one base; reads are default-allow outside
-        // denyRead, so without this a case could read another case's tree.
+        // Reads are default-allow outside denyRead, so without the base itself
+        // denied a case could read a sibling case's tree.
         let p = policy("/repo", "/scratch/base/harvest-work-x");
         let deny = p["sandbox"]["filesystem"]["denyRead"].as_array().unwrap();
         assert!(deny.iter().any(|d| d == "/scratch/base"), "scratch base must be denied: {deny:?}");
@@ -114,10 +101,6 @@ mod tests {
 
     #[test]
     fn policy_is_identical_regardless_of_dataset_depth() {
-        // The old `ancestors().nth(2)` produced different roots for
-        // results/Test-Corpus/<agent>/<battery>/<case> vs
-        // results/HarvestBench/<agent>/<name>. Deriving from the repo root
-        // cannot: both must yield the same deny list.
         let tc = policy("/repo", "/scratch/base/w1");
         let hb = policy("/repo", "/scratch/base/w2");
         assert_eq!(
@@ -142,7 +125,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let parent = tmp.path().join("root");
         std::fs::create_dir_all(&parent).unwrap();
-        // Drive the real function; base() needs HOME, which the test harness has.
+        // The real function, not `policy`: base() needs HOME, which tests have.
         let p = write_settings(Path::new("/repo"), &parent, &parent).expect("writes policy");
         assert_eq!(p, parent.join(".claude/settings.json"));
         let v: serde_json::Value =

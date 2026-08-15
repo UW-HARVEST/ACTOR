@@ -21,3 +21,6 @@ Never:
 
 Before finishing, remove any comment whose meaning is obvious from the code
 directly below it.
+
+Exception: doc comments on `clap`-derived types are `--help` output, not comments.
+Deleting one silently changes what the binary prints.

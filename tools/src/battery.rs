@@ -6,48 +6,34 @@ use std::path::{Path, PathBuf};
 
 // ── Per-case phase directories: ONE source of truth ────────────────────
 //
-// A case's results live in two self-contained PHASE DIRECTORIES, uniform
-// across every dataset:
-//
-//   <case>/translated/   what translation produced (pre-verify). Always present.
-//   <case>/verified/     what the verify phase produced. Present iff verify ran.
-//
-// Each phase dir is fully self-contained: it IS the crate root (src/,
-// Cargo.toml, c_src/), and carries that phase's own `result.json` and
-// `logs/`. Reading a case's "current" score uses [`crate_dir`]: verified/ if
-// it exists, else translated/. This replaces the old asymmetric layout
-// (`translated_rust/` crate + `translated_rust_original/` snapshot + a
-// case-root result.json/logs).
+// A case's results live in two PHASE DIRECTORIES, uniform across every dataset:
+// `<case>/translated/` and `<case>/verified/`. Each IS a self-contained crate
+// root (src/, Cargo.toml, c_src/) and carries that phase's own `result.json`
+// and `logs/`, so nothing lives at the case root.
 
-/// Pre-verify phase dir: exactly what translation produced. Always present.
+/// Always present: exactly what translation produced.
 pub const TRANSLATED: &str = "translated";
 
-/// Post-verify phase dir: what the verify phase produced. Present iff verify ran.
+/// Present iff the verify phase ran.
 pub const VERIFIED: &str = "verified";
 
-/// The phase dir for `phase` under a case dir (`case_dir/translated` or
-/// `case_dir/verified`).
 pub fn phase_dir(case_dir: &Path, phase: &str) -> PathBuf {
     case_dir.join(phase)
 }
 
-/// The canonical crate/result dir for a case under the reader rule:
-/// `verified/` if it exists, else `translated/`. Every reader that wants "the
-/// current state of this case" (score, LOC, unsafe, crate source) uses this,
-/// so pre- and post-verify cases resolve uniformly.
+/// THE READER RULE: every reader wanting a case's current state (score, LOC,
+/// unsafe, crate source) must come through here, so pre- and post-verify cases
+/// resolve uniformly.
 pub fn crate_dir(case_dir: &Path) -> PathBuf {
     let verified = case_dir.join(VERIFIED);
     if verified.is_dir() { verified } else { case_dir.join(TRANSLATED) }
 }
 
-/// The crate-dir name MIT `runtests` hardcodes (`<case>/translated_rust/`,
-/// test-corpus/.../discovery/rust.py) and the neutral name used for the
-/// agent's temp workspace during translate/verify. NOT a storage phase dir —
-/// canonical storage uses [`TRANSLATED`]/[`VERIFIED`]. For runtests scoring a
-/// phase, `<case>/translated_rust` is staged as a symlink to that phase dir.
+/// The crate-dir name MIT `runtests` hardcodes (test-corpus/.../discovery/
+/// rust.py), also used for the agent's temp workspace. NOT a storage phase dir:
+/// for scoring, it is staged as a symlink to [`TRANSLATED`]/[`VERIFIED`].
 pub const TRANSLATED_RUST: &str = "translated_rust";
 
-/// A test case that is independently translated and verified.
 #[derive(Debug, Clone)]
 pub struct IndependentCase {
     pub name: String,
@@ -70,22 +56,18 @@ pub struct SharedSourceGroup {
     pub configs: Vec<Config>,
 }
 
-/// A discovered case — either independent or part of a shared-source group.
 #[derive(Debug, Clone)]
 pub enum Case {
     Independent(IndependentCase),
     SharedSource(SharedSourceGroup),
 }
 
-/// A battery with all its discovered cases.
 #[derive(Debug)]
 pub struct Battery {
     pub name: String,
     pub cases: Vec<Case>,
 }
 
-/// Discover all cases in a battery, resolving symlinks to group shared-source cases.
-/// List all battery names available in the corpus.
 pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
     let public_tests = corpus_dir.join("Public-Tests");
     anyhow::ensure!(public_tests.is_dir(), "Public-Tests not found: {}", public_tests.display());
@@ -99,7 +81,6 @@ pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
     Ok(batteries)
 }
 
-/// Quick check: does this battery contain shared-source groups (symlinked test_case)?
 pub fn has_shared_source_groups(corpus_dir: &Path, battery_name: &str) -> bool {
     let dir = corpus_dir.join("Public-Tests").join(battery_name);
     std::fs::read_dir(&dir).ok().is_some_and(|entries| {
@@ -109,9 +90,9 @@ pub fn has_shared_source_groups(corpus_dir: &Path, battery_name: &str) -> bool {
 
 // ── harvest-bench project ──────────────────────────────────────────────
 
-/// A harvest-bench project: `harvest-bench/tests/<name>/` with a `test_case/`
-/// (the C library the agent translates) and a `gtest_suite/` (the upstream test
-/// suite the runner links against the translated cdylib by ABI).
+/// `harvest-bench/tests/<name>/` holding a `test_case/` (the C library to
+/// translate) and a `gtest_suite/` (the upstream suite the runner links against
+/// the translated cdylib by ABI).
 #[derive(Debug, Clone)]
 pub struct HarvestBenchProject {
     name: String,
@@ -134,8 +115,6 @@ impl HarvestBenchProject {
         Ok(Self { name: name.to_string(), test_case, gtest_suite })
     }
 
-    /// Discover all harvest-bench projects under `tests_dir` (dirs with both a
-    /// `test_case/` and a `gtest_suite/`).
     pub fn discover(tests_dir: &Path) -> Result<Vec<Self>> {
         anyhow::ensure!(tests_dir.is_dir(), "harvest-bench tests dir not found: {} (did you `git submodule update --init`?)", tests_dir.display());
         let mut names: Vec<String> = std::fs::read_dir(tests_dir)?
@@ -155,7 +134,6 @@ pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> 
 
     let filter_re = filter.map(Regex::new).transpose()?;
 
-    // Phase 1: scan all cases, resolve symlinks
     let mut symlink_map: HashMap<String, String> = HashMap::new(); // symlinked_name -> real_name
     let mut all_names: Vec<String> = Vec::new();
 
@@ -168,7 +146,7 @@ pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> 
         let name = entry.file_name().to_string_lossy().to_string();
         let test_case_path = entry.path().join("test_case");
 
-        // Must have test_case/ (dir or symlink) and test_vectors/
+        // `exists()`, not `is_dir()`: test_case may be a symlink.
         if !test_case_path.exists() || !entry.path().join("test_vectors").is_dir() {
             continue;
         }
@@ -194,8 +172,6 @@ pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> 
         all_names.push(name);
     }
 
-    // Phase 2: group into Case variants
-    // Collect real_case -> Vec<symlinked configs>
     let mut shared_groups: HashMap<String, Vec<String>> = HashMap::new();
     for (symlinked, real) in &symlink_map {
         shared_groups
@@ -218,7 +194,6 @@ pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> 
         }
 
         if let Some(config_names) = shared_groups.get(name) {
-            // This is the real case of a shared-source group
             let mut configs = Vec::new();
             for cn in config_names {
                 let cfg = build_config(&input_dir, cn)?;
@@ -232,7 +207,6 @@ pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> 
             }));
             handled.insert(name.clone());
         } else {
-            // Independent case
             cases.push(Case::Independent(IndependentCase {
                 name: name.clone(),
                 is_lib: name.ends_with("_lib"),
@@ -259,7 +233,6 @@ fn build_config(input_dir: &Path, name: &str) -> Result<Config> {
     })
 }
 
-/// Extract features from a CMakePresets.json path directly.
 pub fn extract_features_from_path(presets_path: &Path) -> Result<Vec<String>> {
     if !presets_path.exists() {
         return Ok(vec![]);
@@ -289,12 +262,10 @@ pub fn extract_features_from_path(presets_path: &Path) -> Result<Vec<String>> {
     Ok(features)
 }
 
-/// Extract features from CMakePresets.json cache variables.
 fn extract_features(input_dir: &Path, case_name: &str) -> Result<Vec<String>> {
     extract_features_from_path(&input_dir.join(case_name).join("CMakePresets.json"))
 }
 
-/// Extract [lib] name from the test corpus runner/src/main.rs.
 pub fn extract_lib_name(input_dir: &Path, case_name: &str) -> Option<String> {
     let runner_main = input_dir.join(case_name).join("runner/src/main.rs");
     let content = std::fs::read_to_string(&runner_main).ok()?;
@@ -304,8 +275,7 @@ pub fn extract_lib_name(input_dir: &Path, case_name: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 
-/// Resolve features against actual Cargo.toml feature definitions.
-/// Tries raw names first, then composite names like "sphincs-blake-128f".
+/// Raw names first, then composite names like "sphincs-blake-128f".
 pub fn resolve_features(
     cargo_toml_path: &Path,
     raw_features: &[String],
@@ -343,7 +313,6 @@ pub fn resolve_features(
     Ok(resolved)
 }
 
-/// Get all case names in a battery (flat list, for iteration).
 pub fn all_case_names(battery: &Battery) -> Vec<String> {
     let mut names = Vec::new();
     for case in &battery.cases {
@@ -364,8 +333,7 @@ pub fn all_case_names(battery: &Battery) -> Vec<String> {
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct Credits(pub f64);
 
-/// Token counts for one agent invocation. Every field is what the provider
-/// reported; none is derived.
+/// Every field is as the provider reported it; none is derived.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Tokens {
     pub input: u64,
@@ -374,36 +342,30 @@ pub struct Tokens {
     pub cache_read: u64,
 }
 
-/// Provenance for ONE agent CLI invocation: what ran, on what, at what cost.
-///
-/// All of this was previously recoverable only by grepping a 10 MB stream-json
-/// log, so no result.json and no table said which model produced a number. That
-/// matters here specifically: `--agent claude` passes no `--model`, so the model
-/// is whatever the CLI defaulted to at invocation time, and the CLI auto-updates
-/// mid-sweep.
+/// Provenance for ONE agent CLI invocation. `--agent claude` passes no
+/// `--model`, so the model is whatever the CLI defaulted to at invocation time,
+/// and the CLI auto-updates mid-sweep — it must be recorded per run.
 ///
 /// EVERY OPTIONAL FIELD MUST SERIALIZE AS ABSENT WHEN UNKNOWN, never as zero.
-/// kiro-cli reports "Credits" and no dollar cost; claude reports dollars and no
-/// credits. Writing `total_cost_usd: 0.0` for a kiro run records a measurement
-/// nobody made, and it would silently average into any cost table.
+/// kiro-cli reports credits and no dollars; claude the reverse. A
+/// `total_cost_usd: 0.0` on a kiro run is a measurement nobody made, and it
+/// would silently average into a cost table.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AgentRunMeta {
-    // ── kiro-cli fields, unchanged: existing result.json files carry them and
-    //    `check_enrichment` still requires credits for Agent::Kiro.
+    // Not Option: existing result.json files carry these, and check_enrichment
+    // requires credits for Agent::Kiro.
     pub credits: Credits,
     pub wall_secs: u64,
 
     // ── identity ────────────────────────────────────────────────────────────
-    /// Model the CLI was asked for, from the `system`/`init` record, e.g.
-    /// `global.anthropic.claude-opus-5[1m]`.
+    /// Requested model, from the `system`/`init` record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Agent CLI version, from the same record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_version: Option<String>,
-    /// Every model that actually billed tokens (`modelUsage` keys). May be a
-    /// SUPERSET of `model`: `Task` subagents can run a different one, and a
-    /// verify session spawns many.
+    /// From `modelUsage`. May be a SUPERSET of `model`: `Task` subagents can
+    /// bill a different one, and a verify session spawns many.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models_billed: Vec<String>,
 
@@ -429,17 +391,14 @@ pub struct AgentRunMeta {
     pub tokens: Option<Tokens>,
 }
 
-/// Parse the last `▸ Credits: X.XX • Time: Xm Xs` line from an agent log.
-/// Extract provenance from an agent run log, whichever CLI wrote it.
-///
 /// kiro-cli writes prose; claude writes stream-json. A log in neither format
 /// yields `None` rather than a zero-filled record.
 pub fn extract_agent_meta(log_path: &Path) -> Option<AgentRunMeta> {
     extract_kiro_meta(log_path).or_else(|| extract_stream_json_meta(log_path))
 }
 
-/// The original kiro-cli path. Now reads only the tail — the `Credits:` line is
-/// last, and this is called once per case over logs that reach 10+ MB.
+/// Tail-only: the `Credits:` line is last, and this runs once per case over
+/// logs that reach 10+ MB.
 fn extract_kiro_meta(log_path: &Path) -> Option<AgentRunMeta> {
     let data = crate::agent_health::read_tail(log_path).ok()?;
     let re = Regex::new(r"Credits:\s*([0-9.]+).*?Time:\s*(.+)").ok()?;
@@ -449,12 +408,10 @@ fn extract_kiro_meta(log_path: &Path) -> Option<AgentRunMeta> {
     Some(AgentRunMeta { credits, wall_secs, ..Default::default() })
 }
 
-/// claude stream-json: identity from the `system`/`init` record at the head,
-/// cost and effort from the terminal `result` record at the tail.
-///
-/// Scans line-wise and ignores non-JSON lines — the harness pipes the agent
-/// through `2>&1 | tee`, so stderr is interleaved into the same stream and a
-/// whole-file parse dies on the first such line.
+/// Identity comes from the head `system`/`init` record, cost and effort from the
+/// tail `result` record. Non-JSON lines must be skipped: the harness pipes the
+/// agent through `2>&1 | tee`, so stderr is interleaved and a whole-file parse
+/// dies on the first such line.
 fn extract_stream_json_meta(log_path: &Path) -> Option<AgentRunMeta> {
     let mut m = AgentRunMeta::default();
     let mut found = false;
@@ -475,8 +432,7 @@ fn extract_stream_json_meta(log_path: &Path) -> Option<AgentRunMeta> {
     }) {
         found = true;
         m.terminal_reason = t.get("terminal_reason").and_then(|v| v.as_str()).map(str::to_owned);
-        // `api_error_status` is present-but-null on success, so as_i64 correctly
-        // yields None rather than 0.
+        // Present-but-null on success, so as_i64 yields None rather than 0.
         m.api_error_status = t.get("api_error_status").and_then(|v| v.as_i64());
         m.num_turns = t.get("num_turns").and_then(|v| v.as_u64());
         m.duration_ms = t.get("duration_ms").and_then(|v| v.as_u64());
@@ -493,8 +449,7 @@ fn extract_stream_json_meta(log_path: &Path) -> Option<AgentRunMeta> {
                 cache_creation: g("cache_creation_input_tokens"),
                 cache_read: g("cache_read_input_tokens"),
             };
-            // All-zero means the provider reported nothing usable; do not invent
-            // a measurement.
+            // All-zero means the provider reported nothing usable.
             if tk != Tokens::default() {
                 m.tokens = Some(tk);
             }
@@ -504,9 +459,8 @@ fn extract_stream_json_meta(log_path: &Path) -> Option<AgentRunMeta> {
         }
     }
 
-    // Process exit status lives beside the log, already written by
-    // write_verification_metrics / write_translation_metrics — and previously
-    // read by nothing at all.
+    // Written beside the log by write_verification_metrics /
+    // write_translation_metrics.
     m.exit_code = log_path
         .parent()
         .and_then(|logs| logs.parent())
@@ -558,20 +512,16 @@ fn parse_duration(s: &str) -> u64 {
     secs
 }
 
-/// Unsafe usage counts extracted via AST (`syn`).
+/// Counted via AST (`syn`), not text matching.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UnsafeCounts {
-    /// `unsafe { ... }` blocks
     pub blocks: usize,
-    /// `unsafe fn` declarations
     pub fns: usize,
-    /// `unsafe impl` blocks
     pub impls: usize,
-    /// Total lines inside unsafe blocks/fns/impls
+    /// Total lines inside unsafe blocks/fns/impls.
     pub lines: usize,
 }
 
-/// Count unsafe constructs in `*.rs` files under `src_dir`, excluding `bin/` and `tests/`.
 pub fn count_unsafe(src_dir: &Path) -> UnsafeCounts {
     let mut counts = UnsafeCounts::default();
     let Ok(entries) = std::fs::read_dir(src_dir) else { return counts };
@@ -599,15 +549,12 @@ pub fn count_unsafe(src_dir: &Path) -> UnsafeCounts {
     counts
 }
 
-/// Lines-of-code counts for translated Rust source.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LocCounts {
-    /// Total non-blank, non-comment lines in `*.rs` files.
+    /// Non-blank, non-comment lines: the LOC definition the paper reports.
     pub code: usize,
 }
 
-/// Count lines of code in `*.rs` files under `src_dir`, excluding `bin/` and `tests/`.
-/// Counts non-blank lines that aren't pure `//` comments.
 pub fn count_loc(src_dir: &Path) -> LocCounts {
     let mut counts = LocCounts::default();
     let Ok(entries) = std::fs::read_dir(src_dir) else { return counts };
@@ -675,21 +622,18 @@ impl<'ast> syn::visit::Visit<'ast> for UnsafeVisitor {
 }
 
 pub struct Paths {
-    /// The actual repository root. Needed for the sandbox deny list, which must
-    /// cover the corpus (the graded oracle) and not just a results subdirectory —
-    /// see `crate::sandbox`. Do not confuse with the locals formerly named
-    /// `repo_root` at the old settings-JSON sites, which were dataset/agent dirs.
+    /// The ACTUAL repository root, not a dataset/agent dir: `crate::sandbox`'s
+    /// deny list must cover the corpus (the graded oracle), not just a results
+    /// subdirectory.
     pub repo_root: PathBuf,
     pub corpus_dir: PathBuf,
     pub results_dir: PathBuf,
     pub prompts_dir: PathBuf,
     pub agent: Agent,
     pub model: Option<String>,
-    /// How the agent-invocation cache behaves for this run. Lives here, beside
-    /// `agent` and `model`, because it is the same kind of thing: run-wide
-    /// configuration chosen once on the command line. A required parameter of
-    /// `new` rather than a default, so the compiler names every construction site
-    /// that would otherwise silently get read-write caching.
+    /// A required parameter of `new` rather than a default, so the compiler names
+    /// every construction site that would otherwise silently get read-write
+    /// caching.
     pub cache_mode: crate::cache::Mode,
 }
 
@@ -701,9 +645,8 @@ impl Paths {
         model: Option<&str>,
         cache_mode: crate::cache::Mode,
     ) -> Self {
-        // OpenCode's results dir is derived from --model (like Agent::Oneshot),
-        // so each evaluated model gets its own directory. Owned because the slug
-        // is computed, not a literal; the match below borrows from it.
+        // Derived from --model (like Agent::Oneshot) so each evaluated model gets
+        // its own dir. Owned because the match below borrows from it.
         let opencode_slug = matches!(agent, Agent::OpenCode)
             .then(|| {
                 let m = crate::opencode::parse_model(
@@ -746,9 +689,8 @@ impl Paths {
         };
         let prompts_dir = match agent {
             Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::OpenCode => match dataset {
-                // harvest-bench cases are libraries; reuse the project-type-
-                // dispatching prompts the test-corpus path uses (they handle the
-                // shared-library / cdylib case).
+                // harvest-bench cases are libraries, which the test-corpus
+                // prompts already dispatch on; no separate prompt set needed.
                 Dataset::TestCorpus | Dataset::HarvestBench => repo_root.join("prompts/claude"),
             },
             Agent::Kimi | Agent::Oneshot => repo_root.join("prompts/oneshot"),
@@ -786,9 +728,8 @@ mod tests {
     use std::fs;
     use std::os::unix::fs as unix_fs;
 
-    /// THE BUG: B02_synthetic has 40 independent cases + 2 symlinked (macrodepth).
-    /// Old bash set REAL_CASE globally and skipped ALL non-real cases from verify.
-    /// This test ensures independent cases are NOT grouped with shared-source.
+    /// Regression: the old bash set REAL_CASE globally and so skipped every
+    /// non-real case in a mixed battery (B02_synthetic) from verify.
     #[test]
     fn mixed_battery_separates_independent_and_shared() {
         let tmp = tempfile::tempdir().unwrap();
@@ -928,7 +869,6 @@ mod provenance_tests {
 
     #[test]
     fn records_the_model_and_cli_version_from_the_init_record() {
-        // The gap this closes: no result.json said which model produced a number.
         let tmp = tempfile::tempdir().unwrap();
         let p = log(tmp.path(), &format!("{INIT}\n{DONE}\n"));
         let m = extract_agent_meta(&p).expect("stream-json is recognised");
@@ -952,8 +892,6 @@ mod provenance_tests {
 
     #[test]
     fn models_billed_comes_from_model_usage_not_the_requested_model() {
-        // Task subagents can bill a different model than init asked for, so the
-        // billed set is the honest answer to "what produced this number".
         let tmp = tempfile::tempdir().unwrap();
         let two = DONE.replace(
             r#""modelUsage":{"global.anthropic.claude-opus-5[1m]":{"inputTokens":669}}"#,
@@ -967,12 +905,9 @@ mod provenance_tests {
 
     #[test]
     fn absent_is_absent_never_zero() {
-        // A kiro run has credits and no dollar cost. Serialising 0.0 would record
-        // a measurement nobody made and would average into a cost table.
         let tmp = tempfile::tempdir().unwrap();
-        // Verbatim shape from a real kiro log: credits and time on ONE line.
-        // (Splitting them across two lines does not match, because Rust's `.`
-        // does not cross a newline — my first fixture got this wrong.)
+        // Credits and time MUST stay on one line: the regex `.` does not cross a
+        // newline, so a two-line fixture silently fails to match.
         let p = log(tmp.path(), "▸ Credits: 1.25 • Time: 3m 4s\n");
         let m = extract_agent_meta(&p).expect("kiro log is recognised");
         assert_eq!(m.credits.0, 1.25);
@@ -997,8 +932,8 @@ mod provenance_tests {
 
     #[test]
     fn a_dead_run_records_its_cost_and_its_reason() {
-        // jansson burned $90 over 193 turns and then died on a 403. Both facts
-        // belong in the record: the cost was real, the result was not.
+        // jansson really burned $90 over 193 turns and then died on a 403: the
+        // cost was real, the result was not.
         let tmp = tempfile::tempdir().unwrap();
         let p = log(tmp.path(), &format!("{INIT}\n{DEAD}\n"));
         let m = extract_agent_meta(&p).unwrap();

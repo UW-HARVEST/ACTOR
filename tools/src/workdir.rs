@@ -1,46 +1,30 @@
 //! Where the harness puts its per-case scratch trees.
 //!
-//! These are multi-hundred-MB build trees (a `target/` dir alone runs to
-//! ~350 MB), not temp files. `tempfile`'s default lands them in
-//! `std::env::temp_dir()`, i.e. `/tmp` — and on the dev desktops `/tmp` is a
-//! **tmpfs**, so every C build, Rust build and test binary would run in RAM.
-//! On 2026-08-13 one agent-generated differential harness wrote a 12.0 GiB log
-//! into that tmpfs, which consumed the sweep's whole memory budget and killed
-//! it; earlier the same day the same class of pressure wedged the host for
-//! 2h13m with no swap to absorb it.
-//!
-//! So the base is resolved explicitly, defaults to disk, and **hard-errors if
-//! it resolves onto a tmpfs** unless the operator opts in. A wrong answer here
-//! is expensive and silent, so it is better to refuse than to guess.
+//! These are multi-hundred-MB build trees (`target/` alone runs to ~350 MB), and
+//! `tempfile`'s default puts them in `std::env::temp_dir()` — on the dev desktops
+//! `/tmp` is a **tmpfs**, so every C build, Rust build and test binary would run
+//! in RAM (one agent-generated harness wrote a 12.0 GiB log there and killed the
+//! sweep).
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Override the base directory for all harness scratch trees.
 pub const ENV_BASE: &str = "HARVEST_WORK_BASE";
 /// Escape hatch for hosts whose only writable filesystem is a tmpfs (some CI).
 pub const ENV_ALLOW_TMPFS: &str = "HARVEST_ALLOW_TMPFS_WORK";
 
 static BASE: OnceLock<PathBuf> = OnceLock::new();
 
-/// Resolved base for scratch trees: `$HARVEST_WORK_BASE`, else
-/// `$HOME/.harvest/work`.
+/// Base for scratch trees: `$HARVEST_WORK_BASE`, else `$HOME/.harvest/work`.
 ///
-/// **Not** under `$HOME/.cache`, despite these trees being disposable. XDG
-/// defines the cache dir as regenerable data safe to delete at any time, and on
-/// the dev desktops it is treated that way in practice: it already holds ~75 GB
-/// (huggingface, uv, pip, torch) on a filesystem with ~83 GB free, so it is the
-/// first place anyone reclaims space from, and `brazil-package-cache-clean`
-/// already sweeps a subdirectory of it on a timer. Deleting it mid-sweep would
-/// destroy in-flight cases. A live 20-hour build tree is working state, not
-/// cache, so it gets its own directory.
+/// Not under `$HOME/.cache` even though these trees are disposable: that dir is
+/// treated as free-to-delete (`brazil-package-cache-clean` sweeps part of it on a
+/// timer), which would destroy in-flight cases.
 ///
-/// `TMPDIR` is deliberately **not** consulted either. It is normally unset, so
-/// including it would fall through to `/tmp` and quietly reinstate the tmpfs
-/// default this module exists to avoid. It also collides with the `TMPDIR` the
-/// harness *sets for the agent child* (see `agent_tmp`), which would be
-/// confusing to reason about.
+/// `TMPDIR` is deliberately not consulted: it is normally unset, so it would
+/// fall through to the `/tmp` tmpfs this module exists to avoid, and it collides
+/// with the `TMPDIR` the harness sets for the agent child (see `agent_tmp`).
 pub fn base() -> Result<PathBuf> {
     if let Some(p) = BASE.get() {
         return Ok(p.clone());
@@ -60,9 +44,8 @@ fn resolve() -> Result<PathBuf> {
     )
 }
 
-/// Pure-ish core of [`resolve`]: every input is a parameter, so the precedence
-/// and the tmpfs refusal are testable without mutating process env (which races
-/// across the test harness's threads) or reading the real mount table.
+/// Every input is a parameter so the precedence and the tmpfs refusal are
+/// testable without mutating process env, which races across test threads.
 fn resolve_from(
     base_override: Option<PathBuf>,
     home: Option<PathBuf>,
@@ -77,9 +60,8 @@ fn resolve_from(
     };
     std::fs::create_dir_all(&base)
         .with_context(|| format!("creating scratch base {}", base.display()))?;
-    // Canonicalise before the fstype check: $HOME is a symlink into /local on
-    // the dev desktops, and prefix-matching an uncanonicalised path against
-    // /proc/mounts mis-resolves.
+    // Canonicalise before the fstype check: $HOME is a symlink into /local here,
+    // and prefix-matching an uncanonicalised path against /proc/mounts misfires.
     let base = base
         .canonicalize()
         .with_context(|| format!("resolving scratch base {}", base.display()))?;
@@ -100,14 +82,13 @@ fn resolve_from(
 }
 
 /// Filesystem type of the mount containing `path`, by longest-prefix match over
-/// `/proc/mounts` content. Split out from `resolve` so it is unit-testable
-/// without touching the real mount table.
+/// `/proc/mounts` content: a shorter mount like `/` prefixes almost everything.
 fn fstype_for(mounts: &str, path: &Path) -> Option<String> {
     let mut best: Option<(usize, String)> = None;
     for line in mounts.lines() {
         // <device> <mountpoint> <fstype> <opts> ...  — mountpoints escape spaces as \040.
-        // Skip malformed lines rather than `?`-ing out: aborting the scan would
-        // discard a correct match found earlier and silently report "unknown fs".
+        // Skipping a malformed line rather than bailing keeps a correct match
+        // found earlier, instead of silently reporting "unknown fs".
         let mut f = line.split_whitespace();
         let (Some(_dev), Some(mnt), Some(fstype)) = (f.next(), f.next(), f.next()) else {
             continue;
@@ -120,7 +101,6 @@ fn fstype_for(mounts: &str, path: &Path) -> Option<String> {
     best.map(|(_, t)| t)
 }
 
-/// Create a scratch tree named `<prefix><random>` under [`base`].
 pub fn tempdir(prefix: &str) -> Result<tempfile::TempDir> {
     let base = base()?;
     tempfile::Builder::new()
@@ -129,14 +109,9 @@ pub fn tempdir(prefix: &str) -> Result<tempfile::TempDir> {
         .with_context(|| format!("creating {prefix}* scratch dir in {}", base.display()))
 }
 
-/// Scratch directory to hand the agent as `TMPDIR`, inside its own work root.
-///
-/// This is the fix for the failure that motivated this module: the 12.0 GiB log
-/// was written by *agent-generated* test code calling
-/// `std::env::temp_dir().join("driver-difftest")`, which resolved to `/tmp`
-/// because nothing in the harness set `TMPDIR`. Pointing it inside the work
-/// root puts that scratch on disk *and* inside the tree that is discarded when
-/// the case finishes, instead of leaking into a shared RAM disk.
+/// Scratch dir handed to the agent as `TMPDIR`: agent-generated test code calls
+/// `std::env::temp_dir()`, which is the `/tmp` tmpfs unless `TMPDIR` is set, and
+/// inside the work root that scratch is on disk and discarded with the case.
 pub fn agent_tmp(work_root: &Path) -> Result<PathBuf> {
     let dir = work_root.join("tmp");
     std::fs::create_dir_all(&dir)
@@ -144,34 +119,29 @@ pub fn agent_tmp(work_root: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// `ulimit -f` argument capping any single file the agent writes. A backstop for
-/// the case where the agent hardcodes `/tmp` (30 files in the current corpus do)
-/// so `TMPDIR` cannot help: the write dies with SIGXFSZ and that one case fails,
-/// rather than the sweep or the host.
+/// `ulimit -f` argument capping any single file the agent writes. Backstop for
+/// agent code that hardcodes `/tmp` (30 files in the current corpus do), where
+/// `TMPDIR` cannot help: the write dies with SIGXFSZ, failing one case instead of
+/// the sweep or the host.
 ///
-/// Unit is **1024-byte blocks**: POSIX specifies 512 for `-f`, but bash uses
-/// 1024 outside POSIX mode, and bash is what we invoke. Verified against
-/// `/proc/<pid>/limits` on a live agent — assuming 512 here silently doubled the
-/// cap to 8 GiB.
+/// Unit is **1024-byte blocks**: POSIX specifies 512 for `-f` but bash, which is
+/// what we invoke, uses 1024. Assuming 512 silently doubled the cap to 8 GiB.
 pub const AGENT_FSIZE_BLOCKS: u64 = 4 * 1024 * 1024;
 
 /// `ulimit -d` argument, in KB, capping the heap of *each* process under the
 /// agent (RLIMIT_DATA is per-process and covers anonymous mmap since Linux 4.7).
 ///
-/// Motivated by a generated test binary that reached 13.44 GB of anon RSS
-/// (`phase_b_engine-`, 2026-08-14 01:19) and took the whole sweep's cgroup with
-/// it. Without a cap the failure mode is a cgroup OOM — no result recorded, and
-/// with `Restart=on-failure` the sweep re-enters the same case forever. With
-/// one, the allocation fails inside the test, which is a *recorded* outcome.
+/// Uncapped, a runaway test binary (13.44 GB anon RSS observed) OOMs the sweep's
+/// whole cgroup: no result is recorded and `Restart=on-failure` then re-enters the
+/// same case forever. Capped, the allocation fails inside the test — a *recorded*
+/// outcome.
 ///
-/// Sized at 6 GiB from three constraints: above the largest legitimate test
-/// binaries observed (the `driver` cases at 4.4–4.7 GB), below the 13.44 GB
-/// runaway, and small enough that two concurrent cases plus the agent, cargo and
-/// rust-analyzer overhead stay inside a 16 GiB `MemoryMax` (2×6 + ~2 = 14 GiB).
+/// 6 GiB is above the largest legitimate test binaries seen (`driver` cases at
+/// 4.4–4.7 GB), below that runaway, and leaves two concurrent cases plus agent,
+/// cargo and rust-analyzer inside a 16 GiB `MemoryMax` (2×6 + ~2 = 14 GiB).
 ///
-/// NOTE: a case that fails *at* this cap needs review, not silent scoring — an
-/// allocation this large may itself be a translation-fidelity signal (cf. the
-/// huge-array cases) rather than a bug in the harness.
+/// A case that fails *at* this cap needs review, not silent scoring: the
+/// allocation may be a translation-fidelity signal, not a harness bug.
 pub const AGENT_DATA_KB: u64 = 6 * 1024 * 1024;
 
 #[cfg(test)]
@@ -187,7 +157,6 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
 
     #[test]
     fn fstype_picks_the_longest_matching_mount_not_the_first() {
-        // `/` also prefixes this path; the deeper mount must win.
         assert_eq!(
             fstype_for(MOUNTS, Path::new("/local/home/scheschb/.cache/harvest/work")).as_deref(),
             Some("xfs")
@@ -222,10 +191,6 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
 
     #[test]
     fn default_base_derives_from_home_and_is_not_tmp_or_cache() {
-        // The regression this module exists to prevent: with no override the base
-        // must not be /tmp the way tempfile's default was. And not under .cache,
-        // which is routinely purged to reclaim disk and would take in-flight
-        // cases with it.
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let got = resolve_from(None, Some(home.clone()), true, MOUNTS).expect("resolves from HOME");
@@ -240,8 +205,7 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
 
     #[test]
     fn tmpfs_base_is_refused_with_an_actionable_message() {
-        // tempfile::tempdir() lands in /tmp, which MOUNTS marks as tmpfs — exactly
-        // the situation that killed the 2026-08-13 sweep.
+        // tempfile::tempdir() lands in /tmp, which MOUNTS marks as tmpfs.
         let tmp = tempfile::tempdir().unwrap();
         let err = resolve_from(Some(tmp.path().to_path_buf()), None, false, MOUNTS)
             .expect_err("a tmpfs base must be refused");
@@ -287,8 +251,8 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
 
     #[test]
     fn fsize_cap_is_four_gib_in_bashs_1024_byte_blocks() {
-        // bash's ulimit -f block size, not POSIX's 512. Confirmed against
-        // /proc/<pid>/limits: "Max file size = 8589934592" when this was 4 GiB/512.
+        // bash's ulimit -f block size, not POSIX's 512: /proc/<pid>/limits showed
+        // "Max file size = 8589934592" when this constant assumed 512.
         assert_eq!(AGENT_FSIZE_BLOCKS * 1024, 4 * 1024u64.pow(3));
     }
 
@@ -313,8 +277,6 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
 
     #[test]
     fn data_cap_admits_the_largest_legitimate_test_binary_seen() {
-        // The `driver` binaries in the 2026-08-13 incident peaked at 4.67 GB and
-        // are real cases; only the 13.44 GB outlier should be refused.
         let legit_peak_kb = 4_896_256; // anon-rss from the kernel OOM report
         let runaway_kb = 14_091_264;
         assert!(AGENT_DATA_KB > legit_peak_kb, "must not break the 4.67 GB cases");

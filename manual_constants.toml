@@ -1,18 +1,9 @@
-# MANUALLY ENTERED constants — NOT derived from the results data.
-#
-# Every number here is the product of human analysis or is external cited data
-# that no committed pipeline reproduces. The generator (`harvest-tools report`)
-# only transcribes this file into tables/manual.tex as \newcommand macros; it
-# never computes these values. Edit here (one place) to change them.
-#
-# Each entry documents WHY it is manual. If a value later becomes derivable,
-# move it out of this file and into the generated numbers.tex.
+# Human analysis or external cited data that no committed pipeline reproduces.
+# `harvest-tools report` only transcribes this file into tables/manual.tex; it never
+# computes these values. If one becomes derivable, move it to the generated numbers.tex.
 
-# ---------------------------------------------------------------------------
-# tab:root-causes — manual triage of ACTOR's TRACTOR failures into categories.
-# No categorizer exists; a human read each failing case's diff and assigned
-# (possibly multiple) categories. Counts sum to 30 across the failing cases.
-# ---------------------------------------------------------------------------
+# tab:root-causes — no categorizer exists; a human read each failing case's diff and
+# assigned possibly multiple categories, so these sum to 30, not to the case count.
 [root_causes]
 undefined_behavior = 3
 macros = 3
@@ -21,12 +12,8 @@ input_processing = 9
 underspecified_behavior = 2
 truncated_output = 12
 
-# ---------------------------------------------------------------------------
-# tab:unsafe-root-causes — manual classification of unsafe constructs in
-# ACTOR's translated output. count_unsafe() yields only blocks/fns/impls/lines,
-# never categories; these were produced by a one-off grep-and-classify pass
-# over a de-duplicated file set.
-# ---------------------------------------------------------------------------
+# tab:unsafe-root-causes — count_unsafe() yields blocks/fns/impls/lines, never
+# categories; one-off grep-and-classify pass over a de-duplicated file set.
 [unsafe_categories]
 c_abi_preservation = 1648
 external_ffi_calls = 208
@@ -41,20 +28,15 @@ pointer_arithmetic = 3931
 others = 44
 total = 14791
 
-# Caption aggregates for tab:unsafe-root-causes (de-duplicated file set;
-# comment/blank counting the generator does not currently do).
+# Caption aggregates for tab:unsafe-root-causes; the generator counts no comment/blank lines.
 [unsafe_caption]
 files = 382
 loc = 56258
 comment_lines = 1070
 blank_lines = 7020
 
-# ---------------------------------------------------------------------------
-# tab:prompt-sensitivity cross-prompt swap block (TRACTOR B0X, n=210). A one-off
-# experiment: each library translated with the executable prompt and vice versa,
-# split by exec/lib. TRACTOR-derived (summary.json); kept here as it is a bespoke
-# subset run, not a standard cell.
-# ---------------------------------------------------------------------------
+# tab:prompt-sensitivity — TRACTOR-derived (summary.json), but from a bespoke one-off
+# cross-prompt swap run (B0X, n=210) rather than a standard cell.
 [prompt_sensitivity]
 lib_prompt_on_execs = "59/61"
 exec_prompt_on_libs = "4/149"

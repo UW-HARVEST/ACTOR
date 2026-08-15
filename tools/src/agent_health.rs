@@ -1,85 +1,59 @@
 //! Did the agent actually run, or did the infrastructure fail?
 //!
-//! Nothing in the harness asked this before, and it cost us two runs.
+//! A case whose agent never got to run has *no* measurement and must not be
+//! scored as one: a credential outage once killed all seven HarvestBench verify
+//! agents, and unbuildable crates were dropped by a bare `continue` so the
+//! denominator silently went 7 → 5 and `3/5 projects pass` reached `tables/`.
 //!
-//! On 2026-08-14 all seven HarvestBench verify agents died on expired
-//! credentials. Scoring ran anyway: projects whose crate would not build were
-//! dropped by a bare `continue`, the denominator silently moved from 7 to 5,
-//! `harvest-bench: 3/5 projects pass` was printed, and every file in `tables/`
-//! was regenerated from it. The same outage hit 43 of 209 Test-Corpus cases
-//! earlier the same day, and those were scored too.
+//! Do **not** branch on `subtype`: it reads `"success"` in 214 of 214 real logs,
+//! including every 403. The discriminator is `terminal_reason` (`completed` or
+//! `api_error` in every log examined, 1:1 with `is_error`), which sits in the same
+//! record as `"subtype":"success","is_error":true`.
 //!
-//! An infrastructure failure is not a result. A case whose agent never got to
-//! run has *no* measurement, and must not be reported as one.
-//!
-//! # Do not branch on `subtype`
-//!
-//! The terminal record of a dead run looks like this — note the two fields side
-//! by side:
-//!
-//! ```text
-//! "subtype":"success", "is_error":true, "terminal_reason":"api_error",
-//! "api_error_status":403,
-//! "result":"Failed to authenticate. API Error: 403 The security token ... is expired"
-//! ```
-//!
-//! `subtype` is `"success"` in 214 of 214 real logs, **including every 403**.
-//! The discriminator is `terminal_reason`, which was `completed` or `api_error`
-//! across every log examined and is 1:1 with `is_error`.
-//!
-//! # Why the process exit code is not the discriminator
-//!
-//! `verification.json` already persists `exit_code`, and it happens to be 1:1
-//! with `terminal_reason` today — but it cannot stay that way. Since the agent
-//! runs under `ulimit -f`/`-d` (see [`crate::workdir`]), a test binary killed by
-//! `SIGXFSZ` makes commands inside the session fail without the session itself
-//! being an infrastructure failure. That is a *result*. So the exit code is
-//! reported as corroborating detail and never classified on.
+//! The process exit code is not a discriminator either, though it is 1:1 with
+//! `terminal_reason` today: the agent runs under `ulimit -f`/`-d` (see
+//! [`crate::workdir`]), so a test binary killed by `SIGXFSZ` fails commands inside
+//! a session that is itself fine — that is a *result*. Exit codes are therefore
+//! reported as corroborating detail only.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// How much of the log tail to read. The terminal record is the last line, and
-/// its `result` field can carry several KB of final prose.
+/// The terminal record is the last line, and its `result` field can carry several
+/// KB of final prose.
 const TAIL_BYTES: u64 = 16 * 1024;
 
 /// PROOF that an agent invocation ran to completion.
 ///
-/// The unit field is private, so a `Completed` cannot be constructed outside this
-/// module: the only way to obtain one is [`Health::completed`], i.e. by passing a
-/// real log through [`classify_log`]. Anything that requires `&Completed` therefore
-/// cannot be reached for an infra-failed run — that is a compile error rather than
-/// a runtime check someone can forget. See `crate::artifact::Scrubbed::seal`.
+/// The private unit field makes [`Health::completed`] the only way to obtain one,
+/// so code requiring `&Completed` is unreachable for an infra-failed run as a
+/// compile error, not a forgettable runtime check. See
+/// `crate::artifact::Scrubbed::seal`.
 pub struct Completed(());
 
 impl Completed {
-    /// Test-only constructor. `#[cfg(test)]` so production code still cannot forge
-    /// a proof, while the crate's own tests can exercise the seal path.
+    /// `#[cfg(test)]` so production code still cannot forge a proof.
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         Self(())
     }
 }
 
-/// Verdict for one agent invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
-    /// The agent ran to completion. Says nothing about whether the translation
-    /// or verification *succeeded* — that is a result, and results are the
-    /// scorer's business, not ours.
+    /// Ran to completion. Says nothing about whether the translation or
+    /// verification *succeeded* — that is a result, the scorer's business.
     Completed,
-    /// The agent did not get to finish for a reason outside the thing being
-    /// measured: auth, rate limiting, transport, or a truncated log.
+    /// Did not finish for a reason outside the thing being measured: auth, rate
+    /// limiting, transport, or a truncated log.
     Infra { reason: String, detail: String },
-    /// No evidence either way. Kiro logs are not stream-json, and results
-    /// produced before this module existed have no terminal record. Callers
-    /// must not treat this as a failure.
+    /// No evidence either way (kiro logs are not stream-json; results predating
+    /// this module have no terminal record). Not a failure.
     Unknown { why: String },
 }
 
 impl Health {
-    /// Proof of completion, if this run completed. The ONLY constructor of
-    /// [`Completed`].
+    /// The ONLY constructor of [`Completed`].
     pub fn completed(&self) -> Option<Completed> {
         matches!(self, Health::Completed).then_some(Completed(()))
     }
@@ -89,7 +63,6 @@ impl Health {
     }
 }
 
-/// Classify one agent log by its terminal record.
 pub fn classify_log(log: &Path) -> Health {
     let tail = match read_tail(log) {
         Ok(t) => t,
@@ -98,15 +71,14 @@ pub fn classify_log(log: &Path) -> Health {
         }
     };
 
-    // Not stream-json at all (kiro-cli writes prose): no opinion.
+    // kiro-cli writes prose, not stream-json: no opinion.
     if !tail.contains("\"type\":\"result\"") && !tail.contains("\"terminal_reason\"") {
         if tail.contains("Credits:") {
             return Health::Unknown { why: "kiro-cli log, no terminal record".into() };
         }
-        // Stream-json that stops mid-flight. This is the case the operator's
-        // resume script had to special-case by hand: a run killed partway leaves
-        // a log with a fresh mtime and no terminal record, and skipping on
-        // existence alone would score it as if it had finished.
+        // Stream-json that stops mid-flight: a run killed partway leaves a log
+        // with a fresh mtime and no terminal record, so skipping on existence
+        // alone would score it as if it had finished.
         return Health::Infra {
             reason: "truncated".into(),
             detail: "no terminal record: the agent was killed before finishing".into(),
@@ -126,8 +98,8 @@ pub fn classify_log(log: &Path) -> Health {
         return Health::Completed;
     }
 
-    // A terminal record without `terminal_reason`: fall back to `is_error`,
-    // which was 1:1 with it. Never `subtype`.
+    // Terminal record without `terminal_reason`: fall back to `is_error`, which
+    // was 1:1 with it. Never `subtype`.
     match last_bool(&tail, "is_error") {
         Some(true) => Health::Infra {
             reason: "is_error".into(),
@@ -138,16 +110,14 @@ pub fn classify_log(log: &Path) -> Health {
     }
 }
 
-/// Corroborating process-level detail from `verification.json` /
-/// `translation.json`, for the report only. Deliberately not a classifier: see
-/// the module docs on `SIGXFSZ`.
+/// Report-only detail. Deliberately not a classifier: see the module docs on
+/// `SIGXFSZ`.
 pub fn exit_code(metrics_json: &Path) -> Option<i64> {
     let s = std::fs::read_to_string(metrics_json).ok()?;
     let v: serde_json::Value = serde_json::from_str(&s).ok()?;
     v.get("exit_code")?.as_i64()
 }
 
-/// One case's health, for reporting.
 #[derive(Debug, Clone)]
 pub struct CaseHealth {
     pub name: String,
@@ -156,9 +126,7 @@ pub struct CaseHealth {
     pub log: PathBuf,
 }
 
-/// Classify every case under `results_dir` that has a verify or translate log.
-///
-/// Walks `<results_dir>/**/{verified,translated}/logs/{verify,translation}.log`,
+/// Classify every case under `results_dir` that has a verify or translate log,
 /// preferring the verify log when both exist, since verify is the later phase.
 pub fn audit(results_dir: &Path) -> Result<Vec<CaseHealth>> {
     let mut out = Vec::new();
@@ -175,7 +143,6 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<CaseHealth>) -> Result<()> {
         if !p.is_dir() {
             continue;
         }
-        // A case dir is one holding a phase dir with a log we recognise.
         let verify = p.join("verified/logs/verify.log");
         let translate = p.join("translated/logs/translation.log");
         let (log, metrics) = if verify.is_file() {
@@ -197,7 +164,6 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<CaseHealth>) -> Result<()> {
     Ok(())
 }
 
-/// Human-readable report of the infra failures in an audit, or `None` if clean.
 pub fn describe_infra_failures(audit: &[CaseHealth]) -> Option<String> {
     let bad: Vec<&CaseHealth> = audit.iter().filter(|c| c.health.is_infra()).collect();
     if bad.is_empty() {
@@ -221,10 +187,8 @@ pub fn describe_infra_failures(audit: &[CaseHealth]) -> Option<String> {
     Some(s)
 }
 
-/// Persist the audit's infra failures next to the results, so downstream
-/// consumers (and a human reading the tree later) can see which cases have no
-/// measurement. Written even when `--allow-infra-failures` lets scoring proceed:
-/// the point is that the exclusion is never invisible.
+/// Written even when `--allow-infra-failures` lets scoring proceed, so that the
+/// cases with no measurement are never invisible to a later reader.
 pub fn record_infra_failures(results_dir: &Path, audit: &[CaseHealth]) -> Result<()> {
     let bad: Vec<serde_json::Value> = audit
         .iter()
@@ -258,11 +222,9 @@ pub fn record_infra_failures(results_dir: &Path, audit: &[CaseHealth]) -> Result
     Ok(())
 }
 
-// ── parsing helpers ────────────────────────────────────────────────────────
-//
-// Deliberately string-scanning rather than serde: the logs are NOT pure JSONL
-// (the harness merges the agent's stderr into the same stream via `2>&1 | tee`),
-// so a line-by-line `from_str` would fail on the first non-JSON line.
+// String-scanning rather than serde: the harness merges the agent's stderr into
+// the stream via `2>&1 | tee`, so the logs are not pure JSONL and a line-by-line
+// `from_str` would fail on the first non-JSON line.
 
 pub(crate) fn read_tail(path: &Path) -> Result<String> {
     use std::io::{Read, Seek, SeekFrom};
@@ -299,7 +261,6 @@ fn last_num(hay: &str, key: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
-/// First ~160 chars of the terminal `result` field, for the operator's benefit.
 fn first_line_of_result(tail: &str) -> String {
     match last_str(tail, "result") {
         Some(r) if !r.is_empty() => {
@@ -314,7 +275,7 @@ fn first_line_of_result(tail: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Verbatim shape of a real 2026-08-14 credential-expiry terminal record.
+    /// Verbatim shape of a real credential-expiry terminal record.
     const DEAD: &str = r#"{"type":"system","subtype":"api_retry","attempt":4,"error_status":403}
 {"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":403,"duration_ms":4569000,"num_turns":12,"result":"Failed to authenticate. API Error: 403 The security token included in the request is expired","session_id":"abc"}"#;
 
@@ -329,7 +290,7 @@ mod tests {
 
     #[test]
     fn a_credential_expiry_is_infra_despite_subtype_success() {
-        // THE bug this module exists for. subtype says "success"; the run is dead.
+        // subtype says "success"; the run is dead.
         let tmp = tempfile::tempdir().unwrap();
         let log = write(tmp.path(), "verify.log", DEAD);
         match classify_log(&log) {
@@ -360,8 +321,7 @@ mod tests {
 
     #[test]
     fn a_completed_run_that_failed_verification_is_still_completed() {
-        // Health is not the verdict. A run that completed and concluded "the
-        // translation is wrong" is a RESULT and must reach the scorer.
+        // Concluding "the translation is wrong" is a RESULT: it must be scored.
         let body = CLEAN.replace(
             "Verified. c_src/ was not modified.",
             "Phase B found a divergence; the Rust port returns 0 where C returns -1.",
@@ -373,8 +333,8 @@ mod tests {
 
     #[test]
     fn a_truncated_log_is_infra_not_silently_ok() {
-        // A killed run leaves a fresh mtime and no terminal record. Skipping on
-        // existence alone is what corrupted 4 cases in the 2026-08-13 sweep.
+        // A killed run leaves a fresh mtime and no terminal record; skipping on
+        // existence alone corrupted 4 cases of a real sweep.
         let tmp = tempfile::tempdir().unwrap();
         let log = write(tmp.path(), "v.log",
             "{\"type\":\"system\",\"subtype\":\"init\"}\n{\"type\":\"assistant\"}\n");
@@ -394,8 +354,6 @@ mod tests {
 
     #[test]
     fn stderr_interleaved_into_the_stream_does_not_break_parsing() {
-        // The harness pipes the agent through `2>&1 | tee`, so the log is not
-        // pure JSONL. A serde-per-line parser would die on the first such line.
         let body = format!("warning: something on stderr\n{CLEAN}\n");
         let tmp = tempfile::tempdir().unwrap();
         let log = write(tmp.path(), "v.log", &body);
@@ -434,8 +392,7 @@ mod tests {
         ).unwrap();
         let a = audit(tmp.path()).unwrap();
         assert_eq!(a[0].exit_code, Some(1));
-        // `success:true` is the cargo-check gate, NOT agent health -- the whole
-        // reason exit_code/success could not answer this question on their own.
+        // `success:true` here is the cargo-check gate, NOT agent health.
         assert!(a[0].health.is_infra());
     }
 

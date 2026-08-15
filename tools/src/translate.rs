@@ -8,28 +8,21 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 // ── claude_plain agent (mirrors kiro_plain) ────────────────────────────
-// Used with `--agent claude_plain` to give Claude Code a neutral profile
-// matching kiro_plain.json: built-in tools only (Bash/Edit/Read/Write/Task),
-// no skills/plugins/MCP, no extra system prompt.
+// Deliberately matches kiro_plain.json (built-in tools only, no skills/plugins/
+// MCP, no extra system prompt) so the two agents are compared on equal footing.
 pub const CLAUDE_PLAIN_AGENT_JSON: &str = r#"{"claude_plain":{"description":"Bare-bones agent matching kiro_plain","prompt":"You are a coding assistant. Use the available tools to complete the user's task.","tools":["Bash","Edit","Read","Write","Task"]}}"#;
 
-/// Agent-runtime settings that materially change how a session behaves, and how
-/// long it takes.
+/// Agent-runtime settings that materially change how a session behaves.
 ///
-/// These lived in the shell driver (`hb-rerun.sh`) as bare `export` lines, which
-/// made them invisible to the cache key: two sweeps with different retry policy
-/// would have shared an entry. They belong here, where [`crate::cache::Recipe`]
-/// hashes them by construction and a forgotten `export` cannot silently change the
-/// experiment.
-///
-/// Values are the ones the 2026-08-14 sweep actually ran with, so behaviour is
-/// unchanged — only its location and its visibility to the key.
+/// They belong here, not in the shell driver as bare `export`s, so
+/// [`crate::cache::Recipe`] hashes them by construction: otherwise two sweeps with
+/// different retry policy would share a cache entry.
 pub const AGENT_ENV: &[(&str, &str)] = &[
-    // A single request may legitimately take a long time on a large project; the
+    // A single request may legitimately run this long on a large project; the
     // per-session wall clock is bounded separately by `timeout`.
     ("API_TIMEOUT_MS", "1200000"),
     ("API_FORCE_IDLE_TIMEOUT", "0"),
-    // Bedrock throttles under concurrency. Without generous retries a throttle
+    // Bedrock throttles under concurrency; without generous retries a throttle
     // becomes a dead case, which #67 then correctly refuses to score.
     ("CLAUDE_CODE_MAX_RETRIES", "20"),
     ("CLAUDE_CODE_RETRY_WATCHDOG", "1"),
@@ -37,26 +30,15 @@ pub const AGENT_ENV: &[(&str, &str)] = &[
 
 /// The model every `--agent claude` invocation is pinned to.
 ///
-/// Previously no `--model` was passed at all, so the model was whatever the CLI
-/// defaulted to that day — and the CLI auto-updates. Two things make that
-/// unacceptable rather than merely untidy:
+/// Must be pinned explicitly: the CLI auto-updates, so an unpinned run is attributed
+/// to whatever model it defaulted to that day. The cache key also has to name the
+/// model *before* the run, and the resolved model only appears in the transcript's
+/// `init` record — after the money is spent.
 ///
-/// * **The results are a measurement.** A number attributed to "claude" that was
-///   actually produced by three different models over three weeks is not a
-///   measurement of anything.
-/// * **The cache key must be knowable before the run.** The resolved model only
-///   appears in the transcript's `init` record, i.e. after the money is spent. A
-///   key that omitted it could hand back another model's output; a key that read it
-///   afterwards could not be used to decide whether to run.
-///
-/// This is exactly the value the existing results were produced with — every `init`
-/// record under `results/HarvestBench/claude/*/verified/logs/verify.log` reports
-/// `global.anthropic.claude-opus-5[1m]` — so pinning it changes no number. It is a
-/// Bedrock inference-profile id because `CLAUDE_CODE_USE_BEDROCK` is set;
+/// A Bedrock inference-profile id because `CLAUDE_CODE_USE_BEDROCK` is set;
 /// `HARVEST_CLAUDE_MODEL` overrides it for an environment routed differently.
 pub const CLAUDE_MODEL_DEFAULT: &str = "global.anthropic.claude-opus-5[1m]";
 
-/// The pinned model, validated. See [`CLAUDE_MODEL_DEFAULT`].
 pub fn claude_model() -> Result<crate::cache::ModelId> {
     let raw = std::env::var("HARVEST_CLAUDE_MODEL")
         .unwrap_or_else(|_| CLAUDE_MODEL_DEFAULT.to_string());
@@ -65,16 +47,14 @@ pub fn claude_model() -> Result<crate::cache::ModelId> {
 
 /// Fail loudly if the CLI did not honour the pin.
 ///
-/// `--model` is a request, not a guarantee: an unrecognised id could be silently
-/// substituted, and then a whole sweep would be attributed to the wrong model and
-/// cached under a key naming a model that never ran. The transcript's `init` record
-/// is the CLI's own report of what it resolved, so comparing against it closes the
-/// gap between "we asked for" and "we got".
+/// `--model` is a request, not a guarantee: an unrecognised id can be silently
+/// substituted, and the sweep would then be cached under a key naming a model that
+/// never ran. The transcript's `init` record is the CLI's own report of what it
+/// resolved.
 pub fn assert_model_honoured(log_path: &Path, want: &crate::cache::ModelId) -> Result<()> {
     let text = match std::fs::read_to_string(log_path) {
         Ok(t) => t,
-        // Absent or unreadable log is not this function's failure to report; the
-        // health classifier already treats it as a non-completion.
+        // The health classifier already treats a missing log as a non-completion.
         Err(_) => return Ok(()),
     };
     let Some(got) = text
@@ -96,13 +76,10 @@ pub fn assert_model_honoured(log_path: &Path, want: &crate::cache::ModelId) -> R
     Ok(())
 }
 
-/// Wall-clock cap on one agentic translate/verify session, matching the
-/// `timeout 10800` already used by the claude and codex invocations.
+/// Wall-clock cap on one agentic session; must stay in step with the hard-coded
+/// `timeout 10800` in the claude and codex invocations below.
 const TRANSLATE_TIMEOUT_SECS: u64 = 10800;
 
-/// The `--model` for `--agent opencode`, parsed. `Paths` carries the raw string;
-/// `main` has already validated it, so a failure here means an internal bug
-/// rather than bad user input.
 fn opencode_model(paths: &Paths) -> Result<crate::opencode::Model> {
     let raw = paths.model.as_deref().context(
         "--agent opencode requires --model <provider>/<model-id> (should have been \
@@ -154,9 +131,8 @@ struct CaseResult {
 
 // ── Public entry point ─────────────────────────────────────────────────
 
-/// The CLI value for an agent (e.g. `claude`), for copy-pasteable hints in
-/// diagnostics. Uses clap's derived `ValueEnum` mapping so it always matches
-/// what `--agent` accepts.
+/// Uses clap's derived `ValueEnum` mapping so hints printed in diagnostics always
+/// match what `--agent` actually accepts.
 fn agent_cli_name(agent: Agent) -> String {
     use clap::ValueEnum;
     agent.to_possible_value()
@@ -164,11 +140,9 @@ fn agent_cli_name(agent: Agent) -> String {
         .unwrap_or_else(|| format!("{agent:?}").to_lowercase())
 }
 
-/// A translate target names a BATTERY; cases live one level deeper as
-/// `<battery>/<case>/` with a `test_case/` (C sources) and a `test_vectors/`
-/// dir inside each. Discovering zero cases almost always means the target is a
-/// case dir mistaken for a battery (the #1 first-run pitfall). Fail loudly with
-/// a fix, rather than the old silent "0/0 translated".
+/// Zero discovered cases almost always means a case dir was passed where a battery
+/// was expected, so the message spells the layout out rather than reporting
+/// "0/0 translated".
 fn ensure_cases_found(count: usize, paths: &Paths, battery_name: &str) -> Result<()> {
     if count > 0 { return Ok(()); }
     let input_dir = paths.input_dir(battery_name);
@@ -296,9 +270,9 @@ fn translate_one_independent(
         || dispatch_translate(paths, battery_name, &case.name, case.is_lib),
         || {
             if paths.agent == Agent::ClaudeCrossPrompt {
-                // E4: SWAP prompts. Don't override the agent's lib-vs-bin choice
-                // (that IS the experiment), but DO add `[workspace]` so cargo
-                // doesn't try to absorb each case into a parent workspace.
+                // E4: the agent's lib-vs-bin choice IS the experiment, so it must not
+                // be overridden here; `[workspace]` is still needed so cargo does not
+                // absorb each case into a parent workspace.
                 let cargo_path = crate::battery::phase_dir(&paths.case_dir(battery_name, &case.name), crate::battery::TRANSLATED).join("Cargo.toml");
                 if cargo_path.exists() {
                     if let Ok(mut cargo) = CargoToml::open(&cargo_path) {
@@ -331,7 +305,6 @@ fn translate_one_shared(
         || {
             if let Ok(mut cargo) = CargoToml::open(&crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED).join("Cargo.toml")) {
                 cargo.add_workspace();
-                // Patch default features from CMakePresets.json (same as config copies)
                 let features = battery::extract_features_from_path(
                     &paths.input_dir(battery_name).join(&group.real_case).join("CMakePresets.json"),
                 ).unwrap_or_default();
@@ -357,9 +330,8 @@ fn run_and_record(
     translate_fn: impl FnOnce() -> Result<()>,
     post_process_fn: impl FnOnce() -> Result<()>,
 ) -> CaseResult {
-    // Clear any stale agent-exit from a prior case on this (possibly re-used)
-    // thread; CLI agents re-stamp it during translate_fn, non-CLI agents leave
-    // it absent so no exit_code is falsely attributed.
+    // A thread may be re-used across cases; without this, a non-CLI agent would
+    // inherit the previous case's exit code.
     clear_agent_exit();
     let start = Instant::now();
     match translate_fn() {
@@ -384,8 +356,7 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
         Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
         Agent::Kimi => kimi_translate_case(paths, battery, name, is_lib),
         Agent::Oneshot => oneshot_translate_case(paths, battery, name, is_lib),
-        // OpenCode runs the SAME engineered prompts as Claude Code / Kiro — the
-        // backend is what varies, not the methodology.
+        // One arm on purpose: the backend varies, the methodology does not.
         Agent::Kiro | Agent::Claude | Agent::OpenCode => {
             let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
             let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
@@ -397,40 +368,34 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeMinimal => {
-            // Universal minimal prompt — no project-type dispatch.
             let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-minimal.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeNoIter => {
-            // Same project-type dispatch as Claude, but without "build → fix → iterate" steps.
             let f = if is_lib { "ablations/translate-no-iter-library.md" } else { "ablations/translate-no-iter-executable.md" };
             let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeNoFeatures => {
-            // E2: cmake-features ablation only affects shared-source cases.
-            // Independent (executable/library) cases reuse the engineered claude prompts.
+            // E2: the cmake-features ablation only affects shared-source cases.
             let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
             let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeNoSubtask => {
-            // E6: subtask-decomposition ablation only affects shared-source cases.
-            // Independent (executable/library) cases reuse the engineered claude prompts.
+            // E6: the subtask-decomposition ablation only affects shared-source cases.
             let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
             let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeCrossPrompt => {
-            // E4: SWAP project-type prompts. Libraries get the executable prompt;
-            // executables get the library prompt. Directly answers Reviewer 2's
-            // question about cross-prompt application.
+            // E4: the mismatch is the experiment — libraries get the executable
+            // prompt and vice versa.
             let f = if is_lib { "translate-executable.md" } else { "translate-library.md" };
             let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
         Agent::CodexGpt55 | Agent::CodexGpt54 => {
-            // Codex on Bedrock — same prompts as Claude Code, different harness.
             let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
             let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
@@ -455,7 +420,6 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeMinimal => {
-            // Universal minimal prompt — same as for executables/libraries.
             let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-minimal.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
@@ -464,24 +428,20 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeNoFeatures => {
-            // E2: shared-source prompt without cmake-features → cargo-features guidance.
             let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-no-features-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeNoSubtask => {
-            // E6: shared-source prompt without subtask-decomposition guidance.
             let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-no-subtask-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
         Agent::ClaudeCrossPrompt => {
-            // E4: cross-prompt ablation only affects independent libs/execs.
-            // For shared-source cases, use the standard claude shared prompt.
-            // (Run scope is typically B01_synthetic which has no shared-source anyway.)
+            // E4: the cross-prompt swap only applies to independent libs/execs, so
+            // shared-source cases fall back to the standard claude shared prompt.
             let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
         Agent::CodexGpt55 | Agent::CodexGpt54 => {
-            // Codex on Bedrock — same shared prompt as Claude Code.
             let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default();
             translate_case(paths, battery, name, &prompt)
         }
@@ -492,16 +452,13 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
 // ── harvest-bench translation ──────────────────────────────────────────
 
 /// Translate every harvest-bench project's `test_case/` into a Rust crate that
-/// builds a cdylib with the same C ABI. Each project is independent, so they
-/// run in parallel under a semaphore (like the test-corpus independent cases).
-/// The produced crate lands at `results/HarvestBench/<agent>/<name>/translated_rust`;
-/// the test phase builds it into a `.so` and runs the upstream gtest suite.
+/// builds a cdylib with the same C ABI: the test phase builds it into a `.so` and
+/// runs the upstream gtest suite against it.
 pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject], parallel: usize) -> Result<()> {
     preflight_check(paths.agent)?;
 
-    // harvest-bench test_case/ is always a library (a C lib the suite links by
-    // ABI). Reuse the same project-type-dispatching library prompt the
-    // test-corpus path uses — it handles the cdylib / FFI-type case.
+    // A harvest-bench test_case/ is always a C library the suite links by ABI, so
+    // the library prompt applies to every project — no project-type dispatch.
     let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-library.md"))
         .context("reading translate-library.md for harvest-bench")?;
 
@@ -556,9 +513,8 @@ fn translate_one_harvest_bench(paths: &Paths, project: &battery::HarvestBenchPro
     run_and_record(name, &case_dir, paths.agent,
         || translate_case_at(paths, project.test_case(), &case_dir, prompt),
         || {
-            // Post-process to a library crate: cdylib + strip bin/tests, same as
-            // the test-corpus independent-lib path. The lib name is the project
-            // name (the suite links `lib<name>.so` by ABI, not by symbol crate name).
+            // The lib name must be the project name: the suite links `lib<name>.so`
+            // by ABI, not by crate name.
             let cargo_path = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml");
             if cargo_path.exists() {
                 let mut cargo = CargoToml::open(&cargo_path)?;
@@ -609,8 +565,8 @@ fn preflight_check(agent: Agent) -> Result<()> {
 
     if matches!(agent, Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt) {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // Claude version output may be "2.1.150.280 ..." (older) or
-        // "claude 2.1.158.312 ..." (newer). Match any line containing a digit-dot-digit pattern.
+        // `claude --version` prints either "2.1.150.280 ..." or "claude 2.1.158.312 ...",
+        // depending on version, so scan for the first line carrying digits.
         let version_str = stdout.lines()
             .find(|l| l.chars().any(|c| c.is_ascii_digit()))
             .unwrap_or("");
@@ -634,19 +590,16 @@ fn preflight_check(agent: Agent) -> Result<()> {
 
 // ── Core translation ───────────────────────────────────────────────────
 
-/// Test-corpus wrapper: derive the input `test_case/` and output case dir from
-/// the `battery`/`name` layout, then run the shared core.
 fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Result<()> {
     let input_test_case = paths.input_dir(battery).join(name).join("test_case");
     let case_dir = paths.case_dir(battery, name);
     translate_case_at(paths, &input_test_case, &case_dir, prompt)
 }
 
-/// The agentic-translation core, parameterized by explicit input/output paths
-/// so it serves any dataset layout (test-corpus's `battery/name/test_case`,
-/// harvest-bench's `tests/<name>/test_case`, …). Copies the C source into an
-/// isolated temp workspace, invokes the agent there, and on success copies the
-/// produced crate to `<out_case_dir>/translated_rust`.
+/// The agentic-translation core: copies the C source into an isolated temp
+/// workspace, invokes the agent there, and on success copies the produced crate to
+/// `<out_case_dir>/translated_rust`. Paths are explicit so it serves any dataset
+/// layout.
 pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &Path, prompt: &str) -> Result<()> {
     let case_dir = out_case_dir;
 
@@ -654,10 +607,8 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
         std::fs::remove_dir_all(case_dir)?;
     }
 
-    // Translation output is the immutable `translated/` phase dir; its logs live
-    // inside it (translated/logs/translation.log). Created before the agent runs
-    // so `tee` can write there live; the crate copy-back below merges into this
-    // dir without clobbering logs.
+    // Created before the agent runs so `tee` can write its log there live; the
+    // crate copy-back below merges into this dir rather than replacing it.
     let translated_dir = crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED);
     let logs_dir = translated_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
@@ -679,10 +630,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
             }
 
             if matches!(paths.agent, Agent::OpenCode) {
-                // OpenCode's run-private config: the Bedrock provider, the
-                // sub-agent permission policy, the compaction plugin, and the
-                // XDG isolation dir. Analogous to the .claude/settings.json
-                // sandbox written just above.
+                // OpenCode's equivalent of the .claude/settings.json sandbox above.
                 crate::opencode::materialize_config(
                     tmp.path(),
                     crate::opencode::Phase::Translate,
@@ -694,9 +642,8 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
         }
     };
 
-    // OpenCode needs its filesystem-boundary contract and output-cap warning
-    // appended, and the boundary names the temp dir — so the final prompt is
-    // only known once the workspace exists. Every other agent appends nothing.
+    // OpenCode's appended filesystem-boundary contract names the temp dir, so the
+    // final prompt is only known once the workspace exists.
     let prompt: &str = &match paths.agent {
         Agent::OpenCode => {
             let tmp_root = work_dir.parent().unwrap_or(&work_dir);
@@ -705,12 +652,9 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
         _ => prompt.to_string(),
     };
 
-    // Record the EXACT prompt the agent was given, verbatim, next to the result.
-    // Prompt files evolve over time, so the filename alone isn't enough to know
-    // what a past run actually saw — copying the rendered text makes every result
-    // self-documenting (no need to look up a git hash at the run's timestamp).
-    // Written AFTER any per-agent suffix so it captures what the agent truly saw.
-    // Empty for non-prompt agents (c2rust etc.); skip those to avoid a blank file.
+    // Prompt files evolve, so the filename alone does not say what a past run saw:
+    // store the rendered text, after any per-agent suffix. Empty for non-prompt
+    // agents such as c2rust.
     if !prompt.is_empty() {
         let _ = std::fs::write(logs_dir.join("prompt.md"), prompt);
     }
@@ -732,9 +676,8 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
         Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt => {
             let work_root = work_dir.parent().unwrap();
             let settings_path = work_root.join(".claude/settings.json");
-            // Agent scratch lands inside the work root — on disk, and discarded
-            // with the case — rather than in the shared /tmp tmpfs, and no single
-            // file the agent writes may exceed the cap. See crate::workdir.
+            // Agent scratch must land on disk inside the work root, not in the shared
+            // /tmp tmpfs. See crate::workdir.
             let agent_tmp = crate::workdir::agent_tmp(work_root)?;
             let script = format!(
                 "ulimit -f {} -d {}; set -o pipefail; timeout 10800 claude -p \"$1\" \
@@ -761,8 +704,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                 .env("OPENSSL_DIR", &openssl_dir)
                 .env("TMPDIR", &agent_tmp)
                 .env("CLAUDE_CODE_TMPDIR", &agent_tmp)
-                // `verify.md` and the translate prompt both delegate to subagents via
-                // Task; without this they would pick their own model and the pin would
+                // Prompts delegate to subagents via Task; without this the pin would
                 // cover only the top-level session.
                 .env("CLAUDE_CODE_SUBAGENT_MODEL", model.as_str())
                 .envs(AGENT_ENV.iter().copied())
@@ -772,9 +714,8 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
             record_agent_exit(status);
         }
         Agent::CodexGpt55 | Agent::CodexGpt54 => {
-            // Codex CLI on Bedrock. Bedrock backend only — OpenAI auth/telemetry
-            // disabled. Model + region overridden per-agent via -c flags so
-            // we don't depend on a global ~/.codex/config.toml.
+            // Model and region are passed as `-c` overrides so the run does not
+            // depend on a global ~/.codex/config.toml.
             let (model, region) = match paths.agent {
                 Agent::CodexGpt55 => ("openai.gpt-5.5", "us-east-2"),
                 Agent::CodexGpt54 => ("openai.gpt-5.4", "us-west-2"),
@@ -821,8 +762,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
         anyhow::bail!("no Cargo.toml produced");
     }
 
-    // Merge the produced crate from the temp dir into `translated/`, preserving
-    // the logs/ already written there (copy_dir_all merges, never wipes the dst).
+    // copy_dir_all merges, so the logs/ already written into `translated/` survive.
     copy_dir_all(&work_dir, &translated_dir)?;
 
     Ok(())
@@ -851,11 +791,11 @@ fn post_process_independent(paths: &Paths, battery: &str, name: &str, is_lib: bo
     Ok(())
 }
 
-/// Propagate the real case's crate to a shared-source config follower, for a
-/// given phase. Translate propagates the `translated/` phase; verify (after
-/// fixing the real case) re-propagates the `verified/` phase, so every config
-/// follower has the SAME post-verify crate the real case ended with — this is
-/// what makes runtests score all N configs as verified, not just the real one.
+/// Propagate the real case's crate to a shared-source config follower.
+///
+/// Verify re-propagates the `verified/` phase after fixing the real case, so each
+/// follower carries the same post-verify crate; without that, runtests scores only
+/// the real case as verified.
 pub fn propagate_config_phase(
     paths: &Paths,
     battery: &str,
@@ -864,8 +804,7 @@ pub fn propagate_config_phase(
     phase: &str,
 ) -> Result<()> {
     let real_dir = crate::battery::phase_dir(&paths.case_dir(battery, real_case), phase);
-    // Nothing to propagate if the real case never produced this phase (e.g. an
-    // agent with no verify phase → no verified/ to copy).
+    // An agent with no verify phase produces no verified/ to copy.
     if !real_dir.is_dir() { return Ok(()); }
     let cfg_dir = paths.case_dir(battery, &cfg.name);
     let translated = crate::battery::phase_dir(&cfg_dir, phase);
@@ -881,7 +820,6 @@ pub fn propagate_config_phase(
 
     std::fs::copy(real_dir.join("Cargo.toml"), translated.join("Cargo.toml"))?;
 
-    // Copy root-level files (lib.rs, build.rs, rust-toolchain.toml, etc.)
     for entry in std::fs::read_dir(&real_dir)? {
         let entry = entry?;
         if entry.file_type()?.is_file() && entry.file_name() != "Cargo.toml" {
@@ -920,8 +858,6 @@ pub fn propagate_config_phase(
     Ok(())
 }
 
-/// Propagate the real case's `translated/` crate to a config follower (the
-/// translate-phase default).
 pub fn propagate_config(
     paths: &Paths,
     battery: &str,
@@ -935,19 +871,13 @@ pub fn propagate_config(
 
 // ── Agent process exit capture ─────────────────────────────────────────
 //
-// The agent CLIs (kiro-cli / claude / codex) are shelled out with `.status()`,
-// but the metrics JSON is written in a different, shallower function than the
-// one that invokes them (run_and_record vs translate_case_at, and similarly
-// for verify). Rather than thread the exit status back through
-// dispatch_translate's ~12 match arms, we stash the most recent agent exit in
-// a THREAD-LOCAL. This is sound because each case runs on its own thread
-// (translate/verify parallelize with one case per spawned thread), so the
-// "last agent exit on this thread" is unambiguously this case's agent run.
+// The exit status is captured deep inside translate_case_at but written out by
+// run_and_record, so it is stashed in a thread-local instead of being threaded back
+// through dispatch_translate's ~12 match arms. Sound only because each case runs on
+// its own thread: "last agent exit on this thread" is unambiguously this case's.
 //
-// `exit_code` is the shell pipeline's status (`set -o pipefail` makes it the
-// agent's own code, or `timeout`'s 124 on timeout → `timed_out`). It is absent
-// for non-CLI agents (API-based kimi/oneshot, in-process c2rust) which have no
-// single agent-process exit code.
+// `exit_code` is the shell pipeline's status (`set -o pipefail` makes it the agent's
+// own code). Absent for agents with no single agent process (kimi/oneshot, c2rust).
 #[derive(Clone, Copy, Default)]
 pub struct AgentExit {
     pub exit_code: Option<i32>,
@@ -960,7 +890,6 @@ thread_local! {
         const { std::cell::Cell::new(AgentExit { exit_code: None, timed_out: false, recorded: false }) };
 }
 
-/// Record the exit of an agent CLI invocation for the current case/thread.
 pub fn record_agent_exit(status: std::process::ExitStatus) {
     let code = status.code();
     LAST_AGENT_EXIT.with(|c| c.set(AgentExit {
@@ -970,20 +899,17 @@ pub fn record_agent_exit(status: std::process::ExitStatus) {
     }));
 }
 
-/// Clear the stashed exit at the start of a case, so a non-CLI agent (or a
-/// re-used thread) can never inherit a previous case's exit code.
+/// Call at the start of a case: a non-CLI agent on a re-used thread must not inherit
+/// the previous case's exit code.
 pub fn clear_agent_exit() {
     LAST_AGENT_EXIT.with(|c| c.set(AgentExit::default()));
 }
 
-/// Take (and clear) the stashed exit for the current thread.
 fn take_agent_exit() -> AgentExit {
     LAST_AGENT_EXIT.with(|c| c.replace(AgentExit::default()))
 }
 
-/// Add `exit_code` / `timed_out` to a metrics object if a CLI agent exit was
-/// recorded this run. Shared by translate and verify so both report it
-/// identically — no double standard.
+/// Shared by translate and verify so both report agent process health identically.
 fn merge_agent_exit(metrics: &mut serde_json::Value) {
     let e = take_agent_exit();
     if e.recorded {
@@ -1009,33 +935,28 @@ fn write_translation_metrics(case_dir: &Path, agent: Agent, duration_secs: u64, 
 
 /// What one agent invocation cost and how it exited.
 ///
-/// Built exactly once per invocation, because `merge_agent_exit` consumes the
-/// recorded exit — and then used for both `verification.json` and the cache entry,
-/// so the record beside the artifact and the record inside the store cannot
-/// disagree about the same run.
+/// Must be built exactly once per invocation: `merge_agent_exit` consumes the
+/// recorded exit. The one value then feeds both `verification.json` and the cache
+/// entry, so the two cannot disagree about the same run.
 pub fn agent_provenance(agent: Agent, duration_secs: u64) -> serde_json::Value {
     let mut p = serde_json::json!({
         "agent": format!("{agent:?}").to_lowercase(),
         "duration_secs": duration_secs,
         "success": true,
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        // WHICH CODE produced this. The 2026-08-14 sweep could not answer that
-        // question afterwards, which is why it went unnoticed for twelve hours.
+        // Which harness code produced this; results are otherwise unattributable
+        // after the fact.
         "harness": crate::provenance::harness_id(),
     });
     merge_agent_exit(&mut p);
     p
 }
 
-/// Verify-side sibling of [`write_translation_metrics`], writing
-/// `verification.json` with the same shape (incl. agent exit). No double
-/// standard: verify records agent process health exactly like translate.
+/// Verify-side sibling of [`write_translation_metrics`].
 ///
 /// `provenance` describes the invocation that produced the artifact, which on a
-/// replay is the ORIGINAL one — its cost, its exit code, its timestamp. That is the
-/// honest thing to record next to the artifact, but it must not be mistaken for
-/// this run's spend, so `replayed` says so explicitly and `cache_key` names the
-/// entry it came from.
+/// replay is the ORIGINAL one — so `replayed` and `cache_key` are what stop its cost
+/// and timestamp being read as this run's spend.
 pub fn write_verification_metrics(
     case_dir: &Path,
     provenance: &serde_json::Value,
@@ -1089,7 +1010,7 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copy a directory tree, skipping top-level directories in `skip`.
+/// `skip` applies to top-level directories only.
 pub fn copy_dir_filtered(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)
@@ -1101,7 +1022,6 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
         let dst_path = dst.join(&name);
         let ft = entry.file_type()?;
         if ft.is_symlink() {
-            // Resolve symlink: if target is dir, recurse; if file, copy target
             let target = std::fs::metadata(entry.path());
             match target {
                 Ok(m) if m.is_dir() => {
@@ -1121,30 +1041,26 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
         } else if ft.is_file() {
             std::fs::copy(entry.path(), &dst_path)?;
         }
-        // Skip non-regular files: FIFOs, sockets, char/block devices.
-        // These can appear in agent workspaces (e.g. impcheck creates .pipe FIFOs)
-        // and would cause std::fs::copy to block forever.
+        // Non-regular files (FIFOs, sockets, devices) appear in agent workspaces —
+        // impcheck creates .pipe FIFOs — and std::fs::copy blocks forever on them.
     }
     Ok(())
 }
 
-/// RAII isolated working directory. Copies translated_rust/ into a temp dir,
-/// agent works there, `finish()` copies results back. Drop without finish
-/// discards the temp dir (safe on failure).
 /// The verify phase's working copy, expressed in terms of [`crate::artifact`].
 ///
 /// Materialises `translated/` into disk-backed scratch, hands the agent a
 /// [`crate::artifact::WorkTree`] (the only artifact type that yields a path, hence
-/// the only one anything can execute in), and on `finish` requires PROOF that the
-/// agent completed before the result is allowed to reach `verified/`.
+/// the only one anything can execute in), and on `finish` requires proof that the
+/// agent completed before the result may reach `verified/`.
 pub struct IsolatedWorkDir {
     work: crate::artifact::WorkTree<crate::artifact::Verify>,
     /// Digest of the `translated/` artifact this was materialised from.
     input: crate::artifact::TreeDigest,
-    /// Digest of the C oracle as handed to the agent. Compared on `finish`: the C
-    /// side is the reference the translation is graded against, so a run that
-    /// modified it has not been verified against the original program. Nothing
-    /// checked this before, and `verify.md` still contains no rule forbidding it.
+    /// Digest of the C oracle as handed to the agent, compared on `finish`: the C
+    /// side is the reference being graded against, so a run that modified it has not
+    /// been verified against the original program. `verify.md` contains no rule
+    /// forbidding that, so this check is the only thing catching it.
     c_before: crate::artifact::TreeDigest,
 }
 
@@ -1159,39 +1075,33 @@ impl IsolatedWorkDir {
         Ok(Self { work, input, c_before })
     }
 
-    /// Path the agent should work in.
     pub fn translated_rust(&self) -> PathBuf {
         self.work.crate_dir()
     }
 
-    /// Path to the scratch root (for setting current_dir, the sandbox policy and
-    /// the agent's TMPDIR).
+    /// Scratch root: current_dir, the sandbox policy and the agent's TMPDIR.
     pub fn root(&self) -> &Path {
         self.work.path()
     }
 
-    /// Digest of the `translated/` artifact this work dir was materialised from —
-    /// the cache key's input component. Taken here rather than recomputed later
+    /// The cache key's input component. Taken here rather than recomputed later
     /// because it must describe what the agent was actually given.
     pub fn input_digest(&self) -> &crate::artifact::TreeDigest {
         &self.input
     }
 
-    /// Seal the agent's output. Consumes self.
+    /// Seal the agent's output.
     ///
-    /// Requires `&Completed`, so an infra-failed run cannot be sealed — a
-    /// compile-time guarantee, not a check that can be forgotten. Returns the
-    /// artifact rather than publishing it: publication now happens once, on the
-    /// far side of the cache, so a replayed result and a fresh one travel the same
-    /// path and cannot diverge.
+    /// Requires `&Completed` so an infra-failed run cannot be sealed. Returns the
+    /// artifact rather than publishing it: publication happens once on the far side
+    /// of the cache, so replayed and fresh results travel the same path.
     pub fn finish(
         self,
         proof: &crate::agent_health::Completed,
     ) -> Result<crate::artifact::Sealed<crate::artifact::Verify>> {
         let scrubbed = self.work.scrub()?;
-        // Surface the scrub rather than doing it silently: a file that embedded the
-        // scratch path is a file whose content varied per run, which is worth
-        // knowing about. Measured 3 files across 345 cases in the current corpus.
+        // Reported rather than silent: a file that embedded the scratch path is a
+        // file whose content varied per run (3 files across 345 cases).
         for rel in scrubbed.rewritten() {
             eprintln!("  scrubbed per-run path from {}", rel.as_path().display());
         }
@@ -1238,7 +1148,6 @@ fn c2rust_translate(work_dir: &Path, log_path: &Path) -> Result<()> {
         anyhow::bail!("c2rust transpile failed: {}", String::from_utf8_lossy(&c2r_out.stderr));
     }
 
-    // Patch Cargo.toml and source files
     let cargo_path = work_dir.join("Cargo.toml");
     if cargo_path.exists() {
         let mut cargo = std::fs::read_to_string(&cargo_path)?;
@@ -1320,31 +1229,26 @@ fn oneshot_llm_translate(
     let translated = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
     std::fs::create_dir_all(&translated)?;
 
-    // Copy c_src for the test harness
+    // The test harness expects the C sources beside the crate.
     let c_src = translated.join("c_src");
     std::fs::create_dir_all(&c_src)?;
     copy_dir_all(&input_test_case, &c_src)?;
 
-    // Collect C files and detect project kind
     let files_json = collect_c_files_json(&input_test_case)?;
     let is_lib = detect_is_library(&input_test_case).unwrap_or(is_lib_hint);
     let prompt_file = if is_lib { "translate-library.md" } else { "translate-executable.md" };
     let system_prompt = std::fs::read_to_string(paths.prompts_dir.join(prompt_file))
         .with_context(|| format!("reading {prompt_file}"))?;
 
-    // Record the exact system prompt used, verbatim, next to the result (same
-    // rationale as the CLI-agent path): the result is self-documenting about
-    // which prompt ran, robust to prompt files changing later.
+    // As on the CLI-agent path: prompt files change, so store the text that ran.
     let _ = std::fs::write(logs_dir.join("prompt.md"), &system_prompt);
 
     let user_msg = format!(
         "Please translate the following C project into a Rust project including Cargo manifest:\n\n{files_json}\n\nreturn as JSON"
     );
 
-    // Call LLM backend and write output files
     let resp = invoke_llm(&system_prompt, &user_msg, &log_path)?;
 
-    // Write usage metadata
     let mut usage = serde_json::json!({
         "input_tokens": resp.input_tokens,
         "output_tokens": resp.output_tokens,
@@ -1378,7 +1282,6 @@ fn collect_c_files_json(dir: &Path) -> Result<String> {
     Ok(serde_json::to_string(&FilesPayload { files })?)
 }
 
-/// Detect whether a project is a library by reading CMakeLists.txt.
 fn detect_is_library(dir: &Path) -> Option<bool> {
     let cmake = std::fs::read_to_string(dir.join("CMakeLists.txt")).ok()?;
     if cmake.lines().any(|l| l.trim_start().starts_with("add_library(")) {
@@ -1390,7 +1293,6 @@ fn detect_is_library(dir: &Path) -> Option<bool> {
     }
 }
 
-/// Call AWS Bedrock Converse API and return the assistant's text response.
 fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) -> Result<LlmResponse> {
     let request = serde_json::json!({
         "modelId": BEDROCK_MODEL_ID,
@@ -1414,11 +1316,9 @@ fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) ->
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    // Save full raw response
     let response_file = log_path.parent().unwrap().join("translation.response.json");
     let _ = std::fs::write(&response_file, &stdout);
 
-    // Log human-readable summary
     let log_content = format!(
         "=== BEDROCK REQUEST ===\nModel: {BEDROCK_MODEL_ID}\nRegion: {BEDROCK_REGION}\n\n\
          === SYSTEM PROMPT ===\n{system_prompt}\n\n\
@@ -1432,7 +1332,6 @@ fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) ->
         anyhow::bail!("bedrock converse failed: {stderr}");
     }
 
-    // Parse full response
     let resp: serde_json::Value = serde_json::from_str(&stdout)
         .with_context(|| format!("failed to parse Bedrock response: {}", truncated(&stdout, 500)))?;
 
@@ -1448,7 +1347,6 @@ fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) ->
     Ok(LlmResponse { content, input_tokens, output_tokens })
 }
 
-/// Call OpenRouter chat completions API and return the assistant's text response.
 fn openrouter_converse(model: &str, system_prompt: &str, user_message: &str, log_path: &Path) -> Result<LlmResponse> {
     let api_key = std::env::var("OPENROUTER_API_KEY")
         .context("OPENROUTER_API_KEY env var not set")?;
@@ -1478,11 +1376,9 @@ fn openrouter_converse(model: &str, system_prompt: &str, user_message: &str, log
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-    // Save full raw response
     let response_file = log_path.parent().unwrap().join("translation.response.json");
     let _ = std::fs::write(&response_file, &stdout);
 
-    // Log human-readable summary
     let log_content = format!(
         "=== OPENROUTER REQUEST ===\nModel: {model}\n\n\
          === SYSTEM PROMPT ===\n{system_prompt}\n\n\
@@ -1497,7 +1393,6 @@ fn openrouter_converse(model: &str, system_prompt: &str, user_message: &str, log
         anyhow::bail!("curl failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
-    // Parse OpenAI-compatible response
     let resp: serde_json::Value = serde_json::from_str(&stdout)
         .with_context(|| format!("failed to parse OpenRouter response: {}", truncated(&stdout, 500)))?;
 
@@ -1518,10 +1413,9 @@ fn openrouter_converse(model: &str, system_prompt: &str, user_message: &str, log
 
 /// Truncate to at most `max` **bytes**, ending on a UTF-8 character boundary.
 ///
-/// `&s[..s.len().min(max)]` panics when byte `max` lands inside a multi-byte character.
-/// Every call site below is building an error message about a failed parse, so the
-/// panic would replace the very diagnostic it was trying to print — and the strings
-/// involved are LLM responses and prompts, which routinely contain non-ASCII.
+/// The obvious `&s[..s.len().min(max)]` panics when byte `max` lands mid-character,
+/// which for these call sites (error messages about unparseable LLM output, routinely
+/// non-ASCII) would replace the diagnostic being printed.
 /// `str::floor_char_boundary` would do this directly but is still unstable.
 fn truncated(s: &str, max: usize) -> &str {
     if s.len() <= max {
@@ -1541,10 +1435,10 @@ fn write_llm_files(json_response: &str, output_dir: &Path) -> Result<()> {
     #[derive(serde::Deserialize)]
     struct FilesPayload { files: Vec<FileEntry> }
 
-    // Try to extract JSON from markdown code blocks if present
+    // Models wrap the object in prose or a markdown fence, so cut to the outermost
+    // brace pair rather than parsing the response as-is.
     let json_str = if let Some(start) = json_response.find('{') {
         let from_brace = &json_response[start..];
-        // Find the matching closing brace
         let mut depth = 0;
         let mut end = from_brace.len();
         for (i, c) in from_brace.char_indices() {
@@ -1578,8 +1472,7 @@ fn write_llm_files(json_response: &str, output_dir: &Path) -> Result<()> {
 
 const LAERTES_DOCKER_IMAGE: &str = "laertes-ready";
 
-/// Shell script executed inside the Laertes Docker container.
-/// Expects the project mounted at /mnt/project with read-write access.
+/// Requires the project bind-mounted read-write at /mnt/project.
 const LAERTES_DOCKER_SCRIPT: &str = r#"
 set -e
 export PATH=$HOME/.cargo/bin:$PATH
@@ -1612,8 +1505,7 @@ done
 fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()> {
     use std::io::Write;
 
-    // Locate c2rust source: its translated/ crate (sibling under results/).
-    // c2rust never runs a verify phase, so translated/ IS the crate to consume.
+    // c2rust never runs a verify phase, so its translated/ IS the crate to consume.
     let c2rust_case = paths.results_dir
         .parent().context("no parent for results_dir")?
         .join("c2rust").join(battery).join(name);
@@ -1628,18 +1520,15 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     let log_path = logs_dir.join("translation.log");
     let translated = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
 
-    // Copy c2rust output (skip target/ and Cargo.lock)
     copy_dir_filtered(&c2rust_original, &translated, &["target"])?;
 
     let mut log = std::fs::File::create(&log_path)?;
     writeln!(log, "source: {}", c2rust_original.display())?;
 
-    // Pre-process for nightly-2020-10-15
     writeln!(log, "\n=== Laertes pre-process ===")?;
     laertes_preprocess(&translated)?;
     writeln!(log, "done")?;
 
-    // Run Laertes in Docker
     writeln!(log, "\n=== Laertes Docker ===")?;
     let mount = format!("{}:/mnt/project", translated.display());
     let docker_out = Command::new("docker")
@@ -1649,11 +1538,9 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     log.write_all(&docker_out.stdout)?;
     log.write_all(&docker_out.stderr)?;
 
-    // Post-process for modern toolchain
     writeln!(log, "\n=== Laertes post-process ===")?;
     laertes_postprocess(&translated)?;
 
-    // Verify it compiles
     let build = Command::new("cargo")
         .args(["+nightly", "build", "--release"])
         .env("RUSTFLAGS", "-Awarnings")
@@ -1675,11 +1562,10 @@ const C2SAFERRUST_MODEL: &str = "bedrock-gpt54";
 const C2SAFERRUST_DEFAULT_BASE_URL: &str =
     "https://bedrock-mantle.us-west-2.api.aws/openai/v1";
 
-/// Shell script run inside the C2SaferRust container.
-/// The mounted workspace is at /work; the reshaped crate is /work/rust.
-/// We give the (non-root) container user a writable HOME + CARGO_HOME and seed
-/// the cargo registry from the image so the pinned-nightly build has no network
-/// dependency. translate.py writes its result to /work/rust_WIP.
+/// Runs against the workspace bind-mounted at /work, reshaped crate at /work/rust,
+/// result at /work/rust_WIP. The non-root container user needs a writable HOME +
+/// CARGO_HOME, and the registry is seeded from the image so the pinned-nightly build
+/// needs no network.
 const C2SAFERRUST_DOCKER_SCRIPT: &str = r#"
 set -e
 mkdir -p /work/home /work/cargo
@@ -1697,23 +1583,13 @@ cd /opt/c2saferrust
 timeout 900 python3 translate.py --code_dir /work/rust 2>&1
 "#;
 
-// Process-lived Bedrock bearer-token cache. Follows the internal pattern
-// (e.g. ElasticGumbyAgenticMCP, SageMaker hosting benchmark, CodeBlocksLibrary
-// midway token-refresh): mint a 12h token but refresh well before expiry so a
-// long batch run can never outlive its token. We refresh at 50% of the 12h
-// lifetime (6h), matching ElasticGumby's "hours of retry headroom" guidance.
+// Minted tokens live 12h; refreshing at half that leaves a long batch run unable to
+// outlive its token.
 static BEDROCK_TOKEN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 const BEDROCK_TOKEN_REFRESH_AFTER: Duration = Duration::from_secs(6 * 3600);
 
-/// Return a valid Bedrock bearer token. Precedence:
-///
-/// 1. `BEDROCK_API_KEY` / `AWS_BEARER_TOKEN_BEDROCK` env (CI / manual injection)
-/// 2. process cache, if the cached token is younger than the refresh window
-/// 3. a freshly minted token from the host (`aws_bedrock_token_generator`)
-///
-/// Minting strips AWS_PROFILE/AWS_DEFAULT_PROFILE so the token is issued for the
-/// operator's `default` (ada) profile, not any session profile that Claude Code
-/// or other tooling may have exported (a real bug we hit: wrong-account 401s).
+/// Env override first (CI / manual injection), then the process cache, then a freshly
+/// minted token.
 fn bedrock_token(region: &str) -> Result<String> {
     if let Ok(t) = std::env::var("BEDROCK_API_KEY") {
         if !t.trim().is_empty() { return Ok(t); }
@@ -1734,8 +1610,9 @@ fn bedrock_token(region: &str) -> Result<String> {
     Ok(tok)
 }
 
-/// Mint a short-term (12h) Bedrock bearer token on the host via the standard
-/// `aws_bedrock_token_generator` python package, using the `default` AWS profile.
+/// Mints a 12h token. AWS_PROFILE/AWS_DEFAULT_PROFILE are stripped so it is issued
+/// for the operator's `default` (ada) profile and not a session profile Claude Code
+/// or other tooling exported — that mismatch produced wrong-account 401s.
 fn mint_bedrock_token(region: &str) -> Result<String> {
     let py = "import sys; from aws_bedrock_token_generator import provide_token; \
               sys.stdout.write(provide_token(region=sys.argv[1]))";
@@ -1759,19 +1636,16 @@ fn mint_bedrock_token(region: &str) -> Result<String> {
     Ok(tok)
 }
 
-/// C2SaferRust: post-process this repo's c2rust output with an LLM to reduce
-/// unsafe code. Input is the sibling `c2rust/.../translated_rust_original`
-/// (same source as Laertes). Runs the pinned submodule tool in Docker, driven
-/// by gpt-5.4 via Amazon Bedrock. Blind by design (no `--test_dir`): the tool
-/// is compile-gated only, making its numbers comparable to ACTOR self-verified.
+/// Reduce unsafe code in this repo's c2rust output with the pinned submodule tool in
+/// Docker, driven by gpt-5.4 via Bedrock.
 ///
-/// Requires `BEDROCK_API_KEY` in the environment (a Bedrock bearer token).
-/// `BEDROCK_BASE_URL` may override the default us-west-2 mantle endpoint.
+/// Blind by design (no `--test_dir`): compile-gated only, which is what makes its
+/// numbers comparable to ACTOR self-verified. `BEDROCK_BASE_URL` may override the
+/// default us-west-2 mantle endpoint.
 fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib: bool) -> Result<()> {
     use std::io::Write;
 
-    // Locate c2rust source: its translated/ crate (sibling under results/).
-    // c2rust never runs a verify phase, so translated/ IS the crate to consume.
+    // c2rust never runs a verify phase, so its translated/ IS the crate to consume.
     let c2rust_case = paths.results_dir
         .parent().context("no parent for results_dir")?
         .join("c2rust").join(battery).join(name);
@@ -1780,8 +1654,6 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
         "c2rust translated/ crate not found (run the c2rust agent first): {}",
         c2rust_original.display());
 
-    // Bedrock bearer token: env override wins (CI/manual), else a fresh token
-    // is minted on the host and cached with early refresh (see bedrock_token).
     let base_url = std::env::var("BEDROCK_BASE_URL")
         .unwrap_or_else(|_| C2SAFERRUST_DEFAULT_BASE_URL.to_string());
     let region = base_url
@@ -1798,12 +1670,11 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
     let log_path = logs_dir.join("translation.log");
     let translated = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
 
-    // Isolated workspace we bind-mount into the container. The tool reshapes
-    // <work>/rust and writes <work>/rust_WIP.
+    // Bind-mounted into the container: the tool reshapes <work>/rust in place and
+    // writes <work>/rust_WIP.
     let tmp = crate::workdir::tempdir("harvest-c2sr-")
         .context("creating c2saferrust temp workspace")?;
     let work_rust = tmp.path().join("rust");
-    // Copy c2rust output as the tool's input (skip build artifacts + bundled C).
     copy_dir_filtered(&c2rust_original, &work_rust, &["target", "c_src"])?;
     let _ = std::fs::remove_file(work_rust.join("Cargo.lock"));
 
@@ -1811,12 +1682,11 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
     writeln!(log, "source: {}", c2rust_original.display())?;
     writeln!(log, "model: {} via {}", C2SAFERRUST_MODEL, base_url)?;
 
-    // Pre-process: reshape the c2rust crate into what the slicer expects.
     writeln!(log, "\n=== C2SaferRust pre-process ===")?;
     c2saferrust_preprocess(&work_rust)?;
     writeln!(log, "done")?;
 
-    // Run the tool in Docker, as the host user so outputs are not root-owned.
+    // Runs as the host user so the outputs are not root-owned.
     writeln!(log, "\n=== C2SaferRust Docker (gpt-5.4 via Bedrock) ===")?;
     let uid = unsafe { libc_getuid() };
     let gid = unsafe { libc_getgid() };
@@ -1835,14 +1705,10 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
     log.write_all(&docker_out.stdout)?;
     log.write_all(&docker_out.stderr)?;
 
-    // Collect the tool's output (<work>/rust_WIP) into translated_rust/.
-    // If the tool produced no rust_WIP, the C2Rust input did not compile under
-    // the pinned nightly (e.g. SPHINCS+, whose duplicate `randombytes` symbol is
-    // a hard error on nightly-2022-08-08) or translation otherwise failed. In
-    // that case fall back to emitting the unmodified C2Rust input as the result,
-    // so the case is still counted and fails at test time — the faithful
-    // representation of "C2SaferRust could not improve this input", matching how
-    // c2rust/laertes are reported (0/128 on P01) rather than silently vanishing.
+    // No rust_WIP means the c2rust input did not compile under the pinned nightly
+    // (e.g. SPHINCS+, whose duplicate `randombytes` symbol is a hard error on
+    // nightly-2022-08-08). Emitting the unmodified input then keeps the case counted
+    // and failing at test time instead of silently vanishing from the totals.
     let wip = tmp.path().join("rust_WIP");
     let source_dir = if wip.join("Cargo.toml").exists() {
         writeln!(log, "\nrust_WIP produced; collecting C2SaferRust output")?;
@@ -1853,12 +1719,11 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
                        unmodified C2Rust input so the case is counted as a failure.")?;
         work_rust.clone()
     };
-    // Keep only source + manifest; drop the tool's bookkeeping + build artifacts.
     copy_dir_filtered(&source_dir, &translated, &["target"])?;
     for junk in ["callgraph.dot", "callgraph.pdf", "slices.json", "log.txt", "prompts.txt", "ordering.txt"] {
         let _ = std::fs::remove_file(translated.join(junk));
     }
-    // Remove any leftover .old rollback files.
+    // The tool leaves .old rollback files behind.
     if let Ok(entries) = std::fs::read_dir(&translated) {
         for e in entries.flatten() {
             if e.path().extension().is_some_and(|x| x == "old") {
@@ -1867,11 +1732,10 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
         }
     }
 
-    // Post-process: restore a standard toolchain so downstream testing matches
-    // the other agents (the tool pins nightly-2022-08-08 only for its slicer).
+    // The nightly-2022-08-08 pin exists only for the tool's slicer; downstream
+    // testing must use the same toolchain as every other agent.
     c2saferrust_postprocess(&translated)?;
 
-    // Copy the tool's per-function log alongside for provenance.
     if wip.join("log.txt").exists() {
         let _ = std::fs::copy(wip.join("log.txt"), logs_dir.join("c2saferrust_log.txt"));
     }
@@ -1880,10 +1744,9 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
     Ok(())
 }
 
-/// Reshape a c2rust crate so the C2SaferRust slicer can build it as a library:
-/// ensure an rlib crate-type and pin the nightly the tool requires.
+/// Reshape a c2rust crate so the C2SaferRust slicer can build it as a library.
 fn c2saferrust_preprocess(work_dir: &Path) -> Result<()> {
-    // crate-type must include rlib (c2rust emits cdylib for _lib cases).
+    // The slicer needs an rlib; c2rust emits cdylib for _lib cases.
     let cargo = work_dir.join("Cargo.toml");
     if cargo.exists() {
         let mut s = std::fs::read_to_string(&cargo)?;
@@ -1893,7 +1756,7 @@ fn c2saferrust_preprocess(work_dir: &Path) -> Result<()> {
         }
         std::fs::write(&cargo, s)?;
     }
-    // Pin the toolchain the slicer/metrics were built against.
+    // The toolchain the slicer and its metrics were built against.
     std::fs::write(
         work_dir.join("rust-toolchain.toml"),
         "[toolchain]\nchannel = \"nightly-2022-08-08\"\ncomponents = [\"rustfmt\", \"rustc-dev\", \"rust-src\", \"llvm-tools-preview\"]\n",
@@ -1901,8 +1764,8 @@ fn c2saferrust_preprocess(work_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Restore a standard toolchain after translation so downstream build/test uses
-/// the same toolchain as the other agents rather than the slicer's old pin.
+/// Undo [`c2saferrust_preprocess`]'s toolchain pin so downstream build/test matches
+/// the other agents.
 fn c2saferrust_postprocess(work_dir: &Path) -> Result<()> {
     std::fs::write(
         work_dir.join("rust-toolchain.toml"),
@@ -1936,7 +1799,6 @@ fn laertes_preprocess(work_dir: &Path) -> Result<()> {
         std::fs::write(&path, src)?;
     }
 
-    // Fix entry point features
     let lib_rs = work_dir.join("lib.rs");
     if lib_rs.exists() {
         let mut src = std::fs::read_to_string(&lib_rs)?;
@@ -1946,7 +1808,7 @@ fn laertes_preprocess(work_dir: &Path) -> Result<()> {
         std::fs::write(&lib_rs, src)?;
     }
 
-    // Cargo.toml: edition 2018, pin libc for old resolver
+    // libc must be pinned exactly: the 2020 resolver cannot handle newer releases.
     let cargo = work_dir.join("Cargo.toml");
     if cargo.exists() {
         let mut s = std::fs::read_to_string(&cargo)?;
@@ -1998,23 +1860,7 @@ fn walkdir(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(files)
 }
 
-/// Retry-aware codex invocation. Bedrock occasionally returns transient
-/// errors mid-conversation (404 "Engine not found", "stream disconnected",
-/// "server had an error") that surface in the JSON log as `"type":"error"`
-/// followed by `"type":"turn.failed"`. The codex process exits 0 in those
-/// cases, so the harness has historically treated a Bedrock failure as a
-/// successful (but empty) translation.
-///
-/// This helper runs codex, scans the log for those patterns, and re-runs
-/// up to MAX_RETRIES times if a transient error is detected. Each retry
-/// clears the log (codex's `tee` overwrites anyway) and gets a fresh
-/// invocation so any partial state is discarded.
-/// What every retrying agent invocation needs, regardless of backend.
-///
-/// Extracted because both retry paths take these four and then diverge. An earlier
-/// version suppressed `clippy::too_many_arguments` with a note claiming a struct
-/// "would obscure that the two paths take the same inputs" — the opposite is true:
-/// naming the shared part is what makes the parallel visible, and the lint was right.
+/// The inputs both retrying agent invocations share, regardless of backend.
 struct RetrySession<'a> {
     prompt: &'a str,
     log_path: &'a Path,
@@ -2023,6 +1869,9 @@ struct RetrySession<'a> {
     context_label: &'a str,
 }
 
+/// Retry-aware codex invocation: codex exits 0 after a transient Bedrock error
+/// mid-conversation, so without this a Bedrock failure counts as a successful (but
+/// empty) translation. Each retry is a fresh invocation, discarding partial state.
 fn invoke_codex_with_retry(
     session: RetrySession<'_>,
     model: &str,
@@ -2048,8 +1897,8 @@ fn invoke_codex_with_retry(
             .current_dir(work_dir)
             .status()
             .with_context(|| format!("invoking codex ({context_label})"))?;
-        // Record the final attempt's exit (overwritten each retry, so the last
-        // one wins — the exit that actually determined the outcome).
+        // Overwritten each retry, so the exit that decided the outcome is the one
+        // that survives.
         record_agent_exit(status);
 
         match scan_codex_log_for_transient_error(log_path) {
@@ -2093,13 +1942,11 @@ fn first_transient_pattern(content: &str) -> Option<String> {
 }
 
 /// Returns Some(reason) if the log indicates a transient Bedrock failure.
-/// Detected patterns: see [`TRANSIENT_BEDROCK_PATTERNS`].
 fn scan_codex_log_for_transient_error(log_path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(log_path).ok()?;
 
-    // The transient errors all appear as `"type":"error"` events. We require
-    // the run to ALSO end in `"turn.failed"` (so it really aborted) and
-    // NOT contain a `"turn.completed"` (would mean it recovered).
+    // `"type":"error"` alone is not enough: the run must have aborted
+    // (`turn.failed`) and never recovered (no `turn.completed`).
     if !content.contains(r#""type":"turn.failed""#) {
         return None;
     }
@@ -2110,25 +1957,20 @@ fn scan_codex_log_for_transient_error(log_path: &Path) -> Option<String> {
     first_transient_pattern(&content)
 }
 
-/// Returns Some(reason) if an OpenCode log indicates a transient Bedrock
-/// failure. Same motivation as the codex scanner: the CLI can exit 0 after
-/// Bedrock drops the conversation, so the harness would otherwise record the
-/// throttle as a legitimately-empty translation.
-///
-/// OpenCode's `--format json` emits one event object per line. A transient
-/// failure surfaces as an error event; a session that produced any assistant
-/// output is treated as recovered, since retrying would discard real work.
+/// Same motivation as the codex scanner: the CLI can exit 0 after Bedrock drops the
+/// conversation, which would otherwise be recorded as a legitimately-empty
+/// translation.
 fn scan_opencode_log_for_transient_error(log_path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(log_path).ok()?;
 
-    // No error surfaced at all → nothing to retry.
     let has_error = content.contains(r#""type":"error""#)
         || content.contains(r#""error":"#)
         || content.contains("APICallError");
     if !has_error {
         return None;
     }
-    // The session produced assistant/tool activity → it recovered on its own.
+    // Assistant or tool activity means the session recovered; retrying from here
+    // would discard real work.
     if content.contains(r#""type":"tool"#) || content.contains(r#""role":"assistant""#) {
         return None;
     }
@@ -2136,10 +1978,8 @@ fn scan_opencode_log_for_transient_error(log_path: &Path) -> Option<String> {
     first_transient_pattern(&content)
 }
 
-/// Retry-aware OpenCode invocation, mirroring [`invoke_codex_with_retry`].
-/// Bedrock throttles and 5xx responses are transient and can leave the CLI
-/// exiting 0 with nothing written; without this a throttle is indistinguishable
-/// from a genuine translation failure.
+/// Mirrors [`invoke_codex_with_retry`]: a Bedrock throttle can leave the CLI exiting
+/// 0 with nothing written, indistinguishable from a genuine translation failure.
 fn invoke_opencode_with_retry(
     session: RetrySession<'_>,
     phase: crate::opencode::Phase,
@@ -2180,17 +2020,13 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    /// A real ExitStatus from `sh -c "exit N"`, for testing exit capture.
+    /// ExitStatus cannot be constructed directly, so shell out for a real one.
     fn exit_status(code: i32) -> std::process::ExitStatus {
         Command::new("sh").arg("-c").arg(format!("exit {code}")).status().unwrap()
     }
 
     #[test]
     fn truncated_never_splits_a_character() {
-        // The bug: `&s[..s.len().min(2000)]` panics when byte 2000 lands inside a
-        // multi-byte character. Every call site is formatting an error message about a
-        // failed parse, so the panic would replace the diagnostic it was printing —
-        // and the inputs are LLM responses, which routinely contain non-ASCII.
         let s = "é".repeat(10); // 20 bytes, 10 chars; every odd byte index is mid-char
         for max in 0..=s.len() {
             let t = truncated(&s, max); // must not panic for ANY cut point
@@ -2199,9 +2035,7 @@ mod tests {
         }
         // A cut landing mid-character steps back to the boundary, losing that char.
         assert_eq!(truncated(&s, 3), "é");
-        // Shorter than the cap is returned whole, untouched.
         assert_eq!(truncated("ok", 500), "ok");
-        // And the exact-boundary case is not off by one.
         assert_eq!(truncated(&s, 4), "éé");
     }
 
@@ -2227,8 +2061,7 @@ mod tests {
 
     #[test]
     fn merge_agent_exit_absent_for_non_cli_agent() {
-        // No record_agent_exit call (e.g. kimi/oneshot API path) → no fields,
-        // so a stale exit is never falsely attributed.
+        // No record_agent_exit call, as on the kimi/oneshot API path.
         clear_agent_exit();
         let mut m = serde_json::json!({"success": true});
         merge_agent_exit(&mut m);
@@ -2252,8 +2085,7 @@ mod tests {
 
     #[test]
     fn opencode_scanner_retries_a_throttle_that_produced_nothing() {
-        // Bedrock throttled before any assistant output: retrying is right,
-        // because otherwise the empty result is scored as a real failure.
+        // Otherwise the empty result would be scored as a real failure.
         let log = write_log(
             r#"{"type":"error","error":{"message":"ThrottlingException: rate exceeded"}}"#,
         );
@@ -2265,8 +2097,7 @@ mod tests {
 
     #[test]
     fn opencode_scanner_does_not_retry_after_real_work() {
-        // An error followed by assistant/tool activity means the session
-        // recovered. Retrying would DISCARD a completed translation.
+        // Retrying after the session recovered would DISCARD a completed translation.
         let log = write_log(
             "{\"type\":\"error\",\"error\":{\"message\":\"ThrottlingException\"}}\n\
              {\"type\":\"tool\",\"name\":\"write\"}\n",
@@ -2276,19 +2107,18 @@ mod tests {
 
     #[test]
     fn opencode_scanner_ignores_clean_and_nontransient_logs() {
-        // No error at all → nothing to retry.
         let clean = write_log(r#"{"type":"step","name":"done"}"#);
         assert_eq!(scan_opencode_log_for_transient_error(clean.path()), None);
-        // An error that is NOT transient (a genuine model/tool failure) must
-        // not be retried either — retrying can't fix it and burns hours.
+        // A non-transient error must not be retried: retrying cannot fix it and
+        // burns hours.
         let hard = write_log(r#"{"type":"error","error":{"message":"ValidationException: bad request"}}"#);
         assert_eq!(scan_opencode_log_for_transient_error(hard.path()), None);
     }
 
     #[test]
     fn both_bedrock_backends_share_one_transient_pattern_table() {
-        // The failures come from Bedrock, not from the CLI wrapping it, so the
-        // codex and opencode scanners must agree on what is retryable.
+        // The failures come from Bedrock, not the CLI wrapping it, so both scanners
+        // must agree on what is retryable.
         for (needle, label) in TRANSIENT_BEDROCK_PATTERNS {
             assert_eq!(first_transient_pattern(needle).as_deref(), Some(*label));
         }

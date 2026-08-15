@@ -8,3 +8,7 @@ Dockerfile.laertes
 
 # trybuild scratch: new .stderr expectations land here for review
 tools/wip/
+
+# Byte-compiled Python (tools/comment_budget.py)
+__pycache__/
+*.pyc

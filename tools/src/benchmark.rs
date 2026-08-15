@@ -1,22 +1,7 @@
-//! One lifecycle, parameterized by dataset.
-//!
-//! Every benchmark moves through the same logical lifecycle:
-//!
-//! ```text
-//!   translate → [verify?] → enrich → score(test)
-//! ```
-//!
-//! The lifecycle is written ONCE (in `main.rs`, against this trait). Datasets
-//! differ only in HOW each phase is carried out — discovery, the translate
-//! invocation, whether a separate C-as-oracle verify phase runs, and how the
-//! result is scored. This trait replaces what used to be four parallel
-//! per-dataset match ladders (`make_translate_plan` / `make_verify_plan` /
-//! `make_test_plan` / the `execute_*` arms), three plan enums, and the
-//! nine-clause verify-skip `if` that lived inline in `Run`.
-//!
-//! Each `impl` here is intentionally thin: it DELEGATES to the existing
-//! dataset functions in `translate` / `verify` / `test` rather than
-//! reimplementing them, so this refactor changes structure, not behavior.
+//! One lifecycle — translate → [verify?] → enrich → score(test) — written once in
+//! `main.rs` against this trait; datasets differ only in how each phase is carried out.
+//! Each `impl` must stay thin, delegating to `translate` / `verify` / `test` rather than
+//! reimplementing them.
 
 use crate::battery::{self, Paths};
 use crate::cli::{Agent, Dataset};
@@ -25,11 +10,7 @@ use crate::{translate, verify};
 use anyhow::Result;
 use std::path::Path;
 
-/// A benchmark dataset's participation in the shared lifecycle.
 pub trait Benchmark {
-    /// Human-readable label, for diagnostics. Part of the trait's public
-    /// surface so callers can identify a `Box<dyn Benchmark>`; not all call
-    /// sites use it today.
     #[allow(
         dead_code,
         reason = "part of the trait's public surface so a caller holding a \
@@ -38,33 +19,25 @@ pub trait Benchmark {
     fn name(&self) -> &'static str;
 
     /// Does a separate C-as-oracle verify phase run for this agent?
-    ///
-    /// Replaces the nine-clause skip `if`. Ablation/combined agents that
-    /// self-verify or skip verify by design return `false` (see
-    /// [`agent_runs_separate_verify`]).
     fn verifies(&self, agent: Agent) -> bool;
 
-    /// Translate the target. All discovery + parallelism is internal.
     fn translate(&self, paths: &Paths, target: &str, filter: Option<&str>,
                  parallel: usize) -> Result<()>;
 
-    /// Run the verify phase. Only reached from `Run` when [`verifies`] is true;
-    /// also invoked directly by the `verify` subcommand. Datasets with no
-    /// separate verify phase inherit the no-op default.
+    /// Reached from `Run` only when [`verifies`] is true, but also invoked directly by
+    /// the `verify` subcommand, so an impl cannot assume that gate ran.
     fn verify(&self, _repo_root: &Path, _paths: &Paths, _target: &str,
               _filter: Option<&str>, _force: bool, _parallel: usize) -> Result<()> {
         Ok(())
     }
 
-    /// Score the translated crate(s) against ground-truth tests.
     fn test(&self, paths: &Paths, target: &str, mode: TestMode) -> Result<TestOutcome>;
 
-    /// Backfill result.json enrichment (unsafe/loc/credits). This is folded
-    /// into `test --update`; the `enrich` subcommand re-runs just this step.
+    /// Backfills result.json (unsafe/loc/credits); already folded into `test --update`,
+    /// so the `enrich` subcommand only re-runs this step.
     fn enrich(&self, paths: &Paths, target: &str) -> Result<()>;
 }
 
-/// Construct the benchmark for a dataset. The single dispatch point.
 pub fn for_dataset(d: Dataset) -> Box<dyn Benchmark> {
     match d {
         Dataset::TestCorpus => Box::new(TestCorpus),
@@ -72,19 +45,15 @@ pub fn for_dataset(d: Dataset) -> Box<dyn Benchmark> {
     }
 }
 
-/// The verify-skip predicate shared by TestCorpus and harvest-bench. These
-/// agents either merge translate+verify into one session (ClaudeCombined),
-/// skip verify by prompt-ablation design (the other Claude* variants), or run
-/// their own translate-then-verify pipeline in-harness (Codex). For all of them
-/// the separate ACTOR verify phase does not run.
+/// ClaudeCombined merges translate+verify into one session, the other Claude* variants
+/// are prompt ablations that skip verify by design, and Codex runs its own
+/// translate-then-verify pipeline in-harness — none get the separate ACTOR verify phase.
 fn agent_runs_separate_verify(agent: Agent) -> bool {
     !matches!(agent,
         Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter
         | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
         | Agent::CodexGpt55 | Agent::CodexGpt54)
 }
-
-// ── Shared discovery helpers (moved from main.rs) ──────────────────────
 
 fn resolve_batteries(corpus_dir: &Path, target: &str) -> Result<Vec<String>> {
     if target == "all" {
@@ -112,8 +81,6 @@ fn parse_target(target: &str) -> (String, Option<String>) {
     }
 }
 
-// ── TestCorpus ─────────────────────────────────────────────────────────
-
 struct TestCorpus;
 
 impl Benchmark for TestCorpus {
@@ -125,10 +92,9 @@ impl Benchmark for TestCorpus {
                  parallel: usize) -> Result<()> {
         let batteries = resolve_batteries(&paths.corpus_dir, target)?;
 
-        // Shared-source batteries must run single-threaded (the follower configs
-        // are propagated from one real translation); independent batteries can
-        // share the remaining parallel budget. This partitioning is unchanged
-        // from the previous `execute_translate` TestCorpus arm.
+        // Shared-source batteries must run single-threaded: their follower configs are
+        // propagated from one real translation. Independent batteries split the rest of
+        // the parallel budget.
         if batteries.len() > 1 && parallel > 1 {
             let (shared_bats, indie_bats): (Vec<&str>, Vec<&str>) = batteries.iter()
                 .map(String::as_str)
@@ -171,9 +137,8 @@ impl Benchmark for TestCorpus {
         Ok(())
     }
 
-    // `_repo_root` joins the other three impls in being unused: the real repo
-    // root now travels on `Paths` (see crate::sandbox), so the trait parameter is
-    // dead everywhere and could be dropped from the trait as a follow-up.
+    // `_repo_root` is unused in every impl: the real repo root travels on `Paths` (see
+    // crate::sandbox), so the trait parameter could be dropped as a follow-up.
     fn verify(&self, _repo_root: &Path, paths: &Paths, target: &str,
               _filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
         let batteries = resolve_batteries(&paths.corpus_dir, target)?;
@@ -211,18 +176,11 @@ impl Benchmark for TestCorpus {
     }
 }
 
-// ── harvest-bench ──────────────────────────────────────────────────────
-
 struct HarvestBench;
 
 impl Benchmark for HarvestBench {
     fn name(&self) -> &'static str { "harvest-bench" }
 
-    // Full parity with Test-Corpus: HB gets a real C-as-oracle verify phase
-    // for verifying agents (kiro/claude/codex-gpt5*), using the SAME shared
-    // prompts/claude/verify.md — subagent protocol + Phase A/B/C/D differential
-    // testing (SYMBOLS.md + ERRORS.md gated). Ablation agents (Combined/
-    // Minimal/NoIter/…) skip verify by design, same as elsewhere.
     fn verifies(&self, agent: Agent) -> bool { agent_runs_separate_verify(agent) }
 
     fn translate(&self, paths: &Paths, target: &str, _filter: Option<&str>,
@@ -243,9 +201,8 @@ impl Benchmark for HarvestBench {
     }
 
     fn enrich(&self, paths: &Paths, _target: &str) -> Result<()> {
-        // harvest-bench results are per-project directly under
-        // results/HarvestBench/<agent>/ (no battery grouping) — the same
-        // per-case shape enrich_test_corpus expects with an empty battery.
+        // HB results sit per-project directly under results/HarvestBench/<agent>/ with no
+        // battery grouping, which is the shape enrich_test_corpus sees for an empty battery.
         test::enrich_test_corpus(paths, "")
     }
 }
