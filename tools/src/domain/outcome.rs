@@ -17,9 +17,9 @@ impl ProjectOutcome {
         self.tests_ok > 0 && self.tests_failed == 0
     }
 
-    // `allow`, not `expect`: `dead_code` fires in the BIN target (where `scoring` is a
-    // private module) but not in the LIB target, so an `expect` would be unfulfilled in
-    // one of the two builds — itself a warning.
+    // `allow`, not `expect`: `dead_code` fires in the BIN target (where `domain::outcome`
+    // is a private module) but not in the LIB target, so an `expect` would be unfulfilled
+    // in one of the two builds — itself a warning.
     #[allow(
         dead_code,
         reason = "the Builds column is reported per-dataset today, but the rule that \

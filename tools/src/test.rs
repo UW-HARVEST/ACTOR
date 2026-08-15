@@ -916,7 +916,7 @@ fn check_enrichment(
 
 // ── harvest-bench testing ──────────────────────────────────────────────
 
-/// `passed` defers to the canonical project pass rule in `crate::scoring`, so
+/// `passed` defers to the canonical project pass rule in `crate::domain::outcome`, so
 /// the pass column means the same thing across datasets.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct HarvestBenchResult {
@@ -928,7 +928,7 @@ struct HarvestBenchResult {
 
 impl HarvestBenchResult {
     fn passed(&self) -> bool {
-        crate::scoring::ProjectOutcome {
+        crate::domain::outcome::ProjectOutcome {
             built: self.build_ok,
             tests_ok: self.tests_ok as u32,
             tests_failed: self.tests_failed as u32,
@@ -1407,13 +1407,14 @@ mod tests {
 
     /// Moving the scorer's build out of `results/` is measurement-neutral only if every
     /// file the scorer writes back into a scored crate is outside the digest and outside
-    /// every [`crate::artifact::Carry`]. Enumerated beside the writers: `write_results`
+    /// every [`crate::domain::contents::Carry`]. Enumerated beside the writers: `write_results`
     /// and `run_harvest_bench_test` (result.json, logs/test.log),
     /// `score_harvest_bench_suite` (harvest_bench_report.json, gtest_build/) and
     /// `build_harvest_bench_lib` (target/).
     #[test]
     fn every_file_the_scorer_writes_back_is_excluded_from_the_artifact() {
-        use crate::artifact::{classify, Disposition, RelPath};
+        use crate::domain::contents::{classify, Disposition};
+        use crate::domain::relpath::RelPath;
         let of = |p: &str| classify(&RelPath::new(p).unwrap(), false);
 
         for written in ["result.json", "harvest_bench_report.json", "logs/test.log"] {

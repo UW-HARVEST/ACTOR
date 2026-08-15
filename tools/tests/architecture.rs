@@ -26,6 +26,38 @@ fn file_name(path: &Path) -> String {
         .into_owned()
 }
 
+/// `src/artifact.rs` is `artifact`, `src/domain/contents.rs` is `domain::contents`, and
+/// `src/domain/mod.rs` is `domain`. Rules key on this rather than on the leaf filename,
+/// which stops naming the same code the moment a module becomes a directory.
+fn module_path(file: &Path) -> String {
+    let rel = file.strip_prefix(src_dir()).expect("under src/");
+    let mut parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let leaf = parts.pop().expect("a file name");
+    let stem = leaf.strip_suffix(".rs").unwrap_or(&leaf).to_owned();
+    if stem != "mod" {
+        parts.push(stem);
+    }
+    parts.join("::")
+}
+
+/// The file a rule's module path names, or a panic: a rule whose subject has moved must
+/// say so, rather than inspect nothing and report green.
+fn module_file(module: &str) -> PathBuf {
+    let base = module.split("::").fold(src_dir(), |p, s| p.join(s));
+    for candidate in [base.with_extension("rs"), base.join("mod.rs")] {
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!(
+        "no source file for module `{module}`, which a rule below is written about. Repoint \
+         it at the module that now holds the code."
+    )
+}
+
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
@@ -130,8 +162,10 @@ fn is_public(vis: &syn::Visibility) -> bool {
 /// all of them, `sealed_implements_only_debug` included, and each would still report green.
 #[test]
 fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
-    // 20 files today: 18 modules plus lib.rs and main.rs; the margin is for a merge, not a break.
-    const MIN_FILES: usize = 18;
+    // Measured 23 today: 21 module files plus lib.rs and main.rs. The floor is that count
+    // minus 2, so a merge landing a file needs no edit here while deleting three fails
+    // instead of quietly narrowing what every rule below inspects. Add files, raise it.
+    const MIN_FILES: usize = 21;
     const REQUIRED: &[&str] = &["Sealed", "WorkTree", "Scrubbed", "Corpus", "TreeDigest"];
 
     let found = rust_sources();
@@ -180,9 +214,9 @@ fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
     assert_eq!(
         (found.len(), nested),
         count_rust_files(&dir, 1),
-        "rust_sources() and an independent walk of src/ disagree on (total, nested). The \
-         nested half is 0 == 0 today and goes live with the first module that becomes a \
-         directory."
+        "rust_sources() and an independent walk of src/ disagree on (total, nested). \
+         domain/ made the nested half live: 4 of 23 today, so a traversal that stopped at \
+         the top level of src/ would fail here instead of reporting green."
     );
 }
 
@@ -228,7 +262,8 @@ fn sealed_implements_only_debug() {
 
 // ── A2 ─────────────────────────────────────────────────────────────────────
 
-/// In the artifact and cache modules, no public item may hand out a path.
+/// In the artifact and cache modules, and the pure leaves split out of them, no public
+/// item may hand out a path.
 ///
 /// `WorkTree` is the deliberate exception: cargo and `Command` need a real
 /// directory, so scratch is the one place a path is available. A trybuild test can
@@ -248,9 +283,8 @@ fn no_public_path_escapes_the_artifact_modules() {
     ];
     let mut leaks: Vec<String> = Vec::new();
 
-    for module in ["artifact.rs", "cache.rs"] {
-        let path = src(module);
-        for item in parse(&path).items {
+    for module in ["artifact", "cache", "domain::relpath", "domain::contents"] {
+        for item in parse(&module_file(module)).items {
             match item {
                 syn::Item::Impl(imp) => {
                     let self_ty = type_name(&imp.self_ty);
@@ -316,8 +350,8 @@ fn digests_cannot_be_fabricated() {
     ];
     let mut bad: Vec<String> = Vec::new();
 
-    for module in ["artifact.rs", "cache.rs"] {
-        for item in parse(&src(module)).items {
+    for module in ["artifact", "cache"] {
+        for item in parse(&module_file(module)).items {
             match &item {
                 syn::Item::Struct(s) if GUARDED.contains(&s.ident.to_string().as_str()) => {
                     for f in &s.fields {
@@ -703,7 +737,7 @@ fn the_key_deriving_functions_keep_their_exhaustive_patterns() {
 }
 
 struct Func {
-    file: String,
+    module: String,
     name: String,
 }
 
@@ -719,10 +753,10 @@ fn signatures() -> Vec<Func> {
     for path in rust_sources() {
         let mut v = V(Vec::new());
         v.visit_file(&parse(&path));
-        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        let module = module_path(&path);
         for sig in v.0 {
             out.push(Func {
-                file: file.clone(),
+                module: module.clone(),
                 name: sig.ident.to_string(),
             });
         }
@@ -732,7 +766,7 @@ fn signatures() -> Vec<Func> {
 
 fn method_calls() -> BTreeMap<(String, String), Vec<String>> {
     struct V {
-        file: String,
+        module: String,
         enclosing: Vec<String>,
         out: BTreeMap<(String, String), Vec<String>>,
     }
@@ -760,7 +794,7 @@ fn method_calls() -> BTreeMap<(String, String), Vec<String>> {
                     }
                 }
                 self.out
-                    .entry((self.file.clone(), func.clone()))
+                    .entry((self.module.clone(), func.clone()))
                     .or_default()
                     .push(name);
             }
@@ -768,12 +802,12 @@ fn method_calls() -> BTreeMap<(String, String), Vec<String>> {
         }
     }
     let mut v = V {
-        file: String::new(),
+        module: String::new(),
         enclosing: Vec::new(),
         out: BTreeMap::new(),
     };
     for path in rust_sources() {
-        v.file = path.file_name().unwrap().to_string_lossy().into_owned();
+        v.module = module_path(&path);
         v.visit_file(&parse(&path));
     }
     v.out
@@ -826,34 +860,36 @@ fn returned_ty(sig: &syn::Signature) -> Option<&syn::Type> {
 #[test]
 fn the_digest_path_is_lossless() {
     const GUARDED: &[(&str, &str)] = &[
-        ("artifact.rs", "hash_tree"), // where the path bytes are actually fed
-        ("artifact.rs", "digest_tree"),
-        ("artifact.rs", "scrub"),
-        ("artifact.rs", "classify"), // decides WHICH files hash_tree hashes
-        ("cache.rs", "normalise"),
+        ("artifact", "hash_tree"), // where the path bytes are actually fed
+        ("artifact", "digest_tree"),
+        ("artifact", "scrub"),
+        ("domain::contents", "classify"), // decides WHICH files hash_tree hashes
+        ("cache", "normalise"),
     ];
     const BANNED: &[&str] = &["to_string_lossy", "display().to_string"];
 
     // Existence and call-set are separate questions: a guarded function that delegates
     // (`digest_tree` is one line calling `hash_tree`) makes no method calls at all, so
     // an absent key in `method_calls()` means "calls nothing", not "was renamed".
-    let defined: std::collections::BTreeSet<(String, String)> =
-        signatures().into_iter().map(|f| (f.file, f.name)).collect();
+    let defined: std::collections::BTreeSet<(String, String)> = signatures()
+        .into_iter()
+        .map(|f| (f.module, f.name))
+        .collect();
     let calls = method_calls();
     let mut bad: Vec<String> = Vec::new();
-    for (file, func) in GUARDED {
+    for (module, func) in GUARDED {
         assert!(
-            defined.contains(&(file.to_string(), func.to_string())),
-            "{file}: {func} not found — this rule is guarding a function that has been \
-             renamed or removed. Repoint it at the code that now handles the path bytes."
+            defined.contains(&(module.to_string(), func.to_string())),
+            "{module}: {func} not found — this rule is guarding a function that has been \
+             renamed or moved. Repoint it at the module that now handles the path bytes."
         );
         let empty = Vec::new();
         let found = calls
-            .get(&(file.to_string(), func.to_string()))
+            .get(&(module.to_string(), func.to_string()))
             .unwrap_or(&empty);
         for banned in BANNED {
             if found.iter().any(|c| c == banned) {
-                bad.push(format!("{file}: {func} calls {banned}"));
+                bad.push(format!("{module}: {func} calls {banned}"));
             }
         }
     }
@@ -865,7 +901,7 @@ fn the_digest_path_is_lossless() {
          and skip where a `&str` is required."
     );
 
-    let hashing = &calls[&("artifact.rs".to_string(), "hash_tree".to_string())];
+    let hashing = &calls[&("artifact".to_string(), "hash_tree".to_string())];
     assert!(
         hashing.contains(&"as_encoded_bytes".to_string()),
         "hash_tree no longer feeds as_encoded_bytes: {hashing:?}\n\
@@ -1295,5 +1331,120 @@ fn a_module_cycle_may_only_shrink() {
         "the invisible edge was not refused, so the rule would report the cycle shrank past\n\
          a module that is still in it. `use super::*` in the same file must stay allowed: it\n\
          introduces no name an edge can be read from."
+    );
+}
+
+const PURE_LAYER: &str = "domain";
+
+/// The names that make an edge readable, in every spelling a path can introduce one by:
+/// `use std::fs::…`, a bare `fs::copy`, `std::process::Command`, `env::var`, `env!`,
+/// `option_env!`, and `std::io` on a real handle. `option_env` needs its own entry because
+/// it lexes as one identifier, so the `env` entry does not cover it. `tempfile` is here
+/// because a pure decision needs no directory to be tested in.
+const EDGE_NAMES: &[&str] = &[
+    "Command",
+    "File",
+    "OpenOptions",
+    "Stdio",
+    "env",
+    "fs",
+    "option_env",
+    "process",
+    "stderr",
+    "stdin",
+    "stdout",
+    "tempfile",
+];
+
+/// Which edge names a file introduces. Lexed rather than searched for as text, so prose in
+/// a doc comment and a path inside a string literal are not hits: naming an edge in either
+/// is not reaching for one.
+fn edge_names(text: &str) -> BTreeSet<String> {
+    fn walk(stream: TokenStream, out: &mut BTreeSet<String>) {
+        for token in stream {
+            match token {
+                TokenTree::Group(g) => walk(g.stream(), out),
+                TokenTree::Ident(id) => {
+                    let name = id.to_string();
+                    if EDGE_NAMES.contains(&name.as_str()) {
+                        out.insert(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(text.parse().expect("src/ lexes as Rust tokens"), &mut out);
+    out
+}
+
+/// Takes the layer root, so a planted tree can test the extraction itself.
+fn impurities(layer: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for file in rust_sources_under(layer) {
+        let rel = file.strip_prefix(layer).unwrap_or(&file);
+        for name in edge_names(&read(&file)) {
+            out.push(format!("{}: {name}", rel.to_string_lossy()));
+        }
+    }
+    out
+}
+
+/// "Parse at the edges; types inside" as a rule rather than a habit: a decision that
+/// cannot read a file, spawn a process or look up a variable has to be handed what it
+/// needs, and is then testable without a tempdir.
+#[test]
+fn nothing_in_the_pure_layer_names_the_filesystem_a_process_or_the_environment() {
+    let layer = src_dir().join(PURE_LAYER);
+    assert!(
+        !rust_sources_under(&layer).is_empty(),
+        "src/{PURE_LAYER}/ holds no Rust files, so this rule would report green having \
+         inspected nothing."
+    );
+    let found = impurities(&layer);
+    assert!(
+        found.is_empty(),
+        "the pure layer reaches for an edge: {found:#?}\n\
+         Take the read, the spawn or the lookup out to a caller and pass the result in.\n\
+         The scan is over identifier tokens, so it refuses the spellings that make an edge\n\
+         readable — `env!` and `option_env!` among them — and cannot see access that names\n\
+         none of them: `Path::is_file`, `Path::metadata`, the `include!` family\n\
+         (`include_str!`, `include_bytes!`), or anything a dependency wraps. A helper that\n\
+         sniffs a directory belongs in the io layer for exactly that reason."
+    );
+
+    // Through the real extraction over a planted tree, not a synthetic name list: the hole
+    // the DAG rule shipped with was in its extraction, which no synthetic list reaches.
+    let tree = tempfile::tempdir().expect("tempdir");
+    let planted = tree.path().join(PURE_LAYER);
+    std::fs::create_dir_all(&planted).expect("mkdir");
+    std::fs::write(
+        planted.join("contents.rs"),
+        "use std::fs;\npub fn f(p: &std::path::Path) -> bool {\n    \
+         fs::read(p).is_ok() && !env!(\"CARGO_PKG_NAME\").is_empty()\n}\n",
+    )
+    .expect("write");
+    std::fs::write(
+        planted.join("outcome.rs"),
+        "pub fn f() -> bool { option_env!(\"HOME\").is_some() }\n",
+    )
+    .expect("write");
+    std::fs::write(
+        planted.join("relpath.rs"),
+        "pub fn pure(p: &std::path::Path) -> bool { p.is_relative() }\n",
+    )
+    .expect("write");
+    assert_eq!(
+        impurities(&planted),
+        [
+            "contents.rs: env",
+            "contents.rs: fs",
+            "outcome.rs: option_env"
+        ],
+        "a planted domain/ file naming std::fs and env! was not reported, so this rule\n\
+         cannot fail — and the file beside it that names neither must not be reported.\n\
+         `option_env!` is asserted from a file that names nothing else, because it lexes as\n\
+         the identifier `option_env` and so is not covered by the entry `env!` matches."
     );
 }
