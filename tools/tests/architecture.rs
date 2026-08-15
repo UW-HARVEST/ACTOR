@@ -235,6 +235,7 @@ fn compile_fail_cases_still_assert_what_they_were_written_for() {
         ("worktree_cannot_be_used_after_scrub", "E0382"), // scrub() consumed it
         ("phase_cannot_be_implemented_downstream", "E0277"), // sealed supertrait
         ("sealed_does_not_display", "E0277"),            // no Display impl
+        ("materialise_at_refuses_a_results_tree_path", "E0308"), // not a ScratchPath
     ]
     .into_iter()
     .collect();
@@ -274,14 +275,16 @@ fn compile_fail_cases_still_assert_what_they_were_written_for() {
 
 /// Nothing new may execute inside the results tree.
 ///
-/// Four sites do today, all in the test phase: scoring builds in the canonical
-/// phase dir and writes `target/` into it, so measuring an artifact mutates it.
-/// Fixing that needs the `c/`+`rust/` layout split, which is deliberately not in
-/// this change — so this is a ratchet on the count, not a clean gate. The
-/// allowlist is the to-do list.
+/// A ratchet, not a gate. It matches two sites, and only `build_harvest_bench_lib`
+/// is really in `results/`; the other reaches scratch through `translated_rust()`.
+/// It is also blind to the builds that matter most, which are spawned with a
+/// `--root` or `--target-dir` argument rather than a `current_dir` (MIT `runtests`,
+/// the gtest suite). A `Cwd` newtype only scratch can construct is the real fix.
+/// The `c/`+`rust/` layout split this comment used to demand is not (see
+/// `artifact.rs`): `runtests` pins the build output inside the case either way.
 #[test]
 fn nothing_new_runs_inside_the_results_tree() {
-    const KNOWN: usize = 4;
+    const KNOWN: usize = 2;
 
     struct V {
         current_fn: String,

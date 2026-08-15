@@ -1011,6 +1011,33 @@ mod tests {
         assert!(stored["loc"]["code"].as_u64().unwrap() >= 2);
     }
 
+    /// Moving the scorer's build out of `results/` is measurement-neutral only if every
+    /// file the scorer writes back into a scored crate is outside the digest and outside
+    /// every [`crate::artifact::Carry`]. Enumerated beside the writers: `write_results`
+    /// and `run_harvest_bench_test` (result.json, logs/test.log),
+    /// `score_harvest_bench_suite` (harvest_bench_report.json, gtest_build/) and
+    /// `build_harvest_bench_lib` (target/).
+    #[test]
+    fn every_file_the_scorer_writes_back_is_excluded_from_the_artifact() {
+        use crate::artifact::{classify, Disposition, RelPath};
+        let of = |p: &str| classify(&RelPath::new(p).unwrap(), false);
+
+        for written in ["result.json", "harvest_bench_report.json", "logs/test.log"] {
+            assert_eq!(
+                of(written),
+                Disposition::Ignore,
+                "{written} is written into the crate being scored, so scoring would \
+                 change that crate's identity"
+            );
+        }
+        assert_eq!(of("gtest_build/CMakeCache.txt"), Disposition::BuildOutput);
+        assert_eq!(of("target/release/libfoo.so"), Disposition::BuildOutput);
+
+        // The one write a scored build makes that IS hashed — hence why the build has to
+        // move out of the tree, and not merely its reports.
+        assert_eq!(of("Cargo.lock"), Disposition::StoreAndHash);
+    }
+
     /// Proves the check above is not vacuously empty.
     #[test]
     fn check_detects_tampered_unsafe_count() {
