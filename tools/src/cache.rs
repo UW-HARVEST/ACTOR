@@ -294,12 +294,17 @@ impl<'a> Recipe<'a> {
         Ok(Self { session, policy_shape })
     }
 
+    /// Opens with an EXHAUSTIVE pattern, deliberately. Adding a field to `Recipe` then
+    /// fails to compile here (E0027) instead of silently leaving the key unchanged, and
+    /// binding one without feeding it is an `unused variable` error under
+    /// `warnings = "deny"`. Do not reintroduce `..`.
     pub fn digest(&self) -> RecipeDigest {
+        let Self { session, policy_shape } = self;
         let mut h = Sha256::new();
         feed(&mut h, b"recipe-v2");
-        feed(&mut h, self.session.shape().as_bytes());
+        feed(&mut h, session.shape().as_bytes());
         // Tagged, so "no policy" cannot hash the same as an empty one.
-        match &self.policy_shape {
+        match policy_shape {
             Some(p) => {
                 feed(&mut h, b"policy");
                 feed(&mut h, p.as_bytes());
@@ -328,37 +333,50 @@ pub struct KeyInputs<'a> {
 }
 
 impl KeyInputs<'_> {
+    /// Exhaustive pattern, for the reason on `Recipe::digest`: a component added to
+    /// `KeyInputs` and forgotten here would let two different invocations share an entry.
     pub fn key(&self) -> CacheKey {
+        let Self { phase, agent, model, cli, toolchain, prompt, recipe, input_tree } = self;
         let mut h = Sha256::new();
         feed(&mut h, b"key-v1");
         feed(&mut h, &SCHEMA.to_le_bytes());
         for part in [
-            self.phase,
-            self.agent.as_str(),
-            self.model.as_str(),
-            self.cli.as_str(),
-            self.toolchain.as_str(),
-            self.prompt.as_str(),
-            self.recipe.as_str(),
-            self.input_tree.as_str(),
+            *phase,
+            agent.as_str(),
+            model.as_str(),
+            cli.as_str(),
+            toolchain.as_str(),
+            prompt.as_str(),
+            recipe.as_str(),
+            input_tree.as_str(),
         ] {
             feed(&mut h, part.as_bytes());
         }
         CacheKey(format!("{:x}", h.finalize()))
     }
 
+    /// The fields `load` re-compares, derived from this one function rather than
+    /// hand-listed a second and third time. A component added to `key()` but not here
+    /// silently removes the backstop that turns a forgotten field into a loud
+    /// "meta.json disagrees on X".
+    pub(crate) const VALIDATED: &'static [&'static str] = &[
+        "schema", "phase", "agent", "model", "cli", "toolchain", "prompt", "recipe",
+        "input_tree",
+    ];
+
     fn meta(&self, key: &CacheKey) -> serde_json::Value {
+        let Self { phase, agent, model, cli, toolchain, prompt, recipe, input_tree } = self;
         serde_json::json!({
             "schema": SCHEMA,
             "key": key.as_str(),
-            "phase": self.phase,
-            "agent": self.agent.as_str(),
-            "model": self.model.as_str(),
-            "cli": self.cli.as_str(),
-            "toolchain": self.toolchain.as_str(),
-            "prompt": self.prompt.as_str(),
-            "recipe": self.recipe.as_str(),
-            "input_tree": self.input_tree.as_str(),
+            "phase": phase,
+            "agent": agent.as_str(),
+            "model": model.as_str(),
+            "cli": cli.as_str(),
+            "toolchain": toolchain.as_str(),
+            "prompt": prompt.as_str(),
+            "recipe": recipe.as_str(),
+            "input_tree": input_tree.as_str(),
             // Recorded for audit, deliberately NOT keyed and not among the fields
             // `load` re-compares: every harness commit would otherwise empty the cache,
             // including commits that cannot affect an artifact. When a change genuinely
@@ -539,7 +557,7 @@ impl Store {
             serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json"))?)
                 .context("parsing meta.json")?;
         let want = inputs.meta(key);
-        for k in ["schema", "phase", "agent", "model", "cli", "toolchain", "prompt", "recipe", "input_tree"] {
+        for k in KeyInputs::VALIDATED {
             anyhow::ensure!(
                 meta.get(k) == want.get(k),
                 "meta.json disagrees on {k}: stored {:?}, computed {:?}",
@@ -1464,7 +1482,7 @@ mod tests {
             "the producing commit must be recorded: {meta:?}"
         );
         // `load` re-compares this exact list; `harness` must not be on it.
-        for k in ["schema", "phase", "agent", "model", "cli", "toolchain", "prompt", "recipe", "input_tree"] {
+        for k in KeyInputs::VALIDATED {
             assert!(meta.get(k).is_some(), "{k} must be recorded");
         }
     }

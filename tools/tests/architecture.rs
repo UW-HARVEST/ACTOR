@@ -461,3 +461,73 @@ fn only_battery_defines_the_has_crate_predicate() {
         "battery::has_crate must still BE the predicate this rule redirects callers to"
     );
 }
+
+/// The three key-deriving functions must keep their exhaustive patterns.
+///
+/// `Recipe::digest`, `KeyInputs::key` and `KeyInputs::meta` open with a full destructuring
+/// pattern precisely so adding a field fails to compile (E0027) rather than silently
+/// leaving the cache key unchanged, which would let two different invocations share an
+/// entry. Each escape below restores that silence: `..` and `field: _` skip a field,
+/// `let _ = x` and the bare `_ = x` consume a binding without hashing it (the latter is
+/// destructuring assignment, and compiles with no `let` at all), and
+/// `#[allow(unused_variables)]` disables the other half of the guarantee.
+#[test]
+fn the_key_deriving_functions_keep_their_exhaustive_patterns() {
+    const GUARDED: &[&str] = &["digest", "key", "meta"];
+    let text = std::fs::read_to_string(src("cache.rs")).expect("cache.rs");
+    let file = syn::parse_file(&text).expect("cache.rs parses");
+    let mut bad: Vec<String> = Vec::new();
+
+    for item in file.items {
+        let syn::Item::Impl(imp) = item else { continue };
+        let owner = type_name(&imp.self_ty);
+        if owner != "Recipe" && owner != "KeyInputs" {
+            continue;
+        }
+        for it in imp.items {
+            let syn::ImplItem::Fn(f) = it else { continue };
+            let name = f.sig.ident.to_string();
+            if !GUARDED.contains(&name.as_str()) {
+                continue;
+            }
+            let mut note = |what: &str| bad.push(format!("{owner}::{name}: {what}"));
+            if f.attrs.iter().any(|a| {
+                let p = a.path().segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>().join("::");
+                let t = a.meta.require_list().map(|l| l.tokens.to_string()).unwrap_or_default();
+                p.contains("allow") && t.contains("unused_variables")
+            }) {
+                note("#[allow(unused_variables)]");
+            }
+            for st in &f.block.stmts {
+                match st {
+                    syn::Stmt::Local(l) => {
+                        if let syn::Pat::Struct(ps) = &l.pat {
+                            if ps.rest.is_some() {
+                                note("`..` in the destructuring pattern");
+                            }
+                            if ps.fields.iter().any(|fp| matches!(&*fp.pat, syn::Pat::Wild(_))) {
+                                note("a field bound to `_`");
+                            }
+                        }
+                        if matches!(&l.pat, syn::Pat::Wild(_)) {
+                            note("`let _ =` discards a binding");
+                        }
+                    }
+                    // bare `_ = x;` is destructuring assignment: no `let`, compiles clean
+                    syn::Stmt::Expr(syn::Expr::Assign(a), _) => {
+                        if matches!(&*a.left, syn::Expr::Infer(_)) {
+                            note("bare `_ =` discards a binding");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "a key-deriving function can now skip a field silently: {bad:#?}\n\
+         Keep the pattern exhaustive and feed every binding, so a new field is a compile\n\
+         error rather than two invocations quietly sharing a cache entry."
+    );
+}
