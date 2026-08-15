@@ -74,7 +74,8 @@ impl RelPath {
         let p = p.as_ref();
         anyhow::ensure!(p.is_relative(), "path must be relative: {}", p.display());
         anyhow::ensure!(
-            !p.components().any(|c| matches!(c, std::path::Component::ParentDir)),
+            !p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
             "path must not contain `..`: {}",
             p.display()
         );
@@ -172,7 +173,11 @@ pub(crate) fn set_read_only(root: &Path, ro: bool) -> Result<()> {
         Ok(())
     }
     walk(root, ro).with_context(|| {
-        format!("making {} {}writable", root.display(), if ro { "non-" } else { "" })
+        format!(
+            "making {} {}writable",
+            root.display(),
+            if ro { "non-" } else { "" }
+        )
     })
 }
 
@@ -187,8 +192,16 @@ pub enum Disposition {
 }
 
 const BUILD_DIRS: &[&str] = &[
-    "target", "build", "c_build", "build_c", "artifacts", "gtest_build", "CMakeFiles", "e2e_out",
-    "build_ffi", "fuzz_scripts",
+    "target",
+    "build",
+    "c_build",
+    "build_c",
+    "artifacts",
+    "gtest_build",
+    "CMakeFiles",
+    "e2e_out",
+    "build_ffi",
+    "fuzz_scripts",
 ];
 
 /// `in_build_dir` must be true if any ancestor within the tree was itself classified
@@ -201,8 +214,11 @@ pub fn classify(rel: &RelPath, in_build_dir: bool) -> Disposition {
 
     let ignored_file = matches!(
         name,
-        "result.json" | "verification.json" | "translation.json"
-            | "harvest_bench_report.json" | "harvest_batch_report.json"
+        "result.json"
+            | "verification.json"
+            | "translation.json"
+            | "harvest_bench_report.json"
+            | "harvest_batch_report.json"
     ) || name.ends_with(".log")
         || name.ends_with(".bak")
         || name.ends_with(".sha256");
@@ -212,10 +228,12 @@ pub fn classify(rel: &RelPath, in_build_dir: bool) -> Disposition {
         return Disposition::Ignore;
     }
 
-    if in_build_dir || p.components().any(|c| {
-        let s = c.as_os_str().to_string_lossy();
-        BUILD_DIRS.contains(&s.as_ref()) || s.starts_with("cbuild")
-    }) {
+    if in_build_dir
+        || p.components().any(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            BUILD_DIRS.contains(&s.as_ref()) || s.starts_with("cbuild")
+        })
+    {
         return Disposition::BuildOutput;
     }
 
@@ -239,10 +257,16 @@ fn feed(h: &mut Sha256, bytes: &[u8]) {
 /// phase dirs are staging artifacts whose targets are per-run paths.
 fn digest_tree(root: &Path) -> Result<TreeDigest> {
     let mut files: std::collections::BTreeMap<RelPath, PathBuf> = Default::default();
-    visit(root, root, false, &|d| d == Disposition::StoreAndHash, &mut |rel, abs| {
-        files.insert(rel.clone(), abs.to_path_buf());
-        Ok(())
-    })
+    visit(
+        root,
+        root,
+        false,
+        &|d| d == Disposition::StoreAndHash,
+        &mut |rel, abs| {
+            files.insert(rel.clone(), abs.to_path_buf());
+            Ok(())
+        },
+    )
     .with_context(|| format!("walking {} for a digest", root.display()))?;
 
     let mut h = Sha256::new();
@@ -269,7 +293,9 @@ fn visit(
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let Ok(Ok(rel)) = path.strip_prefix(root).map(RelPath::new) else { continue };
+        let Ok(Ok(rel)) = path.strip_prefix(root).map(RelPath::new) else {
+            continue;
+        };
 
         if !admits(classify(&rel, build_here)) {
             continue;
@@ -291,7 +317,9 @@ pub struct Scratch {
 
 impl Scratch {
     pub fn new(prefix: &str) -> Result<Self> {
-        Ok(Self { dir: crate::workdir::tempdir(prefix)? })
+        Ok(Self {
+            dir: crate::workdir::tempdir(prefix)?,
+        })
     }
 }
 
@@ -319,26 +347,43 @@ impl<P: Phase> WorkTree<P> {
     /// `self`, so nothing can run again against a tree normalised for hashing.
     pub fn scrub(self) -> Result<Scrubbed<P>> {
         let base = crate::workdir::base()?;
-        let needles = [self.root.to_string_lossy().into_owned(), base.to_string_lossy().into_owned()];
+        let needles = [
+            self.root.to_string_lossy().into_owned(),
+            base.to_string_lossy().into_owned(),
+        ];
         let mut rewritten = Vec::new();
 
         let artifact = self.crate_dir();
         // The same predicate the digest uses: nothing can be hashed unscrubbed.
-        visit(&artifact, &artifact, false, &|d| d == Disposition::StoreAndHash, &mut |rel, abs| {
-            let Ok(text) = std::fs::read_to_string(abs) else { return Ok(()) }; // binary: skip
-            let mut out = text.clone();
-            for n in &needles {
-                if !n.is_empty() {
-                    out = out.replace(n.as_str(), "$HARVEST_WORKDIR");
+        visit(
+            &artifact,
+            &artifact,
+            false,
+            &|d| d == Disposition::StoreAndHash,
+            &mut |rel, abs| {
+                let Ok(text) = std::fs::read_to_string(abs) else {
+                    return Ok(());
+                }; // binary: skip
+                let mut out = text.clone();
+                for n in &needles {
+                    if !n.is_empty() {
+                        out = out.replace(n.as_str(), "$HARVEST_WORKDIR");
+                    }
                 }
-            }
-            if out != text {
-                std::fs::write(abs, out).with_context(|| format!("scrubbing {}", abs.display()))?;
-                rewritten.push(rel.clone());
-            }
-            Ok(())
-        })?;
-        Ok(Scrubbed { root: artifact, _scratch: self._scratch, rewritten, _phase: PhantomData })
+                if out != text {
+                    std::fs::write(abs, out)
+                        .with_context(|| format!("scrubbing {}", abs.display()))?;
+                    rewritten.push(rel.clone());
+                }
+                Ok(())
+            },
+        )?;
+        Ok(Scrubbed {
+            root: artifact,
+            _scratch: self._scratch,
+            rewritten,
+            _phase: PhantomData,
+        })
     }
 }
 
@@ -380,7 +425,12 @@ impl<P: Phase> Scrubbed<P> {
             c_after.as_str()
         );
         let digest = digest_tree(&self.root)?;
-        Ok(Sealed { root: self.root, _scratch: self._scratch, digest, _phase: PhantomData })
+        Ok(Sealed {
+            root: self.root,
+            _scratch: self._scratch,
+            digest,
+            _phase: PhantomData,
+        })
     }
 }
 
@@ -403,17 +453,36 @@ impl<P: Phase> fmt::Debug for Sealed<P> {
 impl<P: Phase> Sealed<P> {
     pub fn adopt(case_dir: &Path) -> Result<Self> {
         let root = crate::battery::phase_dir(case_dir, P::DIR);
-        anyhow::ensure!(root.is_dir(), "no {} phase dir at {}", P::DIR, root.display());
+        anyhow::ensure!(
+            root.is_dir(),
+            "no {} phase dir at {}",
+            P::DIR,
+            root.display()
+        );
         let digest = digest_tree(&root)?;
-        Ok(Self { root, _scratch: None, digest, _phase: PhantomData })
+        Ok(Self {
+            root,
+            _scratch: None,
+            digest,
+            _phase: PhantomData,
+        })
     }
 
     /// Re-adopt a tree the cache stored earlier. Kept `pub(crate)`: widening it would be
     /// a way to manufacture a `Sealed` without a `Completed` proof.
     pub(crate) fn from_cache(code_dir: &Path) -> Result<Self> {
-        anyhow::ensure!(code_dir.is_dir(), "cache entry has no code/ at {}", code_dir.display());
+        anyhow::ensure!(
+            code_dir.is_dir(),
+            "cache entry has no code/ at {}",
+            code_dir.display()
+        );
         let digest = digest_tree(code_dir)?;
-        Ok(Self { root: code_dir.to_path_buf(), _scratch: None, digest, _phase: PhantomData })
+        Ok(Self {
+            root: code_dir.to_path_buf(),
+            _scratch: None,
+            digest,
+            _phase: PhantomData,
+        })
     }
 
     pub fn digest(&self) -> &TreeDigest {
@@ -431,8 +500,16 @@ impl<P: Phase> Sealed<P> {
     #[must_use = "materialising and dropping the copy does nothing"]
     pub fn materialise_into<Q: Phase>(&self, scratch: Scratch) -> Result<WorkTree<Q>> {
         let root = scratch.dir.path().to_path_buf();
-        copy_carrying(&self.root, &root.join(crate::battery::TRANSLATED_RUST), Carry::IntoWorkTree)?;
-        Ok(WorkTree { root, _scratch: Some(scratch), _phase: PhantomData })
+        copy_carrying(
+            &self.root,
+            &root.join(crate::battery::TRANSLATED_RUST),
+            Carry::IntoWorkTree,
+        )?;
+        Ok(WorkTree {
+            root,
+            _scratch: Some(scratch),
+            _phase: PhantomData,
+        })
     }
 
     pub fn publish(&self, case_dir: &Path) -> Result<()> {
@@ -483,18 +560,24 @@ mod tests {
             &[
                 ("Cargo.toml", "[package]"),
                 ("src/lib.rs", "pub fn a() {}"),
-                (".cargo/config.toml", "[build]"),      // a real build input
+                (".cargo/config.toml", "[build]"), // a real build input
                 ("c_src/src/lib.c", "int a(void){0;}"), // the oracle: hashed, so carried
                 ("build.rs", "fn main() {}"),
-                ("logs/verify.log", "transcript"),      // Ignore: need not survive
-                ("target/debug/junk", "build output"),  // BuildOutput: must not survive
+                ("logs/verify.log", "transcript"), // Ignore: need not survive
+                ("target/debug/junk", "build output"), // BuildOutput: must not survive
             ],
         );
         let dest = tempfile::tempdir().unwrap();
         let out = dest.path().join("code");
         copy_carrying(src.path(), &out, Carry::FromArtifact).unwrap();
 
-        for hashed in ["Cargo.toml", "src/lib.rs", ".cargo/config.toml", "c_src/src/lib.c", "build.rs"] {
+        for hashed in [
+            "Cargo.toml",
+            "src/lib.rs",
+            ".cargo/config.toml",
+            "c_src/src/lib.c",
+            "build.rs",
+        ] {
             assert_eq!(
                 classify(&rel(hashed), false),
                 Disposition::StoreAndHash,
@@ -505,7 +588,10 @@ mod tests {
                 "{hashed} is hashed, so an export that drops it makes the digest unverifiable"
             );
         }
-        assert!(!out.join("target").exists(), "build output must not be stored");
+        assert!(
+            !out.join("target").exists(),
+            "build output must not be stored"
+        );
 
         assert_eq!(
             digest_tree(src.path()).unwrap(),
@@ -524,7 +610,10 @@ mod tests {
             &[
                 ("Cargo.toml", "[package]"),
                 ("c_src/src/lib.c", "int a(void){return 0;}"),
-                ("c_src/build/CMakeCache.txt", "CMAKE_CACHEFILE_DIR:INTERNAL=/tmp/harvest-translate-w1nAAq/x"),
+                (
+                    "c_src/build/CMakeCache.txt",
+                    "CMAKE_CACHEFILE_DIR:INTERNAL=/tmp/harvest-translate-w1nAAq/x",
+                ),
                 ("c_src/build/CMakeFiles/junk", "cmake internals"),
                 ("logs/translate.log", "transcript"),
             ],
@@ -533,7 +622,10 @@ mod tests {
         let out = dest.path().join("work");
         copy_carrying(src.path(), &out, Carry::IntoWorkTree).unwrap();
 
-        assert!(out.join("c_src/src/lib.c").is_file(), "the C oracle must travel");
+        assert!(
+            out.join("c_src/src/lib.c").is_file(),
+            "the C oracle must travel"
+        );
         assert!(
             out.join("logs/translate.log").is_file(),
             "logs must still travel — the agent has always been able to read them"
@@ -548,7 +640,10 @@ mod tests {
     fn relpath_rejects_escapes() {
         assert!(RelPath::new("a/b").is_ok());
         assert!(RelPath::new("/abs").is_err(), "absolute must be refused");
-        assert!(RelPath::new("../up").is_err(), "parent traversal must be refused");
+        assert!(
+            RelPath::new("../up").is_err(),
+            "parent traversal must be refused"
+        );
         assert!(RelPath::new("").is_err());
     }
 
@@ -566,31 +661,60 @@ mod tests {
     #[test]
     fn classify_ignores_harness_output_and_logs() {
         assert_eq!(classify(&rel("result.json"), false), Disposition::Ignore);
-        assert_eq!(classify(&rel("verification.json"), false), Disposition::Ignore);
-        assert_eq!(classify(&rel("logs/verify.log"), false), Disposition::Ignore);
+        assert_eq!(
+            classify(&rel("verification.json"), false),
+            Disposition::Ignore
+        );
+        assert_eq!(
+            classify(&rel("logs/verify.log"), false),
+            Disposition::Ignore
+        );
         assert_eq!(classify(&rel("src/x.rs.bak"), false), Disposition::Ignore);
     }
 
     #[test]
     fn classify_treats_named_build_dirs_as_build_output() {
-        for p in ["target/debug/x", "cbuild/a", "gtest_build/b", "artifacts/cbuild_sub_7/c"] {
+        for p in [
+            "target/debug/x",
+            "cbuild/a",
+            "gtest_build/b",
+            "artifacts/cbuild_sub_7/c",
+        ] {
             assert_eq!(classify(&rel(p), false), Disposition::BuildOutput, "{p}");
         }
     }
 
     #[test]
     fn classify_catches_nested_build_dirs_a_toplevel_check_would_miss() {
-        assert_eq!(classify(&rel("c_src/build/CMakeCache.txt"), false), Disposition::BuildOutput);
-        assert_eq!(classify(&rel("weird_name/CMakeCache.txt"), true), Disposition::BuildOutput);
+        assert_eq!(
+            classify(&rel("c_src/build/CMakeCache.txt"), false),
+            Disposition::BuildOutput
+        );
+        assert_eq!(
+            classify(&rel("weird_name/CMakeCache.txt"), true),
+            Disposition::BuildOutput
+        );
     }
 
     #[test]
     fn classify_keeps_source_and_dotfiles() {
-        assert_eq!(classify(&rel("src/lib.rs"), false), Disposition::StoreAndHash);
-        assert_eq!(classify(&rel("Cargo.lock"), false), Disposition::StoreAndHash);
+        assert_eq!(
+            classify(&rel("src/lib.rs"), false),
+            Disposition::StoreAndHash
+        );
+        assert_eq!(
+            classify(&rel("Cargo.lock"), false),
+            Disposition::StoreAndHash
+        );
         // .cargo/config.toml is a real build input in 16 corpus cases.
-        assert_eq!(classify(&rel(".cargo/config.toml"), false), Disposition::StoreAndHash);
-        assert_eq!(classify(&rel("c_src/src/lib.c"), false), Disposition::StoreAndHash);
+        assert_eq!(
+            classify(&rel(".cargo/config.toml"), false),
+            Disposition::StoreAndHash
+        );
+        assert_eq!(
+            classify(&rel("c_src/src/lib.c"), false),
+            Disposition::StoreAndHash
+        );
     }
 
     fn tree(root: &Path, files: &[(&str, &str)]) {
@@ -604,7 +728,10 @@ mod tests {
     #[test]
     fn digest_ignores_build_output_and_logs() {
         let a = tempfile::tempdir().unwrap();
-        tree(a.path(), &[("src/lib.rs", "fn a() {}"), ("logs/verify.log", "noise")]);
+        tree(
+            a.path(),
+            &[("src/lib.rs", "fn a() {}"), ("logs/verify.log", "noise")],
+        );
         let b = tempfile::tempdir().unwrap();
         tree(
             b.path(),
@@ -628,7 +755,10 @@ mod tests {
         tree(a.path(), &[("src/lib.rs", "fn a() {}")]);
         let b = tempfile::tempdir().unwrap();
         tree(b.path(), &[("src/lib.rs", "fn b() {}")]);
-        assert_ne!(digest_tree(a.path()).unwrap(), digest_tree(b.path()).unwrap());
+        assert_ne!(
+            digest_tree(a.path()).unwrap(),
+            digest_tree(b.path()).unwrap()
+        );
     }
 
     #[test]
@@ -637,9 +767,15 @@ mod tests {
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
         for r in [a.path(), b.path()] {
-            tree(r, &[("src/lib.rs", "fn a() {}"), ("Cargo.toml", "[package]")]);
+            tree(
+                r,
+                &[("src/lib.rs", "fn a() {}"), ("Cargo.toml", "[package]")],
+            );
         }
-        assert_eq!(digest_tree(a.path()).unwrap(), digest_tree(b.path()).unwrap());
+        assert_eq!(
+            digest_tree(a.path()).unwrap(),
+            digest_tree(b.path()).unwrap()
+        );
     }
 
     /// `verify_case` spawns a real agent and cannot be unit-tested, so the plumbing
@@ -664,17 +800,30 @@ mod tests {
         let scratch = Scratch::new("test-work-").unwrap();
         let work: WorkTree<Verify> = sealed.materialise_into(scratch).expect("materialise");
         let crate_dir = work.crate_dir();
-        assert!(crate_dir.join("src/lib.rs").is_file(), "source must be copied");
-        assert!(crate_dir.join("c_src/src/lib.c").is_file(), "C oracle must be copied");
+        assert!(
+            crate_dir.join("src/lib.rs").is_file(),
+            "source must be copied"
+        );
+        assert!(
+            crate_dir.join("c_src/src/lib.c").is_file(),
+            "C oracle must be copied"
+        );
         assert!(
             crate_dir.join("logs/translation.log").is_file(),
             "logs must still reach the agent — parity with the previous behaviour"
         );
-        assert!(!crate_dir.join("target").exists(), "build output must NOT be copied");
+        assert!(
+            !crate_dir.join("target").exists(),
+            "build output must NOT be copied"
+        );
 
         // Stand in for the agent: edit the Rust, and bake a scratch path into a note.
         let c_before = work.c().digest().unwrap();
-        std::fs::write(crate_dir.join("src/lib.rs"), "pub fn a() { /* verified */ }").unwrap();
+        std::fs::write(
+            crate_dir.join("src/lib.rs"),
+            "pub fn a() { /* verified */ }",
+        )
+        .unwrap();
         std::fs::write(
             crate_dir.join("SYMBOLS.md"),
             format!("built in {}\n", crate_dir.display()),
@@ -683,7 +832,10 @@ mod tests {
 
         let scrubbed = work.scrub().expect("scrub");
         assert!(
-            scrubbed.rewritten().iter().any(|r| r.as_path().ends_with("SYMBOLS.md")),
+            scrubbed
+                .rewritten()
+                .iter()
+                .any(|r| r.as_path().ends_with("SYMBOLS.md")),
             "the embedded scratch path must be rewritten, else the digest varies per run"
         );
 
@@ -698,8 +850,14 @@ mod tests {
             "pub fn a() { /* verified */ }",
             "the agent's edit must reach verified/"
         );
-        assert!(out.join("c_src/src/lib.c").is_file(), "c_src must be seeded from translated/");
-        assert!(!out.join("target").exists(), "build output must not be published");
+        assert!(
+            out.join("c_src/src/lib.c").is_file(),
+            "c_src must be seeded from translated/"
+        );
+        assert!(
+            !out.join("target").exists(),
+            "build output must not be published"
+        );
         assert_eq!(
             std::fs::read_to_string(translated.join("src/lib.rs")).unwrap(),
             "pub fn a() {}",
@@ -712,13 +870,22 @@ mod tests {
         let case = tempfile::tempdir().unwrap();
         tree(
             &case.path().join(crate::battery::TRANSLATED),
-            &[("Cargo.toml", "[package]"), ("c_src/src/lib.c", "int a(void){return 0;}")],
+            &[
+                ("Cargo.toml", "[package]"),
+                ("c_src/src/lib.c", "int a(void){return 0;}"),
+            ],
         );
         let sealed = Sealed::<Translate>::adopt(case.path()).unwrap();
-        let work: WorkTree<Verify> = sealed.materialise_into(Scratch::new("t-").unwrap()).unwrap();
+        let work: WorkTree<Verify> = sealed
+            .materialise_into(Scratch::new("t-").unwrap())
+            .unwrap();
         let c_before = work.c().digest().unwrap();
 
-        std::fs::write(work.crate_dir().join("c_src/src/lib.c"), "int a(void){return 1;}").unwrap();
+        std::fs::write(
+            work.crate_dir().join("c_src/src/lib.c"),
+            "int a(void){return 1;}",
+        )
+        .unwrap();
 
         let err = work
             .scrub()

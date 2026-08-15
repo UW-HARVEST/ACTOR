@@ -67,14 +67,18 @@ pub fn classify_log(log: &Path) -> Health {
     let tail = match read_tail(log) {
         Ok(t) => t,
         Err(e) => {
-            return Health::Unknown { why: format!("cannot read {}: {e}", log.display()) };
+            return Health::Unknown {
+                why: format!("cannot read {}: {e}", log.display()),
+            };
         }
     };
 
     // kiro-cli writes prose, not stream-json: no opinion.
     if !tail.contains("\"type\":\"result\"") && !tail.contains("\"terminal_reason\"") {
         if tail.contains("Credits:") {
-            return Health::Unknown { why: "kiro-cli log, no terminal record".into() };
+            return Health::Unknown {
+                why: "kiro-cli log, no terminal record".into(),
+            };
         }
         // Stream-json that stops mid-flight: a run killed partway leaves a log
         // with a fresh mtime and no terminal record, so skipping on existence
@@ -92,7 +96,10 @@ pub fn classify_log(log: &Path) -> Health {
                 .unwrap_or_default();
             return Health::Infra {
                 reason: reason.clone(),
-                detail: format!("terminal_reason={reason}{status}{}", first_line_of_result(&tail)),
+                detail: format!(
+                    "terminal_reason={reason}{status}{}",
+                    first_line_of_result(&tail)
+                ),
             };
         }
         return Health::Completed;
@@ -106,7 +113,9 @@ pub fn classify_log(log: &Path) -> Health {
             detail: format!("is_error=true{}", first_line_of_result(&tail)),
         },
         Some(false) => Health::Completed,
-        None => Health::Unknown { why: "terminal record has neither terminal_reason nor is_error".into() },
+        None => Health::Unknown {
+            why: "terminal record has neither terminal_reason nor is_error".into(),
+        },
     }
 }
 
@@ -137,7 +146,9 @@ pub fn audit(results_dir: &Path) -> Result<Vec<CaseHealth>> {
 }
 
 fn collect(root: &Path, dir: &Path, out: &mut Vec<CaseHealth>) -> Result<()> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(()) };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
     for e in entries.flatten() {
         let p = e.path();
         if !p.is_dir() {
@@ -153,7 +164,11 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<CaseHealth>) -> Result<()> {
             collect(root, &p, out)?;
             continue;
         };
-        let name = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().into_owned();
+        let name = p
+            .strip_prefix(root)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .into_owned();
         out.push(CaseHealth {
             name,
             health: classify_log(&log),
@@ -177,7 +192,10 @@ pub fn describe_infra_failures(audit: &[CaseHealth]) -> Option<String> {
     );
     for c in bad.iter().take(30) {
         if let Health::Infra { detail, .. } = &c.health {
-            let ec = c.exit_code.map(|e| format!(" exit={e}")).unwrap_or_default();
+            let ec = c
+                .exit_code
+                .map(|e| format!(" exit={e}"))
+                .unwrap_or_default();
             s.push_str(&format!("  {}{ec}\n     {detail}\n", c.name));
         }
     }
@@ -218,7 +236,12 @@ pub fn record_infra_failures(results_dir: &Path, audit: &[CaseHealth]) -> Result
         results_dir.join("INFRA_FAILURES.json"),
         serde_json::to_string_pretty(&doc)? + "\n",
     )
-    .with_context(|| format!("writing INFRA_FAILURES.json under {}", results_dir.display()))?;
+    .with_context(|| {
+        format!(
+            "writing INFRA_FAILURES.json under {}",
+            results_dir.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -248,9 +271,13 @@ fn last_bool(hay: &str, key: &str) -> Option<bool> {
     let pat = format!("\"{key}\":");
     let start = hay.rfind(&pat)? + pat.len();
     let rest = hay[start..].trim_start();
-    if rest.starts_with("true") { Some(true) }
-    else if rest.starts_with("false") { Some(false) }
-    else { None }
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn last_num(hay: &str, key: &str) -> Option<i64> {
@@ -296,8 +323,14 @@ mod tests {
         match classify_log(&log) {
             Health::Infra { reason, detail } => {
                 assert_eq!(reason, "api_error");
-                assert!(detail.contains("HTTP 403"), "detail should name the status: {detail}");
-                assert!(detail.contains("expired"), "detail should carry the message: {detail}");
+                assert!(
+                    detail.contains("HTTP 403"),
+                    "detail should name the status: {detail}"
+                );
+                assert!(
+                    detail.contains("expired"),
+                    "detail should carry the message: {detail}"
+                );
             }
             other => panic!("expected Infra, got {other:?}"),
         }
@@ -309,7 +342,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let log = write(tmp.path(), "v.log", DEAD);
         assert!(classify_log(&log).is_infra());
-        assert!(DEAD.contains("\"subtype\":\"success\""), "fixture must retain the trap");
+        assert!(
+            DEAD.contains("\"subtype\":\"success\""),
+            "fixture must retain the trap"
+        );
     }
 
     #[test]
@@ -336,8 +372,11 @@ mod tests {
         // A killed run leaves a fresh mtime and no terminal record; skipping on
         // existence alone corrupted 4 cases of a real sweep.
         let tmp = tempfile::tempdir().unwrap();
-        let log = write(tmp.path(), "v.log",
-            "{\"type\":\"system\",\"subtype\":\"init\"}\n{\"type\":\"assistant\"}\n");
+        let log = write(
+            tmp.path(),
+            "v.log",
+            "{\"type\":\"system\",\"subtype\":\"init\"}\n{\"type\":\"assistant\"}\n",
+        );
         match classify_log(&log) {
             Health::Infra { reason, .. } => assert_eq!(reason, "truncated"),
             other => panic!("expected Infra/truncated, got {other:?}"),
@@ -366,7 +405,11 @@ mod tests {
         let body = format!("{DEAD}\n{CLEAN}\n");
         let tmp = tempfile::tempdir().unwrap();
         let log = write(tmp.path(), "v.log", &body);
-        assert_eq!(classify_log(&log), Health::Completed, "later record must win");
+        assert_eq!(
+            classify_log(&log),
+            Health::Completed,
+            "later record must win"
+        );
     }
 
     #[test]
@@ -378,7 +421,10 @@ mod tests {
         let a = audit(tmp.path()).unwrap();
         assert_eq!(a.len(), 1, "one case, not one per phase");
         assert_eq!(a[0].name, "B01/case_x");
-        assert!(a[0].health.is_infra(), "verify is the later phase and must win");
+        assert!(
+            a[0].health.is_infra(),
+            "verify is the later phase and must win"
+        );
     }
 
     #[test]
@@ -389,7 +435,8 @@ mod tests {
         std::fs::write(
             case.join("verified/verification.json"),
             r#"{"exit_code":1,"success":true,"duration_secs":4569}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let a = audit(tmp.path()).unwrap();
         assert_eq!(a[0].exit_code, Some(1));
         // `success:true` here is the cargo-check gate, NOT agent health.
@@ -407,12 +454,19 @@ mod tests {
     #[test]
     fn describe_names_the_cases_and_the_counts() {
         let tmp = tempfile::tempdir().unwrap();
-        write(&tmp.path().join("b/good"), "verified/logs/verify.log", CLEAN);
+        write(
+            &tmp.path().join("b/good"),
+            "verified/logs/verify.log",
+            CLEAN,
+        );
         write(&tmp.path().join("b/bad"), "verified/logs/verify.log", DEAD);
         let a = audit(tmp.path()).unwrap();
         let msg = describe_infra_failures(&a).expect("one failure");
         assert!(msg.contains("1 of 2"), "counts: {msg}");
         assert!(msg.contains("b/bad"), "names the case: {msg}");
-        assert!(!msg.contains("b/good"), "does not list healthy cases: {msg}");
+        assert!(
+            !msg.contains("b/good"),
+            "does not list healthy cases: {msg}"
+        );
     }
 }

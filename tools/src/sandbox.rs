@@ -75,7 +75,10 @@ mod tests {
         // Denying something *under* results/ leaves the corpus readable.
         let p = policy("/repo", "/scratch/base/harvest-work-x");
         let deny = p["sandbox"]["filesystem"]["denyRead"].as_array().unwrap();
-        assert!(deny.iter().any(|d| d == "/repo"), "repo root must be denied: {deny:?}");
+        assert!(
+            deny.iter().any(|d| d == "/repo"),
+            "repo root must be denied: {deny:?}"
+        );
         assert!(
             !deny.iter().any(|d| d.as_str().unwrap().contains("results")),
             "deny root must not be a results subdirectory: {deny:?}"
@@ -88,7 +91,10 @@ mod tests {
         // denied a case could read a sibling case's tree.
         let p = policy("/repo", "/scratch/base/harvest-work-x");
         let deny = p["sandbox"]["filesystem"]["denyRead"].as_array().unwrap();
-        assert!(deny.iter().any(|d| d == "/scratch/base"), "scratch base must be denied: {deny:?}");
+        assert!(
+            deny.iter().any(|d| d == "/scratch/base"),
+            "scratch base must be denied: {deny:?}"
+        );
     }
 
     #[test]
@@ -104,8 +110,7 @@ mod tests {
         let tc = policy("/repo", "/scratch/base/w1");
         let hb = policy("/repo", "/scratch/base/w2");
         assert_eq!(
-            tc["sandbox"]["filesystem"]["denyRead"],
-            hb["sandbox"]["filesystem"]["denyRead"],
+            tc["sandbox"]["filesystem"]["denyRead"], hb["sandbox"]["filesystem"]["denyRead"],
             "deny list must not depend on how deep the case dir happens to be"
         );
     }
@@ -116,7 +121,10 @@ mod tests {
         assert_eq!(p["sandbox"]["enabled"], true);
         assert_eq!(p["sandbox"]["allowUnsandboxedCommands"], false);
         for k in ["denyRead", "allowRead", "allowWrite"] {
-            assert!(p["sandbox"]["filesystem"][k].is_array(), "{k} must be an array");
+            assert!(
+                p["sandbox"]["filesystem"][k].is_array(),
+                "{k} must be an array"
+            );
         }
     }
 

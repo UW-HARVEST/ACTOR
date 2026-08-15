@@ -21,13 +21,25 @@ pub trait Benchmark {
     /// Does a separate C-as-oracle verify phase run for this agent?
     fn verifies(&self, agent: Agent) -> bool;
 
-    fn translate(&self, paths: &Paths, target: &str, filter: Option<&str>,
-                 parallel: usize) -> Result<()>;
+    fn translate(
+        &self,
+        paths: &Paths,
+        target: &str,
+        filter: Option<&str>,
+        parallel: usize,
+    ) -> Result<()>;
 
     /// Reached from `Run` only when [`verifies`] is true, but also invoked directly by
     /// the `verify` subcommand, so an impl cannot assume that gate ran.
-    fn verify(&self, _repo_root: &Path, _paths: &Paths, _target: &str,
-              _filter: Option<&str>, _force: bool, _parallel: usize) -> Result<()> {
+    fn verify(
+        &self,
+        _repo_root: &Path,
+        _paths: &Paths,
+        _target: &str,
+        _filter: Option<&str>,
+        _force: bool,
+        _parallel: usize,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -49,10 +61,17 @@ pub fn for_dataset(d: Dataset) -> Box<dyn Benchmark> {
 /// are prompt ablations that skip verify by design, and Codex runs its own
 /// translate-then-verify pipeline in-harness — none get the separate ACTOR verify phase.
 fn agent_runs_separate_verify(agent: Agent) -> bool {
-    !matches!(agent,
-        Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter
-        | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
-        | Agent::CodexGpt55 | Agent::CodexGpt54)
+    !matches!(
+        agent,
+        Agent::ClaudeCombined
+            | Agent::ClaudeMinimal
+            | Agent::ClaudeNoIter
+            | Agent::ClaudeNoFeatures
+            | Agent::ClaudeNoSubtask
+            | Agent::ClaudeCrossPrompt
+            | Agent::CodexGpt55
+            | Agent::CodexGpt54
+    )
 }
 
 fn resolve_batteries(corpus_dir: &Path, target: &str) -> Result<Vec<String>> {
@@ -63,12 +82,16 @@ fn resolve_batteries(corpus_dir: &Path, target: &str) -> Result<Vec<String>> {
     }
 }
 
-fn resolve_harvest_bench_projects(corpus_dir: &Path, target: &str)
-    -> Result<Vec<battery::HarvestBenchProject>> {
+fn resolve_harvest_bench_projects(
+    corpus_dir: &Path,
+    target: &str,
+) -> Result<Vec<battery::HarvestBenchProject>> {
     if target.eq_ignore_ascii_case("hb") || target == "all" {
         battery::HarvestBenchProject::discover(corpus_dir)
     } else {
-        Ok(vec![battery::HarvestBenchProject::resolve(corpus_dir, target)?])
+        Ok(vec![battery::HarvestBenchProject::resolve(
+            corpus_dir, target,
+        )?])
     }
 }
 
@@ -84,19 +107,29 @@ fn parse_target(target: &str) -> (String, Option<String>) {
 struct TestCorpus;
 
 impl Benchmark for TestCorpus {
-    fn name(&self) -> &'static str { "test-corpus" }
+    fn name(&self) -> &'static str {
+        "test-corpus"
+    }
 
-    fn verifies(&self, agent: Agent) -> bool { agent_runs_separate_verify(agent) }
+    fn verifies(&self, agent: Agent) -> bool {
+        agent_runs_separate_verify(agent)
+    }
 
-    fn translate(&self, paths: &Paths, target: &str, _filter: Option<&str>,
-                 parallel: usize) -> Result<()> {
+    fn translate(
+        &self,
+        paths: &Paths,
+        target: &str,
+        _filter: Option<&str>,
+        parallel: usize,
+    ) -> Result<()> {
         let batteries = resolve_batteries(&paths.corpus_dir, target)?;
 
         // Shared-source batteries must run single-threaded: their follower configs are
         // propagated from one real translation. Independent batteries split the rest of
         // the parallel budget.
         if batteries.len() > 1 && parallel > 1 {
-            let (shared_bats, indie_bats): (Vec<&str>, Vec<&str>) = batteries.iter()
+            let (shared_bats, indie_bats): (Vec<&str>, Vec<&str>) = batteries
+                .iter()
                 .map(String::as_str)
                 .partition(|b| battery::has_shared_source_groups(&paths.corpus_dir, b));
 
@@ -114,16 +147,24 @@ impl Benchmark for TestCorpus {
                     handles.push(s.spawn(|| -> Result<()> {
                         for bat in &indie_bats {
                             let (name, filter) = parse_target(bat);
-                            translate::run_test_corpus(paths, &name, filter.as_deref(), indie_parallel)?;
+                            translate::run_test_corpus(
+                                paths,
+                                &name,
+                                filter.as_deref(),
+                                indie_parallel,
+                            )?;
                         }
                         Ok(())
                     }));
                 }
-                handles.into_iter().filter_map(|h| match h.join() {
-                    Ok(Ok(())) => None,
-                    Ok(Err(e)) => Some(e),
-                    Err(_) => Some(anyhow::anyhow!("translate thread panicked")),
-                }).collect()
+                handles
+                    .into_iter()
+                    .filter_map(|h| match h.join() {
+                        Ok(Ok(())) => None,
+                        Ok(Err(e)) => Some(e),
+                        Err(_) => Some(anyhow::anyhow!("translate thread panicked")),
+                    })
+                    .collect()
             });
             if let Some(first) = errors.into_iter().next() {
                 return Err(first);
@@ -139,8 +180,15 @@ impl Benchmark for TestCorpus {
 
     // `_repo_root` is unused in every impl: the real repo root travels on `Paths` (see
     // crate::sandbox), so the trait parameter could be dropped as a follow-up.
-    fn verify(&self, _repo_root: &Path, paths: &Paths, target: &str,
-              _filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
+    fn verify(
+        &self,
+        _repo_root: &Path,
+        paths: &Paths,
+        target: &str,
+        _filter: Option<&str>,
+        force: bool,
+        parallel: usize,
+    ) -> Result<()> {
         let batteries = resolve_batteries(&paths.corpus_dir, target)?;
         if batteries.len() > 1 {
             verify::run_all(paths, &batteries, force, parallel)
@@ -179,18 +227,34 @@ impl Benchmark for TestCorpus {
 struct HarvestBench;
 
 impl Benchmark for HarvestBench {
-    fn name(&self) -> &'static str { "harvest-bench" }
+    fn name(&self) -> &'static str {
+        "harvest-bench"
+    }
 
-    fn verifies(&self, agent: Agent) -> bool { agent_runs_separate_verify(agent) }
+    fn verifies(&self, agent: Agent) -> bool {
+        agent_runs_separate_verify(agent)
+    }
 
-    fn translate(&self, paths: &Paths, target: &str, _filter: Option<&str>,
-                 parallel: usize) -> Result<()> {
+    fn translate(
+        &self,
+        paths: &Paths,
+        target: &str,
+        _filter: Option<&str>,
+        parallel: usize,
+    ) -> Result<()> {
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
         translate::run_harvest_bench(paths, &projects, parallel)
     }
 
-    fn verify(&self, _repo_root: &Path, paths: &Paths, target: &str,
-              _filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
+    fn verify(
+        &self,
+        _repo_root: &Path,
+        paths: &Paths,
+        target: &str,
+        _filter: Option<&str>,
+        force: bool,
+        parallel: usize,
+    ) -> Result<()> {
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
         verify::run_harvest_bench(paths, &projects, parallel, force)
     }

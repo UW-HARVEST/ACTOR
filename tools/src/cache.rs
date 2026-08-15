@@ -281,7 +281,11 @@ pub struct Produced<P: Phase> {
 
 impl<P: Phase> Produced<P> {
     pub fn new(sealed: Sealed<P>, log: PathBuf, provenance: serde_json::Value) -> Self {
-        Self { sealed, log, provenance }
+        Self {
+            sealed,
+            log,
+            provenance,
+        }
     }
 }
 
@@ -353,7 +357,12 @@ impl Store {
         if self.mode == Mode::ReadWrite {
             match self.load(inputs, &key, &dir) {
                 Ok(Some(Loaded { sealed, provenance })) => {
-                    return Ok(Some(Obtained { sealed, replayed: true, key, provenance }));
+                    return Ok(Some(Obtained {
+                        sealed,
+                        replayed: true,
+                        key,
+                        provenance,
+                    }));
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -369,7 +378,9 @@ impl Store {
             }
         }
 
-        let Some(produced) = compute()? else { return Ok(None) };
+        let Some(produced) = compute()? else {
+            return Ok(None);
+        };
         if self.mode != Mode::Bypass {
             self.store(inputs, &key, &dir, &produced)
                 .with_context(|| format!("storing cache entry {}", key.as_str()))?;
@@ -400,7 +411,16 @@ impl Store {
             serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json"))?)
                 .context("parsing meta.json")?;
         let want = inputs.meta(key);
-        for k in ["schema", "phase", "agent", "model", "toolchain", "prompt", "recipe", "input_tree"] {
+        for k in [
+            "schema",
+            "phase",
+            "agent",
+            "model",
+            "toolchain",
+            "prompt",
+            "recipe",
+            "input_tree",
+        ] {
             anyhow::ensure!(
                 meta.get(k) == want.get(k),
                 "meta.json disagrees on {k}: stored {:?}, computed {:?}",
@@ -451,7 +471,10 @@ impl Store {
         dir: &Path,
         produced: &Produced<P>,
     ) -> Result<()> {
-        let staging = self.root.join("tmp").join(format!("{}.partial", key.as_str()));
+        let staging = self
+            .root
+            .join("tmp")
+            .join(format!("{}.partial", key.as_str()));
         let _ = std::fs::remove_dir_all(&staging);
         std::fs::create_dir_all(staging.join("agent"))?;
 
@@ -467,7 +490,10 @@ impl Store {
         // a read can prove the artifact is the one that was written.
         let mut meta = inputs.meta(key);
         meta["output_tree"] = serde_json::json!(produced.sealed.digest().as_str());
-        std::fs::write(staging.join("meta.json"), serde_json::to_string_pretty(&meta)? + "\n")?;
+        std::fs::write(
+            staging.join("meta.json"),
+            serde_json::to_string_pretty(&meta)? + "\n",
+        )?;
 
         // Lock the CONTENTS before the rename, so no file is ever writable while visible
         // at the entry's final path — but leave the staging root itself writable, because
@@ -544,7 +570,15 @@ mod tests {
         r: &'a RecipeDigest,
         i: &'a TreeDigest,
     ) -> KeyInputs<'a> {
-        KeyInputs { phase: "verify", agent: "claude", model: m, toolchain: t, prompt: p, recipe: r, input_tree: i }
+        KeyInputs {
+            phase: "verify",
+            agent: "claude",
+            model: m,
+            toolchain: t,
+            prompt: p,
+            recipe: r,
+            input_tree: i,
+        }
     }
 
     fn fixtures() -> (ModelId, ToolchainId, RecipeDigest) {
@@ -580,7 +614,10 @@ mod tests {
         let text = format!("cd {} && ls {}/prompts", work.display(), repo.display());
         let n = normalise(&text, work, repo);
         assert!(!n.contains("alice"), "no username may survive: {n}");
-        assert!(!n.contains("harvest-work-AbCdEf"), "no scratch name may survive: {n}");
+        assert!(
+            !n.contains("harvest-work-AbCdEf"),
+            "no scratch name may survive: {n}"
+        );
         assert!(n.contains("$WORK") && n.contains("$REPO"), "{n}");
     }
 
@@ -597,14 +634,20 @@ mod tests {
             Path::new("/local/home/bob/.harvest/work/w-2"),
             Path::new("/local/home/bob/repo/ACTOR"),
         );
-        assert_eq!(a, b, "prompt digest must not depend on where anything lives");
+        assert_eq!(
+            a, b,
+            "prompt digest must not depend on where anything lives"
+        );
     }
 
     #[test]
     fn prompt_digest_changes_when_the_prompt_changes() {
         let w = Path::new("/w");
         let r = Path::new("/r");
-        assert_ne!(prompt_digest("verify X", w, r), prompt_digest("verify Y", w, r));
+        assert_ne!(
+            prompt_digest("verify X", w, r),
+            prompt_digest("verify Y", w, r)
+        );
     }
 
     #[test]
@@ -618,13 +661,25 @@ mod tests {
         assert_ne!(base, inputs(&m2, &t, &p, &r, &i).key(), "model must matter");
 
         let t2 = ToolchainId("1.97.1 x86_64-unknown-linux-gnu".into());
-        assert_ne!(base, inputs(&m, &t2, &p, &r, &i).key(), "toolchain must matter");
+        assert_ne!(
+            base,
+            inputs(&m, &t2, &p, &r, &i).key(),
+            "toolchain must matter"
+        );
 
         let p2 = PromptDigest("sha256:p2".into());
-        assert_ne!(base, inputs(&m, &t, &p2, &r, &i).key(), "prompt must matter");
+        assert_ne!(
+            base,
+            inputs(&m, &t, &p2, &r, &i).key(),
+            "prompt must matter"
+        );
 
         let i2 = TreeDigest::for_test("sha256:i2");
-        assert_ne!(base, inputs(&m, &t, &p, &r, &i2).key(), "input tree must matter");
+        assert_ne!(
+            base,
+            inputs(&m, &t, &p, &r, &i2).key(),
+            "input tree must matter"
+        );
 
         let mut ki = inputs(&m, &t, &p, &r, &i);
         ki.phase = "translate";
@@ -636,7 +691,10 @@ mod tests {
         let (m, t, r) = fixtures();
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:i");
-        assert_eq!(inputs(&m, &t, &p, &r, &i).key(), inputs(&m, &t, &p, &r, &i).key());
+        assert_eq!(
+            inputs(&m, &t, &p, &r, &i).key(),
+            inputs(&m, &t, &p, &r, &i).key()
+        );
     }
 
     #[test]
@@ -653,7 +711,10 @@ mod tests {
             agent_env: &[("CLAUDE_CODE_MAX_RETRIES", "20")],
         }
         .digest();
-        assert_ne!(base, changed, "a different cap can change what the agent produces");
+        assert_ne!(
+            base, changed,
+            "a different cap can change what the agent produces"
+        );
     }
 
     // These need a real `Sealed<Verify>`, which needs a `Completed` proof, so the
@@ -683,14 +744,19 @@ mod tests {
             std::fs::write(p, body).unwrap();
         }
         let path = repo.path().to_path_buf();
-        Fixture { _repo: repo, repo: path, case }
+        Fixture {
+            _repo: repo,
+            repo: path,
+            case,
+        }
     }
 
     /// `edit` stands in for the agent's change to the crate.
     fn seal_verify(case: &Path, edit: &str) -> Sealed<Verify> {
         let translated = Sealed::<Translate>::adopt(case).unwrap();
-        let work: WorkTree<Verify> =
-            translated.materialise_into(Scratch::new("cache-test-").unwrap()).unwrap();
+        let work: WorkTree<Verify> = translated
+            .materialise_into(Scratch::new("cache-test-").unwrap())
+            .unwrap();
         let c_before = work.c().digest().unwrap();
         std::fs::write(work.crate_dir().join("src/lib.rs"), edit).unwrap();
         work.scrub()
@@ -791,7 +857,10 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        assert!(second.replayed, "the second obtain must be served from the store");
+        assert!(
+            second.replayed,
+            "the second obtain must be served from the store"
+        );
         assert_eq!(runs, 1, "compute must have run exactly once");
         assert_eq!(first.sealed.digest(), second.sealed.digest());
         assert_eq!(
@@ -813,7 +882,11 @@ mod tests {
 
         let out = store.obtain::<Verify>(&inputs, || Ok(None)).unwrap();
         assert!(out.is_none());
-        assert_eq!(store.stats().unwrap().0, 0, "nothing may be stored for a failure");
+        assert_eq!(
+            store.stats().unwrap().0,
+            0,
+            "nothing may be stored for a failure"
+        );
 
         let mut ran = false;
         store
@@ -823,7 +896,10 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        assert!(ran, "a later run must get another chance, not a cached failure");
+        assert!(
+            ran,
+            "a later run must get another chance, not a cached failure"
+        );
     }
 
     #[test]
@@ -835,7 +911,8 @@ mod tests {
         let inputs = key_inputs(&m, &t, &p, &r, &i);
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+        rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .unwrap();
         assert_eq!(rw.stats().unwrap().0, 1);
 
         let off = Store::open(&f.repo, Mode::Bypass).unwrap();
@@ -849,7 +926,11 @@ mod tests {
             .unwrap();
         assert!(ran, "bypass must not read");
         assert!(!got.replayed);
-        assert_eq!(off.stats().unwrap().0, 1, "bypass must not write, so the count is unchanged");
+        assert_eq!(
+            off.stats().unwrap().0,
+            1,
+            "bypass must not write, so the count is unchanged"
+        );
     }
 
     #[test]
@@ -861,19 +942,28 @@ mod tests {
         let inputs = key_inputs(&m, &t, &p, &r, &i);
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        let old = rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() { /* old */ }"))))
-            .unwrap().unwrap();
+        let old = rw
+            .obtain(&inputs, || {
+                Ok(Some(produced(&f.case, "pub fn a() { /* old */ }")))
+            })
+            .unwrap()
+            .unwrap();
 
         let refresh = Store::open(&f.repo, Mode::Refresh).unwrap();
         let new = refresh
-            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() { /* new */ }"))))
+            .obtain(&inputs, || {
+                Ok(Some(produced(&f.case, "pub fn a() { /* new */ }")))
+            })
             .unwrap()
             .unwrap();
         assert!(!new.replayed, "refresh must re-run");
         assert_ne!(old.sealed.digest(), new.sealed.digest());
 
         // The point of --cache refresh is that the suspect entry is GONE, not shadowed.
-        let after = rw.obtain::<Verify>(&inputs, || panic!("must hit")).unwrap().unwrap();
+        let after = rw
+            .obtain::<Verify>(&inputs, || panic!("must hit"))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             after.sealed.digest(),
             new.sealed.digest(),
@@ -892,7 +982,9 @@ mod tests {
         let i = TreeDigest::for_test("sha256:in");
         let inputs = key_inputs(&m, &t, &p, &r, &i);
         let key = inputs.key();
-        store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+        store
+            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .unwrap();
 
         let code = store.entry_dir(&inputs, &key).join("code");
         assert!(
@@ -915,15 +1007,23 @@ mod tests {
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:in");
         let inputs = key_inputs(&m, &t, &p, &r, &i);
-        store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+        store
+            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .unwrap();
 
-        let replay = store.obtain::<Verify>(&inputs, || panic!("must hit")).unwrap().unwrap();
+        let replay = store
+            .obtain::<Verify>(&inputs, || panic!("must hit"))
+            .unwrap()
+            .unwrap();
         assert!(replay.replayed);
         replay.sealed.publish(&f.case).unwrap();
 
         let published = crate::battery::phase_dir(&f.case, crate::battery::VERIFIED);
-        std::fs::write(published.join("src/lib.rs"), "pub fn a() { /* editable */ }")
-            .expect("a replayed artifact must be writable once published, or scoring cannot build");
+        std::fs::write(
+            published.join("src/lib.rs"),
+            "pub fn a() { /* editable */ }",
+        )
+        .expect("a replayed artifact must be writable once published, or scoring cannot build");
     }
 
     #[test]
@@ -935,7 +1035,9 @@ mod tests {
         let i = TreeDigest::for_test("sha256:in");
         let inputs = key_inputs(&m, &t, &p, &r, &i);
         let key = inputs.key();
-        store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+        store
+            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .unwrap();
 
         // Defeat the read-only bit first: this is the scenario the digest check exists for.
         let dir = store.entry_dir(&inputs, &key);
@@ -953,7 +1055,10 @@ mod tests {
         assert!(ran, "a corrupted entry must be recomputed, never served");
         assert!(!got.replayed);
         assert!(
-            f.repo.join("results/.cache/quarantine").join(key.as_str()).exists(),
+            f.repo
+                .join("results/.cache/quarantine")
+                .join(key.as_str())
+                .exists(),
             "and the corruption must be preserved for inspection, not destroyed"
         );
     }
@@ -968,7 +1073,9 @@ mod tests {
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:in");
         let inputs = key_inputs(&m, &t, &p, &r, &i);
-        store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+        store
+            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .unwrap();
 
         let per_agent = f.repo.join("results/Test-Corpus/claude");
         let walked: Vec<String> = std::fs::read_dir(&per_agent)
@@ -980,7 +1087,10 @@ mod tests {
             !walked.iter().any(|n| n.contains("cache")),
             "the store must not be reachable from the per-agent results dir: {walked:?}"
         );
-        assert!(f.repo.join("results/.cache").is_dir(), "it lives two levels above instead");
+        assert!(
+            f.repo.join("results/.cache").is_dir(),
+            "it lives two levels above instead"
+        );
     }
 
     fn recipe_with_env(env: &'static [(&'static str, &'static str)]) -> RecipeDigest {
@@ -1028,11 +1138,22 @@ mod tests {
         let ki = inputs(&m, &t, &p, &r, &i);
         let meta = ki.meta(&ki.key());
         assert!(
-            meta.get("harness").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()),
+            meta.get("harness")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
             "the producing commit must be recorded: {meta:?}"
         );
         // `load` re-compares this exact list; `harness` must not be on it.
-        for k in ["schema", "phase", "agent", "model", "toolchain", "prompt", "recipe", "input_tree"] {
+        for k in [
+            "schema",
+            "phase",
+            "agent",
+            "model",
+            "toolchain",
+            "prompt",
+            "recipe",
+            "input_tree",
+        ] {
             assert!(meta.get(k).is_some(), "{k} must be recorded");
         }
     }

@@ -53,7 +53,6 @@ mod quote_min {
                 syn::Type::Reference(r) => format!("&{}", r.elem.to_text()),
                 syn::Type::Slice(s) => format!("[{}]", s.elem.to_text()),
                 _ => String::new(), // only Type::Path is load-bearing below
-
             }
         }
     }
@@ -65,7 +64,10 @@ fn is_pathish(ty: &syn::Type) -> bool {
     struct V<'a>(&'a mut bool);
     impl<'ast> Visit<'ast> for V<'_> {
         fn visit_path_segment(&mut self, s: &'ast syn::PathSegment) {
-            if matches!(s.ident.to_string().as_str(), "Path" | "PathBuf" | "OsStr" | "OsString") {
+            if matches!(
+                s.ident.to_string().as_str(),
+                "Path" | "PathBuf" | "OsStr" | "OsString"
+            ) {
                 *self.0 = true;
             }
             syn::visit::visit_path_segment(self, s);
@@ -76,7 +78,10 @@ fn is_pathish(ty: &syn::Type) -> bool {
 }
 
 fn is_public(vis: &syn::Visibility) -> bool {
-    matches!(vis, syn::Visibility::Public(_) | syn::Visibility::Restricted(_))
+    matches!(
+        vis,
+        syn::Visibility::Public(_) | syn::Visibility::Restricted(_)
+    )
 }
 
 // ── A1 ─────────────────────────────────────────────────────────────────────
@@ -98,7 +103,11 @@ fn sealed_implements_only_debug() {
             }
             let name = match &imp.trait_ {
                 None => continue, // the inherent impl is where the API lives
-                Some((_, p, _)) => p.segments.last().map(|s| s.ident.to_string()).unwrap_or_default(),
+                Some((_, p, _)) => p
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default(),
             };
             if !ALLOWED.contains(&name.as_str()) {
                 let file = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -148,20 +157,26 @@ fn no_public_path_escapes_the_artifact_modules() {
                         if !is_public(&f.vis) {
                             continue;
                         }
-                        let syn::ReturnType::Type(_, ret) = &f.sig.output else { continue };
+                        let syn::ReturnType::Type(_, ret) = &f.sig.output else {
+                            continue;
+                        };
                         let name = f.sig.ident.to_string();
-                        if is_pathish(ret)
-                            && !ALLOWED.contains(&(self_ty.as_str(), name.as_str()))
+                        if is_pathish(ret) && !ALLOWED.contains(&(self_ty.as_str(), name.as_str()))
                         {
-                            leaks.push(format!("{module}: {self_ty}::{name} -> {}", type_name(ret)));
+                            leaks
+                                .push(format!("{module}: {self_ty}::{name} -> {}", type_name(ret)));
                         }
                     }
                 }
                 syn::Item::Struct(s) if is_public(&s.vis) => {
                     for f in s.fields {
                         if is_public(&f.vis) && is_pathish(&f.ty) {
-                            let fname = f.ident.map(|i| i.to_string()).unwrap_or_else(|| "0".into());
-                            leaks.push(format!("{module}: {}.{fname} is a public path field", s.ident));
+                            let fname =
+                                f.ident.map(|i| i.to_string()).unwrap_or_else(|| "0".into());
+                            leaks.push(format!(
+                                "{module}: {}.{fname} is a public path field",
+                                s.ident
+                            ));
                         }
                     }
                 }
@@ -185,7 +200,13 @@ fn no_public_path_escapes_the_artifact_modules() {
 /// be wrong, and the cache compares them to decide whether to reuse an artifact.
 #[test]
 fn digests_cannot_be_fabricated() {
-    const GUARDED: &[&str] = &["TreeDigest", "PromptDigest", "RecipeDigest", "CacheKey", "ToolchainId"];
+    const GUARDED: &[&str] = &[
+        "TreeDigest",
+        "PromptDigest",
+        "RecipeDigest",
+        "CacheKey",
+        "ToolchainId",
+    ];
     let mut bad: Vec<String> = Vec::new();
 
     for module in ["artifact.rs", "cache.rs"] {
@@ -199,7 +220,9 @@ fn digests_cannot_be_fabricated() {
                     }
                 }
                 syn::Item::Impl(imp) => {
-                    let Some((_, tr, _)) = &imp.trait_ else { continue };
+                    let Some((_, tr, _)) = &imp.trait_ else {
+                        continue;
+                    };
                     let is_from = tr.segments.last().is_some_and(|s| s.ident == "From");
                     let target = type_name(&imp.self_ty);
                     if is_from && GUARDED.contains(&target.as_str()) {
@@ -228,13 +251,13 @@ fn digests_cannot_be_fabricated() {
 #[test]
 fn compile_fail_cases_still_assert_what_they_were_written_for() {
     let expected: BTreeMap<&str, &str> = [
-        ("sealed_has_no_path", "E0599"),                // no method named `path`
-        ("sealed_is_not_a_command_cwd", "E0277"),        // AsRef<Path> not satisfied
-        ("phases_are_not_interchangeable", "E0308"),     // mismatched types
-        ("completed_cannot_be_forged", "E0603"),         // private constructor
+        ("sealed_has_no_path", "E0599"),             // no method named `path`
+        ("sealed_is_not_a_command_cwd", "E0277"),    // AsRef<Path> not satisfied
+        ("phases_are_not_interchangeable", "E0308"), // mismatched types
+        ("completed_cannot_be_forged", "E0603"),     // private constructor
         ("worktree_cannot_be_used_after_scrub", "E0382"), // scrub() consumed it
         ("phase_cannot_be_implemented_downstream", "E0277"), // sealed supertrait
-        ("sealed_does_not_display", "E0277"),            // no Display impl
+        ("sealed_does_not_display", "E0277"),        // no Display impl
     ]
     .into_iter()
     .collect();
@@ -267,7 +290,11 @@ fn compile_fail_cases_still_assert_what_they_were_written_for() {
              re-record, which would leave the case passing while asserting nothing."
         );
     }
-    assert_eq!(cases.len(), expected.len(), "a pinned case disappeared: {cases:?}");
+    assert_eq!(
+        cases.len(),
+        expected.len(),
+        "a pinned case disappeared: {cases:?}"
+    );
 }
 
 // ── A5 ─────────────────────────────────────────────────────────────────────
@@ -320,7 +347,10 @@ fn nothing_new_runs_inside_the_results_tree() {
         }
     }
 
-    let mut v = V { current_fn: "<top>".into(), hits: Vec::new() };
+    let mut v = V {
+        current_fn: "<top>".into(),
+        hits: Vec::new(),
+    };
     for path in rust_sources() {
         v.visit_file(&parse(&path));
     }

@@ -66,12 +66,16 @@ pub fn generate(repo_root: &Path) -> Result<()> {
     for agent_entry in sorted_read_dir(&results_dir)? {
         let agent = agent_entry.file_name().to_string_lossy().to_string();
         let agent_dir = agent_entry.path();
-        if !agent_dir.is_dir() { continue; }
+        if !agent_dir.is_dir() {
+            continue;
+        }
 
         for bat_entry in sorted_read_dir(&agent_dir)? {
             let battery = bat_entry.file_name().to_string_lossy().to_string();
             let bat_dir = bat_entry.path();
-            if !bat_dir.is_dir() { continue; }
+            if !bat_dir.is_dir() {
+                continue;
+            }
 
             // Headline row: the verified phase.
             let summary_path = bat_dir.join("summary.json");
@@ -83,9 +87,9 @@ pub fn generate(repo_root: &Path) -> Result<()> {
             let (total_loc, unsafe_lines, cases_built) =
                 aggregate_cases(&bat_dir, &test_corpus_dir.join(&battery));
 
-            let c_loc = *c_loc_cache.entry(battery.clone()).or_insert_with(|| {
-                count_c_loc_battery(&test_corpus_dir, &battery)
-            });
+            let c_loc = *c_loc_cache
+                .entry(battery.clone())
+                .or_insert_with(|| count_c_loc_battery(&test_corpus_dir, &battery));
 
             rows.push(BatteryRow {
                 agent: agent.clone(),
@@ -106,7 +110,9 @@ pub fn generate(repo_root: &Path) -> Result<()> {
             if agent == "kiro" {
                 if let Some(nv) = read_json::<Summary>(&bat_dir.join("summary_translated.json")) {
                     let (nv_loc, nv_unsafe, nv_built) = aggregate_cases_phase(
-                        &bat_dir, &test_corpus_dir.join(&battery), Some(crate::battery::TRANSLATED),
+                        &bat_dir,
+                        &test_corpus_dir.join(&battery),
+                        Some(crate::battery::TRANSLATED),
                     );
                     rows.push(BatteryRow {
                         agent: "kiro-translate".to_string(),
@@ -132,12 +138,18 @@ pub fn generate(repo_root: &Path) -> Result<()> {
 
     let mut all = String::new();
     writeln!(all, "# Translation Results\n")?;
-    writeln!(all, "Auto-generated from validated `result.json` and `summary.json` files.\n")?;
+    writeln!(
+        all,
+        "Auto-generated from validated `result.json` and `summary.json` files.\n"
+    )?;
 
     for (battery, brows) in &by_battery {
         writeln!(all, "## {battery}\n")?;
         writeln!(all, "| Agent | Cases Passed | Vectors Passed | C LOC | Rust LOC | Unsafe Lines | Unsafe % |")?;
-        writeln!(all, "|-------|-------------|----------------|-------|----------|-------------|----------|")?;
+        writeln!(
+            all,
+            "|-------|-------------|----------------|-------|----------|-------------|----------|"
+        )?;
         for r in brows {
             let unsafe_pct = if r.total_loc > 0 {
                 format!("{:.1}%", r.unsafe_lines as f64 / r.total_loc as f64 * 100.0)
@@ -147,25 +159,40 @@ pub fn generate(repo_root: &Path) -> Result<()> {
             writeln!(
                 all,
                 "| {} | {}/{} | {}/{} | {} | {} | {} | {} |",
-                r.agent, r.cases_passed, r.cases_tested,
-                r.vectors_passed, r.vectors_total,
-                r.c_loc, r.total_loc, r.unsafe_lines, unsafe_pct,
+                r.agent,
+                r.cases_passed,
+                r.cases_tested,
+                r.vectors_passed,
+                r.vectors_total,
+                r.c_loc,
+                r.total_loc,
+                r.unsafe_lines,
+                unsafe_pct,
             )?;
         }
         writeln!(all)?;
     }
 
     writeln!(all, "## Summary: Cases Passed\n")?;
-    let agents: Vec<String> = rows.iter().map(|r| r.agent.clone())
-        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let agents: Vec<String> = rows
+        .iter()
+        .map(|r| r.agent.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     write!(all, "| Battery |")?;
-    for a in &agents { write!(all, " {} |", a)?; }
+    for a in &agents {
+        write!(all, " {} |", a)?;
+    }
     writeln!(all)?;
     write!(all, "|---------|")?;
-    for _ in &agents { write!(all, "------|")?; }
+    for _ in &agents {
+        write!(all, "------|")?;
+    }
     writeln!(all)?;
     for (battery, brows) in &by_battery {
-        let lookup: BTreeMap<&str, &BatteryRow> = brows.iter().map(|r| (r.agent.as_str(), *r)).collect();
+        let lookup: BTreeMap<&str, &BatteryRow> =
+            brows.iter().map(|r| (r.agent.as_str(), *r)).collect();
         write!(all, "| {} |", battery)?;
         for a in &agents {
             if let Some(r) = lookup.get(a.as_str()) {
@@ -238,9 +265,12 @@ pub fn generate(repo_root: &Path) -> Result<()> {
     // (1b) Also pin each battery, so compensating errors cannot inflate one
     //      denominator while the total still sums to 338.
     const EXPECTED_BATTERY_SIZES: &[(&str, u32)] = &[
-        ("B01_synthetic", 85), ("B01_organic", 38),
-        ("B02_synthetic", 42), ("B02_organic", 44),
-        ("P00_perlin_noise", 1), ("P01_sphincs_plus", 128),
+        ("B01_synthetic", 85),
+        ("B01_organic", 38),
+        ("B02_synthetic", 42),
+        ("B02_organic", 44),
+        ("P00_perlin_noise", 1),
+        ("P01_sphincs_plus", 128),
     ];
     let mut battery_max: BTreeMap<&str, u32> = BTreeMap::new();
     for r in &rows {
@@ -287,13 +317,18 @@ pub fn generate(repo_root: &Path) -> Result<()> {
     if has_c_corpus {
         for (bat, expected_cases) in [("P01_sphincs_plus", 1u32), ("P00_perlin_noise", 1u32)] {
             let bat_dir = test_corpus_dir.join(bat);
-            if !bat_dir.is_dir() { continue; }
-            let mut distinct: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+            if !bat_dir.is_dir() {
+                continue;
+            }
+            let mut distinct: std::collections::HashSet<std::path::PathBuf> =
+                std::collections::HashSet::new();
             let mut case_dirs = 0u32;
             if let Ok(cases) = sorted_read_dir(&bat_dir) {
                 for ce in cases {
                     let tc = ce.path().join("test_case");
-                    if !tc.is_dir() { continue; }
+                    if !tc.is_dir() {
+                        continue;
+                    }
                     case_dirs += 1;
                     distinct.insert(std::fs::canonicalize(&tc).unwrap_or(tc));
                 }
@@ -316,7 +351,9 @@ pub fn generate(repo_root: &Path) -> Result<()> {
         let mut missing = Vec::new();
         for line in std::fs::read_to_string(&macros_used)?.lines() {
             let name = line.trim();
-            if name.is_empty() || name.starts_with('#') { continue; }
+            if name.is_empty() || name.starts_with('#') {
+                continue;
+            }
             // match `\newcommand{\Name}` in the emitted files
             if !emitted.contains(&format!("{{\\{name}}}")) {
                 missing.push(name.to_string());
@@ -348,7 +385,9 @@ fn fmt_commas(n: u32) -> String {
 
 /// Rounds half away from zero (`f64::round`); 0 for an empty slice.
 fn median_round(values: &[u32]) -> u32 {
-    if values.is_empty() { return 0; }
+    if values.is_empty() {
+        return 0;
+    }
     let mut v = values.to_vec();
     v.sort_unstable();
     let n = v.len();
@@ -362,8 +401,12 @@ fn median_round(values: &[u32]) -> u32 {
 
 /// TRACTOR battery directory names, in paper order (results-dir keys).
 const TRACTOR_BATTERY_DIRS: &[&str] = &[
-    "B01_synthetic", "B01_organic", "B02_synthetic",
-    "B02_organic", "P00_perlin_noise", "P01_sphincs_plus",
+    "B01_synthetic",
+    "B01_organic",
+    "B02_synthetic",
+    "B02_organic",
+    "P00_perlin_noise",
+    "P01_sphincs_plus",
 ];
 
 /// Cases whose corpus `test_case/` symlinks to one real source are counted once
@@ -375,11 +418,17 @@ fn tractor_battery_c_locs(corpus: &Path, dir_name: &str) -> Vec<u32> {
     let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
     if let Ok(cases) = sorted_read_dir(&bat_dir) {
         for ce in cases {
-            if !ce.path().is_dir() { continue; }
+            if !ce.path().is_dir() {
+                continue;
+            }
             let test_case = ce.path().join("test_case");
-            if !test_case.is_dir() { continue; }
+            if !test_case.is_dir() {
+                continue;
+            }
             let real = std::fs::canonicalize(&test_case).unwrap_or_else(|_| test_case.clone());
-            if !seen.insert(real) { continue; }
+            if !seen.insert(real) {
+                continue;
+            }
             locs.push(count_c_loc_dir(&test_case));
         }
     }
@@ -405,19 +454,29 @@ fn generate_datasets_tex(repo_root: &Path) -> String {
 
     let emit_row = |out: &mut String, name: &str, cases: u32, vec: &[u32]| {
         let total: u32 = vec.iter().sum();
-        let mean = if cases > 0 { (total as f64 / cases as f64).round() as u32 } else { 0 };
+        let mean = if cases > 0 {
+            (total as f64 / cases as f64).round() as u32
+        } else {
+            0
+        };
         let median = median_round(vec);
         let max = vec.iter().copied().max().unwrap_or(0);
         out.push_str(&format!(
             "{} & {} & {} & {} & {} & {} \\\\\n",
-            name, cases,
-            fmt_commas(total), fmt_commas(mean), fmt_commas(median), fmt_commas(max),
+            name,
+            cases,
+            fmt_commas(total),
+            fmt_commas(mean),
+            fmt_commas(median),
+            fmt_commas(max),
         ));
     };
 
     for (dir_name, display) in batteries {
         let locs = tractor_battery_c_locs(&corpus, dir_name);
-        if locs.is_empty() { continue; }
+        if locs.is_empty() {
+            continue;
+        }
         emit_row(&mut out, display, locs.len() as u32, &locs);
     }
 
@@ -474,8 +533,12 @@ fn generate_prompt_sensitivity_tex(repo_root: &Path, rows: &[BatteryRow]) -> Str
 fn prompt_sensitivity_manual(repo_root: &Path) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
     let path = repo_root.join("manual_constants.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else { return out };
-    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else { return out };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return out;
+    };
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return out;
+    };
     if let Some(table) = doc.get("prompt_sensitivity").and_then(|t| t.as_table()) {
         for (k, v) in table.iter() {
             if let Some(s) = v.as_str() {
@@ -494,8 +557,12 @@ fn generate_manual_tex(repo_root: &Path) -> String {
     out.push_str("% MANUALLY ENTERED — not derived from data. Source: manual_constants.toml\n");
 
     let path = repo_root.join("manual_constants.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else { return out };
-    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else { return out };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return out;
+    };
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return out;
+    };
 
     let camel = |s: &str| -> String {
         let mut r = String::new();
@@ -520,12 +587,18 @@ fn generate_manual_tex(repo_root: &Path) -> String {
     };
 
     for (section, item) in doc.iter() {
-        let Some(table) = item.as_table() else { continue };
+        let Some(table) = item.as_table() else {
+            continue;
+        };
         let sec_camel = camel(section);
         for (key, val) in table.iter() {
             let Some(v) = val.as_value() else { continue };
             let macro_name = format!("{}{}", sec_camel, camel(key));
-            out.push_str(&format!("\\newcommand{{\\{}}}{{{}}}\n", macro_name, render(v)));
+            out.push_str(&format!(
+                "\\newcommand{{\\{}}}{{{}}}\n",
+                macro_name,
+                render(v)
+            ));
         }
     }
 
@@ -536,17 +609,30 @@ fn generate_manual_tex(repo_root: &Path) -> String {
 fn case_builds(repo_root: &Path, agent: &str) -> std::collections::BTreeMap<String, bool> {
     let mut out = std::collections::BTreeMap::new();
     let agent_dir = repo_root.join("results/Test-Corpus").join(agent);
-    let Ok(bats) = sorted_read_dir(&agent_dir) else { return out };
+    let Ok(bats) = sorted_read_dir(&agent_dir) else {
+        return out;
+    };
     for be in bats {
-        if !be.path().is_dir() { continue; }
+        if !be.path().is_dir() {
+            continue;
+        }
         let battery = be.file_name().to_string_lossy().to_string();
-        let Ok(cases) = sorted_read_dir(&be.path()) else { continue };
+        let Ok(cases) = sorted_read_dir(&be.path()) else {
+            continue;
+        };
         for ce in cases {
-            if !ce.path().is_dir() { continue; }
+            if !ce.path().is_dir() {
+                continue;
+            }
             let case = ce.file_name().to_string_lossy().to_string();
             let rp = crate::battery::crate_dir(&ce.path()).join("result.json");
-            let Some(r) = read_json::<CaseResult>(&rp) else { continue };
-            out.insert(format!("{battery}/{case}"), r.error.as_deref() != Some("build failed"));
+            let Some(r) = read_json::<CaseResult>(&rp) else {
+                continue;
+            };
+            out.insert(
+                format!("{battery}/{case}"),
+                r.error.as_deref() != Some("build failed"),
+            );
         }
     }
     out
@@ -560,8 +646,12 @@ fn laertes_vs_c2rust(repo_root: &Path) -> (u32, u32) {
     let (mut broke, mut fixed) = (0u32, 0u32);
     for (case, c2_ok) in &c2 {
         if let Some(&la_ok) = la.get(case) {
-            if *c2_ok && !la_ok { broke += 1; }
-            if !*c2_ok && la_ok { fixed += 1; }
+            if *c2_ok && !la_ok {
+                broke += 1;
+            }
+            if !*c2_ok && la_ok {
+                fixed += 1;
+            }
         }
     }
     (broke, fixed)
@@ -576,20 +666,33 @@ fn laertes_vs_c2rust(repo_root: &Path) -> (u32, u32) {
 /// duplicates carry no credits, so they do not inflate the total.
 fn kiro_cost(base: &Path) -> (f64, f64, u64) {
     let (mut total, mut verify, mut secs) = (0.0f64, 0.0f64, 0u64);
-    let Ok(rd) = std::fs::read_dir(base) else { return (0.0, 0.0, 0) };
+    let Ok(rd) = std::fs::read_dir(base) else {
+        return (0.0, 0.0, 0);
+    };
     let mut stack: Vec<std::path::PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
     while let Some(p) = stack.pop() {
-        if !p.is_dir() { continue; }
+        if !p.is_dir() {
+            continue;
+        }
         // A case dir is one with a translated/ phase. Do NOT also descend into
         // its phase dirs — each carries a result.json and would double-count.
         if crate::battery::phase_dir(&p, crate::battery::TRANSLATED).is_dir() {
             let rp = crate::battery::crate_dir(&p).join("result.json");
             if let Some(r) = read_json::<serde_json::Value>(&rp) {
                 for ph in ["translate", "verify"] {
-                    let c = r.pointer(&format!("/{ph}/credits")).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let s = r.pointer(&format!("/{ph}/wall_secs")).and_then(|v| v.as_u64()).unwrap_or(0);
-                    total += c; secs += s;
-                    if ph == "verify" { verify += c; }
+                    let c = r
+                        .pointer(&format!("/{ph}/credits"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let s = r
+                        .pointer(&format!("/{ph}/wall_secs"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    total += c;
+                    secs += s;
+                    if ph == "verify" {
+                        verify += c;
+                    }
                 }
             }
         } else if let Ok(rd) = std::fs::read_dir(&p) {
@@ -623,61 +726,119 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
     o.push_str("% GENERATED by `harvest-tools report`. Do not edit by hand.\n");
     o.push_str("% Named constants for result numbers quoted in the prose, so text and\n");
     o.push_str("% tables cannot disagree. Values are derived from results/.\n");
-    o.push_str(&format!("\\newcommand{{\\TractorTotalCases}}{{{}}}\n", total_cases));
+    o.push_str(&format!(
+        "\\newcommand{{\\TractorTotalCases}}{{{}}}\n",
+        total_cases
+    ));
     // Same deduped counting as tab:datasets, so prose and table agree.
     let corpus = repo_root.join("test-corpus/Public-Tests");
-    let tractor_total_loc: u32 = TRACTOR_BATTERY_DIRS.iter()
+    let tractor_total_loc: u32 = TRACTOR_BATTERY_DIRS
+        .iter()
         .flat_map(|d| tractor_battery_c_locs(&corpus, d))
         .sum();
     if tractor_total_loc > 0 && total_cases > 0 {
         let mean = (tractor_total_loc as f64 / total_cases as f64).round() as u32;
-        o.push_str(&format!("\\newcommand{{\\TractorTotalLoc}}{{{}}}\n", fmt_commas(tractor_total_loc)));
+        o.push_str(&format!(
+            "\\newcommand{{\\TractorTotalLoc}}{{{}}}\n",
+            fmt_commas(tractor_total_loc)
+        ));
         o.push_str(&format!("\\newcommand{{\\TractorMeanLoc}}{{{}}}\n", mean));
     }
     // The Kiro Power add-on rate. Claude and Codex report no credits, so their
     // costs stay manual in the prose.
     const USD_PER_CREDIT: f64 = 0.04;
     // Deduped per-battery Rust LOC, matching what the tables report.
-    let tractor_rust_loc: u32 = rows.iter().filter(|r| r.agent == "kiro").map(|r| r.total_loc).sum();
+    let tractor_rust_loc: u32 = rows
+        .iter()
+        .filter(|r| r.agent == "kiro")
+        .map(|r| r.total_loc)
+        .sum();
     // (label, results dir, translated-Rust-kLOC denominator)
-    let cost_rows: &[(&str, &str, u32)] = &[
-        ("Tractor", "results/Test-Corpus/kiro", tractor_rust_loc),
-    ];
+    let cost_rows: &[(&str, &str, u32)] =
+        &[("Tractor", "results/Test-Corpus/kiro", tractor_rust_loc)];
     for (name, base, rust_loc) in cost_rows {
         let (credits, verify_credits, secs) = kiro_cost(&repo_root.join(base));
-        if credits <= 0.0 { continue; }
+        if credits <= 0.0 {
+            continue;
+        }
         let dollars = credits * USD_PER_CREDIT;
         let minutes = secs as f64 / 60.0;
         let kloc = *rust_loc as f64 / 1000.0;
         o.push_str(&format!("\\newcommand{{\\Cost{name}}}{{{:.0}}}\n", dollars));
-        o.push_str(&format!("\\newcommand{{\\Cost{name}Minutes}}{{{:.0}}}\n", minutes));
+        o.push_str(&format!(
+            "\\newcommand{{\\Cost{name}Minutes}}{{{:.0}}}\n",
+            minutes
+        ));
         if kloc > 0.0 {
-            o.push_str(&format!("\\newcommand{{\\Cost{name}PerKLoc}}{{{:.2}}}\n", dollars / kloc));
-            o.push_str(&format!("\\newcommand{{\\Cost{name}MinPerKLoc}}{{{:.0}}}\n", minutes / kloc));
+            o.push_str(&format!(
+                "\\newcommand{{\\Cost{name}PerKLoc}}{{{:.2}}}\n",
+                dollars / kloc
+            ));
+            o.push_str(&format!(
+                "\\newcommand{{\\Cost{name}MinPerKLoc}}{{{:.0}}}\n",
+                minutes / kloc
+            ));
         }
         if credits > 0.0 {
-            o.push_str(&format!("\\newcommand{{\\Cost{name}ValidatePct}}{{{:.0}}}\n",
-                verify_credits / credits * 100.0));
+            o.push_str(&format!(
+                "\\newcommand{{\\Cost{name}ValidatePct}}{{{:.0}}}\n",
+                verify_credits / credits * 100.0
+            ));
         }
     }
-    let (p01_cr, _, p01_secs) = kiro_cost(&repo_root.join("results/Test-Corpus/kiro/P01_sphincs_plus"));
+    let (p01_cr, _, p01_secs) =
+        kiro_cost(&repo_root.join("results/Test-Corpus/kiro/P01_sphincs_plus"));
     if p01_cr > 0.0 {
-        o.push_str(&format!("\\newcommand{{\\CostPOne}}{{{:.2}}}\n", p01_cr * USD_PER_CREDIT));
-        o.push_str(&format!("\\newcommand{{\\CostPOneMinutes}}{{{:.0}}}\n", p01_secs as f64 / 60.0));
+        o.push_str(&format!(
+            "\\newcommand{{\\CostPOne}}{{{:.2}}}\n",
+            p01_cr * USD_PER_CREDIT
+        ));
+        o.push_str(&format!(
+            "\\newcommand{{\\CostPOneMinutes}}{{{:.0}}}\n",
+            p01_secs as f64 / 60.0
+        ));
     }
 
-    o.push_str(&format!("\\newcommand{{\\ActorKiroTests}}{{{}/{}}}\n", g(&total_tests, "kiro"), total_cases));
-    o.push_str(&format!("\\newcommand{{\\ActorClaudeTests}}{{{}/{}}}\n", g(&total_tests, "claude"), total_cases));
-    o.push_str(&format!("\\newcommand{{\\ActorCodexTests}}{{{}/{}}}\n", g(&total_tests, "codex-gpt54"), total_cases));
+    o.push_str(&format!(
+        "\\newcommand{{\\ActorKiroTests}}{{{}/{}}}\n",
+        g(&total_tests, "kiro"),
+        total_cases
+    ));
+    o.push_str(&format!(
+        "\\newcommand{{\\ActorClaudeTests}}{{{}/{}}}\n",
+        g(&total_tests, "claude"),
+        total_cases
+    ));
+    o.push_str(&format!(
+        "\\newcommand{{\\ActorCodexTests}}{{{}/{}}}\n",
+        g(&total_tests, "codex-gpt54"),
+        total_cases
+    ));
     // The paper says "no validate" where the agent dir says `kiro-translate`.
     // The macro name MUST match paper.tex, else it is an undefined control
     // sequence.
-    o.push_str(&format!("\\newcommand{{\\ActorKiroNoValidateTests}}{{{}/{}}}\n", g(&total_tests, "kiro-translate"), total_cases));
-    o.push_str(&format!("\\newcommand{{\\ActorKiroPOneTests}}{{{}/128}}\n", g(&p01_tests, "kiro")));
-    o.push_str(&format!("\\newcommand{{\\ActorKiroNoValidatePOneTests}}{{{}/128}}\n", g(&p01_tests, "kiro-translate")));
+    o.push_str(&format!(
+        "\\newcommand{{\\ActorKiroNoValidateTests}}{{{}/{}}}\n",
+        g(&total_tests, "kiro-translate"),
+        total_cases
+    ));
+    o.push_str(&format!(
+        "\\newcommand{{\\ActorKiroPOneTests}}{{{}/128}}\n",
+        g(&p01_tests, "kiro")
+    ));
+    o.push_str(&format!(
+        "\\newcommand{{\\ActorKiroNoValidatePOneTests}}{{{}/128}}\n",
+        g(&p01_tests, "kiro-translate")
+    ));
     let (laertes_breaks, laertes_fixes) = laertes_vs_c2rust(repo_root);
-    o.push_str(&format!("\\newcommand{{\\LaertesBreaks}}{{{}}}\n", laertes_breaks));
-    o.push_str(&format!("\\newcommand{{\\LaertesFixes}}{{{}}}\n", laertes_fixes));
+    o.push_str(&format!(
+        "\\newcommand{{\\LaertesBreaks}}{{{}}}\n",
+        laertes_breaks
+    ));
+    o.push_str(&format!(
+        "\\newcommand{{\\LaertesFixes}}{{{}}}\n",
+        laertes_fixes
+    ));
     o
 }
 
@@ -687,7 +848,11 @@ const TRACTOR_TABLE_ROWS: &[(&str, &str, bool)] = &[
     ("ACTOR (Kiro)", "kiro", true),
     ("ACTOR (Claude Code)", "claude", true),
     ("ACTOR (Codex)", "codex-gpt54", true),
-    ("\\makebox[\\knvLength][l]{ACTOR (Kiro, no validate)}", "kiro-translate", true),
+    (
+        "\\makebox[\\knvLength][l]{ACTOR (Kiro, no validate)}",
+        "kiro-translate",
+        true,
+    ),
     ("C2Rust", "c2rust", false),
     ("Laertes", "laertes", false),
     ("C2SaferRust", "c2saferrust", false),
@@ -706,7 +871,11 @@ const TRACTOR_BATTERIES: &[(&str, &str, &str)] = &[
     ("B02-syn", "", "B02_synthetic"),
     ("B02-org", "", "B02_organic"),
     ("P00", "(Perlin)", "P00_perlin_noise"),
-    ("P01", "\\makebox[1cm][l]{\\smaller (SPHINCS+)}", "P01_sphincs_plus"),
+    (
+        "P01",
+        "\\makebox[1cm][l]{\\smaller (SPHINCS+)}",
+        "P01_sphincs_plus",
+    ),
     ("Total", "", ""), // empty battery dir => aggregate across all
 ];
 
@@ -739,11 +908,20 @@ fn generate_tractor_tex(rows: &[BatteryRow]) -> String {
         *e = (*e).max(r.cases_tested);
     }
     // Derived, not hardcoded, so it stays correct if the corpus changes.
-    let total_cases: u32 = TRACTOR_BATTERIES.iter()
-        .filter(|&(_, _, d)| !d.is_empty() ).map(|(_, _, d)| battery_size.get(d).copied().unwrap_or(0))
+    let total_cases: u32 = TRACTOR_BATTERIES
+        .iter()
+        .filter(|&(_, _, d)| !d.is_empty())
+        .map(|(_, _, d)| battery_size.get(d).copied().unwrap_or(0))
         .sum();
 
-    struct Cell { built: u32, denom: u32, tests_pass: u32, loc: u32, unsafe_lines: u32, present: bool }
+    struct Cell {
+        built: u32,
+        denom: u32,
+        tests_pass: u32,
+        loc: u32,
+        unsafe_lines: u32,
+        present: bool,
+    }
     let cell = |agent: &str, bat_dir: &str| -> Cell {
         if bat_dir.is_empty() {
             let (mut b, mut tp, mut loc, mut un) = (0u32, 0u32, 0u32, 0u32);
@@ -751,31 +929,59 @@ fn generate_tractor_tex(rows: &[BatteryRow]) -> String {
             for (_, _, bd) in TRACTOR_BATTERIES.iter().filter(|(_, _, d)| !d.is_empty()) {
                 if let Some(r) = idx.get(&(agent, *bd)) {
                     present = true;
-                    b += r.cases_built; tp += r.cases_passed; loc += r.total_loc; un += r.unsafe_lines;
+                    b += r.cases_built;
+                    tp += r.cases_passed;
+                    loc += r.total_loc;
+                    un += r.unsafe_lines;
                 }
             }
-            Cell { built: b, denom: total_cases, tests_pass: tp, loc, unsafe_lines: un, present }
+            Cell {
+                built: b,
+                denom: total_cases,
+                tests_pass: tp,
+                loc,
+                unsafe_lines: un,
+                present,
+            }
         } else {
             let denom = battery_size.get(bat_dir).copied().unwrap_or(0);
             if let Some(r) = idx.get(&(agent, bat_dir)) {
-                Cell { built: r.cases_built, denom, tests_pass: r.cases_passed,
-                       loc: r.total_loc, unsafe_lines: r.unsafe_lines, present: true }
+                Cell {
+                    built: r.cases_built,
+                    denom,
+                    tests_pass: r.cases_passed,
+                    loc: r.total_loc,
+                    unsafe_lines: r.unsafe_lines,
+                    present: true,
+                }
             } else {
-                Cell { built: 0, denom, tests_pass: 0, loc: 0, unsafe_lines: 0, present: false }
+                Cell {
+                    built: 0,
+                    denom,
+                    tests_pass: 0,
+                    loc: 0,
+                    unsafe_lines: 0,
+                    present: false,
+                }
             }
         }
     };
 
     let mut out = String::new();
-    out.push_str("% GENERATED by `harvest-tools report` from results/Test-Corpus/. Do not edit by hand.\n");
+    out.push_str(
+        "% GENERATED by `harvest-tools report` from results/Test-Corpus/. Do not edit by hand.\n",
+    );
     out.push_str("% Builds = crate compiles (result.json error != \"build failed\").\n");
     out.push_str("% Tests = cases passing all vectors. Every system is scored over all cases.\n");
 
     for (bi, (bat_line1, bat_line2, bat_dir)) in TRACTOR_BATTERIES.iter().enumerate() {
         // Bold goes to the best Tests among ACTOR harness rows.
-        let best = TRACTOR_TABLE_ROWS.iter().filter(|(_, _, actor)| *actor)
+        let best = TRACTOR_TABLE_ROWS
+            .iter()
+            .filter(|(_, _, actor)| *actor)
             .map(|(_, a, _)| cell(a, bat_dir).tests_pass)
-            .max().unwrap_or(0);
+            .max()
+            .unwrap_or(0);
         for (ri, (label, agent, _)) in TRACTOR_TABLE_ROWS.iter().enumerate() {
             let c = cell(agent, bat_dir);
             let denom = c.denom;
@@ -792,17 +998,27 @@ fn generate_tractor_tex(rows: &[BatteryRow]) -> String {
             // "--" only when the system produced no output at all for this
             // battery (the paper's dashes for e.g. SmartC2Rust P01).
             let (loc, un) = if c.present && c.loc > 0 {
-                (fmt_k(c.loc), format!("{}\\%",
-                    (c.unsafe_lines as f64 / c.loc as f64 * 100.0).round() as u32))
+                (
+                    fmt_k(c.loc),
+                    format!(
+                        "{}\\%",
+                        (c.unsafe_lines as f64 / c.loc as f64 * 100.0).round() as u32
+                    ),
+                )
             } else {
                 ("--".into(), "--".into())
             };
-            out.push_str(&format!("{} & {} & {}/{} & {} & {} & {} \\\\\n",
-                first_col, label, c.built, denom, tests, loc, un));
+            out.push_str(&format!(
+                "{} & {} & {}/{} & {} & {} & {} \\\\\n",
+                first_col, label, c.built, denom, tests, loc, un
+            ));
         }
         // hline between batteries; double before Total.
-        if bi + 2 == TRACTOR_BATTERIES.len() { out.push_str("\\hline\\hline\n"); }
-        else if bi + 1 < TRACTOR_BATTERIES.len() { out.push_str("\\hline\n"); }
+        if bi + 2 == TRACTOR_BATTERIES.len() {
+            out.push_str("\\hline\\hline\n");
+        } else if bi + 1 < TRACTOR_BATTERIES.len() {
+            out.push_str("\\hline\n");
+        }
     }
     out
 }
@@ -826,12 +1042,20 @@ fn aggregate_cases(bat_dir: &Path, corpus_bat_dir: &Path) -> (u32, u32, u32) {
 /// `phase` selects which phase dir's result.json to read: `Some("translated")`
 /// for the pre-verify (no-validate) numbers, `None` for the headline phase under
 /// the reader rule (verified/ if present, else translated/).
-fn aggregate_cases_phase(bat_dir: &Path, corpus_bat_dir: &Path, phase: Option<&str>) -> (u32, u32, u32) {
+fn aggregate_cases_phase(
+    bat_dir: &Path,
+    corpus_bat_dir: &Path,
+    phase: Option<&str>,
+) -> (u32, u32, u32) {
     let corpus_present = corpus_bat_dir.is_dir();
     let (mut total_loc, mut total_unsafe, mut built) = (0u32, 0u32, 0u32);
-    let Ok(entries) = std::fs::read_dir(bat_dir) else { return (0, 0, 0) };
+    let Ok(entries) = std::fs::read_dir(bat_dir) else {
+        return (0, 0, 0);
+    };
     for entry in entries.flatten() {
-        if !entry.path().is_dir() { continue; }
+        if !entry.path().is_dir() {
+            continue;
+        }
         let phase_dir = match phase {
             Some(p) => crate::battery::phase_dir(&entry.path(), p),
             None => crate::battery::crate_dir(&entry.path()),
@@ -847,7 +1071,9 @@ fn aggregate_cases_phase(bat_dir: &Path, corpus_bat_dir: &Path, phase: Option<&s
         // Skip shared-source followers so one translation is counted once.
         if corpus_present {
             let tc = corpus_bat_dir.join(entry.file_name()).join("test_case");
-            if tc.is_symlink() { continue; }
+            if tc.is_symlink() {
+                continue;
+            }
         }
         total_loc += cr.loc.map_or(0, |l| l.code);
         total_unsafe += cr.unsafe_.map_or(0, |u| u.lines);
@@ -871,15 +1097,23 @@ fn sorted_read_dir(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
 /// once, so P01's 128 configs contribute their one source a single time.
 fn count_c_loc_battery(test_corpus_dir: &Path, battery: &str) -> u32 {
     let bat_dir = test_corpus_dir.join(battery);
-    let Ok(entries) = std::fs::read_dir(&bat_dir) else { return 0 };
+    let Ok(entries) = std::fs::read_dir(&bat_dir) else {
+        return 0;
+    };
     let mut total = 0u32;
     let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
     for entry in entries.flatten() {
-        if !entry.path().is_dir() { continue; }
+        if !entry.path().is_dir() {
+            continue;
+        }
         let test_case = entry.path().join("test_case");
-        if !test_case.is_dir() { continue; }
+        if !test_case.is_dir() {
+            continue;
+        }
         let real = std::fs::canonicalize(&test_case).unwrap_or_else(|_| test_case.clone());
-        if !seen.insert(real) { continue; }
+        if !seen.insert(real) {
+            continue;
+        }
         total += count_c_loc_dir(&test_case);
     }
     total
@@ -887,15 +1121,23 @@ fn count_c_loc_battery(test_corpus_dir: &Path, battery: &str) -> u32 {
 
 fn count_c_loc_dir(dir: &Path) -> u32 {
     let mut total = 0u32;
-    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
             total += count_c_loc_dir(&path);
         } else if path.extension().is_some_and(|x| x == "c" || x == "h") {
-            let Ok(src) = std::fs::read_to_string(&path) else { continue };
-            total += src.lines()
-                .filter(|l| { let t = l.trim(); !t.is_empty() && !t.starts_with("//") && !t.starts_with("/*") })
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            total += src
+                .lines()
+                .filter(|l| {
+                    let t = l.trim();
+                    !t.is_empty() && !t.starts_with("//") && !t.starts_with("/*")
+                })
                 .count() as u32;
         }
     }

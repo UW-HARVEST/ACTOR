@@ -1,10 +1,9 @@
-
 use anyhow::Result;
 // Never re-declare these with `mod` here; see the note in lib.rs.
+use harvest_tools::cli::{Cli, Command, Dataset};
 use harvest_tools::{
     agent_health, battery, benchmark, cache, cli, opencode, provenance, report, test,
 };
-use harvest_tools::cli::{Cli, Command, Dataset};
 
 fn main() -> Result<()> {
     let cli = Cli::parse_args();
@@ -27,7 +26,11 @@ fn main() -> Result<()> {
             "--model is required with --agent {}\n  \
              oneshot:  --model openai/gpt-5.4\n  \
              opencode: --model amazon-bedrock/us.anthropic.claude-sonnet-5",
-            if agent == cli::Agent::Oneshot { "oneshot" } else { "opencode" },
+            if agent == cli::Agent::Oneshot {
+                "oneshot"
+            } else {
+                "opencode"
+            },
         );
     }
     if !model_driven && model.is_some() {
@@ -52,10 +55,24 @@ fn main() -> Result<()> {
 
             bench.translate(&paths, inner, include_regex.as_deref(), parallel)?;
             if !no_verify && bench.verifies(agent) {
-                bench.verify(&repo_root, &paths, inner, include_regex.as_deref(), false, parallel)?;
+                bench.verify(
+                    &repo_root,
+                    &paths,
+                    inner,
+                    include_regex.as_deref(),
+                    false,
+                    parallel,
+                )?;
             }
             // `Update` covers enrichment and table regeneration; no separate steps.
-            run_test(&repo_root, bench.as_ref(), &paths, inner, test::TestMode::Update, false)?;
+            run_test(
+                &repo_root,
+                bench.as_ref(),
+                &paths,
+                inner,
+                test::TestMode::Update,
+                false,
+            )?;
         }
         Command::Translate {
             ref target,
@@ -65,8 +82,12 @@ fn main() -> Result<()> {
             let dataset = Dataset::detect(target);
             let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into())?;
             let inner = Dataset::strip_prefix(target);
-            benchmark::for_dataset(dataset)
-                .translate(&paths, inner, include_regex.as_deref(), parallel)?;
+            benchmark::for_dataset(dataset).translate(
+                &paths,
+                inner,
+                include_regex.as_deref(),
+                parallel,
+            )?;
         }
         Command::Verify {
             ref target,
@@ -77,8 +98,14 @@ fn main() -> Result<()> {
             let dataset = Dataset::detect(target);
             let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into())?;
             let inner = Dataset::strip_prefix(target);
-            benchmark::for_dataset(dataset)
-                .verify(&repo_root, &paths, inner, include_regex.as_deref(), force, parallel)?;
+            benchmark::for_dataset(dataset).verify(
+                &repo_root,
+                &paths,
+                inner,
+                include_regex.as_deref(),
+                force,
+                parallel,
+            )?;
         }
         Command::Cache { action } => match action {
             cli::CacheAction::Stats => {
@@ -109,7 +136,14 @@ fn main() -> Result<()> {
                 test::TestMode::Run
             };
 
-            run_test(&repo_root, benchmark::for_dataset(dataset).as_ref(), &paths, inner, mode, allow_infra_failures)?;
+            run_test(
+                &repo_root,
+                benchmark::for_dataset(dataset).as_ref(),
+                &paths,
+                inner,
+                mode,
+                allow_infra_failures,
+            )?;
         }
         Command::Enrich { ref target } => {
             let dataset = Dataset::detect(target);

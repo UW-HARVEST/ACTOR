@@ -156,7 +156,11 @@ mod tests {
 
     #[test]
     fn a_stale_binary_is_refused() {
-        let p = assess("1d2afa1aaaaa", Some("2cdc503bbbbbccccddddeeeeffff000011112222"), 0);
+        let p = assess(
+            "1d2afa1aaaaa",
+            Some("2cdc503bbbbbccccddddeeeeffff000011112222"),
+            0,
+        );
         assert_eq!(
             p,
             Some(Unreproducible::StaleBinary {
@@ -170,25 +174,44 @@ mod tests {
     #[test]
     fn a_matching_prefix_is_accepted() {
         // build.rs stamps --short=12; rev-parse HEAD is 40 chars.
-        assert_eq!(assess("2cdc503bbbbb", Some("2cdc503bbbbbccccddddeeeeffff000011112222"), 0), None);
+        assert_eq!(
+            assess(
+                "2cdc503bbbbb",
+                Some("2cdc503bbbbbccccddddeeeeffff000011112222"),
+                0
+            ),
+            None
+        );
     }
 
     #[test]
     fn a_dirty_tree_is_refused_and_says_how_many() {
-        assert_eq!(assess("abc123abc123", Some("abc123abc123ff"), 4), Some(Unreproducible::DirtyTree { files: 4 }));
+        assert_eq!(
+            assess("abc123abc123", Some("abc123abc123ff"), 4),
+            Some(Unreproducible::DirtyTree { files: 4 })
+        );
     }
 
     #[test]
     fn dirtiness_outranks_staleness() {
         // A rebuild cannot help while the tree is dirty: no commit to rebuild to.
         let p = assess("aaaaaaaaaaaa", Some("bbbbbbbbbbbb"), 2);
-        assert!(matches!(p, Some(Unreproducible::DirtyTree { .. })), "got {p:?}");
+        assert!(
+            matches!(p, Some(Unreproducible::DirtyTree { .. })),
+            "got {p:?}"
+        );
     }
 
     #[test]
     fn an_unstamped_binary_is_refused_rather_than_assumed_fine() {
-        assert_eq!(assess("unknown", Some("abc123abc123"), 0), Some(Unreproducible::UnknownProvenance));
-        assert_eq!(assess("unknown", None, 0), Some(Unreproducible::UnknownProvenance));
+        assert_eq!(
+            assess("unknown", Some("abc123abc123"), 0),
+            Some(Unreproducible::UnknownProvenance)
+        );
+        assert_eq!(
+            assess("unknown", None, 0),
+            Some(Unreproducible::UnknownProvenance)
+        );
     }
 
     #[test]
@@ -202,7 +225,11 @@ mod tests {
         // Guards build.rs itself: if the stamp silently became empty, every check
         // above would still pass while proving nothing.
         assert!(!built_from().is_empty());
-        assert_ne!(built_from(), "unknown", "built inside the repo, so a SHA must be stamped");
+        assert_ne!(
+            built_from(),
+            "unknown",
+            "built inside the repo, so a SHA must be stamped"
+        );
         assert_ne!(built_from(), VERGEN_PLACEHOLDER);
         let v = version_string();
         assert!(v.contains(built_from()) && v.contains("rustc"), "{v}");

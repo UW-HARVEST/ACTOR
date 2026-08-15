@@ -37,8 +37,12 @@ pub fn base() -> Result<PathBuf> {
 fn resolve() -> Result<PathBuf> {
     let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
     resolve_from(
-        std::env::var_os(ENV_BASE).filter(|v| !v.is_empty()).map(PathBuf::from),
-        std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
+        std::env::var_os(ENV_BASE)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
+        std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from),
         std::env::var_os(ENV_ALLOW_TMPFS).is_some(),
         &mounts,
     )
@@ -158,22 +162,38 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
     #[test]
     fn fstype_picks_the_longest_matching_mount_not_the_first() {
         assert_eq!(
-            fstype_for(MOUNTS, Path::new("/local/home/scheschb/.cache/harvest/work")).as_deref(),
+            fstype_for(
+                MOUNTS,
+                Path::new("/local/home/scheschb/.cache/harvest/work")
+            )
+            .as_deref(),
             Some("xfs")
         );
-        assert_eq!(fstype_for(MOUNTS, Path::new("/var/log")).as_deref(), Some("xfs"));
+        assert_eq!(
+            fstype_for(MOUNTS, Path::new("/var/log")).as_deref(),
+            Some("xfs")
+        );
     }
 
     #[test]
     fn fstype_detects_tmpfs() {
-        assert_eq!(fstype_for(MOUNTS, Path::new("/tmp/harvest-work-abc")).as_deref(), Some("tmpfs"));
-        assert_eq!(fstype_for(MOUNTS, Path::new("/dev/shm/x")).as_deref(), Some("tmpfs"));
+        assert_eq!(
+            fstype_for(MOUNTS, Path::new("/tmp/harvest-work-abc")).as_deref(),
+            Some("tmpfs")
+        );
+        assert_eq!(
+            fstype_for(MOUNTS, Path::new("/dev/shm/x")).as_deref(),
+            Some("tmpfs")
+        );
     }
 
     #[test]
     fn fstype_handles_escaped_spaces_and_short_lines() {
         let m = "/dev/sda1 /mnt/my\\040disk ext4 rw 0 0\nbroken\n";
-        assert_eq!(fstype_for(m, Path::new("/mnt/my disk/x")).as_deref(), Some("ext4"));
+        assert_eq!(
+            fstype_for(m, Path::new("/mnt/my disk/x")).as_deref(),
+            Some("ext4")
+        );
         assert_eq!(fstype_for(m, Path::new("/elsewhere")), None);
     }
 
@@ -186,7 +206,10 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
             .expect("explicit base resolves");
         assert!(got.is_dir(), "base should be created recursively");
         assert_eq!(got, want.canonicalize().unwrap());
-        assert!(!home.exists(), "HOME must be ignored when an override is given");
+        assert!(
+            !home.exists(),
+            "HOME must be ignored when an override is given"
+        );
     }
 
     #[test]
@@ -195,7 +218,10 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
         let home = tmp.path().join("home");
         let got = resolve_from(None, Some(home.clone()), true, MOUNTS).expect("resolves from HOME");
         assert_eq!(got, home.join(".harvest/work").canonicalize().unwrap());
-        assert!(!got.starts_with("/tmp/harvest"), "must not be tempfile's old default");
+        assert!(
+            !got.starts_with("/tmp/harvest"),
+            "must not be tempfile's old default"
+        );
         assert!(
             !got.components().any(|c| c.as_os_str() == ".cache"),
             "scratch must not live under a cache dir: {}",
@@ -210,9 +236,18 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
         let err = resolve_from(Some(tmp.path().to_path_buf()), None, false, MOUNTS)
             .expect_err("a tmpfs base must be refused");
         let err = format!("{err:#}");
-        assert!(err.contains("tmpfs"), "message should name the fstype: {err}");
-        assert!(err.contains(ENV_BASE), "message should say how to fix it: {err}");
-        assert!(err.contains(ENV_ALLOW_TMPFS), "message should offer the override: {err}");
+        assert!(
+            err.contains("tmpfs"),
+            "message should name the fstype: {err}"
+        );
+        assert!(
+            err.contains(ENV_BASE),
+            "message should say how to fix it: {err}"
+        );
+        assert!(
+            err.contains(ENV_ALLOW_TMPFS),
+            "message should offer the override: {err}"
+        );
     }
 
     #[test]
@@ -224,9 +259,13 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
 
     #[test]
     fn missing_home_without_override_errors_and_says_what_to_set() {
-        let err = resolve_from(None, None, true, MOUNTS).expect_err("no base and no HOME must fail");
+        let err =
+            resolve_from(None, None, true, MOUNTS).expect_err("no base and no HOME must fail");
         let err = format!("{err:#}");
-        assert!(err.contains(ENV_BASE), "error should name the env var to set: {err}");
+        assert!(
+            err.contains(ENV_BASE),
+            "error should name the env var to set: {err}"
+        );
     }
 
     #[test]
@@ -238,7 +277,10 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
         let err = resolve_from(Some(bad), None, true, MOUNTS)
             .expect_err("nesting under a regular file must fail");
         let err = format!("{err:#}");
-        assert!(err.contains("cannot/nest"), "error should name the offending path, got: {err}");
+        assert!(
+            err.contains("cannot/nest"),
+            "error should name the offending path, got: {err}"
+        );
     }
 
     #[test]
@@ -279,7 +321,13 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
     fn data_cap_admits_the_largest_legitimate_test_binary_seen() {
         let legit_peak_kb = 4_896_256; // anon-rss from the kernel OOM report
         let runaway_kb = 14_091_264;
-        assert!(AGENT_DATA_KB > legit_peak_kb, "must not break the 4.67 GB cases");
-        assert!(AGENT_DATA_KB < runaway_kb, "must refuse the 13.44 GB runaway");
+        assert!(
+            AGENT_DATA_KB > legit_peak_kb,
+            "must not break the 4.67 GB cases"
+        );
+        assert!(
+            AGENT_DATA_KB < runaway_kb,
+            "must refuse the 13.44 GB runaway"
+        );
     }
 }

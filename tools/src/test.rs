@@ -81,15 +81,25 @@ pub fn run_test_corpus(paths: &Paths, target: &str, mode: TestMode) -> Result<Te
         println!("========================================");
         println!("  Check Summary");
         println!("========================================");
-        println!("  {:<25} {:>15} {:>15}  Status", "Battery", "Stored", "Actual");
+        println!(
+            "  {:<25} {:>15} {:>15}  Status",
+            "Battery", "Stored", "Actual"
+        );
         println!("  {}", "─".repeat(75));
         for row in &check_rows {
-            let stored = format!("{}/{} ({}v)", row.expected.cases_passed, row.expected.cases_tested,
-                row.expected.vectors_passed);
-            let actual = format!("{}/{} ({}v)", row.actual.cases_passed, row.actual.cases_tested,
-                row.actual.vectors_passed);
+            let stored = format!(
+                "{}/{} ({}v)",
+                row.expected.cases_passed, row.expected.cases_tested, row.expected.vectors_passed
+            );
+            let actual = format!(
+                "{}/{} ({}v)",
+                row.actual.cases_passed, row.actual.cases_tested, row.actual.vectors_passed
+            );
             let status = if row.ok { "✅" } else { "❌" };
-            println!("  {:<25} {:>15} {:>15}  {}", row.battery, stored, actual, status);
+            println!(
+                "  {:<25} {:>15} {:>15}  {}",
+                row.battery, stored, actual, status
+            );
         }
         println!("========================================");
     }
@@ -140,7 +150,12 @@ fn discover_batteries(results_dir: &Path) -> Result<Vec<String>> {
 
 // ── Single battery ─────────────────────────────────────────────────────
 
-fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Vec<CheckRow>) -> Result<TestOutcome> {
+fn run_battery(
+    paths: &Paths,
+    battery: &str,
+    mode: TestMode,
+    check_rows: &mut Vec<CheckRow>,
+) -> Result<TestOutcome> {
     let output_dir = paths.output_dir(battery);
 
     if !output_dir.is_dir() {
@@ -154,18 +169,31 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
     println!("========================================");
 
     copy_test_artifacts(paths, battery)?;
-    let _guard = TestArtifactGuard { output_dir: output_dir.clone() };
+    let _guard = TestArtifactGuard {
+        output_dir: output_dir.clone(),
+    };
 
     generate_workspace(&output_dir)?;
 
-    let has_verified = std::fs::read_dir(&output_dir)?.filter_map(|e| e.ok())
-        .any(|e| crate::battery::phase_dir(&e.path(), crate::battery::VERIFIED).join("Cargo.toml").exists());
+    let has_verified = std::fs::read_dir(&output_dir)?
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            crate::battery::phase_dir(&e.path(), crate::battery::VERIFIED)
+                .join("Cargo.toml")
+                .exists()
+        });
 
     // Order matters: the LAST phase scored becomes the headline summary, so
     // verified/ must follow translated/. Each pass stages `translated_rust` at
     // its phase dir so unmodified runtests scores that crate. translated/ is
     // scored unconditionally, which is what makes the headline unconditional.
-    let mut headline = score_phase(paths, battery, &output_dir, crate::battery::TRANSLATED, mode)?;
+    let mut headline = score_phase(
+        paths,
+        battery,
+        &output_dir,
+        crate::battery::TRANSLATED,
+        mode,
+    )?;
     if has_verified {
         headline = score_phase(paths, battery, &output_dir, crate::battery::VERIFIED, mode)?;
     }
@@ -176,8 +204,10 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
     match mode {
         TestMode::Update => {
             let vt = summary.vectors_passed + summary.vectors_failed;
-            println!("   📝 Updated: {}/{} cases, {}/{vt} vectors",
-                summary.cases_passed, summary.cases_tested, summary.vectors_passed);
+            println!(
+                "   📝 Updated: {}/{} cases, {}/{vt} vectors",
+                summary.cases_passed, summary.cases_tested, summary.vectors_passed
+            );
             Ok(TestOutcome::Ok)
         }
         TestMode::Check => {
@@ -215,9 +245,7 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
                 }]))
             }
         }
-        TestMode::Run => {
-            Ok(TestOutcome::Ok)
-        }
+        TestMode::Run => Ok(TestOutcome::Ok),
     }
 }
 
@@ -239,9 +267,13 @@ fn score_phase(
     let vt = summary.vectors_passed + summary.vectors_failed;
     let pct = if vt > 0 {
         format!("{:.1}%", 100.0 * summary.vectors_passed as f64 / vt as f64)
-    } else { "N/A".to_string() };
-    println!("  {battery} [{phase}]: {}/{} cases, {}/{vt} vectors ({pct})",
-        summary.cases_passed, summary.cases_tested, summary.vectors_passed);
+    } else {
+        "N/A".to_string()
+    };
+    println!(
+        "  {battery} [{phase}]: {}/{} cases, {}/{vt} vectors ({pct})",
+        summary.cases_passed, summary.cases_tested, summary.vectors_passed
+    );
 
     if matches!(mode, TestMode::Update) {
         write_results(output_dir, phase, &summary, &per_case)?;
@@ -261,14 +293,20 @@ fn stage_phase_for_runtests(output_dir: &Path, phase: &str) -> Result<usize> {
     let mut staged = 0usize;
     for entry in std::fs::read_dir(output_dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() { continue; }
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
         let case_dir = entry.path();
         let phase_path = crate::battery::phase_dir(&case_dir, phase);
-        if !phase_path.join("Cargo.toml").exists() { continue; }
+        if !phase_path.join("Cargo.toml").exists() {
+            continue;
+        }
         let link = case_dir.join(crate::battery::TRANSLATED_RUST);
         if link.is_symlink() || link.exists() {
             let _ = std::fs::remove_file(&link);
-            if link.is_dir() { let _ = std::fs::remove_dir_all(&link); }
+            if link.is_dir() {
+                let _ = std::fs::remove_dir_all(&link);
+            }
         }
         std::os::unix::fs::symlink(phase, &link)?;
         staged += 1;
@@ -279,7 +317,9 @@ fn stage_phase_for_runtests(output_dir: &Path, phase: &str) -> Result<usize> {
 fn unstage_phase(output_dir: &Path) -> Result<()> {
     for entry in std::fs::read_dir(output_dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() { continue; }
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
         let link = entry.path().join(crate::battery::TRANSLATED_RUST);
         if link.is_symlink() {
             let _ = std::fs::remove_file(&link);
@@ -365,7 +405,9 @@ fn cleanup_test_artifacts(output_dir: &Path) -> Result<()> {
 fn clean_targets(output_dir: &Path) -> Result<()> {
     for entry in std::fs::read_dir(output_dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() { continue; }
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
         let target = crate::battery::crate_dir(&entry.path()).join("target");
         if target.exists() {
             std::fs::remove_dir_all(&target)?;
@@ -399,7 +441,11 @@ fn generate_workspace(output_dir: &Path) -> Result<()> {
 
 // ── Run runtests ───────────────────────────────────────────────────────
 
-fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary, HashMap<String, serde_json::Value>)> {
+fn run_runtests(
+    paths: &Paths,
+    battery: &str,
+    mode: TestMode,
+) -> Result<(Summary, HashMap<String, serde_json::Value>)> {
     let output_dir = paths.output_dir(battery);
     let scripts_dir = paths.corpus_dir.join("deployment/scripts/github-actions");
 
@@ -409,8 +455,16 @@ fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary
     }
 
     let output = Command::new("python3")
-        .args(["-m", "runtests.rust", "--root", &output_dir.to_string_lossy(),
-               "--subset", &output_dir.to_string_lossy(), "--keep-going", "--verbose"])
+        .args([
+            "-m",
+            "runtests.rust",
+            "--root",
+            &output_dir.to_string_lossy(),
+            "--subset",
+            &output_dir.to_string_lossy(),
+            "--keep-going",
+            "--verbose",
+        ])
         .env("PYTHONPATH", &pythonpath)
         .env("OPENSSL_DIR", openssl_dir())
         .current_dir(&paths.corpus_dir)
@@ -457,12 +511,17 @@ fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary
     for line in text.lines() {
         if let Some(caps) = build_fail_re.captures(line) {
             let name = caps[1].to_string();
-            if !failed_cases.contains(&name) { failed_cases.push(name.clone()); }
-            per_case.insert(name.clone(), serde_json::json!({
-                "case": name, "battery": battery,
-                "vectors_failed": 1, "passed": false,
-                "error": "build failed",
-            }));
+            if !failed_cases.contains(&name) {
+                failed_cases.push(name.clone());
+            }
+            per_case.insert(
+                name.clone(),
+                serde_json::json!({
+                    "case": name, "battery": battery,
+                    "vectors_failed": 1, "passed": false,
+                    "error": "build failed",
+                }),
+            );
         }
     }
 
@@ -486,11 +545,18 @@ fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary
                 end += 1;
             }
             let body = lines[start..end].join("\n");
-            let (expected_rc, actual_rc) = rc_re.captures(&body)
-                .map(|c| (c[1].parse::<i64>().unwrap_or(-1), c[2].parse::<i64>().unwrap_or(-1)))
+            let (expected_rc, actual_rc) = rc_re
+                .captures(&body)
+                .map(|c| {
+                    (
+                        c[1].parse::<i64>().unwrap_or(-1),
+                        c[2].parse::<i64>().unwrap_or(-1),
+                    )
+                })
                 .unwrap_or((-1, -1));
 
-            let diff = body.lines()
+            let diff = body
+                .lines()
                 .filter(|l| !rc_re.is_match(l))
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -499,14 +565,19 @@ fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary
             // e.g. "stdout mismatch", "stderr mismatch, return code mismatch".
             let reason = reason_first_line.trim_end_matches(',').trim().to_string();
 
-            case_vector_fails.entry(name.clone()).or_default().push(serde_json::json!({
-                "vector": vector,
-                "reason": reason,
-                "expected_rc": expected_rc,
-                "actual_rc": actual_rc,
-                "diff": diff,
-            }));
-            if !failed_cases.contains(&name) { failed_cases.push(name.clone()); }
+            case_vector_fails
+                .entry(name.clone())
+                .or_default()
+                .push(serde_json::json!({
+                    "vector": vector,
+                    "reason": reason,
+                    "expected_rc": expected_rc,
+                    "actual_rc": actual_rc,
+                    "diff": diff,
+                }));
+            if !failed_cases.contains(&name) {
+                failed_cases.push(name.clone());
+            }
             i = end + 1;
         } else {
             i += 1;
@@ -519,49 +590,61 @@ fn run_runtests(paths: &Paths, battery: &str, mode: TestMode) -> Result<(Summary
     for line in text.lines() {
         if let Some(caps) = test_fail_simple_re.captures(line) {
             let name = caps[1].to_string();
-            if !failed_cases.contains(&name) { failed_cases.push(name.clone()); }
-            case_vector_fails.entry(name).or_insert_with(|| vec![serde_json::json!({
-                "vector": "unknown",
-                "reason": "test failed (no vector-level detail)",
-                "expected_rc": -1,
-                "actual_rc": -1,
-                "diff": "",
-            })]);
+            if !failed_cases.contains(&name) {
+                failed_cases.push(name.clone());
+            }
+            case_vector_fails.entry(name).or_insert_with(|| {
+                vec![serde_json::json!({
+                    "vector": "unknown",
+                    "reason": "test failed (no vector-level detail)",
+                    "expected_rc": -1,
+                    "actual_rc": -1,
+                    "diff": "",
+                })]
+            });
         }
     }
 
     for (name, failures) in case_vector_fails {
-        per_case.insert(name.clone(), serde_json::json!({
-            "case": name,
-            "battery": battery,
-            "vectors_failed": failures.len(),
-            "passed": false,
-            "error": "test failed",
-            "failures": failures,
-        }));
+        per_case.insert(
+            name.clone(),
+            serde_json::json!({
+                "case": name,
+                "battery": battery,
+                "vectors_failed": failures.len(),
+                "passed": false,
+                "error": "test failed",
+                "failures": failures,
+            }),
+        );
     }
 
     // Executed and not already recorded as failed ⇒ passed.
     let exec_re = Regex::new(r"Executing (\S+)")?;
     for caps in exec_re.captures_iter(&text) {
         let name = caps[1].to_string();
-        per_case.entry(name.clone()).or_insert_with(|| serde_json::json!({
-            "case": name, "battery": battery,
-            "vectors_failed": 0, "passed": true,
-        }));
+        per_case.entry(name.clone()).or_insert_with(|| {
+            serde_json::json!({
+                "case": name, "battery": battery,
+                "vectors_failed": 0, "passed": true,
+            })
+        });
     }
 
     failed_cases.sort();
     let cases_passed = cases_discovered.saturating_sub(failed_cases.len());
 
-    Ok((Summary {
-        cases_tested: cases_discovered,
-        cases_passed,
-        vectors_passed,
-        vectors_failed,
-        vectors_skipped,
-        failed_cases,
-    }, per_case))
+    Ok((
+        Summary {
+            cases_tested: cases_discovered,
+            cases_passed,
+            vectors_passed,
+            vectors_failed,
+            vectors_skipped,
+            failed_cases,
+        },
+        per_case,
+    ))
 }
 
 // ── Summary I/O ────────────────────────────────────────────────────────
@@ -584,7 +667,8 @@ fn write_results(
             Enrichment::compute(
                 &phase_dir.join("src"),
                 &[("translate", &tlog), ("verify", &vlog)],
-            ).merge_into(&mut val);
+            )
+            .merge_into(&mut val);
             let json = serde_json::to_string_pretty(&val)?;
             std::fs::write(phase_dir.join("result.json"), format!("{json}\n"))?;
         }
@@ -595,12 +679,20 @@ fn write_results(
 }
 
 fn summary_file(phase: &str) -> &'static str {
-    if phase == crate::battery::VERIFIED { "summary.json" } else { "summary_translated.json" }
+    if phase == crate::battery::VERIFIED {
+        "summary.json"
+    } else {
+        "summary_translated.json"
+    }
 }
 
 fn load_summary(output_dir: &Path) -> Summary {
     let verified = output_dir.join("summary.json");
-    let path = if verified.exists() { verified } else { output_dir.join("summary_translated.json") };
+    let path = if verified.exists() {
+        verified
+    } else {
+        output_dir.join("summary_translated.json")
+    };
     std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -612,7 +704,12 @@ fn diff_summaries(expected: &Summary, actual: &Summary) -> Vec<String> {
     macro_rules! cmp {
         ($field:ident) => {
             if actual.$field != expected.$field {
-                diffs.push(format!("{}: {} → {}", stringify!($field), expected.$field, actual.$field));
+                diffs.push(format!(
+                    "{}: {} → {}",
+                    stringify!($field),
+                    expected.$field,
+                    actual.$field
+                ));
             }
         };
     }
@@ -620,17 +717,38 @@ fn diff_summaries(expected: &Summary, actual: &Summary) -> Vec<String> {
     cmp!(vectors_failed);
     cmp!(cases_passed);
     cmp!(cases_tested);
-    let added: Vec<_> = actual.failed_cases.iter().filter(|c| !expected.failed_cases.contains(c)).collect();
-    let removed: Vec<_> = expected.failed_cases.iter().filter(|c| !actual.failed_cases.contains(c)).collect();
+    let added: Vec<_> = actual
+        .failed_cases
+        .iter()
+        .filter(|c| !expected.failed_cases.contains(c))
+        .collect();
+    let removed: Vec<_> = expected
+        .failed_cases
+        .iter()
+        .filter(|c| !actual.failed_cases.contains(c))
+        .collect();
     if !added.is_empty() {
-        diffs.push(format!("new failures: {}", added.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+        diffs.push(format!(
+            "new failures: {}",
+            added
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     if !removed.is_empty() {
-        diffs.push(format!("no longer failing: {}", removed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+        diffs.push(format!(
+            "no longer failing: {}",
+            removed
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     diffs
 }
-
 
 // ── Enrichment: the ONE definition of result.json metadata ─────────────
 //
@@ -647,7 +765,8 @@ pub struct Enrichment {
 impl Enrichment {
     /// `logs` maps each result.json phase key to that phase's agent log.
     pub fn compute(src_dir: &Path, logs: &[(&str, &Path)]) -> Self {
-        let meta = logs.iter()
+        let meta = logs
+            .iter()
             .filter_map(|(key, log)| {
                 crate::battery::extract_agent_meta(log).map(|m| (key.to_string(), m))
             })
@@ -678,7 +797,9 @@ impl Enrichment {
     }
 
     fn enrich_file(rj: &Path, src_dir: &Path, logs: &[(&str, &Path)]) -> Result<bool> {
-        if !rj.exists() { return Ok(false); }
+        if !rj.exists() {
+            return Ok(false);
+        }
         let mut json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(rj)?)?;
         // The only [`Self::merge_into`] caller whose value comes off disk, so the
         // only one that can hand it a scalar or an array — which `json[key] = ..`
@@ -705,8 +826,12 @@ fn check_enrichment(
     agent: crate::cli::Agent,
 ) -> Vec<String> {
     let mut diffs = Vec::new();
-    let Ok(data) = std::fs::read_to_string(result_json) else { return diffs };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else { return diffs };
+    let Ok(data) = std::fs::read_to_string(result_json) else {
+        return diffs;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
+        return diffs;
+    };
 
     let live = Enrichment::compute(src_dir, log_paths);
 
@@ -715,11 +840,31 @@ fn check_enrichment(
             let sb = stored.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let sf = stored.get("fns").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let si = stored.get("impls").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            if sb != live.unsafe_.blocks { diffs.push(format!("unsafe.blocks expected={sb} actual={}", live.unsafe_.blocks)); }
-            if sf != live.unsafe_.fns { diffs.push(format!("unsafe.fns expected={sf} actual={}", live.unsafe_.fns)); }
-            if si != live.unsafe_.impls { diffs.push(format!("unsafe.impls expected={si} actual={}", live.unsafe_.impls)); }
+            if sb != live.unsafe_.blocks {
+                diffs.push(format!(
+                    "unsafe.blocks expected={sb} actual={}",
+                    live.unsafe_.blocks
+                ));
+            }
+            if sf != live.unsafe_.fns {
+                diffs.push(format!(
+                    "unsafe.fns expected={sf} actual={}",
+                    live.unsafe_.fns
+                ));
+            }
+            if si != live.unsafe_.impls {
+                diffs.push(format!(
+                    "unsafe.impls expected={si} actual={}",
+                    live.unsafe_.impls
+                ));
+            }
             let sl = stored.get("lines").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            if sl != live.unsafe_.lines { diffs.push(format!("unsafe.lines expected={sl} actual={}", live.unsafe_.lines)); }
+            if sl != live.unsafe_.lines {
+                diffs.push(format!(
+                    "unsafe.lines expected={sl} actual={}",
+                    live.unsafe_.lines
+                ));
+            }
         }
         None => diffs.push("missing unsafe field".into()),
     }
@@ -727,7 +872,9 @@ fn check_enrichment(
     match json.get("loc") {
         Some(stored) => {
             let sc = stored.get("code").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            if sc != live.loc.code { diffs.push(format!("loc.code expected={sc} actual={}", live.loc.code)); }
+            if sc != live.loc.code {
+                diffs.push(format!("loc.code expected={sc} actual={}", live.loc.code));
+            }
         }
         None => diffs.push("missing loc field".into()),
     }
@@ -738,13 +885,25 @@ fn check_enrichment(
     for (key, live) in &live.meta {
         match json.get(key) {
             Some(stored) => {
-                let sc = stored.get("credits").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let sw = stored.get("wall_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+                let sc = stored
+                    .get("credits")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let sw = stored
+                    .get("wall_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 if (sc - live.credits.0).abs() > 0.001 {
-                    diffs.push(format!("{key}.credits expected={sc} actual={}", live.credits.0));
+                    diffs.push(format!(
+                        "{key}.credits expected={sc} actual={}",
+                        live.credits.0
+                    ));
                 }
                 if sw != live.wall_secs {
-                    diffs.push(format!("{key}.wall_secs expected={sw} actual={}", live.wall_secs));
+                    diffs.push(format!(
+                        "{key}.wall_secs expected={sw} actual={}",
+                        live.wall_secs
+                    ));
                 }
             }
             None if require_credits => diffs.push(format!("missing {key} field")),
@@ -772,14 +931,16 @@ impl HarvestBenchResult {
             built: self.build_ok,
             tests_ok: self.tests_ok as u32,
             tests_failed: self.tests_failed as u32,
-        }.passed()
+        }
+        .passed()
     }
 }
 
 /// `corpus_dir` is `harvest-bench/tests`, hence the `.parent()`.
 fn harvest_bench_runner(corpus_dir: &Path) -> Result<PathBuf> {
     let bin = corpus_dir
-        .parent().context("harvest-bench/tests has no parent")?
+        .parent()
+        .context("harvest-bench/tests has no parent")?
         .join("runner/target/release/harvest-bench");
     anyhow::ensure!(bin.is_file(),
         "harvest-bench runner not built: {} (run `cargo build --release --manifest-path harvest-bench/runner/Cargo.toml`)",
@@ -795,19 +956,31 @@ fn build_harvest_bench_lib(crate_dir: &Path, name: &str) -> (Option<PathBuf>, St
         .env("OPENSSL_NO_VENDOR", "1")
         .current_dir(crate_dir)
         .output();
-    let Ok(out) = out else { return (None, "failed to spawn cargo build".into()) };
+    let Ok(out) = out else {
+        return (None, "failed to spawn cargo build".into());
+    };
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     // cargo normalizes `-`→`_` in the cdylib output name.
     let lib_stem = name.replace('-', "_");
     let so = crate_dir.join(format!("target/release/lib{lib_stem}.so"));
-    if so.is_file() { (Some(so), stderr) } else { (None, stderr) }
+    if so.is_file() {
+        (Some(so), stderr)
+    } else {
+        (None, stderr)
+    }
 }
 
 fn score_harvest_bench_suite(
-    runner: &Path, suite_dir: &Path, lib: &Path, report_json: &Path,
+    runner: &Path,
+    suite_dir: &Path,
+    lib: &Path,
+    report_json: &Path,
 ) -> Result<(usize, usize, usize)> {
     // Suite build dir is per-result so parallel/rerun don't collide.
-    let build_dir = report_json.parent().unwrap_or(Path::new(".")).join("gtest_build");
+    let build_dir = report_json
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("gtest_build");
     let _ = Command::new(runner)
         .arg("run")
         .args(["--suite".as_ref(), suite_dir.as_os_str()])
@@ -821,33 +994,53 @@ fn score_harvest_bench_suite(
     // incompatible, cmake choked) must record a zero-score case, not abort the
     // whole sweep with an error.
     let Ok(data) = std::fs::read_to_string(report_json) else {
-        eprintln!("⚠️  harvest-bench runner produced no report {} — recording 0 tests", report_json.display());
+        eprintln!(
+            "⚠️  harvest-bench runner produced no report {} — recording 0 tests",
+            report_json.display()
+        );
         return Ok((0, 0, 0));
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
-        eprintln!("⚠️  harvest-bench runner report at {} is not valid JSON — recording 0 tests", report_json.display());
+        eprintln!(
+            "⚠️  harvest-bench runner report at {} is not valid JSON — recording 0 tests",
+            report_json.display()
+        );
         return Ok((0, 0, 0));
     };
     let verdicts = json.pointer("/run/verdicts").and_then(|v| v.as_array());
-    let Some(verdicts) = verdicts else { return Ok((0, 0, 0)) };
+    let Some(verdicts) = verdicts else {
+        return Ok((0, 0, 0));
+    };
 
-    let mut ok = 0usize; let mut failed = 0usize; let mut skipped = 0usize;
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
     for v in verdicts {
         let passed = v.get("passed").and_then(|b| b.as_bool()).unwrap_or(false);
         let skip = v.get("skipped").and_then(|b| b.as_bool()).unwrap_or(false);
-        if skip { skipped += 1; }
-        else if passed { ok += 1; }
-        else { failed += 1; }
+        if skip {
+            skipped += 1;
+        } else if passed {
+            ok += 1;
+        } else {
+            failed += 1;
+        }
     }
     Ok((ok, failed, skipped))
 }
 
 /// Load stored harvest-bench result.json files as a baseline for --check.
-fn load_harvest_bench_stored(paths: &Paths) -> std::collections::BTreeMap<String, HarvestBenchResult> {
+fn load_harvest_bench_stored(
+    paths: &Paths,
+) -> std::collections::BTreeMap<String, HarvestBenchResult> {
     let mut map = std::collections::BTreeMap::new();
-    let Ok(entries) = std::fs::read_dir(&paths.results_dir) else { return map };
+    let Ok(entries) = std::fs::read_dir(&paths.results_dir) else {
+        return map;
+    };
     for entry in entries.filter_map(|e| e.ok()) {
-        if !entry.path().is_dir() { continue; }
+        if !entry.path().is_dir() {
+            continue;
+        }
         // Single-phase: score lives in translated/result.json (reader rule).
         let rj = crate::battery::crate_dir(&entry.path()).join("result.json");
         if let Ok(data) = std::fs::read_to_string(&rj) {
@@ -878,7 +1071,9 @@ pub fn run_harvest_bench_test(
         // translated/ — which also covers verify breaking the crate, since the
         // compile gate then discards verified/ entirely.
         let crate_dir = crate::battery::crate_dir(&case_dir);
-        if !crate_dir.join("Cargo.toml").exists() { continue; }
+        if !crate_dir.join("Cargo.toml").exists() {
+            continue;
+        }
 
         let logs_dir = crate_dir.join("logs");
         std::fs::create_dir_all(&logs_dir)?;
@@ -890,12 +1085,23 @@ pub fn run_harvest_bench_test(
             None => {
                 build_failed += 1;
                 println!("  ❌ {name}: build failed (no cdylib)");
-                HarvestBenchResult { tests_ok: 0, tests_failed: 0, tests_skipped: 0, build_ok: false }
+                HarvestBenchResult {
+                    tests_ok: 0,
+                    tests_failed: 0,
+                    tests_skipped: 0,
+                    build_ok: false,
+                }
             }
             Some(so) => {
                 let report = crate_dir.join("harvest_bench_report.json");
-                let (ok, fail, skip) = score_harvest_bench_suite(&runner, project.gtest_suite(), &so, &report)?;
-                let res = HarvestBenchResult { tests_ok: ok, tests_failed: fail, tests_skipped: skip, build_ok: true };
+                let (ok, fail, skip) =
+                    score_harvest_bench_suite(&runner, project.gtest_suite(), &so, &report)?;
+                let res = HarvestBenchResult {
+                    tests_ok: ok,
+                    tests_failed: fail,
+                    tests_skipped: skip,
+                    build_ok: true,
+                };
                 if res.passed() {
                     passed += 1;
                     println!("  ✅ {name}: {ok} ok, {skip} skipped");
@@ -911,8 +1117,12 @@ pub fn run_harvest_bench_test(
         if matches!(mode, TestMode::Update) {
             let mut json = serde_json::to_value(&r)?;
             let tlog = logs_dir.join("translation.log");
-            Enrichment::compute(&crate_dir.join("src"), &[("translate", &tlog)]).merge_into(&mut json);
-            std::fs::write(crate_dir.join("result.json"), serde_json::to_string_pretty(&json)? + "\n")?;
+            Enrichment::compute(&crate_dir.join("src"), &[("translate", &tlog)])
+                .merge_into(&mut json);
+            std::fs::write(
+                crate_dir.join("result.json"),
+                serde_json::to_string_pretty(&json)? + "\n",
+            )?;
         }
 
         results.insert(name.to_string(), r);
@@ -933,10 +1143,16 @@ pub fn run_harvest_bench_test(
                     None => diffs.push(format!("{name}: missing stored result")),
                     Some(exp) => {
                         if actual.tests_ok < exp.tests_ok {
-                            diffs.push(format!("{name}: tests_ok expected={} actual={}", exp.tests_ok, actual.tests_ok));
+                            diffs.push(format!(
+                                "{name}: tests_ok expected={} actual={}",
+                                exp.tests_ok, actual.tests_ok
+                            ));
                         }
                         if actual.tests_failed > exp.tests_failed {
-                            diffs.push(format!("{name}: tests_failed expected={} actual={}", exp.tests_failed, actual.tests_failed));
+                            diffs.push(format!(
+                                "{name}: tests_failed expected={} actual={}",
+                                exp.tests_failed, actual.tests_failed
+                            ));
                         }
                         if exp.build_ok && !actual.build_ok {
                             diffs.push(format!("{name}: build_ok expected=true actual=false"));
@@ -949,8 +1165,13 @@ pub fn run_harvest_bench_test(
                 Ok(TestOutcome::Passed)
             } else {
                 println!("\n❌ {} regression(s):", diffs.len());
-                for d in &diffs { println!("  {d}"); }
-                Ok(TestOutcome::Failed(vec![BatteryMismatch { battery: "harvest-bench".into(), diffs }]))
+                for d in &diffs {
+                    println!("  {d}");
+                }
+                Ok(TestOutcome::Failed(vec![BatteryMismatch {
+                    battery: "harvest-bench".into(),
+                    diffs,
+                }]))
             }
         }
         TestMode::Run => Ok(TestOutcome::Ok),
@@ -959,11 +1180,15 @@ pub fn run_harvest_bench_test(
 
 pub fn enrich_test_corpus(paths: &Paths, battery: &str) -> Result<()> {
     let output_dir = paths.results_dir.join(battery);
-    if !output_dir.is_dir() { return Ok(()); }
+    if !output_dir.is_dir() {
+        return Ok(());
+    }
     let mut enriched = 0usize;
     for entry in std::fs::read_dir(&output_dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() { continue; }
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
         let case_dir = entry.path();
         // Each phase's result.json is enriched against ITS OWN crate. enrich_file
         // no-ops on absent files, so single-phase cases just skip verified/.
@@ -975,7 +1200,9 @@ pub fn enrich_test_corpus(paths: &Paths, battery: &str) -> Result<()> {
                 &pdir.join("result.json"),
                 &pdir.join("src"),
                 &[("translate", &tlog), ("verify", &vlog)],
-            )? { enriched += 1; }
+            )? {
+                enriched += 1;
+            }
         }
     }
     println!("✅ Enriched {enriched} {battery} result.json files");
@@ -992,8 +1219,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         fs::create_dir_all(&src).unwrap();
-        fs::write(src.join("lib.rs"),
-            "pub fn f() { unsafe { let _p = 1u8 as *const u8; } }\npub fn g() {}\n").unwrap();
+        fs::write(
+            src.join("lib.rs"),
+            "pub fn f() { unsafe { let _p = 1u8 as *const u8; } }\npub fn g() {}\n",
+        )
+        .unwrap();
 
         // No logs on disk → no meta phases; a claude-family agent (no credits).
         let rj = tmp.path().join("result.json");
@@ -1002,11 +1232,20 @@ mod tests {
         Enrichment::compute(&src, &[("translate", &missing)]).merge_into(&mut json);
         fs::write(&rj, serde_json::to_string_pretty(&json).unwrap()).unwrap();
 
-        let diffs = check_enrichment(&rj, &src, &[("translate", &missing)], crate::cli::Agent::Claude);
-        assert!(diffs.is_empty(), "merge_into output should pass its own check: {diffs:?}");
+        let diffs = check_enrichment(
+            &rj,
+            &src,
+            &[("translate", &missing)],
+            crate::cli::Agent::Claude,
+        );
+        assert!(
+            diffs.is_empty(),
+            "merge_into output should pass its own check: {diffs:?}"
+        );
 
         // And it actually recorded the unsafe block + loc (not a vacuous pass).
-        let stored: serde_json::Value = serde_json::from_str(&fs::read_to_string(&rj).unwrap()).unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&rj).unwrap()).unwrap();
         assert_eq!(stored["unsafe"]["blocks"], 1);
         assert!(stored["loc"]["code"].as_u64().unwrap() >= 2);
     }
@@ -1017,7 +1256,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         fs::create_dir_all(&src).unwrap();
-        fs::write(src.join("lib.rs"), "pub fn f() { unsafe { let _x = 0; } }\n").unwrap();
+        fs::write(
+            src.join("lib.rs"),
+            "pub fn f() { unsafe { let _x = 0; } }\n",
+        )
+        .unwrap();
 
         let rj = tmp.path().join("result.json");
         let mut json = serde_json::json!({});
@@ -1027,6 +1270,9 @@ mod tests {
         fs::write(&rj, serde_json::to_string_pretty(&json).unwrap()).unwrap();
 
         let diffs = check_enrichment(&rj, &src, &[], crate::cli::Agent::Claude);
-        assert!(diffs.iter().any(|d| d.contains("unsafe.blocks")), "tamper should be caught: {diffs:?}");
+        assert!(
+            diffs.iter().any(|d| d.contains("unsafe.blocks")),
+            "tamper should be caught: {diffs:?}"
+        );
     }
 }
