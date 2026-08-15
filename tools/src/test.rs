@@ -159,7 +159,7 @@ fn run_battery(paths: &Paths, battery: &str, mode: TestMode, check_rows: &mut Ve
     generate_workspace(&output_dir)?;
 
     let has_verified = std::fs::read_dir(&output_dir)?.filter_map(|e| e.ok())
-        .any(|e| crate::battery::phase_dir(&e.path(), crate::battery::VERIFIED).join("Cargo.toml").exists());
+        .any(|e| crate::battery::has_crate(&crate::battery::phase_dir(&e.path(), crate::battery::VERIFIED)));
 
     // Order matters: the LAST phase scored becomes the headline summary, so
     // verified/ must follow translated/. Each pass stages `translated_rust` at
@@ -264,7 +264,7 @@ fn stage_phase_for_runtests(output_dir: &Path, phase: &str) -> Result<usize> {
         if !entry.file_type()?.is_dir() { continue; }
         let case_dir = entry.path();
         let phase_path = crate::battery::phase_dir(&case_dir, phase);
-        if !phase_path.join("Cargo.toml").exists() { continue; }
+        if !crate::battery::has_crate(&phase_path) { continue; }
         let link = case_dir.join(crate::battery::TRANSLATED_RUST);
         if link.is_symlink() || link.exists() {
             let _ = std::fs::remove_file(&link);
@@ -806,13 +806,23 @@ fn build_harvest_bench_lib(crate_dir: &Path, name: &str) -> (Option<PathBuf>, St
 /// Returns the whole [`HarvestBenchResult`] rather than a `(usize, usize, usize)` the
 /// caller re-labels: `passed()` is `tests_ok > 0 && tests_failed == 0`, so transposing the
 /// failed and skipped counts turns a project with failures and no skips into a PASS.
-/// `build_ok` is true by construction — this is only reached once the cdylib linked.
+/// The cdylib has already linked by the time this runs, so `build_ok` here reports
+/// whether the suite produced a readable report — false meaning nothing was measured.
 fn score_harvest_bench_suite(
     runner: &Path, suite_dir: &Path, lib: &Path, report_json: &Path,
 ) -> Result<HarvestBenchResult> {
     // Suite build dir is per-result so parallel/rerun don't collide.
     let build_dir = report_json.parent().unwrap_or(Path::new(".")).join("gtest_build");
-    let _ = Command::new(runner)
+
+    // The runner only writes the report once the suite ran, so a rerun that dies
+    // earlier leaves the PREVIOUS run's file in place and the code below would score
+    // it as this run's result.
+    if report_json.exists() {
+        std::fs::remove_file(report_json)
+            .with_context(|| format!("removing the stale report {}", report_json.display()))?;
+    }
+
+    let out = Command::new(runner)
         .arg("run")
         .args(["--suite".as_ref(), suite_dir.as_os_str()])
         .args(["--lib".as_ref(), lib.as_os_str()])
@@ -821,23 +831,51 @@ fn score_harvest_bench_suite(
         .output()
         .context("invoking harvest-bench runner")?;
 
+    // The runner exits 0 when every test passed and 1 when some failed; both are
+    // results and both write the report. Any other status (2 = its own error, or a
+    // signal) means it failed before scoring, and its stderr was previously discarded.
+    if !matches!(out.status.code(), Some(0 | 1)) {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let tail: Vec<&str> = err.lines().rev().take(20).collect();
+        eprintln!("⚠️  harvest-bench runner {} on suite {} — recording 0 tests\n{}",
+            out.status, suite_dir.display(),
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n"));
+        // The runner failed or its report is unusable: nothing measured, and build_ok stays
+        // false so this is a failure rather than a silent zero.
+        return Ok(HarvestBenchResult {
+            tests_ok: 0,
+            tests_failed: 0,
+            tests_skipped: 0,
+            build_ok: false,
+        });
+    }
+
     // A missing or malformed report (gtest suite failed to build, cdylib
     // incompatible, cmake choked) must record a zero-score case, not abort the
     // whole sweep with an error.
-    let no_tests =
-        || HarvestBenchResult { tests_ok: 0, tests_failed: 0, tests_skipped: 0, build_ok: true };
+    //
+    // `build_ok: false`, for the same reason the runner-error branch above uses it:
+    // in this function it means "nothing was measured", not "the cdylib failed to
+    // link". Exiting 0 or 1 is the runner promising it wrote a report; if the report
+    // is absent or unreadable that promise is broken, and recording `build_ok: true`
+    // with zero tests would present an infra failure as a legitimate zero — the
+    // silent-zero the stale-report deletion above exists to prevent.
+    let unmeasured =
+        || HarvestBenchResult { tests_ok: 0, tests_failed: 0, tests_skipped: 0, build_ok: false };
     let Ok(data) = std::fs::read_to_string(report_json) else {
         eprintln!("⚠️  harvest-bench runner produced no report {} — recording 0 tests", report_json.display());
-        return Ok(no_tests());
+        return Ok(unmeasured());
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
         eprintln!("⚠️  harvest-bench runner report at {} is not valid JSON — recording 0 tests", report_json.display());
-        return Ok(no_tests());
+        return Ok(unmeasured());
     };
     let verdicts = json.pointer("/run/verdicts").and_then(|v| v.as_array());
-    let Some(verdicts) = verdicts else { return Ok(no_tests()) };
+    let Some(verdicts) = verdicts else { return Ok(unmeasured()) };
 
-    let mut res = no_tests();
+    // Past here a report was read and parsed, so the suite did run: `build_ok` is
+    // true even if the verdict list turns out to be empty.
+    let mut res = HarvestBenchResult { tests_ok: 0, tests_failed: 0, tests_skipped: 0, build_ok: true };
     for v in verdicts {
         let passed = v.get("passed").and_then(|b| b.as_bool()).unwrap_or(false);
         let skip = v.get("skipped").and_then(|b| b.as_bool()).unwrap_or(false);
@@ -876,6 +914,7 @@ pub fn run_harvest_bench_test(
     let mut results: std::collections::BTreeMap<String, HarvestBenchResult> = Default::default();
     let mut passed = 0usize;
     let mut build_failed = 0usize;
+    let mut recorded = 0usize;
 
     for project in projects {
         let name = project.name();
@@ -884,7 +923,18 @@ pub fn run_harvest_bench_test(
         // translated/ — which also covers verify breaking the crate, since the
         // compile gate then discards verified/ entirely.
         let crate_dir = crate::battery::crate_dir(&case_dir);
-        if !crate_dir.join("Cargo.toml").exists() { continue; }
+
+        // A project the harness got no crate out of is a FAILED project, not an absent
+        // one: `continue`ing shrank the denominator, publishing `N/6` for 7 projects.
+        // There is no phase dir to hold a result.json, so the failure lives in the count
+        // and `--check` reports the missing stored result rather than passing vacuously.
+        if !crate::battery::has_crate(&crate_dir) {
+            build_failed += 1;
+            println!("  ❌ {name}: no crate in translated/ or verified/ — counted as a build failure");
+            results.insert(name.to_string(),
+                HarvestBenchResult { tests_ok: 0, tests_failed: 0, tests_skipped: 0, build_ok: false });
+            continue;
+        }
 
         let logs_dir = crate_dir.join("logs");
         std::fs::create_dir_all(&logs_dir)?;
@@ -921,17 +971,23 @@ pub fn run_harvest_bench_test(
             let tlog = logs_dir.join("translation.log");
             Enrichment::compute(&crate_dir.join("src"), &[("translate", &tlog)]).merge_into(&mut json);
             std::fs::write(crate_dir.join("result.json"), serde_json::to_string_pretty(&json)? + "\n")?;
+            recorded += 1;
         }
 
         results.insert(name.to_string(), r);
     }
 
     let total = results.len();
+    anyhow::ensure!(total == projects.len(),
+        "harvest-bench denominator is {total} but {} projects were requested; a project \
+         was dropped rather than scored, which is how `N/6 projects pass` was once \
+         published for a 7-project dataset",
+        projects.len());
     println!("\nharvest-bench: {passed}/{total} projects pass ({build_failed} build failures)");
 
     match mode {
         TestMode::Update => {
-            println!("📝 result.json written for {total} projects");
+            println!("📝 result.json written for {recorded} of {total} projects");
             Ok(TestOutcome::Ok)
         }
         TestMode::Check => {
@@ -994,6 +1050,54 @@ mod tests {
     use super::*;
     use std::fs;
 
+    const STALE: &str = r#"{"run":{"verdicts":[{"passed":true},{"passed":true},{"passed":true}]}}"#;
+
+    /// Three passes reported for a rerun that produced none.
+    #[test]
+    fn a_failed_rerun_never_scores_the_previous_runs_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report = tmp.path().join("harvest_bench_report.json");
+        fs::write(&report, STALE).unwrap();
+
+        let scored = score_harvest_bench_suite(
+            Path::new("/bin/false"), tmp.path(), Path::new("libx.so"), &report,
+        ).unwrap();
+
+        assert_eq!(
+            (scored.tests_ok, scored.tests_failed, scored.tests_skipped, scored.build_ok),
+            (0, 0, 0, false),
+            "the stale report must not be scored"
+        );
+        assert!(!report.exists(), "and must not be left to mislead the next run either");
+    }
+
+    /// Exit 2 is the runner failing, not a test failing: whatever report is on disk
+    /// afterwards did not come from a completed scoring run.
+    #[test]
+    fn a_runner_that_errors_is_not_scored_from_the_file_it_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report = tmp.path().join("harvest_bench_report.json");
+        let fake = tmp.path().join("fake-runner");
+        fs::write(&fake, format!(
+            "#!/bin/sh\n\
+             while [ $# -gt 0 ]; do\n\
+             \x20 case \"$1\" in --json) shift; printf '%s' '{STALE}' > \"$1\";; esac\n\
+             \x20 shift\n\
+             done\n\
+             exit 2\n")).unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+        let scored = score_harvest_bench_suite(&fake, tmp.path(), Path::new("libx.so"), &report)
+            .unwrap();
+
+        assert!(report.is_file(), "fixture assumption: the fake runner did write a report");
+        assert_eq!(
+            (scored.tests_ok, scored.tests_failed, scored.tests_skipped, scored.build_ok),
+            (0, 0, 0, false),
+            "a runner error must not be scored as 3 passes"
+        );
+    }
+
     /// Guards the `merge_into` / `check_enrichment` inverse invariant.
     #[test]
     fn merge_into_then_check_has_no_diffs() {
@@ -1017,6 +1121,33 @@ mod tests {
         let stored: serde_json::Value = serde_json::from_str(&fs::read_to_string(&rj).unwrap()).unwrap();
         assert_eq!(stored["unsafe"]["blocks"], 1);
         assert!(stored["loc"]["code"].as_u64().unwrap() >= 2);
+    }
+
+    /// Moving the scorer's build out of `results/` is measurement-neutral only if every
+    /// file the scorer writes back into a scored crate is outside the digest and outside
+    /// every [`crate::artifact::Carry`]. Enumerated beside the writers: `write_results`
+    /// and `run_harvest_bench_test` (result.json, logs/test.log),
+    /// `score_harvest_bench_suite` (harvest_bench_report.json, gtest_build/) and
+    /// `build_harvest_bench_lib` (target/).
+    #[test]
+    fn every_file_the_scorer_writes_back_is_excluded_from_the_artifact() {
+        use crate::artifact::{classify, Disposition, RelPath};
+        let of = |p: &str| classify(&RelPath::new(p).unwrap(), false);
+
+        for written in ["result.json", "harvest_bench_report.json", "logs/test.log"] {
+            assert_eq!(
+                of(written),
+                Disposition::Ignore,
+                "{written} is written into the crate being scored, so scoring would \
+                 change that crate's identity"
+            );
+        }
+        assert_eq!(of("gtest_build/CMakeCache.txt"), Disposition::BuildOutput);
+        assert_eq!(of("target/release/libfoo.so"), Disposition::BuildOutput);
+
+        // The one write a scored build makes that IS hashed — hence why the build has to
+        // move out of the tree, and not merely its reports.
+        assert_eq!(of("Cargo.lock"), Disposition::StoreAndHash);
     }
 
     /// Proves the check above is not vacuously empty.

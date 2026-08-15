@@ -45,16 +45,6 @@ pub fn for_dataset(d: Dataset) -> Box<dyn Benchmark> {
     }
 }
 
-/// ClaudeCombined merges translate+verify into one session, the other Claude* variants
-/// are prompt ablations that skip verify by design, and Codex runs its own
-/// translate-then-verify pipeline in-harness — none get the separate ACTOR verify phase.
-fn agent_runs_separate_verify(agent: Agent) -> bool {
-    !matches!(agent,
-        Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter
-        | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
-        | Agent::CodexGpt55 | Agent::CodexGpt54)
-}
-
 fn resolve_batteries(corpus_dir: &Path, target: &str) -> Result<Vec<String>> {
     if target == "all" {
         battery::all_batteries(corpus_dir)
@@ -86,7 +76,7 @@ struct TestCorpus;
 impl Benchmark for TestCorpus {
     fn name(&self) -> &'static str { "test-corpus" }
 
-    fn verifies(&self, agent: Agent) -> bool { agent_runs_separate_verify(agent) }
+    fn verifies(&self, agent: Agent) -> bool { verify::has_verify_phase(agent) }
 
     fn translate(&self, paths: &Paths, target: &str, _filter: Option<&str>,
                  parallel: usize) -> Result<()> {
@@ -181,7 +171,7 @@ struct HarvestBench;
 impl Benchmark for HarvestBench {
     fn name(&self) -> &'static str { "harvest-bench" }
 
-    fn verifies(&self, agent: Agent) -> bool { agent_runs_separate_verify(agent) }
+    fn verifies(&self, agent: Agent) -> bool { verify::has_verify_phase(agent) }
 
     fn translate(&self, paths: &Paths, target: &str, _filter: Option<&str>,
                  parallel: usize) -> Result<()> {

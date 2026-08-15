@@ -45,40 +45,59 @@ pub fn claude_model() -> Result<crate::cache::ModelId> {
     crate::cache::ModelId::new(raw)
 }
 
-/// Fail loudly if the CLI did not honour the pin.
+/// Fail loudly if the CLI did not honour the model pin, or is not the build the key
+/// was computed for.
 ///
 /// `--model` is a request, not a guarantee: an unrecognised id can be silently
 /// substituted, and the sweep would then be cached under a key naming a model that
-/// never ran. The transcript's `init` record is the CLI's own report of what it
-/// resolved.
-pub fn assert_model_honoured(log_path: &Path, want: &crate::cache::ModelId) -> Result<()> {
+/// never ran. The CLI build has the same problem from the other end — it auto-updates
+/// through a shim, so the binary can change between the probe and the run. The
+/// transcript's `init` record is the CLI's own report of both.
+pub fn assert_pins_honoured(
+    log_path: &Path,
+    want: &crate::cache::ModelId,
+    cli: &crate::cache::CliVersion,
+) -> Result<()> {
     let text = match std::fs::read_to_string(log_path) {
         Ok(t) => t,
         // The health classifier already treats a missing log as a non-completion.
         Err(_) => return Ok(()),
     };
-    let Some(got) = text
+    let Some(init) = text
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|r| r["type"] == "system" && r["subtype"] == "init")
-        .and_then(|r| r["model"].as_str().map(str::to_string))
     else {
         // Older transcripts predate the init record; nothing to compare against.
         return Ok(());
     };
-    anyhow::ensure!(
-        got == want.as_str(),
-        "the CLI resolved a different model than the pin: asked for {}, got {got}. \
-         Refusing to attribute this run to {}.",
-        want.as_str(),
-        want.as_str()
-    );
+    // A typed refusal, not an ensure!: the sweep collects these and fails the command,
+    // where an anyhow error would have been folded into an ordinary red X.
+    if let Some(got) = init["model"].as_str() {
+        if got != want.as_str() {
+            return Err(crate::refusal::Refusal::ModelSubstituted {
+                asked: want.as_str().to_string(),
+                got: got.to_string(),
+            }
+            .into());
+        }
+    }
+    if let Some(got) = init["claude_code_version"].as_str() {
+        anyhow::ensure!(
+            cli.covers(got),
+            "the CLI upgraded under the run: the key names {}, the session reports {got}. \
+             Refusing to store this artifact under a key naming another build.",
+            cli.as_str()
+        );
+    }
     Ok(())
 }
 
-/// Wall-clock cap on one agentic session; must stay in step with the hard-coded
-/// `timeout 10800` in the claude and codex invocations below.
+/// Wall-clock cap on one agentic session. Reaches the command through
+/// [`crate::session::Session`], which is also what the cache key records.
 const TRANSLATE_TIMEOUT_SECS: u64 = 10800;
+
+const KIRO_TRANSLATE_TIMEOUT_SECS: u64 = 5400;
 
 fn opencode_model(paths: &Paths) -> Result<crate::opencode::Model> {
     let raw = paths.model.as_deref().context(
@@ -140,7 +159,12 @@ impl CaseResult {
     /// `case_dir` is taken so the panic is recorded on disk too. Every other failure
     /// path writes `translation.json` via `run_and_record`; without this, a panicked case
     /// is the only one that leaves no trace and so reads as never attempted.
-    fn panicked(name: String, case_dir: &Path, agent: Agent, payload: Box<dyn std::any::Any + Send>) -> Self {
+    fn panicked(
+        name: String,
+        case_dir: &Path,
+        agent: &crate::cache::AgentKey,
+        payload: Box<dyn std::any::Any + Send>,
+    ) -> Self {
         let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
             (*s).to_owned()
         } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -148,7 +172,13 @@ impl CaseResult {
         } else {
             "panic with a non-string payload".to_owned()
         };
-        write_translation_metrics(case_dir, agent, 0, false);
+        // Runs on the JOINING thread, whose `LAST_AGENT_EXIT` belongs to whichever case
+        // that thread last ran, and a panic after `run_and_record` returned must not
+        // overwrite the real record with a zero-duration failure.
+        clear_agent_exit();
+        if !translation_metrics_path(case_dir).is_file() {
+            write_translation_metrics(case_dir, agent, 0, false);
+        }
         CaseResult {
             name,
             elapsed_secs: 0,
@@ -161,22 +191,13 @@ impl CaseResult {
 
 // ── Public entry point ─────────────────────────────────────────────────
 
-/// Uses clap's derived `ValueEnum` mapping so hints printed in diagnostics always
-/// match what `--agent` actually accepts.
-fn agent_cli_name(agent: Agent) -> String {
-    use clap::ValueEnum;
-    agent.to_possible_value()
-        .map(|v| v.get_name().to_string())
-        .unwrap_or_else(|| format!("{agent:?}").to_lowercase())
-}
-
 /// Zero discovered cases almost always means a case dir was passed where a battery
 /// was expected, so the message spells the layout out rather than reporting
 /// "0/0 translated".
 fn ensure_cases_found(count: usize, paths: &Paths, battery_name: &str) -> Result<()> {
     if count > 0 { return Ok(()); }
     let input_dir = paths.input_dir(battery_name);
-    let agent = agent_cli_name(paths.agent);
+    let agent = crate::cli::cli_name(paths.agent)?;
     anyhow::bail!(
         "No translatable cases found under battery '{battery_name}' ({}).\n\
          A translate target is a BATTERY; each case must be one level deeper as \
@@ -222,7 +243,7 @@ pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, 
         handles.into_iter()
             .map(|(name, h)| {
                 let case_dir = output_dir.join(&name);
-                h.join().unwrap_or_else(|e| CaseResult::panicked(name, &case_dir, paths.agent, e))
+                h.join().unwrap_or_else(|e| CaseResult::panicked(name, &case_dir, &paths.agent_key, e))
             })
             .collect()
     });
@@ -267,7 +288,7 @@ pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, 
 
         for cfg in &group.configs {
             current += 1;
-            if crate::battery::phase_dir(&output_dir.join(&cfg.name), crate::battery::TRANSLATED).join("Cargo.toml").exists() {
+            if crate::battery::has_crate(&crate::battery::phase_dir(&output_dir.join(&cfg.name), crate::battery::TRANSLATED)) {
                 translated += 1;
                 println!("[{current}/{total}] ⏭️  {} (already done)", cfg.name);
                 continue;
@@ -298,11 +319,11 @@ fn translate_one_independent(
     battery_name: &str,
     case: &battery::IndependentCase,
 ) -> CaseResult {
-    if crate::battery::phase_dir(&output_dir.join(&case.name), crate::battery::TRANSLATED).join("Cargo.toml").exists() {
+    if crate::battery::has_crate(&crate::battery::phase_dir(&output_dir.join(&case.name), crate::battery::TRANSLATED)) {
         return CaseResult { name: case.name.clone(), elapsed_secs: 0, success: true, error: None, skipped: true };
     }
 
-    run_and_record(&case.name, &output_dir.join(&case.name), paths.agent,
+    run_and_record(&case.name, &output_dir.join(&case.name), &paths.agent_key,
         || dispatch_translate(paths, battery_name, &case.name, case.is_lib),
         || {
             if paths.agent == Agent::ClaudeCrossPrompt {
@@ -331,12 +352,12 @@ fn translate_one_shared(
     group: &battery::SharedSourceGroup,
 ) -> CaseResult {
     let real_dir = output_dir.join(&group.real_case);
-    if crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
+    if crate::battery::has_crate(&crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED)) {
         return CaseResult { name: group.real_case.clone(), elapsed_secs: 0, success: true, error: None, skipped: true };
     }
 
     println!("Translating: {} (shared-source, {} configs)", group.real_case, group.configs.len());
-    run_and_record(&group.real_case, &real_dir, paths.agent,
+    run_and_record(&group.real_case, &real_dir, &paths.agent_key,
         || dispatch_translate_shared(paths, battery_name, &group.real_case),
         || {
             if let Ok(mut cargo) = CargoToml::open(&crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED).join("Cargo.toml")) {
@@ -362,7 +383,7 @@ fn translate_one_shared(
 fn run_and_record(
     name: &str,
     case_dir: &Path,
-    agent: Agent,
+    agent: &crate::cache::AgentKey,
     translate_fn: impl FnOnce() -> Result<()>,
     post_process_fn: impl FnOnce() -> Result<()>,
 ) -> CaseResult {
@@ -385,6 +406,128 @@ fn run_and_record(
     }
 }
 
+/// Which prompt a phase needs. `Library`/`Executable` is the project-type dispatch;
+/// `Shared` is a shared-source group's real case.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PromptKind {
+    Library,
+    Executable,
+    Shared,
+    Verify,
+}
+
+impl PromptKind {
+    pub fn independent(is_lib: bool) -> Self {
+        if is_lib { PromptKind::Library } else { PromptKind::Executable }
+    }
+
+    #[cfg(test)]
+    const ALL: &'static [PromptKind] =
+        &[PromptKind::Library, PromptKind::Executable, PromptKind::Shared, PromptKind::Verify];
+}
+
+/// The one place a prompt file is chosen, relative to [`Paths::prompts_dir`].
+///
+/// `None` means this agent reads no prompt of that kind at all: c2rust and the
+/// docker-driven translators are given none, and the ablations plus the one-shot LLM
+/// arms have no verify phase (`verify::has_verify_phase` must agree — a test asserts
+/// it). Returning the *name* rather than the text is what lets a test check the choice
+/// against the files on disk, so a renamed prompt fails in CI instead of reaching a
+/// paid agent run as an empty one.
+pub fn prompt_file_for(agent: Agent, kind: PromptKind) -> Option<&'static str> {
+    use PromptKind::{Executable, Library, Shared, Verify};
+    match agent {
+        // One arm on purpose: the backend varies, the methodology does not.
+        Agent::Kiro | Agent::Claude | Agent::OpenCode => Some(match kind {
+            Library => "translate-library.md",
+            Executable => "translate-executable.md",
+            Shared => "translate-shared.md",
+            Verify => "verify.md",
+        }),
+        Agent::ClaudeCombined => match kind {
+            Library => Some("ablations/translate-and-verify-library.md"),
+            Executable => Some("ablations/translate-and-verify-executable.md"),
+            Shared => Some("ablations/translate-and-verify-shared.md"),
+            Verify => None,
+        },
+        Agent::ClaudeMinimal => match kind {
+            // One prompt for every project type — that is the ablation.
+            Library | Executable | Shared => Some("ablations/translate-minimal.md"),
+            Verify => None,
+        },
+        Agent::ClaudeNoIter => match kind {
+            Library => Some("ablations/translate-no-iter-library.md"),
+            Executable => Some("ablations/translate-no-iter-executable.md"),
+            Shared => Some("ablations/translate-no-iter-shared.md"),
+            Verify => None,
+        },
+        // E2 and E6 differ from `claude` on shared-source cases only, so their
+        // independent cases deliberately read the unmodified prompts.
+        Agent::ClaudeNoFeatures => match kind {
+            Library => Some("translate-library.md"),
+            Executable => Some("translate-executable.md"),
+            Shared => Some("ablations/translate-no-features-shared.md"),
+            Verify => None,
+        },
+        Agent::ClaudeNoSubtask => match kind {
+            Library => Some("translate-library.md"),
+            Executable => Some("translate-executable.md"),
+            Shared => Some("ablations/translate-no-subtask-shared.md"),
+            Verify => None,
+        },
+        Agent::ClaudeCrossPrompt => match kind {
+            // E4: the mismatch IS the experiment — a library gets the executable
+            // prompt and vice versa. Shared-source cases have no counterpart to swap
+            // with, so they read the standard shared prompt.
+            Library => Some("translate-executable.md"),
+            Executable => Some("translate-library.md"),
+            Shared => Some("translate-shared.md"),
+            Verify => None,
+        },
+        Agent::CodexGpt55 | Agent::CodexGpt54 => match kind {
+            Library => Some("translate-library.md"),
+            Executable => Some("translate-executable.md"),
+            Shared => Some("translate-shared.md"),
+            Verify => None,
+        },
+        Agent::Kimi | Agent::Oneshot => match kind {
+            // A single LLM call with the project-type prompt as its system message.
+            // `oneshot_llm_translate` detects the type from CMakeLists even for a
+            // shared-source group, so neither Shared nor Verify is ever asked for.
+            Library => Some("translate-library.md"),
+            Executable => Some("translate-executable.md"),
+            Shared | Verify => None,
+        },
+        // Non-LLM translators: c2rust transpiles, and laertes/c2saferrust/smartc2rust
+        // are driven by their own docker pipelines.
+        Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust => None,
+    }
+}
+
+/// The text of the prompt for `kind`, or `None` when this agent reads none.
+///
+/// A prompt that IS named but missing on disk is an error, never an empty string: an
+/// empty prompt invokes the agent with nothing to do and the result is then recorded
+/// as a measurement.
+pub fn read_prompt(paths: &Paths, kind: PromptKind) -> Result<Option<String>> {
+    let Some(file) = prompt_file_for(paths.agent, kind) else { return Ok(None) };
+    let path = paths.prompts_dir.join(file);
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading the {kind:?} prompt {}", path.display()))?;
+    anyhow::ensure!(!text.trim().is_empty(), "the prompt {} is empty", path.display());
+    Ok(Some(text))
+}
+
+/// [`read_prompt`] where the phase cannot run without one.
+pub fn require_prompt(paths: &Paths, kind: PromptKind) -> Result<String> {
+    read_prompt(paths, kind)?.with_context(|| {
+        format!(
+            "--agent {} has no {kind:?} prompt, so this phase does not exist for it",
+            paths.agent_key.as_str()
+        )
+    })
+}
+
 fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) -> Result<()> {
     match paths.agent {
         Agent::Laertes => laertes_translate_case(paths, battery, name),
@@ -392,51 +535,15 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
         Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
         Agent::Kimi => kimi_translate_case(paths, battery, name, is_lib),
         Agent::Oneshot => oneshot_translate_case(paths, battery, name, is_lib),
-        // One arm on purpose: the backend varies, the methodology does not.
-        Agent::Kiro | Agent::Claude | Agent::OpenCode => {
-            let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeCombined => {
-            let f = if is_lib { "ablations/translate-and-verify-library.md" } else { "ablations/translate-and-verify-executable.md" };
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeMinimal => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-minimal.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeNoIter => {
-            let f = if is_lib { "ablations/translate-no-iter-library.md" } else { "ablations/translate-no-iter-executable.md" };
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeNoFeatures => {
-            // E2: the cmake-features ablation only affects shared-source cases.
-            let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeNoSubtask => {
-            // E6: the subtask-decomposition ablation only affects shared-source cases.
-            let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeCrossPrompt => {
-            // E4: the mismatch is the experiment — libraries get the executable
-            // prompt and vice versa.
-            let f = if is_lib { "translate-executable.md" } else { "translate-library.md" };
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::CodexGpt55 | Agent::CodexGpt54 => {
-            let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
         Agent::C2rust => translate_case(paths, battery, name, ""),
+        // Every remaining agent differs only in which prompt file it reads.
+        Agent::Kiro | Agent::Claude | Agent::OpenCode | Agent::ClaudeCombined
+        | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures
+        | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
+        | Agent::CodexGpt55 | Agent::CodexGpt54 => {
+            let prompt = require_prompt(paths, PromptKind::independent(is_lib))?;
+            translate_case(paths, battery, name, &prompt)
+        }
     }
 }
 
@@ -447,41 +554,14 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
         Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
         Agent::Kimi => kimi_translate_case(paths, battery, name, true),
         Agent::Oneshot => oneshot_translate_case(paths, battery, name, true),
-        Agent::Kiro | Agent::Claude | Agent::OpenCode => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeCombined => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-and-verify-shared.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeMinimal => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-minimal.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeNoIter => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-no-iter-shared.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeNoFeatures => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-no-features-shared.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeNoSubtask => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-no-subtask-shared.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeCrossPrompt => {
-            // E4: the cross-prompt swap only applies to independent libs/execs, so
-            // shared-source cases fall back to the standard claude shared prompt.
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::CodexGpt55 | Agent::CodexGpt54 => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
         Agent::C2rust => translate_case(paths, battery, name, ""),
+        Agent::Kiro | Agent::Claude | Agent::OpenCode | Agent::ClaudeCombined
+        | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures
+        | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
+        | Agent::CodexGpt55 | Agent::CodexGpt54 => {
+            let prompt = require_prompt(paths, PromptKind::Shared)?;
+            translate_case(paths, battery, name, &prompt)
+        }
     }
 }
 
@@ -493,10 +573,10 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
 pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject], parallel: usize) -> Result<()> {
     preflight_check(paths.agent)?;
 
-    // A harvest-bench test_case/ is always a C library the suite links by ABI, so
-    // the library prompt applies to every project — no project-type dispatch.
-    let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-library.md"))
-        .context("reading translate-library.md for harvest-bench")?;
+    // A harvest-bench test_case/ is always a C library the suite links by ABI, so the
+    // library prompt applies to every project — no project-type dispatch. Empty only
+    // for the agents that are handed no prompt at all (see `prompt_file_for`).
+    let prompt = read_prompt(paths, PromptKind::Library)?.unwrap_or_default();
 
     anyhow::ensure!(!projects.is_empty(),
         "No harvest-bench projects to translate. Targets are `HB` (all) or \
@@ -518,7 +598,7 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
         handles.into_iter()
             .map(|(name, h)| {
                 let case_dir = paths.output_dir(&name);
-                h.join().unwrap_or_else(|e| CaseResult::panicked(name, &case_dir, paths.agent, e))
+                h.join().unwrap_or_else(|e| CaseResult::panicked(name, &case_dir, &paths.agent_key, e))
             })
             .collect()
     });
@@ -548,11 +628,11 @@ fn translate_one_harvest_bench(paths: &Paths, project: &battery::HarvestBenchPro
     let name = project.name();
     let case_dir = paths.output_dir(name);
 
-    if crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
+    if crate::battery::has_crate(&crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED)) {
         return CaseResult { name: name.into(), elapsed_secs: 0, success: true, error: None, skipped: true };
     }
 
-    run_and_record(name, &case_dir, paths.agent,
+    run_and_record(name, &case_dir, &paths.agent_key,
         || translate_case_at(paths, project.test_case(), &case_dir, prompt),
         || {
             // The lib name must be the project name: the suite links `lib<name>.so`
@@ -674,6 +754,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                 crate::sandbox::write_settings(crate::sandbox::Policy {
                     repo_root: &paths.repo_root,
                     work_root: tmp.path(),
+                    enforcement: paths.enforcement,
                 })?;
             }
 
@@ -706,56 +787,32 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
 
     match paths.agent {
         Agent::Kiro => {
-            let status = Command::new("bash")
-                .arg("-lc")
-                .arg(r#"set -o pipefail; timeout 5400 kiro-cli chat --no-interactive --trust-all-tools --agent kiro_plain "$1" < /dev/null 2>&1 | tee "$2""#)
-                .arg("--")
-                .arg(prompt)
-                .arg(&log_path)
-                .env("OPENSSL_DIR", &openssl_dir)
-                .current_dir(&work_dir)
+            let status = crate::session::Session::kiro(KIRO_TRANSLATE_TIMEOUT_SECS)
+                .kiro_command(&work_dir, prompt, &log_path)
                 .status()
                 .context("invoking kiro-cli")?;
             record_agent_exit(status);
         }
         Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt => {
-            let settings_path = work_root.join(".claude/settings.json");
-            // Agent scratch must land on disk inside the work root, not in the shared
-            // /tmp tmpfs. See crate::workdir.
-            let agent_tmp = crate::workdir::agent_tmp(&work_root)?;
-            let script = format!(
-                "ulimit -f {} -d {}; set -o pipefail; timeout 10800 claude -p \"$1\" \
-                 --strict-mcp-config --disable-slash-commands --settings \"$3\" \
-                 --agents \"$4\" --agent claude_plain --max-turns 1000 \
-                 --model \"$5\" \
-                 --permission-mode bypassPermissions --verbose \
-                 --output-format stream-json < /dev/null 2>&1 | tee \"$2\"",
-                crate::workdir::AGENT_FSIZE_BLOCKS,
-                crate::workdir::AGENT_DATA_KB
-            );
-            // Passed positionally, never interpolated: the id contains `[1m]`, which
-            // bash would expand as a bracket glob inside the script text.
+            // The same builder verify uses, so the two phases cannot drift into
+            // different flags for the same CLI.
             let model = claude_model()?;
-            let status = Command::new("bash")
-                .arg("-lc")
-                .arg(&script)
-                .arg("--")
-                .arg(prompt)
-                .arg(&log_path)
-                .arg(&settings_path)
-                .arg(CLAUDE_PLAIN_AGENT_JSON)
-                .arg(model.as_str())
-                .env("OPENSSL_DIR", &openssl_dir)
-                .env("TMPDIR", &agent_tmp)
-                .env("CLAUDE_CODE_TMPDIR", &agent_tmp)
-                // Prompts delegate to subagents via Task; without this the pin would
-                // cover only the top-level session.
-                .env("CLAUDE_CODE_SUBAGENT_MODEL", model.as_str())
-                .envs(AGENT_ENV.iter().copied())
-                .current_dir(&work_dir)
+            let cli = crate::cache::CliVersion::probe("claude")?;
+            let status = crate::session::Session::claude(TRANSLATE_TIMEOUT_SECS)
+                .claude_command(&crate::session::ClaudeRun {
+                    cwd: &work_dir,
+                    prompt,
+                    log: &log_path,
+                    settings: &work_root.join(".claude/settings.json"),
+                    agent_tmp: &crate::workdir::agent_tmp(&work_root)?,
+                    model: &model,
+                })
                 .status()
                 .context("invoking claude")?;
             record_agent_exit(status);
+            // Translate is not cached, but an unhonoured pin still misattributes the
+            // artifact — and `verified/` is built on top of it.
+            assert_pins_honoured(&log_path, &model, &cli)?;
         }
         Agent::CodexGpt55 | Agent::CodexGpt54 => {
             // Model and region are passed as `-c` overrides so the run does not
@@ -785,10 +842,11 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                     work_dir: &work_dir,
                     context_label: "translate",
                 },
-                crate::opencode::Phase::Translate,
+                &crate::session::Session::opencode(
+                    crate::opencode::Phase::Translate, TRANSLATE_TIMEOUT_SECS,
+                ),
                 &work_root,
                 &opencode_model(paths)?,
-                TRANSLATE_TIMEOUT_SECS,
             )?;
         }
         Agent::C2rust => {
@@ -801,7 +859,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
         Agent::Oneshot => unreachable!("oneshot uses oneshot_translate_case"),
     };
 
-    if !work_dir.join("Cargo.toml").exists() {
+    if !crate::battery::has_crate(&work_dir) {
         anyhow::bail!("no Cargo.toml produced");
     }
 
@@ -961,17 +1019,33 @@ fn merge_agent_exit(metrics: &mut serde_json::Value) {
     }
 }
 
-fn write_translation_metrics(case_dir: &Path, agent: Agent, duration_secs: u64, success: bool) {
+/// Inside the `translated/` PHASE dir, beside the log it describes. The case ROOT is
+/// where this used to land, while `agent_health::collect` and `battery.rs` both read the
+/// phase dir — so `exit_code`/`timed_out` were written and then read by nothing, and
+/// that is the 124-on-timeout signal for a project killed at the wall clock.
+fn translation_metrics_path(case_dir: &Path) -> PathBuf {
+    crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED).join("translation.json")
+}
+
+fn write_translation_metrics(
+    case_dir: &Path,
+    agent: &crate::cache::AgentKey,
+    duration_secs: u64,
+    success: bool,
+) {
     let mut metrics = serde_json::json!({
-        "agent": format!("{agent:?}").to_lowercase(),
+        "agent": agent.as_str(),
         "duration_secs": duration_secs,
         "success": success,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
     merge_agent_exit(&mut metrics);
-    let _ = std::fs::create_dir_all(case_dir);
+    let path = translation_metrics_path(case_dir);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let _ = std::fs::write(
-        case_dir.join("translation.json"),
+        path,
         serde_json::to_string_pretty(&metrics).unwrap_or_default() + "\n",
     );
 }
@@ -981,15 +1055,16 @@ fn write_translation_metrics(case_dir: &Path, agent: Agent, duration_secs: u64, 
 /// Must be built exactly once per invocation: `merge_agent_exit` consumes the
 /// recorded exit. The one value then feeds both `verification.json` and the cache
 /// entry, so the two cannot disagree about the same run.
-pub fn agent_provenance(agent: Agent, duration_secs: u64) -> serde_json::Value {
+pub fn agent_provenance(agent: &crate::cache::AgentKey, duration_secs: u64) -> serde_json::Value {
     let mut p = serde_json::json!({
-        "agent": format!("{agent:?}").to_lowercase(),
+        "agent": agent.as_str(),
         "duration_secs": duration_secs,
         "success": true,
         "timestamp": chrono::Utc::now().to_rfc3339(),
         // Which harness code produced this; results are otherwise unattributable
         // after the fact.
         "harness": crate::provenance::harness_id(),
+        "sandboxed": crate::sandbox::is_enforceable(),
     });
     merge_agent_exit(&mut p);
     p
@@ -1298,9 +1373,7 @@ fn oneshot_llm_translate(
 
     let files_json = collect_c_files_json(&input_test_case)?;
     let is_lib = detect_is_library(&input_test_case).unwrap_or(is_lib_hint);
-    let prompt_file = if is_lib { "translate-library.md" } else { "translate-executable.md" };
-    let system_prompt = std::fs::read_to_string(paths.prompts_dir.join(prompt_file))
-        .with_context(|| format!("reading {prompt_file}"))?;
+    let system_prompt = require_prompt(paths, PromptKind::independent(is_lib))?;
 
     // As on the CLI-agent path: prompt files change, so store the text that ran.
     let _ = std::fs::write(logs_dir.join("prompt.md"), &system_prompt);
@@ -1321,7 +1394,7 @@ fn oneshot_llm_translate(
 
     write_llm_files(&resp.content, &translated)?;
 
-    if !translated.join("Cargo.toml").exists() {
+    if !crate::battery::has_crate(&translated) {
         anyhow::bail!("no Cargo.toml in LLM response");
     }
     Ok(())
@@ -1586,31 +1659,46 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     let log_path = logs_dir.join("translation.log");
     let translated = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
 
-    copy_dir_filtered(&c2rust_original, &translated, &["target"])?;
+    // Staged in scratch like its c2saferrust neighbour: the container gets this mounted
+    // read-write, and the compile check writes `target/` plus a `Cargo.lock` that is part
+    // of the hashed artifact — so in `translated/` the arm mutated its own result.
+    let tmp = crate::workdir::tempdir("harvest-laertes-")
+        .context("creating laertes temp workspace")?;
+    let work = tmp.path().join("project");
+    copy_dir_filtered(&c2rust_original, &work, &["target"])?;
 
     let mut log = std::fs::File::create(&log_path)?;
     writeln!(log, "source: {}", c2rust_original.display())?;
 
     writeln!(log, "\n=== Laertes pre-process ===")?;
-    laertes_preprocess(&translated)?;
+    laertes_preprocess(&work)?;
     writeln!(log, "done")?;
 
     writeln!(log, "\n=== Laertes Docker ===")?;
-    let mount = format!("{}:/mnt/project", translated.display());
+    let mount = format!("{}:/mnt/project", work.display());
     let docker_out = Command::new("docker")
         .args(["run", "--rm", "-v", &mount, LAERTES_DOCKER_IMAGE, "bash", "-c", LAERTES_DOCKER_SCRIPT])
         .output()
         .context("running laertes docker container")?;
     log.write_all(&docker_out.stdout)?;
     log.write_all(&docker_out.stderr)?;
+    // Unchecked, a container that never ran (missing image, dead daemon) published the
+    // untouched c2rust input as this arm's translation, and the comparison silently
+    // measured c2rust twice.
+    anyhow::ensure!(
+        docker_out.status.success(),
+        "laertes container failed ({}), so this case has no laertes translation; see {}",
+        docker_out.status,
+        log_path.display()
+    );
 
     writeln!(log, "\n=== Laertes post-process ===")?;
-    laertes_postprocess(&translated)?;
+    laertes_postprocess(&work)?;
 
     let build = Command::new("cargo")
         .args(["+nightly", "build", "--release"])
         .env("RUSTFLAGS", "-Awarnings")
-        .current_dir(&translated)
+        .current_dir(&work)
         .output()
         .context("cargo build after laertes")?;
     log.write_all(&build.stdout)?;
@@ -1618,6 +1706,7 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     let ok = build.status.success();
     writeln!(log, "\nlaertes translation {}", if ok { "succeeded" } else { "FAILED to compile (non-fatal)" })?;
 
+    copy_dir_filtered(&work, &translated, &["target"])?;
     Ok(())
 }
 
@@ -1778,7 +1867,7 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
     // nightly-2022-08-08). Emitting the unmodified input then keeps the case counted
     // and failing at test time instead of silently vanishing from the totals.
     let wip = tmp.path().join("rust_WIP");
-    let source_dir = if wip.join("Cargo.toml").exists() {
+    let source_dir = if crate::battery::has_crate(&wip) {
         writeln!(log, "\nrust_WIP produced; collecting C2SaferRust output")?;
         wip.clone()
     } else {
@@ -2060,18 +2149,17 @@ fn scan_opencode_log_for_transient_error(log_path: &Path) -> Option<String> {
 /// Mirrors [`invoke_codex_with_retry`]: a Bedrock throttle can leave the CLI exiting
 /// 0 with nothing written, indistinguishable from a genuine translation failure.
 fn invoke_opencode_with_retry(
-    session: RetrySession<'_>,
-    phase: crate::opencode::Phase,
+    retry: RetrySession<'_>,
+    session: &crate::session::Session,
     tmp_root: &Path,
     model: &crate::opencode::Model,
-    timeout_secs: u64,
 ) -> Result<()> {
-    let RetrySession { prompt, log_path, work_dir, context_label } = session;
+    let RetrySession { prompt, log_path, work_dir, context_label } = retry;
     const MAX_RETRIES: u32 = 3;
     const RETRY_BACKOFF_SECS: u64 = 30;
 
     for attempt in 1..=MAX_RETRIES {
-        crate::opencode::invoke(phase, prompt, log_path, work_dir, tmp_root, model, timeout_secs)
+        crate::opencode::invoke(session, prompt, log_path, work_dir, tmp_root, model)
             .with_context(|| format!("invoking opencode ({context_label})"))?;
 
         match scan_opencode_log_for_transient_error(log_path) {
@@ -2100,6 +2188,11 @@ mod tests {
     use std::process::Command;
 
     /// ExitStatus cannot be constructed directly, so shell out for a real one.
+    /// main's tests predate `AgentKey`; this is the one spelling they share.
+    fn test_agent_key() -> crate::cache::AgentKey {
+        crate::cache::AgentKey::new(Agent::Claude, None).expect("claude has a fixed name")
+    }
+
     fn exit_status(code: i32) -> std::process::ExitStatus {
         Command::new("sh").arg("-c").arg(format!("exit {code}")).status().unwrap()
     }
@@ -2145,6 +2238,68 @@ mod tests {
         let mut m = serde_json::json!({"success": true});
         merge_agent_exit(&mut m);
         assert!(m.get("exit_code").is_none(), "exit_code must be absent when no CLI agent ran");
+        assert!(m.get("timed_out").is_none());
+    }
+
+    /// The writer must land where `agent_health::collect` and `battery.rs` look, or the
+    /// timeout signal (`timeout` exits 124) is written and read by nobody.
+    #[test]
+    fn translation_metrics_land_where_the_readers_look() {
+        let tmp = tempfile::tempdir().unwrap();
+        let case = tmp.path().join("mujs");
+        clear_agent_exit();
+        record_agent_exit(exit_status(124));
+        write_translation_metrics(&case, &test_agent_key(), 10_800, false);
+
+        let expected = case.join(crate::battery::TRANSLATED).join("translation.json");
+        assert!(expected.is_file(), "the reader path must be the writer path");
+        assert!(!case.join("translation.json").exists(), "and nothing may be left at the case root");
+        let m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&expected).unwrap()).unwrap();
+        assert_eq!(m["exit_code"], serde_json::json!(124));
+        assert_eq!(m["timed_out"], serde_json::json!(true));
+        assert_eq!(
+            crate::agent_health::exit_code(&expected),
+            Some(124),
+            "the reader must now actually reach it",
+        );
+    }
+
+    #[test]
+    fn a_panic_after_the_metrics_were_written_does_not_overwrite_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let case = tmp.path().join("libpng");
+        clear_agent_exit();
+        record_agent_exit(exit_status(124));
+        write_translation_metrics(&case, &test_agent_key(), 10_800, false);
+        let before = std::fs::read_to_string(translation_metrics_path(&case)).unwrap();
+
+        // The joining thread carries some OTHER case's exit; it must not be borrowed.
+        record_agent_exit(exit_status(0));
+        let r = CaseResult::panicked("libpng".into(), &case, &test_agent_key(), Box::new("boom"));
+
+        assert!(!r.success);
+        assert_eq!(
+            std::fs::read_to_string(translation_metrics_path(&case)).unwrap(),
+            before,
+            "the real 3h/124 record must survive the panic report",
+        );
+    }
+
+    #[test]
+    fn a_panic_with_no_record_yet_writes_one_without_borrowing_an_exit_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let case = tmp.path().join("jansson");
+        clear_agent_exit();
+        // Belongs to whatever case this thread ran before, NOT to jansson.
+        record_agent_exit(exit_status(0));
+
+        CaseResult::panicked("jansson".into(), &case, &test_agent_key(), Box::new("boom"));
+
+        let m: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(translation_metrics_path(&case)).unwrap()).unwrap();
+        assert_eq!(m["success"], serde_json::json!(false), "the panic must leave a trace");
+        assert!(m.get("exit_code").is_none(), "another case's exit must not be attributed here");
         assert!(m.get("timed_out").is_none());
     }
 
@@ -2200,6 +2355,87 @@ mod tests {
         // must agree on what is retryable.
         for (needle, label) in TRANSIENT_BEDROCK_PATTERNS {
             assert_eq!(first_transient_pattern(needle).as_deref(), Some(*label));
+        }
+    }
+
+    fn paths_for(agent: Agent, dataset: crate::cli::Dataset) -> Paths {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("tools/ has a parent");
+        let model = match agent {
+            Agent::Oneshot => Some("openai/gpt-5.4"),
+            Agent::OpenCode => Some("amazon-bedrock/us.anthropic.claude-sonnet-5"),
+            _ => None,
+        };
+        Paths::new(root, agent, dataset, model, crate::cache::Mode::Bypass,
+            crate::sandbox::Enforcement::AllowUnsandboxed).expect("Paths")
+    }
+
+    #[test]
+    fn every_prompt_the_matrix_names_is_on_disk() {
+        // The whole point of naming the file separately from reading it: a rename used
+        // to surface as an empty prompt handed to a live agent, mid-sweep.
+        use clap::ValueEnum;
+        for dataset in [crate::cli::Dataset::TestCorpus, crate::cli::Dataset::HarvestBench] {
+            for agent in Agent::value_variants() {
+                let paths = paths_for(*agent, dataset);
+                for kind in PromptKind::ALL {
+                    if prompt_file_for(*agent, *kind).is_none() {
+                        continue;
+                    }
+                    let text = read_prompt(&paths, *kind)
+                        .unwrap_or_else(|e| panic!("{agent:?} {kind:?} {dataset:?}: {e:#}"));
+                    assert!(text.is_some_and(|t| t.len() > 100), "{agent:?} {kind:?}: too short to be a prompt");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_verify_prompt_exists_exactly_where_a_verify_phase_does() {
+        use clap::ValueEnum;
+        for agent in Agent::value_variants() {
+            assert_eq!(
+                prompt_file_for(*agent, PromptKind::Verify).is_some(),
+                crate::verify::has_verify_phase(*agent),
+                "{agent:?}: the verify prompt and the verify backend disagree, so either a \
+                 phase would run with no prompt or a prompt is named for a phase that never runs"
+            );
+        }
+    }
+
+    #[test]
+    fn each_ablation_differs_from_claude_exactly_where_its_experiment_says() {
+        use PromptKind::{Executable, Library, Shared};
+        let claude = |k| prompt_file_for(Agent::Claude, k);
+
+        // E4: libraries get the executable prompt and vice versa — the swap IS the arm.
+        assert_eq!(prompt_file_for(Agent::ClaudeCrossPrompt, Library), claude(Executable));
+        assert_eq!(prompt_file_for(Agent::ClaudeCrossPrompt, Executable), claude(Library));
+        assert_eq!(prompt_file_for(Agent::ClaudeCrossPrompt, Shared), claude(Shared));
+
+        // E2 and E6 vary the shared-source prompt only; their independent cases must be
+        // byte-identical to claude's or the arm measures more than one change.
+        for (agent, shared) in [
+            (Agent::ClaudeNoFeatures, "ablations/translate-no-features-shared.md"),
+            (Agent::ClaudeNoSubtask, "ablations/translate-no-subtask-shared.md"),
+        ] {
+            assert_eq!(prompt_file_for(agent, Library), claude(Library), "{agent:?}");
+            assert_eq!(prompt_file_for(agent, Executable), claude(Executable), "{agent:?}");
+            assert_eq!(prompt_file_for(agent, Shared), Some(shared));
+        }
+
+        // The calibration baseline is one universal prompt for every project type.
+        for k in [Library, Executable, Shared] {
+            assert_eq!(
+                prompt_file_for(Agent::ClaudeMinimal, k),
+                Some("ablations/translate-minimal.md")
+            );
+        }
+
+        // Kiro, OpenCode and Codex are portability arms: same prompts, different harness.
+        for agent in [Agent::Kiro, Agent::OpenCode, Agent::CodexGpt55, Agent::CodexGpt54] {
+            for k in [Library, Executable, Shared] {
+                assert_eq!(prompt_file_for(agent, k), claude(k), "{agent:?} {k:?}");
+            }
         }
     }
 }

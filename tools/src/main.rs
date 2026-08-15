@@ -50,7 +50,8 @@ fn main() -> Result<()> {
             parallel,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into())?;
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into(),
+                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(cli.allow_unsandboxed))?;
             let inner = Dataset::strip_prefix(target);
             let bench = benchmark::for_dataset(dataset);
 
@@ -67,7 +68,8 @@ fn main() -> Result<()> {
             parallel,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into())?;
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into(),
+                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(cli.allow_unsandboxed))?;
             let inner = Dataset::strip_prefix(target);
             benchmark::for_dataset(dataset)
                 .translate(&paths, inner, include_regex.as_deref(), parallel)?;
@@ -79,10 +81,19 @@ fn main() -> Result<()> {
             parallel,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into())?;
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into(),
+                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(cli.allow_unsandboxed))?;
             let inner = Dataset::strip_prefix(target);
-            benchmark::for_dataset(dataset)
-                .verify(&repo_root, &paths, inner, include_regex.as_deref(), force, parallel)?;
+            let bench = benchmark::for_dataset(dataset);
+            // At startup, not per case: this agent has no C-as-oracle verify phase, and
+            // the sweep would otherwise print a ✅ per case for a phase that never ran.
+            anyhow::ensure!(
+                bench.verifies(agent),
+                "--agent {} has no separate C-as-oracle verify phase, so there is nothing \
+                 to verify. Its `translated/` result is what gets scored (`test`).",
+                format!("{agent:?}").to_lowercase(),
+            );
+            bench.verify(&repo_root, &paths, inner, include_regex.as_deref(), force, parallel)?;
         }
         Command::Cache { action } => match action {
             cli::CacheAction::Stats => {
@@ -103,7 +114,8 @@ fn main() -> Result<()> {
             allow_infra_failures,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into())?;
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into(),
+                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(cli.allow_unsandboxed))?;
             let inner = Dataset::strip_prefix(target);
             let mode = if update {
                 test::TestMode::Update
@@ -117,7 +129,8 @@ fn main() -> Result<()> {
         }
         Command::Enrich { ref target } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into())?;
+            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into(),
+                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(cli.allow_unsandboxed))?;
             let inner = Dataset::strip_prefix(target);
             benchmark::for_dataset(dataset).enrich(&paths, inner)?;
         }

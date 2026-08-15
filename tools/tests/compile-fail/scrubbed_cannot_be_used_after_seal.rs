@@ -1,12 +1,8 @@
-// seal() consumes the Scrubbed, so the tree that was hashed cannot be handed on a second
-// time — a second seal would re-digest a tree the first seal's caller may already have
-// published, and the two digests would silently describe different states.
-//
-// `scrub` is pinned separately; without this case the seal edge of the same typestate
-// chain is asserted by nothing.
+// seal() consumes the Scrubbed, so a second seal cannot re-digest a tree the first
+// seal's caller may already have published. `scrub`'s edge is pinned separately; without
+// this case the seal edge of the same chain is asserted by nothing.
 fn proof() -> &'static harvest_tools::agent_health::Completed {
-    // Never runs: this file must fail to compile. The token's field is private, so a
-    // trybuild case cannot construct one, and only its *type* is needed here.
+    // Never runs: the file must fail to compile, and only the token's *type* is needed.
     unreachable!()
 }
 
