@@ -7,6 +7,7 @@ pub mod agent_health;
 pub mod artifact;
 pub mod cache;
 pub mod provenance;
+pub mod refusal;
 pub mod report;
 pub mod battery;
 pub mod benchmark;

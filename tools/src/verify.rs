@@ -1,7 +1,8 @@
 use crate::battery::{self, Case, Paths};
 use crate::cache;
 use crate::cli::Agent;
-use crate::translate::{IsolatedWorkDir, Semaphore};
+use crate::refusal::Refusal;
+use crate::translate::{IsolatedWorkDir, PromptKind, Semaphore};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -9,6 +10,53 @@ use std::sync::Arc;
 
 /// Must stay equal to the `timeout 10800` hard-coded in the claude invocation below.
 pub(crate) const VERIFY_TIMEOUT_SECS: u64 = 10800;
+
+/// What one case contributed to the sweep.
+///
+/// `Measured(false)` is a result: the agent ran and the crate did not come out
+/// verified. `Unmeasured` is the absence of one — a refusal (see [`Refusal`]), an
+/// infrastructure error, or a panicked worker — which must not be reported as an
+/// ordinary red X, because #67's rule is that a non-measurement cannot be scored.
+enum Verdict {
+    Skipped,
+    Measured(bool),
+    Unmeasured(anyhow::Error),
+}
+
+impl Verdict {
+    fn of(result: Result<bool>) -> Self {
+        match result {
+            Ok(ok) => Verdict::Measured(ok),
+            Err(e) => Verdict::Unmeasured(e),
+        }
+    }
+}
+
+/// The sweep's terminal refusal, run after the reporting loop so the cases that did
+/// verify are not wasted and the operator sees every problem at once.
+fn ensure_every_case_was_measured(results: &[(String, Verdict)]) -> Result<()> {
+    let mut lines = Vec::new();
+    let mut refused = 0usize;
+    for (name, verdict) in results {
+        let Verdict::Unmeasured(e) = verdict else { continue };
+        match Refusal::in_chain(e) {
+            Some(r) => {
+                refused += 1;
+                lines.push(format!("  {name}: REFUSED — {r}"));
+            }
+            None => lines.push(format!("  {name}: {e:#}")),
+        }
+    }
+    anyhow::ensure!(
+        lines.is_empty(),
+        "{} case(s) produced no measurement ({refused} refused outright), so this sweep \
+         cannot be scored:\n{}\nA refusal names a setup fault that would have made the \
+         number wrong; fix the cause and re-run. Already-verified cases are skipped.",
+        lines.len(),
+        lines.join("\n")
+    );
+    Ok(())
+}
 
 pub fn run(paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
     let sem = Arc::new(Semaphore::new(parallel));
@@ -43,7 +91,7 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
     let store = cache::Store::open(&paths.repo_root, paths.cache_mode)?;
-    let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))?;
+    let prompt_template = crate::translate::require_prompt(paths, PromptKind::Verify)?;
 
     let mut independent: Vec<&battery::IndependentCase> = Vec::new();
     let mut shared: Vec<&battery::SharedSourceGroup> = Vec::new();
@@ -56,47 +104,41 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
     let total = independent.len() + shared.len();
     println!("=== Verifying {battery_name} ({total} cases) ===");
 
-    let ind_results: Vec<(String, Option<bool>, bool)> = std::thread::scope(|s| {
+    let mut results: Vec<(String, Verdict)> = std::thread::scope(|s| {
         let handles: Vec<_> = independent.iter().map(|c| {
             let handle = s.spawn(|| {
                 let _permit = sem.acquire();
                 let case_dir = output_dir.join(&c.name);
                 if !crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
-                    return (c.name.clone(), None);
+                    return Verdict::Skipped;
                 }
                 if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
-                    return (c.name.clone(), None);
+                    return Verdict::Skipped;
                 }
                 let cmake_flags = get_cmake_flags(paths, battery_name, &c.name);
-                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths, &store)
-                    .unwrap_or(false);
-                (c.name.clone(), Some(ok))
+                Verdict::of(verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths, &store))
             });
             (c.name.clone(), handle)
         }).collect();
         // A panicking worker is that one case's failure, not the sweep's: the name is kept
-        // outside the thread so the remaining cases still report. The panic is collected
-        // rather than swallowed — see the bail below.
+        // outside the thread so the remaining cases still report.
         handles.into_iter().map(|(name, h)| match h.join() {
-            Ok((n, r)) => (n, r, false),
-            Err(_) => {
-                eprintln!("  ⚠️  {name}: verify thread panicked — counting as failed");
-                (name, Some(false), true)
-            }
+            Ok(v) => (name, v),
+            Err(_) => (name, Verdict::Unmeasured(anyhow::anyhow!("the verify worker panicked"))),
         }).collect()
     });
-    let panicked: Vec<&str> =
-        ind_results.iter().filter(|(_, _, p)| *p).map(|(n, _, _)| n.as_str()).collect();
 
     let mut verified = 0usize;
     let mut failed = 0usize;
+    let mut unmeasured = 0usize;
     let mut current = 0usize;
-    for (name, result, _) in &ind_results {
+    for (name, verdict) in &results {
         current += 1;
-        match result {
-            None => println!("[{current}/{total}] ⏭️  {name} (skipped)"),
-            Some(true) => { verified += 1; println!("[{current}/{total}] ✅ {name}"); }
-            Some(false) => { failed += 1; println!("[{current}/{total}] ❌ {name}"); }
+        match verdict {
+            Verdict::Skipped => println!("[{current}/{total}] ⏭️  {name} (skipped)"),
+            Verdict::Measured(true) => { verified += 1; println!("[{current}/{total}] ✅ {name}"); }
+            Verdict::Measured(false) => { failed += 1; println!("[{current}/{total}] ❌ {name}"); }
+            Verdict::Unmeasured(e) => { unmeasured += 1; println!("[{current}/{total}] ⛔ {name} — not measured: {e:#}"); }
         }
     }
 
@@ -114,10 +156,17 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
             println!("[{current}/{total}] 🔬 {} (shared-source, {} configs)", group.real_case, group.configs.len());
             let cmake_flags = get_cmake_flags(paths, battery_name, &group.real_case);
             let configs_text = build_configs_text(paths, battery_name, group);
-            let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, paths, &store)?;
-
-            if ok { verified += 1; println!("[{current}/{total}] ✅ {} — verified", group.real_case); }
-            else { failed += 1; println!("[{current}/{total}] ❌ {} — verification incomplete", group.real_case); }
+            // Collected rather than propagated with `?`: the followers below still need
+            // re-propagating, and the remaining groups are still worth verifying.
+            match verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, paths, &store) {
+                Ok(true) => { verified += 1; println!("[{current}/{total}] ✅ {} — verified", group.real_case); }
+                Ok(false) => { failed += 1; println!("[{current}/{total}] ❌ {} — verification incomplete", group.real_case); }
+                Err(e) => {
+                    unmeasured += 1;
+                    println!("[{current}/{total}] ⛔ {} — not measured: {e:#}", group.real_case);
+                    results.push((group.real_case.clone(), Verdict::Unmeasured(e)));
+                }
+            }
         }
 
         // Unconditional: without it runtests scores only the real case as verified,
@@ -132,19 +181,8 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
     }
 
     println!();
-    println!("Verified: {verified}, Failed: {failed} (of {total})");
-    // A worker panic is an infrastructure failure, not a measurement, and #67's rule is
-    // that scoring must refuse one. Reporting it only on stdout while exiting 0 would let
-    // a panic that hit every worker produce a plausible-looking verify rate that was never
-    // measured. The sweep still finishes first, so the surviving cases are not wasted.
-    anyhow::ensure!(
-        panicked.is_empty(),
-        "{} verify worker(s) panicked: {}. Their cases are recorded as failed, but a panic \
-         is not a measurement — re-run them before scoring.",
-        panicked.len(),
-        panicked.join(", ")
-    );
-    Ok(())
+    println!("Verified: {verified}, Failed: {failed}, Not measured: {unmeasured} (of {total})");
+    ensure_every_case_was_measured(&results)
 }
 
 /// Deliberately shares `verify.md` and `verify_case` with Test-Corpus so both
@@ -152,14 +190,13 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
 /// configs, hence the empty strings passed through.
 pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject], parallel: usize, force: bool) -> Result<()> {
     let sem = Arc::new(Semaphore::new(parallel));
-    let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))
-        .context("reading verify.md")?;
+    let prompt_template = crate::translate::require_prompt(paths, PromptKind::Verify)?;
 
     let store = cache::Store::open(&paths.repo_root, paths.cache_mode)?;
     let total = projects.len();
     println!("=== Verifying harvest-bench ({total} projects) ===");
 
-    let results: Vec<(String, Option<bool>, bool)> = std::thread::scope(|s| {
+    let results: Vec<(String, Verdict)> = std::thread::scope(|s| {
         let handles: Vec<_> = projects.iter().map(|p| {
             let sem = sem.clone();
             let prompt = &prompt_template;
@@ -171,13 +208,12 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
                     let _permit = sem.acquire();
                     let case_dir = paths.output_dir(&name);
                     if !crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
-                        return (name, None);
+                        return Verdict::Skipped;
                     }
                     if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
-                        return (name, None);
+                        return Verdict::Skipped;
                     }
-                    let ok = verify_case(&case_dir, prompt, "", "", paths, store).unwrap_or(false);
-                    (name, Some(ok))
+                    Verdict::of(verify_case(&case_dir, prompt, "", "", paths, store))
                 }
             });
             (name, handle)
@@ -185,34 +221,23 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
         // A panicking worker is that one project's failure, not the sweep's: the name is
         // kept outside the thread so the remaining projects still report.
         handles.into_iter().map(|(name, h)| match h.join() {
-            Ok((n, r)) => (n, r, false),
-            Err(_) => {
-                eprintln!("  ⚠️  {name}: verify thread panicked — counting as failed");
-                (name, Some(false), true)
-            }
+            Ok(v) => (name, v),
+            Err(_) => (name, Verdict::Unmeasured(anyhow::anyhow!("the verify worker panicked"))),
         }).collect()
     });
-    let panicked: Vec<&str> =
-        results.iter().filter(|(_, _, p)| *p).map(|(n, _, _)| n.as_str()).collect();
 
-    let (mut verified, mut failed) = (0usize, 0usize);
-    for (i, (name, result, _)) in results.iter().enumerate() {
+    let (mut verified, mut failed, mut unmeasured) = (0usize, 0usize, 0usize);
+    for (i, (name, verdict)) in results.iter().enumerate() {
         let n = i + 1;
-        match result {
-            None => println!("[{n}/{total}] ⏭️  {name} (skipped: no translated/ or already verified)"),
-            Some(true) => { verified += 1; println!("[{n}/{total}] ✅ {name}"); }
-            Some(false) => { failed += 1; println!("[{n}/{total}] ❌ {name}"); }
+        match verdict {
+            Verdict::Skipped => println!("[{n}/{total}] ⏭️  {name} (skipped: no translated/ or already verified)"),
+            Verdict::Measured(true) => { verified += 1; println!("[{n}/{total}] ✅ {name}"); }
+            Verdict::Measured(false) => { failed += 1; println!("[{n}/{total}] ❌ {name}"); }
+            Verdict::Unmeasured(e) => { unmeasured += 1; println!("[{n}/{total}] ⛔ {name} — not measured: {e:#}"); }
         }
     }
-    println!("\nHB verify: {verified}/{total} verified, {failed} failed");
-    // See run_with_semaphore: a panic is an infrastructure failure, not a result.
-    anyhow::ensure!(
-        panicked.is_empty(),
-        "{} verify worker(s) panicked: {}. Re-run them before scoring.",
-        panicked.len(),
-        panicked.join(", ")
-    );
-    Ok(())
+    println!("\nHB verify: {verified}/{total} verified, {failed} failed, {unmeasured} not measured");
+    ensure_every_case_was_measured(&results)
 }
 
 /// The only place a per-agent verify phase is decided; `None` means no verify phase.
@@ -224,6 +249,13 @@ enum Backend {
     Kiro,
     Claude,
     OpenCode,
+}
+
+/// Whether a separate C-as-oracle verify phase exists for `agent` at all — asked by
+/// `benchmark::Benchmark::verifies` and by `main`, which refuses `verify` rather than
+/// reporting a phase that never ran (`prompt_file_for` must agree; a test asserts it).
+pub fn has_verify_phase(agent: Agent) -> bool {
+    verify_backend(agent).is_some()
 }
 
 fn verify_backend(agent: Agent) -> Option<Backend> {
@@ -255,8 +287,10 @@ fn verify_case(
     store: &cache::Store,
 ) -> Result<bool> {
     let agent = paths.agent;
+    // Unreachable through the CLI — `require_prompt` and `main` refuse first — and a bail
+    // rather than `Ok(true)` so no path reports a case as verified without verifying it.
     let Some(backend) = verify_backend(agent) else {
-        return Ok(true);
+        anyhow::bail!("--agent {agent:?} has no verify backend, so nothing was verified");
     };
 
     // Verify never mutates `translated/`, so no snapshot/restore is needed.
@@ -529,4 +563,55 @@ fn get_cmake_flags(paths: &Paths, battery: &str, case_name: &str) -> String {
         .map(|(k, v)| format!("-D{}={}", k, v.as_str().unwrap_or("")))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::refusal::Refusal;
+
+    #[test]
+    fn a_refusal_stops_the_sweep_and_is_reported_as_one() {
+        let results = vec![
+            ("verified_case".to_string(), Verdict::Measured(true)),
+            ("failed_case".to_string(), Verdict::Measured(false)),
+            ("untranslated".to_string(), Verdict::Skipped),
+            (
+                "substituted".to_string(),
+                Verdict::Unmeasured(
+                    anyhow::Error::from(Refusal::ModelSubstituted {
+                        asked: "opus-5".into(),
+                        got: "sonnet-4".into(),
+                    })
+                    // As the call stack adds it, on the way up out of verify_case.
+                    .context("verifying substituted"),
+                ),
+            ),
+        ];
+        let msg = format!("{:#}", ensure_every_case_was_measured(&results).expect_err("must refuse"));
+        assert!(msg.contains("substituted: REFUSED"), "{msg}");
+        assert!(msg.contains("1 refused"), "{msg}");
+        assert!(msg.contains("asked for opus-5, got sonnet-4"), "{msg}");
+        // A measured failure is a result: naming it here would make every red X fatal.
+        assert!(!msg.contains("failed_case"), "{msg}");
+    }
+
+    #[test]
+    fn a_sweep_that_measured_everything_is_scoreable_even_with_failures() {
+        let results = vec![
+            ("failed_case".to_string(), Verdict::Measured(false)),
+            ("untranslated".to_string(), Verdict::Skipped),
+        ];
+        assert!(ensure_every_case_was_measured(&results).is_ok());
+    }
+
+    #[test]
+    fn an_infrastructure_error_is_not_a_measurement_either() {
+        let results = vec![(
+            "disk_full".to_string(),
+            Verdict::Unmeasured(anyhow::anyhow!("No space left on device")),
+        )];
+        let msg = format!("{:#}", ensure_every_case_was_measured(&results).expect_err("must refuse"));
+        assert!(msg.contains("0 refused") && msg.contains("No space left"), "{msg}");
+    }
 }
