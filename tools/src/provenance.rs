@@ -4,6 +4,8 @@
 //! Hence [`require_reproducible`] as a startup preflight, not a post-hoc record.
 
 use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Stamped by `build.rs` via `vergen`. Outside a git tree vergen emits a placeholder
 /// rather than failing the build, so read it through [`built_from`].
@@ -61,8 +63,9 @@ impl std::fmt::Display for Unreproducible {
             ),
             Unreproducible::DirtyTree { files } => write!(
                 f,
-                "{files} tracked file(s) differ from HEAD, so no commit describes the \
-                 code that would run. Commit or stash first."
+                "{files} tracked file(s) under {} differ from HEAD, so no commit describes \
+                 the code that would run. Commit or stash first.",
+                BEHAVIOUR_PATHS.join(" ")
             ),
             Unreproducible::UnknownProvenance => write!(
                 f,
@@ -96,7 +99,7 @@ pub fn assess(built_from: &str, head: Option<&str>, dirty_files: usize) -> Optio
 
 pub fn harness_id() -> String {
     match dirty_file_count() {
-        Ok(n) if n > 0 => format!("{}-dirty", built_from()),
+        Some(n) if n > 0 => format!("{}-dirty", built_from()),
         _ => built_from().to_string(),
     }
 }
@@ -128,8 +131,10 @@ pub fn require_reproducible(allow_dirty: bool) -> Result<()> {
     }
 }
 
-fn git(args: &[&str]) -> Result<String> {
+fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
         .args(args)
         .output()
         .with_context(|| format!("running git {}", args.join(" ")))?;
@@ -137,17 +142,55 @@ fn git(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Every git call is anchored here, because the process may be several levels deep
+/// inside `results/` — a submodule, whose HEAD and dirtiness are not this repo's.
+fn repo_root() -> PathBuf {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let cwd = PathBuf::from(".");
+        let super_tree = git(&cwd, &["rev-parse", "--show-superproject-working-tree"]);
+        match super_tree {
+            Ok(s) if !s.is_empty() => PathBuf::from(s),
+            _ => git(&cwd, &["rev-parse", "--show-toplevel"])
+                .map(PathBuf::from)
+                .unwrap_or(cwd),
+        }
+    })
+    .clone()
+}
+
 fn head_sha() -> Option<String> {
-    git(&["rev-parse", "HEAD"]).ok().filter(|s| !s.is_empty())
+    git(&repo_root(), &["rev-parse", "HEAD"]).ok().filter(|s| !s.is_empty())
+}
+
+/// The paths an edit to which can change what this binary does: its own sources, the
+/// prompts the agents are handed, the toolchain the crates are built with.
+///
+/// Scoped rather than whole-tree because `results/` and `tables/` are this harness's
+/// own OUTPUT, which a half-finished sweep has necessarily written — counting those
+/// refused the documented resume path and left `--allow-dirty`, which stamps every
+/// artifact unpublishable, as the only way through.
+const BEHAVIOUR_PATHS: &[&str] =
+    &["tools/", "prompts/", "rust-toolchain.toml", ".cargo/config.toml"];
+
+/// `None` when git could not answer, which `assess` already treats as "outside a
+/// repository" — the same case as an absent HEAD.
+///
+/// Memoised: it is consulted once per produced artifact through [`harness_id`], and
+/// the state that matters is the tree the running binary was loaded from.
+fn dirty_file_count() -> Option<usize> {
+    static COUNT: OnceLock<Option<usize>> = OnceLock::new();
+    *COUNT.get_or_init(|| count_dirty_in(&repo_root()).ok())
 }
 
 /// Untracked files are deliberately ignored: `results/` alone carries thousands, and
-/// an untracked file cannot change the behaviour of the compiled binary.
-fn dirty_file_count() -> Result<usize> {
-    Ok(git(&["status", "--porcelain", "--untracked-files=no"])?
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .count())
+/// an untracked file cannot change the behaviour of the compiled binary. Submodules
+/// likewise: none of the four is a build input of this crate.
+fn count_dirty_in(dir: &Path) -> Result<usize> {
+    let mut args =
+        vec!["status", "--porcelain", "--untracked-files=no", "--ignore-submodules=all", "--"];
+    args.extend_from_slice(BEHAVIOUR_PATHS);
+    Ok(git(dir, &args)?.lines().filter(|l| !l.trim().is_empty()).count())
 }
 
 #[cfg(test)]
@@ -195,6 +238,58 @@ mod tests {
     fn a_stamped_binary_outside_a_repo_is_allowed() {
         // Refusing here would make the tool unusable off a dev box.
         assert_eq!(assess("abc123abc123", None, 0), None);
+    }
+
+    #[test]
+    fn every_scoped_path_is_still_in_the_checkout() {
+        // A rename or a move would leave the gate silently covering nothing.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("tools/ has a parent");
+        for p in BEHAVIOUR_PATHS {
+            assert!(root.join(p).exists(), "{p} is gone; the dirty-tree gate now covers nothing");
+        }
+    }
+
+    #[test]
+    fn the_scope_catches_code_and_ignores_harness_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "--quiet"]);
+        run(&["config", "user.email", "t@example.invalid"]);
+        run(&["config", "user.name", "t"]);
+        let files =
+            ["tools/src/verify.rs", "prompts/claude/verify.md", "rust-toolchain.toml", "tables/results.md"];
+        for f in files {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "before\n").unwrap();
+        }
+        // --force: a developer's global excludes file may ignore `rust-toolchain.toml`,
+        // which would leave it untracked here and the assertion below vacuous.
+        run(&["add", "--force", "-A"]);
+        run(&["-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "base"]);
+        assert_eq!(count_dirty_in(root).unwrap(), 0, "a clean tree");
+
+        // Five of the nine lines that refused the resume path were regenerated tables.
+        std::fs::write(root.join("tables/results.md"), "after\n").unwrap();
+        assert_eq!(count_dirty_in(root).unwrap(), 0, "harness output must not refuse a resume");
+
+        for f in &files[..3] {
+            std::fs::write(root.join(f), "after\n").unwrap();
+        }
+        assert_eq!(
+            count_dirty_in(root).unwrap(),
+            3,
+            "code, prompts and the toolchain pin must still be caught"
+        );
     }
 
     #[test]

@@ -71,14 +71,16 @@ pub fn assert_pins_honoured(
         // Older transcripts predate the init record; nothing to compare against.
         return Ok(());
     };
+    // A typed refusal, not an ensure!: the sweep collects these and fails the command,
+    // where an anyhow error would have been folded into an ordinary red X.
     if let Some(got) = init["model"].as_str() {
-        anyhow::ensure!(
-            got == want.as_str(),
-            "the CLI resolved a different model than the pin: asked for {}, got {got}. \
-             Refusing to attribute this run to {}.",
-            want.as_str(),
-            want.as_str()
-        );
+        if got != want.as_str() {
+            return Err(crate::refusal::Refusal::ModelSubstituted {
+                asked: want.as_str().to_string(),
+                got: got.to_string(),
+            }
+            .into());
+        }
     }
     if let Some(got) = init["claude_code_version"].as_str() {
         anyhow::ensure!(
@@ -404,6 +406,128 @@ fn run_and_record(
     }
 }
 
+/// Which prompt a phase needs. `Library`/`Executable` is the project-type dispatch;
+/// `Shared` is a shared-source group's real case.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PromptKind {
+    Library,
+    Executable,
+    Shared,
+    Verify,
+}
+
+impl PromptKind {
+    pub fn independent(is_lib: bool) -> Self {
+        if is_lib { PromptKind::Library } else { PromptKind::Executable }
+    }
+
+    #[cfg(test)]
+    const ALL: &'static [PromptKind] =
+        &[PromptKind::Library, PromptKind::Executable, PromptKind::Shared, PromptKind::Verify];
+}
+
+/// The one place a prompt file is chosen, relative to [`Paths::prompts_dir`].
+///
+/// `None` means this agent reads no prompt of that kind at all: c2rust and the
+/// docker-driven translators are given none, and the ablations plus the one-shot LLM
+/// arms have no verify phase (`verify::has_verify_phase` must agree — a test asserts
+/// it). Returning the *name* rather than the text is what lets a test check the choice
+/// against the files on disk, so a renamed prompt fails in CI instead of reaching a
+/// paid agent run as an empty one.
+pub fn prompt_file_for(agent: Agent, kind: PromptKind) -> Option<&'static str> {
+    use PromptKind::{Executable, Library, Shared, Verify};
+    match agent {
+        // One arm on purpose: the backend varies, the methodology does not.
+        Agent::Kiro | Agent::Claude | Agent::OpenCode => Some(match kind {
+            Library => "translate-library.md",
+            Executable => "translate-executable.md",
+            Shared => "translate-shared.md",
+            Verify => "verify.md",
+        }),
+        Agent::ClaudeCombined => match kind {
+            Library => Some("ablations/translate-and-verify-library.md"),
+            Executable => Some("ablations/translate-and-verify-executable.md"),
+            Shared => Some("ablations/translate-and-verify-shared.md"),
+            Verify => None,
+        },
+        Agent::ClaudeMinimal => match kind {
+            // One prompt for every project type — that is the ablation.
+            Library | Executable | Shared => Some("ablations/translate-minimal.md"),
+            Verify => None,
+        },
+        Agent::ClaudeNoIter => match kind {
+            Library => Some("ablations/translate-no-iter-library.md"),
+            Executable => Some("ablations/translate-no-iter-executable.md"),
+            Shared => Some("ablations/translate-no-iter-shared.md"),
+            Verify => None,
+        },
+        // E2 and E6 differ from `claude` on shared-source cases only, so their
+        // independent cases deliberately read the unmodified prompts.
+        Agent::ClaudeNoFeatures => match kind {
+            Library => Some("translate-library.md"),
+            Executable => Some("translate-executable.md"),
+            Shared => Some("ablations/translate-no-features-shared.md"),
+            Verify => None,
+        },
+        Agent::ClaudeNoSubtask => match kind {
+            Library => Some("translate-library.md"),
+            Executable => Some("translate-executable.md"),
+            Shared => Some("ablations/translate-no-subtask-shared.md"),
+            Verify => None,
+        },
+        Agent::ClaudeCrossPrompt => match kind {
+            // E4: the mismatch IS the experiment — a library gets the executable
+            // prompt and vice versa. Shared-source cases have no counterpart to swap
+            // with, so they read the standard shared prompt.
+            Library => Some("translate-executable.md"),
+            Executable => Some("translate-library.md"),
+            Shared => Some("translate-shared.md"),
+            Verify => None,
+        },
+        Agent::CodexGpt55 | Agent::CodexGpt54 => match kind {
+            Library => Some("translate-library.md"),
+            Executable => Some("translate-executable.md"),
+            Shared => Some("translate-shared.md"),
+            Verify => None,
+        },
+        Agent::Kimi | Agent::Oneshot => match kind {
+            // A single LLM call with the project-type prompt as its system message.
+            // `oneshot_llm_translate` detects the type from CMakeLists even for a
+            // shared-source group, so neither Shared nor Verify is ever asked for.
+            Library => Some("translate-library.md"),
+            Executable => Some("translate-executable.md"),
+            Shared | Verify => None,
+        },
+        // Non-LLM translators: c2rust transpiles, and laertes/c2saferrust/smartc2rust
+        // are driven by their own docker pipelines.
+        Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust => None,
+    }
+}
+
+/// The text of the prompt for `kind`, or `None` when this agent reads none.
+///
+/// A prompt that IS named but missing on disk is an error, never an empty string: an
+/// empty prompt invokes the agent with nothing to do and the result is then recorded
+/// as a measurement.
+pub fn read_prompt(paths: &Paths, kind: PromptKind) -> Result<Option<String>> {
+    let Some(file) = prompt_file_for(paths.agent, kind) else { return Ok(None) };
+    let path = paths.prompts_dir.join(file);
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading the {kind:?} prompt {}", path.display()))?;
+    anyhow::ensure!(!text.trim().is_empty(), "the prompt {} is empty", path.display());
+    Ok(Some(text))
+}
+
+/// [`read_prompt`] where the phase cannot run without one.
+pub fn require_prompt(paths: &Paths, kind: PromptKind) -> Result<String> {
+    read_prompt(paths, kind)?.with_context(|| {
+        format!(
+            "--agent {} has no {kind:?} prompt, so this phase does not exist for it",
+            paths.agent_key.as_str()
+        )
+    })
+}
+
 fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) -> Result<()> {
     match paths.agent {
         Agent::Laertes => laertes_translate_case(paths, battery, name),
@@ -411,51 +535,15 @@ fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) ->
         Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
         Agent::Kimi => kimi_translate_case(paths, battery, name, is_lib),
         Agent::Oneshot => oneshot_translate_case(paths, battery, name, is_lib),
-        // One arm on purpose: the backend varies, the methodology does not.
-        Agent::Kiro | Agent::Claude | Agent::OpenCode => {
-            let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeCombined => {
-            let f = if is_lib { "ablations/translate-and-verify-library.md" } else { "ablations/translate-and-verify-executable.md" };
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeMinimal => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-minimal.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeNoIter => {
-            let f = if is_lib { "ablations/translate-no-iter-library.md" } else { "ablations/translate-no-iter-executable.md" };
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeNoFeatures => {
-            // E2: the cmake-features ablation only affects shared-source cases.
-            let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeNoSubtask => {
-            // E6: the subtask-decomposition ablation only affects shared-source cases.
-            let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeCrossPrompt => {
-            // E4: the mismatch is the experiment — libraries get the executable
-            // prompt and vice versa.
-            let f = if is_lib { "translate-executable.md" } else { "translate-library.md" };
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::CodexGpt55 | Agent::CodexGpt54 => {
-            let f = if is_lib { "translate-library.md" } else { "translate-executable.md" };
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join(f)).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
         Agent::C2rust => translate_case(paths, battery, name, ""),
+        // Every remaining agent differs only in which prompt file it reads.
+        Agent::Kiro | Agent::Claude | Agent::OpenCode | Agent::ClaudeCombined
+        | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures
+        | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
+        | Agent::CodexGpt55 | Agent::CodexGpt54 => {
+            let prompt = require_prompt(paths, PromptKind::independent(is_lib))?;
+            translate_case(paths, battery, name, &prompt)
+        }
     }
 }
 
@@ -466,41 +554,14 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
         Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
         Agent::Kimi => kimi_translate_case(paths, battery, name, true),
         Agent::Oneshot => oneshot_translate_case(paths, battery, name, true),
-        Agent::Kiro | Agent::Claude | Agent::OpenCode => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeCombined => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-and-verify-shared.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeMinimal => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-minimal.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeNoIter => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-no-iter-shared.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeNoFeatures => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-no-features-shared.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeNoSubtask => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("ablations/translate-no-subtask-shared.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::ClaudeCrossPrompt => {
-            // E4: the cross-prompt swap only applies to independent libs/execs, so
-            // shared-source cases fall back to the standard claude shared prompt.
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
-        Agent::CodexGpt55 | Agent::CodexGpt54 => {
-            let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-shared.md")).unwrap_or_default();
-            translate_case(paths, battery, name, &prompt)
-        }
         Agent::C2rust => translate_case(paths, battery, name, ""),
+        Agent::Kiro | Agent::Claude | Agent::OpenCode | Agent::ClaudeCombined
+        | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures
+        | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
+        | Agent::CodexGpt55 | Agent::CodexGpt54 => {
+            let prompt = require_prompt(paths, PromptKind::Shared)?;
+            translate_case(paths, battery, name, &prompt)
+        }
     }
 }
 
@@ -512,10 +573,10 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
 pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject], parallel: usize) -> Result<()> {
     preflight_check(paths.agent)?;
 
-    // A harvest-bench test_case/ is always a C library the suite links by ABI, so
-    // the library prompt applies to every project — no project-type dispatch.
-    let prompt = std::fs::read_to_string(paths.prompts_dir.join("translate-library.md"))
-        .context("reading translate-library.md for harvest-bench")?;
+    // A harvest-bench test_case/ is always a C library the suite links by ABI, so the
+    // library prompt applies to every project — no project-type dispatch. Empty only
+    // for the agents that are handed no prompt at all (see `prompt_file_for`).
+    let prompt = read_prompt(paths, PromptKind::Library)?.unwrap_or_default();
 
     anyhow::ensure!(!projects.is_empty(),
         "No harvest-bench projects to translate. Targets are `HB` (all) or \
@@ -1298,9 +1359,7 @@ fn oneshot_llm_translate(
 
     let files_json = collect_c_files_json(&input_test_case)?;
     let is_lib = detect_is_library(&input_test_case).unwrap_or(is_lib_hint);
-    let prompt_file = if is_lib { "translate-library.md" } else { "translate-executable.md" };
-    let system_prompt = std::fs::read_to_string(paths.prompts_dir.join(prompt_file))
-        .with_context(|| format!("reading {prompt_file}"))?;
+    let system_prompt = require_prompt(paths, PromptKind::independent(is_lib))?;
 
     // As on the CLI-agent path: prompt files change, so store the text that ran.
     let _ = std::fs::write(logs_dir.join("prompt.md"), &system_prompt);
@@ -2280,6 +2339,86 @@ mod tests {
         // must agree on what is retryable.
         for (needle, label) in TRANSIENT_BEDROCK_PATTERNS {
             assert_eq!(first_transient_pattern(needle).as_deref(), Some(*label));
+        }
+    }
+
+    fn paths_for(agent: Agent, dataset: crate::cli::Dataset) -> Paths {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("tools/ has a parent");
+        let model = match agent {
+            Agent::Oneshot => Some("openai/gpt-5.4"),
+            Agent::OpenCode => Some("amazon-bedrock/us.anthropic.claude-sonnet-5"),
+            _ => None,
+        };
+        Paths::new(root, agent, dataset, model, crate::cache::Mode::Bypass, true).expect("Paths")
+    }
+
+    #[test]
+    fn every_prompt_the_matrix_names_is_on_disk() {
+        // The whole point of naming the file separately from reading it: a rename used
+        // to surface as an empty prompt handed to a live agent, mid-sweep.
+        use clap::ValueEnum;
+        for dataset in [crate::cli::Dataset::TestCorpus, crate::cli::Dataset::HarvestBench] {
+            for agent in Agent::value_variants() {
+                let paths = paths_for(*agent, dataset);
+                for kind in PromptKind::ALL {
+                    if prompt_file_for(*agent, *kind).is_none() {
+                        continue;
+                    }
+                    let text = read_prompt(&paths, *kind)
+                        .unwrap_or_else(|e| panic!("{agent:?} {kind:?} {dataset:?}: {e:#}"));
+                    assert!(text.is_some_and(|t| t.len() > 100), "{agent:?} {kind:?}: too short to be a prompt");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_verify_prompt_exists_exactly_where_a_verify_phase_does() {
+        use clap::ValueEnum;
+        for agent in Agent::value_variants() {
+            assert_eq!(
+                prompt_file_for(*agent, PromptKind::Verify).is_some(),
+                crate::verify::has_verify_phase(*agent),
+                "{agent:?}: the verify prompt and the verify backend disagree, so either a \
+                 phase would run with no prompt or a prompt is named for a phase that never runs"
+            );
+        }
+    }
+
+    #[test]
+    fn each_ablation_differs_from_claude_exactly_where_its_experiment_says() {
+        use PromptKind::{Executable, Library, Shared};
+        let claude = |k| prompt_file_for(Agent::Claude, k);
+
+        // E4: libraries get the executable prompt and vice versa — the swap IS the arm.
+        assert_eq!(prompt_file_for(Agent::ClaudeCrossPrompt, Library), claude(Executable));
+        assert_eq!(prompt_file_for(Agent::ClaudeCrossPrompt, Executable), claude(Library));
+        assert_eq!(prompt_file_for(Agent::ClaudeCrossPrompt, Shared), claude(Shared));
+
+        // E2 and E6 vary the shared-source prompt only; their independent cases must be
+        // byte-identical to claude's or the arm measures more than one change.
+        for (agent, shared) in [
+            (Agent::ClaudeNoFeatures, "ablations/translate-no-features-shared.md"),
+            (Agent::ClaudeNoSubtask, "ablations/translate-no-subtask-shared.md"),
+        ] {
+            assert_eq!(prompt_file_for(agent, Library), claude(Library), "{agent:?}");
+            assert_eq!(prompt_file_for(agent, Executable), claude(Executable), "{agent:?}");
+            assert_eq!(prompt_file_for(agent, Shared), Some(shared));
+        }
+
+        // The calibration baseline is one universal prompt for every project type.
+        for k in [Library, Executable, Shared] {
+            assert_eq!(
+                prompt_file_for(Agent::ClaudeMinimal, k),
+                Some("ablations/translate-minimal.md")
+            );
+        }
+
+        // Kiro, OpenCode and Codex are portability arms: same prompts, different harness.
+        for agent in [Agent::Kiro, Agent::OpenCode, Agent::CodexGpt55, Agent::CodexGpt54] {
+            for k in [Library, Executable, Shared] {
+                assert_eq!(prompt_file_for(agent, k), claude(k), "{agent:?} {k:?}");
+            }
         }
     }
 }

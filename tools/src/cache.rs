@@ -209,12 +209,12 @@ impl ToolchainId {
     /// `rust-toolchain.toml` — the current results tree holds 676 crates built with
     /// 1.97.1 next to 11 built with the pinned 1.94.0.
     pub fn detect() -> Result<Self> {
-        anyhow::ensure!(
-            std::env::var_os("RUSTUP_TOOLCHAIN").is_none(),
-            "RUSTUP_TOOLCHAIN is set, which silently overrides rust-toolchain.toml. \
-             Unset it (`env -u RUSTUP_TOOLCHAIN`) so the pinned compiler is used and \
-             the cache key reflects it."
-        );
+        if let Some(value) = std::env::var_os("RUSTUP_TOOLCHAIN") {
+            return Err(crate::refusal::Refusal::ToolchainOverridden {
+                value: value.to_string_lossy().into_owned(),
+            }
+            .into());
+        }
         let out = std::process::Command::new("rustc")
             .arg("-vV")
             .output()

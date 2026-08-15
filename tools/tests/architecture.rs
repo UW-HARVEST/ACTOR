@@ -389,7 +389,12 @@ fn an_agents_identity_is_never_its_debug_output() {
     struct V(Vec<String>);
     impl<'ast> Visit<'ast> for V {
         fn visit_macro(&mut self, m: &'ast syn::Macro) {
-            if debugs_an_agent(m.tokens.clone()) {
+            let name = m.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+            // Diagnostic macros are exempt: their Debug output is a message a human reads
+            // when a test or invariant fails, never a persisted identity.
+            let diagnostic = name.starts_with("assert")
+                || matches!(name.as_str(), "panic" | "unreachable" | "todo" | "ensure" | "bail");
+            if !diagnostic && debugs_an_agent(m.tokens.clone()) {
                 let name = m.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
                 self.0.push(format!("{name}!"));
             }

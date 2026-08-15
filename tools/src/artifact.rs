@@ -429,6 +429,14 @@ impl<P: Phase> Scrubbed<P> {
     }
 
     pub fn seal(self, _proof: &Completed, c_before: &TreeDigest) -> Result<Sealed<P>> {
+        let c_after = CDir(self.root.join("c_src")).digest()?;
+        if &c_after != c_before {
+            return Err(crate::refusal::Refusal::OracleModified {
+                before: c_before.as_str().to_string(),
+                after: c_after.as_str().to_string(),
+            }
+            .into());
+        }
         let c_after = CDir(self.root.join(C_ORACLE_DIR)).digest()?;
         anyhow::ensure!(
             &c_after == c_before,

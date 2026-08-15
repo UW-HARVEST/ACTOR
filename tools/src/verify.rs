@@ -72,9 +72,8 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
                     return (c.name.clone(), None);
                 }
                 let cmake_flags = get_cmake_flags(paths, battery_name, &c.name);
-                let ok = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths, &store)
-                    .unwrap_or(false);
-                (c.name.clone(), Some(ok))
+                let outcome = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths, &store);
+                (c.name.clone(), Some(crate::refusal::record(&c.name, outcome)))
             });
             (c.name.clone(), handle)
         }).collect();
@@ -141,6 +140,7 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
     // that scoring must refuse one. Reporting it only on stdout while exiting 0 would let
     // a panic that hit every worker produce a plausible-looking verify rate that was never
     // measured. The sweep still finishes first, so the surviving cases are not wasted.
+    crate::refusal::bail_if_any()?;
     anyhow::ensure!(
         panicked.is_empty(),
         "{} verify worker(s) panicked: {}. Their cases are recorded as failed, but a panic \
@@ -180,7 +180,10 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
                     if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
                         return (name, None);
                     }
-                    let ok = verify_case(&case_dir, prompt, "", "", paths, store).unwrap_or(false);
+                    let ok = crate::refusal::record(
+                        &name,
+                        verify_case(&case_dir, prompt, "", "", paths, store),
+                    );
                     (name, Some(ok))
                 }
             });
@@ -210,6 +213,7 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
     }
     println!("\nHB verify: {verified}/{total} verified, {failed} failed");
     // See run_with_semaphore: a panic is an infrastructure failure, not a result.
+    crate::refusal::bail_if_any()?;
     anyhow::ensure!(
         panicked.is_empty(),
         "{} verify worker(s) panicked: {}. Re-run them before scoring.",
@@ -247,6 +251,15 @@ const KIRO_UNPINNED_MODEL: &str = "unpinned:kiro-cli-default";
 /// The only place a per-agent verify phase is decided; `None` means no verify phase.
 /// Consulted before the store so a verify-less agent never materialises a work tree to
 /// discard.
+/// Whether this agent has a verify phase at all.
+///
+/// The same match as `verify_invocation`, minus the parts that need `Paths` — kept next
+/// to it so the two cannot disagree about which arms verify. `translate.rs` asserts they
+/// agree.
+pub fn has_verify_phase(agent: Agent) -> bool {
+    matches!(agent, Agent::Kiro | Agent::Claude | Agent::OpenCode)
+}
+
 fn verify_invocation(paths: &Paths) -> Result<Option<Invocation>> {
     let inv = match paths.agent {
         Agent::Kiro => Invocation {
