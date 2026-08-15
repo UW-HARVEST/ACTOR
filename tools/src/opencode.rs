@@ -139,7 +139,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    fn agent_name(self) -> &'static str {
+    pub(crate) fn agent_name(self) -> &'static str {
         match self {
             Phase::Translate => "harvest-translate",
             Phase::Verify => "harvest-verify",
@@ -186,7 +186,6 @@ pub fn prompt_suffix(tmp_root: &Path) -> String {
 /// must be emitted BEFORE the tempdir allow — reversing them denies everything.
 /// Hence ordered text rather than a `HashMap`.
 fn project_config(tmp_root: &Path, m: &Model) -> String {
-    let tempdir_pattern = format!("{}/**", tmp_root.display());
     let provider_block = if m.is_bedrock() {
         let region = std::env::var("AWS_REGION")
             .ok()
@@ -206,8 +205,22 @@ fn project_config(tmp_root: &Path, m: &Model) -> String {
 
     format!(
         "{{\n  \"$schema\": \"https://opencode.ai/config.json\",\n{provider_block}  \
-         \"permission\": {{\n    \"external_directory\": {{\n      \
-         \"*\": \"deny\",\n      {}: \"allow\"\n    }}\n  }}\n}}\n",
+         {}\n}}\n",
+        permission_shape(tmp_root),
+    )
+}
+
+/// The filesystem policy alone — OpenCode's equivalent of `sandbox::settings_json`, and
+/// what the cache key records for this backend.
+///
+/// Deliberately excludes the provider block: it carries `AWS_PROFILE`, a machine-local
+/// name that would make every key machine-specific and so make a colleague's cache
+/// silently never hit.
+pub(crate) fn permission_shape(tmp_root: &Path) -> String {
+    let tempdir_pattern = format!("{}/**", tmp_root.display());
+    format!(
+        "\"permission\": {{\n    \"external_directory\": {{\n      \
+         \"*\": \"deny\",\n      {}: \"allow\"\n    }}\n  }}",
         json_str(&tempdir_pattern),
     )
 }
@@ -362,34 +375,20 @@ fn extract_limits(output: &str, provider: &str, model_id: &str) -> Option<ModelL
 /// [`prompt_suffix`] — callers append it so the text recorded to
 /// `logs/prompt.md` is exactly what the agent received.
 pub fn invoke(
-    phase: Phase,
+    session: &crate::session::Session,
     prompt: &str,
     log_path: &Path,
     work_dir: &Path,
     tmp_root: &Path,
     m: &Model,
-    timeout_secs: u64,
 ) -> Result<()> {
-    let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
-
-    // No `--pure`: it clears external plugins, disabling the compaction plugin.
-    let script = format!(
-        "set -o pipefail; timeout {timeout_secs} opencode run \
-         --format json --thinking --dangerously-skip-permissions \
-         --agent {} --model \"$MODEL\" \"$PROMPT\" \
-         < /dev/null 2>&1 | tee \"$LOG\"",
-        phase.agent_name(),
-    );
-
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c")
-        .arg(&script)
-        .env("PROMPT", prompt)
-        .env("LOG", log_path)
-        .env("MODEL", m.as_arg())
-        .env("OPENSSL_DIR", &openssl_dir)
-        .env("XDG_CONFIG_HOME", xdg_config_dir(tmp_root))
-        .current_dir(work_dir);
+    let mut cmd = session.opencode_command(crate::session::OpencodeRun {
+        cwd: work_dir,
+        prompt,
+        log: log_path,
+        model_arg: &m.as_arg(),
+        xdg_config_home: &xdg_config_dir(tmp_root),
+    });
 
     // WORKAROUND 2 — raise the 32k per-response cap to the registry limit.
     match load_model_limits(m) {
@@ -407,9 +406,7 @@ pub fn invoke(
         ),
     }
 
-    let status = cmd
-        .status()
-        .with_context(|| format!("invoking opencode ({})", phase.agent_name()))?;
+    let status = cmd.status().context("invoking opencode")?;
     crate::translate::record_agent_exit(status);
     Ok(())
 }

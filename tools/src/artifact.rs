@@ -4,7 +4,11 @@
 //! * Nothing runs in a published artifact: `Command::current_dir` and `--target-dir`
 //!   both take `impl AsRef<Path>`, so "can obtain a path" *is* "can execute here", and
 //!   [`Sealed`] yields no path in any form. (`test.rs` still builds inside the tree it
-//!   scores; fixing that needs the `c/`+`rust/` layout split.)
+//!   scores. No layout *inside* `results/` fixes that: MIT `runtests` resolves each
+//!   crate at `<case>/translated_rust` and pins its build output to
+//!   `<that>/target` with an explicit `--target-dir`, and its `cando2` runner bakes
+//!   `CARGO_MANIFEST_DIR`. The build has to leave the tree, which is what
+//!   [`Scratch::subdir`] + [`Sealed::materialise_at`] exist for.)
 //! * An infra-failed run cannot be sealed: [`Scrubbed::seal`] demands a
 //!   [`crate::agent_health::Completed`], which only `classify_log` can mint.
 //! * A tree cannot be hashed before it is scrubbed: agent output embeds the random
@@ -16,6 +20,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 mod sealed_trait {
     pub trait Sealed {}
@@ -140,43 +145,58 @@ fn copy_carrying(src: &Path, dest: &Path, carry: Carry) -> Result<()> {
     .with_context(|| format!("copying {} to {}", src.display(), dest.display()))?;
     // `std::fs::copy` carries mode bits and cache entries are stored read-only, so
     // without this a replay would publish a read-only crate and later builds hit EACCES.
-    set_read_only(dest, false)
+    set_read_only(dest, Access::Writable)
+}
+
+/// Which way [`set_read_only`] goes. As a `bool` the call site read `set_read_only(dest,
+/// false)`, where `false` says nothing about which; backwards, it either leaves the store
+/// writable or publishes a crate later builds cannot write to.
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum Access {
+    ReadOnly,
+    Writable,
+}
+
+impl Access {
+    fn locked(self) -> bool {
+        self == Access::ReadOnly
+    }
 }
 
 /// Types stop *this crate* from executing in a stored artifact; `0o555`/`0o444` also
 /// binds what the types cannot see — a shell-out, a stray `cargo build --manifest-path` —
 /// which then fails with `EACCES` instead of quietly filling the store with `target/`
 /// dirs and mutating the artifact it was reading.
-pub(crate) fn set_read_only(root: &Path, ro: bool) -> Result<()> {
+pub(crate) fn set_read_only(root: &Path, access: Access) -> Result<()> {
     fn perms(mode: u32) -> std::fs::Permissions {
         use std::os::unix::fs::PermissionsExt;
         std::fs::Permissions::from_mode(mode)
     }
-    fn walk(p: &Path, ro: bool) -> Result<()> {
+    fn walk(p: &Path, access: Access) -> Result<()> {
         let meta = std::fs::symlink_metadata(p)?;
         if meta.is_dir() {
             // A `0o555` directory cannot have entries added or removed, so unlocking on
             // the way down and locking on the way out is what makes this reversible.
-            if !ro {
+            if !access.locked() {
                 std::fs::set_permissions(p, perms(0o755))?;
             }
             for e in std::fs::read_dir(p)? {
-                walk(&e?.path(), ro)?;
+                walk(&e?.path(), access)?;
             }
-            if ro {
+            if access.locked() {
                 std::fs::set_permissions(p, perms(0o555))?;
             }
         } else if !meta.file_type().is_symlink() {
             // chmod follows symlinks: locking one would lock a target outside this tree.
-            std::fs::set_permissions(p, perms(if ro { 0o444 } else { 0o644 }))?;
+            std::fs::set_permissions(p, perms(if access.locked() { 0o444 } else { 0o644 }))?;
         }
         Ok(())
     }
-    walk(root, ro).with_context(|| {
+    walk(root, access).with_context(|| {
         format!(
             "making {} {}writable",
             root.display(),
-            if ro { "non-" } else { "" }
+            if access.locked() { "non-" } else { "" }
         )
     })
 }
@@ -204,40 +224,68 @@ const BUILD_DIRS: &[&str] = &[
     "fuzz_scripts",
 ];
 
+/// Harness bookkeeping. Matched only at the artifact ROOT: deeper down the same name
+/// is the translated program's own file, and must be inside its digest.
+const ROOT_ONLY_IGNORED: &[&str] = &[
+    "result.json",
+    "verification.json",
+    "translation.json",
+    "harvest_bench_report.json",
+    "harvest_batch_report.json",
+];
+
+/// Likewise root-anchored: `src/logs/` is source, and matching `logs` at any depth hid
+/// it from the digest entirely.
+const ROOT_ONLY_IGNORED_DIRS: &[&str] = &["logs", ".claude"];
+
+/// The C oracle. Nothing under it is ever [`Disposition::Ignore`]: [`Scrubbed::seal`]
+/// grades a run by comparing this subtree's digest before and after, so a rule firing
+/// inside it hides a change to the reference. 26 real `c_src/doc/footer.html.bak` files
+/// sat in that blind spot.
+const C_ORACLE_DIR: &str = "c_src";
+
 /// `in_build_dir` must be true if any ancestor within the tree was itself classified
 /// `BuildOutput`, including by the content sniff in `visit`: the name check below misses
 /// `c_src/build`, which is *nested* (so a top-level check walks past it) and which is
 /// precisely the directory whose `CMakeCache.txt` records the random scratch path.
 pub fn classify(rel: &RelPath, in_build_dir: bool) -> Disposition {
     let p = rel.as_path();
-    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
 
-    let ignored_file = matches!(
-        name,
-        "result.json"
-            | "verification.json"
-            | "translation.json"
-            | "harvest_bench_report.json"
-            | "harvest_batch_report.json"
-    ) || name.ends_with(".log")
-        || name.ends_with(".bak")
-        || name.ends_with(".sha256");
-    let in_logs = p.components().any(|c| c.as_os_str() == "logs");
-    let in_claude = p.components().any(|c| c.as_os_str() == ".claude");
-    if ignored_file || in_logs || in_claude {
+    if is_ignored(p) {
         return Disposition::Ignore;
     }
 
     if in_build_dir
         || p.components().any(|c| {
-            let s = c.as_os_str().to_string_lossy();
-            BUILD_DIRS.contains(&s.as_ref()) || s.starts_with("cbuild")
+            // Bytes, not `to_string_lossy`: a lossy name maps every invalid byte to U+FFFD,
+            // so two different directories can compare equal here and be classified alike.
+            let s = c.as_os_str().as_encoded_bytes();
+            BUILD_DIRS.iter().any(|d| d.as_bytes() == s) || s.starts_with(b"cbuild")
         })
     {
         return Disposition::BuildOutput;
     }
 
     Disposition::StoreAndHash
+}
+
+fn is_ignored(p: &Path) -> bool {
+    let mut components = p.components().map(|c| c.as_os_str());
+    let Some(first) = components.next() else {
+        return false;
+    };
+    if first == C_ORACLE_DIR {
+        return false;
+    }
+    if ROOT_ONLY_IGNORED_DIRS.iter().any(|d| first == *d) {
+        return true;
+    }
+    let at_root = components.next().is_none();
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    (at_root && ROOT_ONLY_IGNORED.contains(&name))
+        || name.ends_with(".log")
+        || name.ends_with(".bak")
+        || name.ends_with(".sha256")
 }
 
 fn is_cmake_build_dir(dir: &Path) -> bool {
@@ -256,23 +304,24 @@ fn feed(h: &mut Sha256, bytes: &[u8]) {
 /// and following symlinks to hash content rather than the link target — the links around
 /// phase dirs are staging artifacts whose targets are per-run paths.
 fn digest_tree(root: &Path) -> Result<TreeDigest> {
+    hash_tree(root, &|d| d == Disposition::StoreAndHash)
+}
+
+fn hash_tree(root: &Path, admits: &dyn Fn(Disposition) -> bool) -> Result<TreeDigest> {
     let mut files: std::collections::BTreeMap<RelPath, PathBuf> = Default::default();
-    visit(
-        root,
-        root,
-        false,
-        &|d| d == Disposition::StoreAndHash,
-        &mut |rel, abs| {
-            files.insert(rel.clone(), abs.to_path_buf());
-            Ok(())
-        },
-    )
+    visit(root, root, false, admits, &mut |rel, abs| {
+        files.insert(rel.clone(), abs.to_path_buf());
+        Ok(())
+    })
     .with_context(|| format!("walking {} for a digest", root.display()))?;
 
     let mut h = Sha256::new();
     feed(&mut h, b"harvest-tree-v1");
     for (rel, abs) in &files {
-        feed(&mut h, rel.as_path().to_string_lossy().as_bytes());
+        // `RelPath::new` validates relative/no-`..`/non-empty but NOT UTF-8, and a lossy
+        // name collapses every invalid byte to U+FFFD — so `a\xFF` and `a\xFE` would hash
+        // alike, losing the injectivity the rest of this digest rests on.
+        feed(&mut h, rel.as_path().as_os_str().as_encoded_bytes());
         let bytes = std::fs::read(abs).with_context(|| format!("reading {}", abs.display()))?;
         feed(&mut h, &bytes);
     }
@@ -309,18 +358,43 @@ fn visit(
     Ok(())
 }
 
-/// Disk-backed, never tmpfs (see [`crate::workdir`]); removed on drop.
+/// Disk-backed, never tmpfs (see [`crate::workdir`]); removed once the last handle to
+/// it drops. Shared rather than solely owned so that a [`ScratchPath`] cut from it
+/// cannot name a directory the tempdir has already deleted.
 #[must_use]
 pub struct Scratch {
-    dir: tempfile::TempDir,
+    dir: Arc<tempfile::TempDir>,
 }
 
 impl Scratch {
     pub fn new(prefix: &str) -> Result<Self> {
         Ok(Self {
-            dir: crate::workdir::tempdir(prefix)?,
+            dir: Arc::new(crate::workdir::tempdir(prefix)?),
         })
     }
+
+    /// Room for ONE case inside a root shared by many. [`Sealed::materialise_into`]
+    /// cannot serve a whole battery: it consumes the `Scratch` and roots the work tree
+    /// at the tempdir itself, so N cases would need N roots.
+    pub fn subdir(&self, name: impl AsRef<Path>) -> Result<ScratchPath> {
+        let rel = RelPath::new(name)?;
+        let root = self.dir.path().join(rel.as_path());
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("creating scratch subdir {}", root.display()))?;
+        Ok(ScratchPath {
+            root,
+            keep: Arc::clone(&self.dir),
+        })
+    }
+}
+
+/// Where a case may be materialised. Hands out no path of its own, so the only thing a
+/// caller can do with one is pass it to [`Sealed::materialise_at`] — which is what stops
+/// that destination from being the results-tree phase dir being measured.
+#[must_use]
+pub struct ScratchPath {
+    root: PathBuf,
+    keep: Arc<tempfile::TempDir>,
 }
 
 /// A materialised, writable copy. The ONLY artifact type that yields a `Path`.
@@ -340,17 +414,22 @@ impl<P: Phase> WorkTree<P> {
     }
 
     pub fn c(&self) -> CDir {
-        CDir(self.crate_dir().join("c_src"))
+        CDir(self.crate_dir().join(C_ORACLE_DIR))
     }
 
     /// Rewrite per-run absolute paths to a stable token, then allow hashing. Consumes
     /// `self`, so nothing can run again against a tree normalised for hashing.
     pub fn scrub(self) -> Result<Scrubbed<P>> {
         let base = crate::workdir::base()?;
-        let needles = [
-            self.root.to_string_lossy().into_owned(),
-            base.to_string_lossy().into_owned(),
-        ];
+        // The files below are read as UTF-8, so a non-UTF-8 path cannot occur in one and
+        // there is nothing to rewrite — whereas its lossy form (U+FFFD per invalid byte)
+        // can occur, and would rewrite text that is not a path.
+        let needles: Vec<String> = [self.root.as_path(), base.as_path()]
+            .into_iter()
+            .filter_map(|p| p.to_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
         let mut rewritten = Vec::new();
 
         let artifact = self.crate_dir();
@@ -366,9 +445,7 @@ impl<P: Phase> WorkTree<P> {
                 }; // binary: skip
                 let mut out = text.clone();
                 for n in &needles {
-                    if !n.is_empty() {
-                        out = out.replace(n.as_str(), "$HARVEST_WORKDIR");
-                    }
+                    out = out.replace(n.as_str(), "$HARVEST_WORKDIR");
                 }
                 if out != text {
                     std::fs::write(abs, out)
@@ -392,9 +469,13 @@ impl<P: Phase> WorkTree<P> {
 pub struct CDir(PathBuf);
 
 impl CDir {
+    /// Everything but build output — the same files [`classify`] keeps under `c_src/`
+    /// when reached from the artifact root. This walk sees `c_src` as its own root, where
+    /// the root-anchored rules cannot recognise the prefix, so the predicate is spelled
+    /// here instead.
     pub fn digest(&self) -> Result<TreeDigest> {
         if self.0.is_dir() {
-            digest_tree(&self.0)
+            hash_tree(&self.0, &|d| d != Disposition::BuildOutput)
         } else {
             Ok(TreeDigest("sha256:absent".into()))
         }
@@ -416,6 +497,14 @@ impl<P: Phase> Scrubbed<P> {
 
     pub fn seal(self, _proof: &Completed, c_before: &TreeDigest) -> Result<Sealed<P>> {
         let c_after = CDir(self.root.join("c_src")).digest()?;
+        if &c_after != c_before {
+            return Err(crate::refusal::Refusal::OracleModified {
+                before: c_before.as_str().to_string(),
+                after: c_after.as_str().to_string(),
+            }
+            .into());
+        }
+        let c_after = CDir(self.root.join(C_ORACLE_DIR)).digest()?;
         anyhow::ensure!(
             &c_after == c_before,
             "the agent modified the C oracle source: {} before, {} after. \
@@ -500,6 +589,20 @@ impl<P: Phase> Sealed<P> {
     #[must_use = "materialising and dropping the copy does nothing"]
     pub fn materialise_into<Q: Phase>(&self, scratch: Scratch) -> Result<WorkTree<Q>> {
         let root = scratch.dir.path().to_path_buf();
+        self.materialise(root, scratch)
+    }
+
+    /// As [`Self::materialise_into`], but into one slot of a scratch root the caller
+    /// keeps, so a battery of N cases needs one root and not N.
+    #[must_use = "materialising and dropping the copy does nothing"]
+    pub fn materialise_at<Q: Phase>(&self, at: ScratchPath) -> Result<WorkTree<Q>> {
+        let ScratchPath { root, keep } = at;
+        self.materialise(root, Scratch { dir: keep })
+    }
+
+    /// Both public entry points route here, so "what a work tree is seeded with" has one
+    /// answer whether the root is shared or owned.
+    fn materialise<Q: Phase>(&self, root: PathBuf, keep: Scratch) -> Result<WorkTree<Q>> {
         copy_carrying(
             &self.root,
             &root.join(crate::battery::TRANSLATED_RUST),
@@ -507,7 +610,7 @@ impl<P: Phase> Sealed<P> {
         )?;
         Ok(WorkTree {
             root,
-            _scratch: Some(scratch),
+            _scratch: Some(keep),
             _phase: PhantomData,
         })
     }
@@ -562,6 +665,7 @@ mod tests {
                 ("src/lib.rs", "pub fn a() {}"),
                 (".cargo/config.toml", "[build]"), // a real build input
                 ("c_src/src/lib.c", "int a(void){0;}"), // the oracle: hashed, so carried
+                ("c_src/doc/footer.html.bak", "upstream"), // hashed too: it is oracle source
                 ("build.rs", "fn main() {}"),
                 ("logs/verify.log", "transcript"), // Ignore: need not survive
                 ("target/debug/junk", "build output"), // BuildOutput: must not survive
@@ -576,6 +680,7 @@ mod tests {
             "src/lib.rs",
             ".cargo/config.toml",
             "c_src/src/lib.c",
+            "c_src/doc/footer.html.bak",
             "build.rs",
         ] {
             assert_eq!(
@@ -658,6 +763,38 @@ mod tests {
         assert_ne!(format!("{:x}", a.finalize()), format!("{:x}", b.finalize()));
     }
 
+    /// Pinned from the pre-`as_encoded_bytes` implementation. On Unix an `OsStr` *is* its
+    /// encoded bytes and lossy conversion of valid UTF-8 is the identity, so every digest
+    /// in `results/` must survive; this measures that rather than assuming it.
+    #[test]
+    fn lossless_path_encoding_does_not_change_an_existing_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = tmp.path();
+        std::fs::create_dir_all(r.join("src")).unwrap();
+        std::fs::write(r.join("Cargo.toml"), b"[package]\nname=\"x\"\n").unwrap();
+        std::fs::write(r.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
+        std::fs::create_dir_all(r.join("c_src/nested")).unwrap();
+        std::fs::write(r.join("c_src/nested/a.c"), b"int a;\n").unwrap();
+        assert_eq!(
+            digest_tree(r).unwrap().as_str(),
+            "sha256:bb95dbd7dfe0089c8568c8421bcca59e4d32bc0f406fb65d9f3bd8ab6302a6df"
+        );
+    }
+
+    /// The hole the lossy encoding left. `RelPath` does not validate UTF-8, so this is
+    /// reachable, and both trees used to digest alike — a cache hit across different work.
+    #[test]
+    fn paths_differing_only_outside_utf8_digest_differently() {
+        use std::os::unix::ffi::OsStrExt;
+        let digest_of = |name: &[u8]| {
+            let tmp = tempfile::tempdir().unwrap();
+            let f = tmp.path().join(std::ffi::OsStr::from_bytes(name));
+            std::fs::write(&f, b"same content").unwrap();
+            digest_tree(tmp.path()).unwrap().as_str().to_owned()
+        };
+        assert_ne!(digest_of(b"a\xff"), digest_of(b"a\xfe"));
+    }
+
     #[test]
     fn classify_ignores_harness_output_and_logs() {
         assert_eq!(classify(&rel("result.json"), false), Disposition::Ignore);
@@ -670,6 +807,82 @@ mod tests {
             Disposition::Ignore
         );
         assert_eq!(classify(&rel("src/x.rs.bak"), false), Disposition::Ignore);
+    }
+
+    /// The harness writes its bookkeeping at the phase-dir root. The same NAME deeper in
+    /// the tree is the translated program's own file and must be inside its digest.
+    #[test]
+    fn harness_bookkeeping_is_ignored_only_at_the_artifact_root() {
+        for name in ROOT_ONLY_IGNORED {
+            assert_eq!(
+                classify(&rel(name), false),
+                Disposition::Ignore,
+                "{name} at the root"
+            );
+            let nested = format!("src/data/{name}");
+            assert_eq!(
+                classify(&rel(&nested), false),
+                Disposition::StoreAndHash,
+                "{nested} belongs to the translation, not the harness"
+            );
+        }
+        assert_eq!(
+            classify(&rel("src/logs/mod.rs"), false),
+            Disposition::StoreAndHash,
+            "a source module named logs/ is source"
+        );
+    }
+
+    /// `Scrubbed::seal` grades a run on the c_src digest before vs after. Anything
+    /// excluded there is a change to the reference that nothing detects — and
+    /// `c_src/doc/footer.html.bak` is a real upstream file in 26 stored cases.
+    #[test]
+    fn nothing_under_the_c_oracle_is_ignored() {
+        for p in [
+            "c_src/doc/footer.html.bak",
+            "c_src/tests/expected.log",
+            "c_src/lib.c.sha256",
+            "c_src/logs/note.txt",
+            "c_src/result.json",
+        ] {
+            assert_eq!(classify(&rel(p), false), Disposition::StoreAndHash, "{p}");
+        }
+        // Build output under the oracle stays build output: its CMakeCache.txt names a
+        // dead scratch dir, which is why it is neither carried nor hashed.
+        assert_eq!(
+            classify(&rel("c_src/build/CMakeCache.txt"), false),
+            Disposition::BuildOutput
+        );
+    }
+
+    /// The oracle guard walks `c_src` as its OWN root, where the root-anchored rules in
+    /// `classify` cannot see the `c_src` prefix. Both walks must cover the same files or
+    /// the guard is blind to exactly what the artifact digest records.
+    #[test]
+    fn the_oracle_guard_sees_a_bak_file_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = tmp.path().join("c_src");
+        tree(
+            &c,
+            &[
+                ("src/lib.c", "int a(void){return 0;}"),
+                ("doc/footer.html.bak", "upstream"),
+            ],
+        );
+
+        let before = CDir(c.clone()).digest().unwrap();
+        std::fs::write(c.join("doc/footer.html.bak"), "the agent edited the oracle").unwrap();
+        assert_ne!(
+            before,
+            CDir(c.clone()).digest().unwrap(),
+            "a .bak edit must move the digest"
+        );
+
+        assert_eq!(
+            classify(&rel("c_src/doc/footer.html.bak"), false),
+            Disposition::StoreAndHash,
+            "and the artifact digest must cover the same file",
+        );
     }
 
     #[test]
@@ -863,6 +1076,56 @@ mod tests {
             "pub fn a() {}",
             "translated/ must be left untouched — verify is pure"
         );
+    }
+
+    /// One root, many cases — the shape `materialise_into` cannot express, and the
+    /// prerequisite for scoring a battery outside the tree it scores.
+    #[test]
+    fn one_scratch_root_holds_many_cases_and_outlives_each_of_them() {
+        let case = tempfile::tempdir().unwrap();
+        tree(
+            &case.path().join(crate::battery::TRANSLATED),
+            &[("Cargo.toml", "[package]"), ("src/lib.rs", "pub fn a() {}")],
+        );
+        let sealed = Sealed::<Translate>::adopt(case.path()).unwrap();
+
+        let root = Scratch::new("test-battery-").unwrap();
+        let a: WorkTree<Verify> = sealed
+            .materialise_at(root.subdir("case-a").unwrap())
+            .unwrap();
+        let b: WorkTree<Verify> = sealed
+            .materialise_at(root.subdir("case-b").unwrap())
+            .unwrap();
+
+        assert_eq!(
+            a.path().parent(),
+            b.path().parent(),
+            "both cases must share the one root"
+        );
+        assert_ne!(
+            a.path(),
+            b.path(),
+            "each case still needs a crate of its own to build in"
+        );
+        for w in [&a, &b] {
+            assert!(
+                w.crate_dir().join("src/lib.rs").is_file(),
+                "the crate must be copied"
+            );
+        }
+
+        let b_crate = b.crate_dir();
+        drop(b);
+        assert!(
+            b_crate.join("src/lib.rs").is_file(),
+            "one case ending must not delete the root the others are still building in"
+        );
+
+        assert!(
+            root.subdir("/abs").is_err(),
+            "a destination outside the root must be refused"
+        );
+        assert!(root.subdir("../up").is_err());
     }
 
     #[test]

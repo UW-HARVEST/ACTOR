@@ -22,15 +22,24 @@ pub fn phase_dir(case_dir: &Path, phase: &str) -> PathBuf {
     case_dir.join(phase)
 }
 
+/// THE PHASE PREDICATE: did this phase produce a crate? ONE definition, enforced by
+/// `tests/architecture.rs` (A6), because a case falls between two spellings of it.
+/// `verified/` exists as soon as verify writes a log, so the old `is_dir()` said yes
+/// for pcre2 — logs, no crate — while every reader asked for `Cargo.toml` and
+/// `continue`d, taking pcre2 out of the harvest-bench denominator.
+pub fn has_crate(phase_dir: &Path) -> bool {
+    phase_dir.join("Cargo.toml").is_file()
+}
+
 /// THE READER RULE: every reader wanting a case's current state (score, LOC,
 /// unsafe, crate source) must come through here, so pre- and post-verify cases
 /// resolve uniformly.
 pub fn crate_dir(case_dir: &Path) -> PathBuf {
-    let verified = case_dir.join(VERIFIED);
-    if verified.is_dir() {
+    let verified = phase_dir(case_dir, VERIFIED);
+    if has_crate(&verified) {
         verified
     } else {
-        case_dir.join(TRANSLATED)
+        phase_dir(case_dir, TRANSLATED)
     }
 }
 
@@ -371,9 +380,42 @@ pub fn all_case_names(battery: &Battery) -> Vec<String> {
     names
 }
 
-/// LLM API credits consumed by a single agent invocation.
+/// The Kiro Power add-on rate, and the only bridge between the two money types below.
+const USD_PER_CREDIT: f64 = 0.04;
+
+/// LLM API credits consumed by a single agent invocation. The field is private so the
+/// only way to read the number is [`Credits::as_f64`], which cannot be reached by
+/// accident where a dollar amount was meant.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
-pub struct Credits(pub f64);
+pub struct Credits(f64);
+
+/// US dollars — deliberately NOT the same type as [`Credits`]. Both end up in the paper's
+/// cost table and they differ by 25x, so a bare `f64` for each makes a 25x error a
+/// type-correct expression.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Usd(f64);
+
+impl Credits {
+    pub fn new(credits: f64) -> Self {
+        Self(credits)
+    }
+
+    pub fn as_f64(self) -> f64 {
+        self.0
+    }
+
+    /// The single place the rate is applied, so no other expression in the crate can
+    /// produce a dollar figure and none can spell a dollar figure as a credit count.
+    pub fn to_usd(self) -> Usd {
+        Usd(self.0 * USD_PER_CREDIT)
+    }
+}
+
+impl Usd {
+    pub fn as_f64(self) -> f64 {
+        self.0
+    }
+}
 
 /// Every field is as the provider reported it; none is derived.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -447,7 +489,7 @@ static KIRO_CREDITS_RE: LazyLock<Regex> =
 fn extract_kiro_meta(log_path: &Path) -> Option<AgentRunMeta> {
     let data = crate::agent_health::read_tail(log_path).ok()?;
     let caps = KIRO_CREDITS_RE.captures_iter(&data).last()?;
-    let credits = Credits(caps[1].parse().ok()?);
+    let credits = Credits::new(caps[1].parse().ok()?);
     let wall_secs = parse_duration(&caps[2]);
     Some(AgentRunMeta {
         credits,
@@ -720,11 +762,16 @@ pub struct Paths {
     pub results_dir: PathBuf,
     pub prompts_dir: PathBuf,
     pub agent: Agent,
+    /// How this run is spelled in the results tree, the cache key and the recorded
+    /// provenance — one value, so the three cannot disagree.
+    pub agent_key: crate::cache::AgentKey,
     pub model: Option<String>,
     /// A required parameter of `new` rather than a default, so the compiler names
     /// every construction site that would otherwise silently get read-write
     /// caching.
     pub cache_mode: crate::cache::Mode,
+    /// Whether the operator accepted running without an enforceable sandbox.
+    pub enforcement: crate::sandbox::Enforcement,
 }
 
 impl Paths {
@@ -734,49 +781,24 @@ impl Paths {
         dataset: Dataset,
         model: Option<&str>,
         cache_mode: crate::cache::Mode,
+        enforcement: crate::sandbox::Enforcement,
     ) -> Result<Self> {
-        // Derived from --model (like Agent::Oneshot) so each evaluated model gets
-        // its own dir. Owned because the match below borrows from it.
-        let opencode_slug = match agent {
-            Agent::OpenCode => {
-                let raw = model.context(
-                    "--agent opencode needs --model <provider>/<model-id>: it names the results dir",
-                )?;
-                crate::opencode::results_slug(&crate::opencode::parse_model(raw)?)
-            }
-            _ => String::new(),
-        };
-        let agent_name: &str = match agent {
-            Agent::Kiro => "kiro",
-            Agent::Claude => "claude",
-            Agent::ClaudeCombined => "claude-combined",
-            Agent::ClaudeMinimal => "claude-minimal",
-            Agent::ClaudeNoIter => "claude-no-iter",
-            Agent::ClaudeNoFeatures => "claude-no-features",
-            Agent::ClaudeNoSubtask => "claude-no-subtask",
-            Agent::ClaudeCrossPrompt => "claude-cross-prompt",
-            Agent::CodexGpt55 => "codex-gpt55",
-            Agent::CodexGpt54 => "codex-gpt54",
-            Agent::OpenCode => &opencode_slug,
-            Agent::C2rust => "c2rust",
-            Agent::Laertes => "laertes",
-            Agent::C2SaferRust => "c2saferrust",
-            Agent::SmartC2Rust => "smartc2rust",
-            Agent::Kimi => "kimi",
-            Agent::Oneshot => model
-                .map(|m| m.rsplit_once('/').map_or(m, |(_, last)| last))
-                .context(
-                    "--agent oneshot needs --model <provider>/<model-id>: it names the results dir",
-                )?,
-        };
+        // The same value the cache key and every `"agent"` field use: a second table
+        // here is what let 208 result files record an agent name no `--agent` value
+        // spells, under a `codex-gpt55/` directory.
+        let agent_key = crate::cache::AgentKey::new(agent, model)?;
         let (corpus_dir, results_dir) = match dataset {
             Dataset::TestCorpus => (
                 repo_root.join("test-corpus"),
-                repo_root.join("results/Test-Corpus").join(agent_name),
+                repo_root
+                    .join("results/Test-Corpus")
+                    .join(agent_key.as_str()),
             ),
             Dataset::HarvestBench => (
                 repo_root.join("harvest-bench/tests"),
-                repo_root.join("results/HarvestBench").join(agent_name),
+                repo_root
+                    .join("results/HarvestBench")
+                    .join(agent_key.as_str()),
             ),
         };
         let prompts_dir = match agent {
@@ -806,8 +828,10 @@ impl Paths {
             corpus_dir,
             results_dir,
             cache_mode,
+            enforcement,
             prompts_dir,
             agent,
+            agent_key,
             model: model.map(String::from),
         })
     }
@@ -874,6 +898,44 @@ mod tests {
         }
         assert_eq!(independent_count, 3, "should have 3 independent cases");
         assert_eq!(shared_count, 1, "should have 1 shared-source group");
+    }
+
+    /// Regression, pcre2: a `verified/` holding only logs used to shadow the crate.
+    #[test]
+    fn a_verified_dir_holding_only_logs_resolves_to_translated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let case = tmp.path().join("pcre2");
+        fs::create_dir_all(case.join("verified/logs")).unwrap();
+        fs::write(case.join("verified/logs/verify.log"), "transcript").unwrap();
+        fs::write(case.join("verified/verification.json"), "{}").unwrap();
+        fs::create_dir_all(case.join("translated")).unwrap();
+        fs::write(case.join("translated/Cargo.toml"), "[package]").unwrap();
+
+        assert!(
+            case.join("verified").is_dir(),
+            "fixture must retain the trap"
+        );
+        assert!(!has_crate(&case.join("verified")));
+        assert_eq!(
+            crate_dir(&case),
+            case.join("translated"),
+            "a phase that produced no crate must not shadow the one that did"
+        );
+        assert!(
+            has_crate(&crate_dir(&case)),
+            "the resolved dir must be scoreable"
+        );
+    }
+
+    #[test]
+    fn a_verified_crate_still_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let case = tmp.path().join("zstd");
+        for phase in [TRANSLATED, VERIFIED] {
+            fs::create_dir_all(case.join(phase)).unwrap();
+            fs::write(case.join(phase).join("Cargo.toml"), "[package]").unwrap();
+        }
+        assert_eq!(crate_dir(&case), case.join(VERIFIED));
     }
 
     #[test]
@@ -1029,7 +1091,7 @@ mod provenance_tests {
         // newline, so a two-line fixture silently fails to match.
         let p = log(tmp.path(), "▸ Credits: 1.25 • Time: 3m 4s\n");
         let m = extract_agent_meta(&p).expect("kiro log is recognised");
-        assert_eq!(m.credits.0, 1.25);
+        assert_eq!(m.credits.as_f64(), 1.25);
         assert_eq!(m.wall_secs, 184);
         assert!(m.total_cost_usd.is_none(), "no dollar cost for kiro");
         assert!(m.model.is_none());

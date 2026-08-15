@@ -16,6 +16,15 @@ pub const ENV_ALLOW_TMPFS: &str = "HARVEST_ALLOW_TMPFS_WORK";
 
 static BASE: OnceLock<PathBuf> = OnceLock::new();
 
+/// Whether a RAM-backed scratch base is tolerated. Named rather than `bool` because the
+/// permissive side of this switch is what lets a runaway build tree be charged to memory
+/// and kill the host, and `resolve_from(.., .., true, ..)` does not say which side that is.
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub enum Tmpfs {
+    Refuse,
+    Allow,
+}
+
 /// Base for scratch trees: `$HARVEST_WORK_BASE`, else `$HOME/.harvest/work`.
 ///
 /// Not under `$HOME/.cache` even though these trees are disposable: that dir is
@@ -43,7 +52,11 @@ fn resolve() -> Result<PathBuf> {
         std::env::var_os("HOME")
             .filter(|h| !h.is_empty())
             .map(PathBuf::from),
-        std::env::var_os(ENV_ALLOW_TMPFS).is_some(),
+        if std::env::var_os(ENV_ALLOW_TMPFS).is_some() {
+            Tmpfs::Allow
+        } else {
+            Tmpfs::Refuse
+        },
         &mounts,
     )
 }
@@ -53,7 +66,7 @@ fn resolve() -> Result<PathBuf> {
 fn resolve_from(
     base_override: Option<PathBuf>,
     home: Option<PathBuf>,
-    allow_tmpfs: bool,
+    tmpfs: Tmpfs,
     mounts: &str,
 ) -> Result<PathBuf> {
     let base = match base_override {
@@ -70,7 +83,7 @@ fn resolve_from(
         .canonicalize()
         .with_context(|| format!("resolving scratch base {}", base.display()))?;
 
-    if !allow_tmpfs {
+    if tmpfs == Tmpfs::Refuse {
         if let Some(fstype) = fstype_for(mounts, &base) {
             if fstype == "tmpfs" || fstype == "ramfs" {
                 bail!(
@@ -202,7 +215,7 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
         let tmp = tempfile::tempdir().unwrap();
         let want = tmp.path().join("deep/nested/base");
         let home = tmp.path().join("home");
-        let got = resolve_from(Some(want.clone()), Some(home.clone()), true, MOUNTS)
+        let got = resolve_from(Some(want.clone()), Some(home.clone()), Tmpfs::Allow, MOUNTS)
             .expect("explicit base resolves");
         assert!(got.is_dir(), "base should be created recursively");
         assert_eq!(got, want.canonicalize().unwrap());
@@ -216,7 +229,8 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
     fn default_base_derives_from_home_and_is_not_tmp_or_cache() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
-        let got = resolve_from(None, Some(home.clone()), true, MOUNTS).expect("resolves from HOME");
+        let got = resolve_from(None, Some(home.clone()), Tmpfs::Allow, MOUNTS)
+            .expect("resolves from HOME");
         assert_eq!(got, home.join(".harvest/work").canonicalize().unwrap());
         assert!(
             !got.starts_with("/tmp/harvest"),
@@ -233,7 +247,7 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
     fn tmpfs_base_is_refused_with_an_actionable_message() {
         // tempfile::tempdir() lands in /tmp, which MOUNTS marks as tmpfs.
         let tmp = tempfile::tempdir().unwrap();
-        let err = resolve_from(Some(tmp.path().to_path_buf()), None, false, MOUNTS)
+        let err = resolve_from(Some(tmp.path().to_path_buf()), None, Tmpfs::Refuse, MOUNTS)
             .expect_err("a tmpfs base must be refused");
         let err = format!("{err:#}");
         assert!(
@@ -253,14 +267,14 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
     #[test]
     fn tmpfs_base_is_accepted_when_explicitly_allowed() {
         let tmp = tempfile::tempdir().unwrap();
-        resolve_from(Some(tmp.path().to_path_buf()), None, true, MOUNTS)
+        resolve_from(Some(tmp.path().to_path_buf()), None, Tmpfs::Allow, MOUNTS)
             .expect("override should permit a tmpfs base");
     }
 
     #[test]
     fn missing_home_without_override_errors_and_says_what_to_set() {
-        let err =
-            resolve_from(None, None, true, MOUNTS).expect_err("no base and no HOME must fail");
+        let err = resolve_from(None, None, Tmpfs::Allow, MOUNTS)
+            .expect_err("no base and no HOME must fail");
         let err = format!("{err:#}");
         assert!(
             err.contains(ENV_BASE),
@@ -274,7 +288,7 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
         let file = tmp.path().join("i-am-a-file");
         std::fs::write(&file, b"x").unwrap();
         let bad = file.join("cannot/nest/under/a/file");
-        let err = resolve_from(Some(bad), None, true, MOUNTS)
+        let err = resolve_from(Some(bad), None, Tmpfs::Allow, MOUNTS)
             .expect_err("nesting under a regular file must fail");
         let err = format!("{err:#}");
         assert!(

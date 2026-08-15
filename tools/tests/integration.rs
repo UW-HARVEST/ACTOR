@@ -289,46 +289,7 @@ mod test_artifacts {
     }
 }
 
-/// Guards the prompt layout: every prompt the loader references must exist on
-/// disk. 21 load sites use `.unwrap_or_default()`, so a missing/misplaced prompt
-/// does NOT error at runtime — it silently runs the agent with an EMPTY prompt.
-/// This test turns that silent failure into a loud test failure (e.g. if an
-/// ablation prompt is moved without updating the loader path).
-mod prompt_layout {
-    use super::*;
-
-    #[test]
-    fn all_referenced_prompts_exist() {
-        let claude = repo_root().join("prompts/claude");
-        // Main pipeline (claude/kiro/codex/harvest-bench).
-        let main = [
-            "translate-library.md",
-            "translate-executable.md",
-            "translate-shared.md",
-            "verify.md",
-        ];
-        // Ablation variants (claude-minimal / no-iter / no-features / no-subtask),
-        // now under ablations/. If one is moved without updating translate.rs, the
-        // loader would silently read "" — this catches that.
-        let ablations = [
-            // combined-mode (claude-combined)
-            "ablations/translate-and-verify-library.md",
-            "ablations/translate-and-verify-executable.md",
-            "ablations/translate-and-verify-shared.md",
-            "ablations/translate-minimal.md",
-            "ablations/translate-no-iter-library.md",
-            "ablations/translate-no-iter-executable.md",
-            "ablations/translate-no-iter-shared.md",
-            "ablations/translate-no-features-shared.md",
-            "ablations/translate-no-subtask-shared.md",
-        ];
-        for rel in main.iter().chain(ablations.iter()) {
-            let p = claude.join(rel);
-            assert!(
-                p.is_file(),
-                "referenced prompt missing (loader would run EMPTY): {}",
-                p.display()
-            );
-        }
-    }
-}
+// The prompt-layout guard that lived here listed the claude prompts by hand and only
+// covered that one directory. `translate::tests::every_prompt_the_matrix_names_is_on_disk`
+// derives the same check from `prompt_file_for` for every agent, and runs in the
+// type-safety job — which this file, needing submodules, is excluded from.

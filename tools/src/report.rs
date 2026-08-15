@@ -1,3 +1,4 @@
+use crate::battery::Credits;
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -84,8 +85,7 @@ pub fn generate(repo_root: &Path) -> Result<()> {
                 None => continue,
             };
 
-            let (total_loc, unsafe_lines, cases_built) =
-                aggregate_cases(&bat_dir, &test_corpus_dir.join(&battery));
+            let totals = aggregate_cases(&bat_dir, &test_corpus_dir.join(&battery));
 
             let c_loc = *c_loc_cache
                 .entry(battery.clone())
@@ -96,12 +96,12 @@ pub fn generate(repo_root: &Path) -> Result<()> {
                 battery: battery.clone(),
                 cases_passed: summary.cases_passed,
                 cases_tested: summary.cases_tested,
-                cases_built,
+                cases_built: totals.cases_built,
                 vectors_passed: summary.vectors_passed,
                 vectors_total: summary.vectors_passed + summary.vectors_failed,
                 c_loc,
-                total_loc,
-                unsafe_lines,
+                total_loc: totals.total_loc,
+                unsafe_lines: totals.unsafe_lines,
             });
 
             // Kiro's PRE-verify numbers, emitted as a synthetic "kiro-translate"
@@ -109,7 +109,7 @@ pub fn generate(repo_root: &Path) -> Result<()> {
             // on it without a separate results tree.
             if agent == "kiro" {
                 if let Some(nv) = read_json::<Summary>(&bat_dir.join("summary_translated.json")) {
-                    let (nv_loc, nv_unsafe, nv_built) = aggregate_cases_phase(
+                    let nv_totals = aggregate_cases_phase(
                         &bat_dir,
                         &test_corpus_dir.join(&battery),
                         Some(crate::battery::TRANSLATED),
@@ -119,12 +119,12 @@ pub fn generate(repo_root: &Path) -> Result<()> {
                         battery: battery.clone(),
                         cases_passed: nv.cases_passed,
                         cases_tested: nv.cases_tested,
-                        cases_built: nv_built,
+                        cases_built: nv_totals.cases_built,
                         vectors_passed: nv.vectors_passed,
                         vectors_total: nv.vectors_passed + nv.vectors_failed,
                         c_loc,
-                        total_loc: nv_loc,
-                        unsafe_lines: nv_unsafe,
+                        total_loc: nv_totals.total_loc,
+                        unsafe_lines: nv_totals.unsafe_lines,
                     });
                 }
             }
@@ -638,36 +638,55 @@ fn case_builds(repo_root: &Path, agent: &str) -> std::collections::BTreeMap<Stri
     out
 }
 
-/// `(broke, fixed)`: compilations Laertes breaks that C2Rust had working, and
-/// ones it fixes that C2Rust could not build.
-fn laertes_vs_c2rust(repo_root: &Path) -> (u32, u32) {
+/// The paper's Laertes claim is the *direction* of these two counts, so they are named:
+/// as a `(u32, u32)` the two are interchangeable at every call site and swapping them
+/// reverses the claim without changing a type.
+struct LaertesDelta {
+    /// Compilations Laertes breaks that C2Rust had working.
+    broke: u32,
+    /// Ones it fixes that C2Rust could not build.
+    fixed: u32,
+}
+
+fn laertes_vs_c2rust(repo_root: &Path) -> LaertesDelta {
     let c2 = case_builds(repo_root, "c2rust");
     let la = case_builds(repo_root, "laertes");
-    let (mut broke, mut fixed) = (0u32, 0u32);
+    let mut d = LaertesDelta { broke: 0, fixed: 0 };
     for (case, c2_ok) in &c2 {
         if let Some(&la_ok) = la.get(case) {
             if *c2_ok && !la_ok {
-                broke += 1;
+                d.broke += 1;
             }
             if !*c2_ok && la_ok {
-                fixed += 1;
+                d.fixed += 1;
             }
         }
     }
-    (broke, fixed)
+    d
 }
 
-/// Returns `(total_credits, verify_credits, total_wall_secs)`.
-///
+struct KiroCost {
+    credits: Credits,
+    /// The verify phase's share OF `credits`, not an addition to it — the published
+    /// validate-percentage is the ratio of the two.
+    verify_credits: Credits,
+    wall_secs: u64,
+}
+
 /// Reads exactly ONE result.json per case, the canonical phase dir. Each case
 /// may have BOTH translated/result.json and verified/result.json, and the
 /// verified one already carries the full translate+verify credit breakdown, so
 /// reading both would double-count the translate phase. Shared-source
 /// duplicates carry no credits, so they do not inflate the total.
-fn kiro_cost(base: &Path) -> (f64, f64, u64) {
+fn kiro_cost(base: &Path) -> KiroCost {
+    let zero = || KiroCost {
+        credits: Credits::new(0.0),
+        verify_credits: Credits::new(0.0),
+        wall_secs: 0,
+    };
     let (mut total, mut verify, mut secs) = (0.0f64, 0.0f64, 0u64);
     let Ok(rd) = std::fs::read_dir(base) else {
-        return (0.0, 0.0, 0);
+        return zero();
     };
     let mut stack: Vec<std::path::PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
     while let Some(p) = stack.pop() {
@@ -699,7 +718,11 @@ fn kiro_cost(base: &Path) -> (f64, f64, u64) {
             stack.extend(rd.filter_map(|e| e.ok().map(|e| e.path())));
         }
     }
-    (total, verify, secs)
+    KiroCost {
+        credits: Credits::new(total),
+        verify_credits: Credits::new(verify),
+        wall_secs: secs,
+    }
 }
 
 /// Named constants for result numbers quoted in the prose, so text and tables
@@ -744,9 +767,7 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
         ));
         o.push_str(&format!("\\newcommand{{\\TractorMeanLoc}}{{{}}}\n", mean));
     }
-    // The Kiro Power add-on rate. Claude and Codex report no credits, so their
-    // costs stay manual in the prose.
-    const USD_PER_CREDIT: f64 = 0.04;
+    // Claude and Codex report no credits, so their costs stay manual in the prose.
     // Deduped per-battery Rust LOC, matching what the tables report.
     let tractor_rust_loc: u32 = rows
         .iter()
@@ -757,12 +778,13 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
     let cost_rows: &[(&str, &str, u32)] =
         &[("Tractor", "results/Test-Corpus/kiro", tractor_rust_loc)];
     for (name, base, rust_loc) in cost_rows {
-        let (credits, verify_credits, secs) = kiro_cost(&repo_root.join(base));
+        let cost = kiro_cost(&repo_root.join(base));
+        let credits = cost.credits.as_f64();
         if credits <= 0.0 {
             continue;
         }
-        let dollars = credits * USD_PER_CREDIT;
-        let minutes = secs as f64 / 60.0;
+        let dollars = cost.credits.to_usd().as_f64();
+        let minutes = cost.wall_secs as f64 / 60.0;
         let kloc = *rust_loc as f64 / 1000.0;
         o.push_str(&format!("\\newcommand{{\\Cost{name}}}{{{:.0}}}\n", dollars));
         o.push_str(&format!(
@@ -779,23 +801,20 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
                 minutes / kloc
             ));
         }
-        if credits > 0.0 {
-            o.push_str(&format!(
-                "\\newcommand{{\\Cost{name}ValidatePct}}{{{:.0}}}\n",
-                verify_credits / credits * 100.0
-            ));
-        }
+        o.push_str(&format!(
+            "\\newcommand{{\\Cost{name}ValidatePct}}{{{:.0}}}\n",
+            cost.verify_credits.as_f64() / credits * 100.0
+        ));
     }
-    let (p01_cr, _, p01_secs) =
-        kiro_cost(&repo_root.join("results/Test-Corpus/kiro/P01_sphincs_plus"));
-    if p01_cr > 0.0 {
+    let p01 = kiro_cost(&repo_root.join("results/Test-Corpus/kiro/P01_sphincs_plus"));
+    if p01.credits.as_f64() > 0.0 {
         o.push_str(&format!(
             "\\newcommand{{\\CostPOne}}{{{:.2}}}\n",
-            p01_cr * USD_PER_CREDIT
+            p01.credits.to_usd().as_f64()
         ));
         o.push_str(&format!(
             "\\newcommand{{\\CostPOneMinutes}}{{{:.0}}}\n",
-            p01_secs as f64 / 60.0
+            p01.wall_secs as f64 / 60.0
         ));
     }
 
@@ -830,14 +849,14 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
         "\\newcommand{{\\ActorKiroNoValidatePOneTests}}{{{}/128}}\n",
         g(&p01_tests, "kiro-translate")
     ));
-    let (laertes_breaks, laertes_fixes) = laertes_vs_c2rust(repo_root);
+    let laertes = laertes_vs_c2rust(repo_root);
     o.push_str(&format!(
         "\\newcommand{{\\LaertesBreaks}}{{{}}}\n",
-        laertes_breaks
+        laertes.broke
     ));
     o.push_str(&format!(
         "\\newcommand{{\\LaertesFixes}}{{{}}}\n",
-        laertes_fixes
+        laertes.fixed
     ));
     o
 }
@@ -1023,9 +1042,17 @@ fn generate_tractor_tex(rows: &[BatteryRow]) -> String {
     out
 }
 
-/// Returns `(total_loc, unsafe_lines, cases_built)`; `corpus_bat_dir` is the
-/// matching `test-corpus/Public-Tests/<battery>`, needed to dedup shared-source
-/// LOC.
+/// Three same-width counts feeding three different published columns — one of them the
+/// unsafe percentage, which is `unsafe_lines / total_loc`. As a `(u32, u32, u32)` any
+/// permutation type-checks at every call site and lands in the table relabelled.
+struct CaseTotals {
+    total_loc: u32,
+    unsafe_lines: u32,
+    cases_built: u32,
+}
+
+/// `corpus_bat_dir` is the matching `test-corpus/Public-Tests/<battery>`, needed to dedup
+/// shared-source LOC.
 ///
 /// Two quantities, two rules. `built` counts EVERY config (P01 = 128/128 — all
 /// are compiled and run despite sharing one translation), whereas `loc`/`unsafe`
@@ -1035,22 +1062,22 @@ fn generate_tractor_tex(rows: &[BatteryRow]) -> String {
 /// grouping, not a LOC-ratio guess. Without the corpus that grouping is
 /// unresolvable, so LOC/unsafe sum every case (correct for the all-independent
 /// batteries; only P00/P01 need dedup and they require the corpus anyway).
-fn aggregate_cases(bat_dir: &Path, corpus_bat_dir: &Path) -> (u32, u32, u32) {
+fn aggregate_cases(bat_dir: &Path, corpus_bat_dir: &Path) -> CaseTotals {
     aggregate_cases_phase(bat_dir, corpus_bat_dir, None)
 }
 
 /// `phase` selects which phase dir's result.json to read: `Some("translated")`
 /// for the pre-verify (no-validate) numbers, `None` for the headline phase under
 /// the reader rule (verified/ if present, else translated/).
-fn aggregate_cases_phase(
-    bat_dir: &Path,
-    corpus_bat_dir: &Path,
-    phase: Option<&str>,
-) -> (u32, u32, u32) {
+fn aggregate_cases_phase(bat_dir: &Path, corpus_bat_dir: &Path, phase: Option<&str>) -> CaseTotals {
     let corpus_present = corpus_bat_dir.is_dir();
     let (mut total_loc, mut total_unsafe, mut built) = (0u32, 0u32, 0u32);
     let Ok(entries) = std::fs::read_dir(bat_dir) else {
-        return (0, 0, 0);
+        return CaseTotals {
+            total_loc: 0,
+            unsafe_lines: 0,
+            cases_built: 0,
+        };
     };
     for entry in entries.flatten() {
         if !entry.path().is_dir() {
@@ -1078,7 +1105,11 @@ fn aggregate_cases_phase(
         total_loc += cr.loc.map_or(0, |l| l.code);
         total_unsafe += cr.unsafe_.map_or(0, |u| u.lines);
     }
-    (total_loc, total_unsafe, built)
+    CaseTotals {
+        total_loc,
+        unsafe_lines: total_unsafe,
+        cases_built: built,
+    }
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
