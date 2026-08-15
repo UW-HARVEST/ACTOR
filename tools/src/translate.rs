@@ -170,7 +170,13 @@ impl CaseResult {
         } else {
             "panic with a non-string payload".to_owned()
         };
-        write_translation_metrics(case_dir, agent, 0, false);
+        // Runs on the JOINING thread, whose `LAST_AGENT_EXIT` belongs to whichever case
+        // that thread last ran, and a panic after `run_and_record` returned must not
+        // overwrite the real record with a zero-duration failure.
+        clear_agent_exit();
+        if !translation_metrics_path(case_dir).is_file() {
+            write_translation_metrics(case_dir, agent, 0, false);
+        }
         CaseResult {
             name,
             elapsed_secs: 0,
@@ -280,7 +286,7 @@ pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, 
 
         for cfg in &group.configs {
             current += 1;
-            if crate::battery::phase_dir(&output_dir.join(&cfg.name), crate::battery::TRANSLATED).join("Cargo.toml").exists() {
+            if crate::battery::has_crate(&crate::battery::phase_dir(&output_dir.join(&cfg.name), crate::battery::TRANSLATED)) {
                 translated += 1;
                 println!("[{current}/{total}] ⏭️  {} (already done)", cfg.name);
                 continue;
@@ -311,7 +317,7 @@ fn translate_one_independent(
     battery_name: &str,
     case: &battery::IndependentCase,
 ) -> CaseResult {
-    if crate::battery::phase_dir(&output_dir.join(&case.name), crate::battery::TRANSLATED).join("Cargo.toml").exists() {
+    if crate::battery::has_crate(&crate::battery::phase_dir(&output_dir.join(&case.name), crate::battery::TRANSLATED)) {
         return CaseResult { name: case.name.clone(), elapsed_secs: 0, success: true, error: None, skipped: true };
     }
 
@@ -344,7 +350,7 @@ fn translate_one_shared(
     group: &battery::SharedSourceGroup,
 ) -> CaseResult {
     let real_dir = output_dir.join(&group.real_case);
-    if crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
+    if crate::battery::has_crate(&crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED)) {
         return CaseResult { name: group.real_case.clone(), elapsed_secs: 0, success: true, error: None, skipped: true };
     }
 
@@ -561,7 +567,7 @@ fn translate_one_harvest_bench(paths: &Paths, project: &battery::HarvestBenchPro
     let name = project.name();
     let case_dir = paths.output_dir(name);
 
-    if crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
+    if crate::battery::has_crate(&crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED)) {
         return CaseResult { name: name.into(), elapsed_secs: 0, success: true, error: None, skipped: true };
     }
 
@@ -684,7 +690,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
             copy_dir_all(input_test_case, &c_src)?;
 
             if matches!(paths.agent, Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt) {
-                crate::sandbox::write_settings(&paths.repo_root, tmp.path(), tmp.path())?;
+                crate::sandbox::write_settings(&paths.repo_root, tmp.path(), tmp.path(), paths.allow_unsandboxed)?;
             }
 
             if matches!(paths.agent, Agent::OpenCode) {
@@ -788,7 +794,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
         Agent::Oneshot => unreachable!("oneshot uses oneshot_translate_case"),
     };
 
-    if !work_dir.join("Cargo.toml").exists() {
+    if !crate::battery::has_crate(&work_dir) {
         anyhow::bail!("no Cargo.toml produced");
     }
 
@@ -948,6 +954,14 @@ fn merge_agent_exit(metrics: &mut serde_json::Value) {
     }
 }
 
+/// Inside the `translated/` PHASE dir, beside the log it describes. The case ROOT is
+/// where this used to land, while `agent_health::collect` and `battery.rs` both read the
+/// phase dir — so `exit_code`/`timed_out` were written and then read by nothing, and
+/// that is the 124-on-timeout signal for a project killed at the wall clock.
+fn translation_metrics_path(case_dir: &Path) -> PathBuf {
+    crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED).join("translation.json")
+}
+
 fn write_translation_metrics(
     case_dir: &Path,
     agent: &crate::cache::AgentKey,
@@ -961,9 +975,12 @@ fn write_translation_metrics(
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
     merge_agent_exit(&mut metrics);
-    let _ = std::fs::create_dir_all(case_dir);
+    let path = translation_metrics_path(case_dir);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let _ = std::fs::write(
-        case_dir.join("translation.json"),
+        path,
         serde_json::to_string_pretty(&metrics).unwrap_or_default() + "\n",
     );
 }
@@ -982,6 +999,7 @@ pub fn agent_provenance(agent: &crate::cache::AgentKey, duration_secs: u64) -> s
         // Which harness code produced this; results are otherwise unattributable
         // after the fact.
         "harness": crate::provenance::harness_id(),
+        "sandboxed": crate::sandbox::is_enforceable(),
     });
     merge_agent_exit(&mut p);
     p
@@ -1303,7 +1321,7 @@ fn oneshot_llm_translate(
 
     write_llm_files(&resp.content, &translated)?;
 
-    if !translated.join("Cargo.toml").exists() {
+    if !crate::battery::has_crate(&translated) {
         anyhow::bail!("no Cargo.toml in LLM response");
     }
     Ok(())
@@ -1566,31 +1584,46 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     let log_path = logs_dir.join("translation.log");
     let translated = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
 
-    copy_dir_filtered(&c2rust_original, &translated, &["target"])?;
+    // Staged in scratch like its c2saferrust neighbour: the container gets this mounted
+    // read-write, and the compile check writes `target/` plus a `Cargo.lock` that is part
+    // of the hashed artifact — so in `translated/` the arm mutated its own result.
+    let tmp = crate::workdir::tempdir("harvest-laertes-")
+        .context("creating laertes temp workspace")?;
+    let work = tmp.path().join("project");
+    copy_dir_filtered(&c2rust_original, &work, &["target"])?;
 
     let mut log = std::fs::File::create(&log_path)?;
     writeln!(log, "source: {}", c2rust_original.display())?;
 
     writeln!(log, "\n=== Laertes pre-process ===")?;
-    laertes_preprocess(&translated)?;
+    laertes_preprocess(&work)?;
     writeln!(log, "done")?;
 
     writeln!(log, "\n=== Laertes Docker ===")?;
-    let mount = format!("{}:/mnt/project", translated.display());
+    let mount = format!("{}:/mnt/project", work.display());
     let docker_out = Command::new("docker")
         .args(["run", "--rm", "-v", &mount, LAERTES_DOCKER_IMAGE, "bash", "-c", LAERTES_DOCKER_SCRIPT])
         .output()
         .context("running laertes docker container")?;
     log.write_all(&docker_out.stdout)?;
     log.write_all(&docker_out.stderr)?;
+    // Unchecked, a container that never ran (missing image, dead daemon) published the
+    // untouched c2rust input as this arm's translation, and the comparison silently
+    // measured c2rust twice.
+    anyhow::ensure!(
+        docker_out.status.success(),
+        "laertes container failed ({}), so this case has no laertes translation; see {}",
+        docker_out.status,
+        log_path.display()
+    );
 
     writeln!(log, "\n=== Laertes post-process ===")?;
-    laertes_postprocess(&translated)?;
+    laertes_postprocess(&work)?;
 
     let build = Command::new("cargo")
         .args(["+nightly", "build", "--release"])
         .env("RUSTFLAGS", "-Awarnings")
-        .current_dir(&translated)
+        .current_dir(&work)
         .output()
         .context("cargo build after laertes")?;
     log.write_all(&build.stdout)?;
@@ -1598,6 +1631,7 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     let ok = build.status.success();
     writeln!(log, "\nlaertes translation {}", if ok { "succeeded" } else { "FAILED to compile (non-fatal)" })?;
 
+    copy_dir_filtered(&work, &translated, &["target"])?;
     Ok(())
 }
 
@@ -1758,7 +1792,7 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
     // nightly-2022-08-08). Emitting the unmodified input then keeps the case counted
     // and failing at test time instead of silently vanishing from the totals.
     let wip = tmp.path().join("rust_WIP");
-    let source_dir = if wip.join("Cargo.toml").exists() {
+    let source_dir = if crate::battery::has_crate(&wip) {
         writeln!(log, "\nrust_WIP produced; collecting C2SaferRust output")?;
         wip.clone()
     } else {
@@ -2079,6 +2113,11 @@ mod tests {
     use std::process::Command;
 
     /// ExitStatus cannot be constructed directly, so shell out for a real one.
+    /// main's tests predate `AgentKey`; this is the one spelling they share.
+    fn test_agent_key() -> crate::cache::AgentKey {
+        crate::cache::AgentKey::new(Agent::Claude, None).expect("claude has a fixed name")
+    }
+
     fn exit_status(code: i32) -> std::process::ExitStatus {
         Command::new("sh").arg("-c").arg(format!("exit {code}")).status().unwrap()
     }
@@ -2124,6 +2163,68 @@ mod tests {
         let mut m = serde_json::json!({"success": true});
         merge_agent_exit(&mut m);
         assert!(m.get("exit_code").is_none(), "exit_code must be absent when no CLI agent ran");
+        assert!(m.get("timed_out").is_none());
+    }
+
+    /// The writer must land where `agent_health::collect` and `battery.rs` look, or the
+    /// timeout signal (`timeout` exits 124) is written and read by nobody.
+    #[test]
+    fn translation_metrics_land_where_the_readers_look() {
+        let tmp = tempfile::tempdir().unwrap();
+        let case = tmp.path().join("mujs");
+        clear_agent_exit();
+        record_agent_exit(exit_status(124));
+        write_translation_metrics(&case, &test_agent_key(), 10_800, false);
+
+        let expected = case.join(crate::battery::TRANSLATED).join("translation.json");
+        assert!(expected.is_file(), "the reader path must be the writer path");
+        assert!(!case.join("translation.json").exists(), "and nothing may be left at the case root");
+        let m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&expected).unwrap()).unwrap();
+        assert_eq!(m["exit_code"], serde_json::json!(124));
+        assert_eq!(m["timed_out"], serde_json::json!(true));
+        assert_eq!(
+            crate::agent_health::exit_code(&expected),
+            Some(124),
+            "the reader must now actually reach it",
+        );
+    }
+
+    #[test]
+    fn a_panic_after_the_metrics_were_written_does_not_overwrite_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let case = tmp.path().join("libpng");
+        clear_agent_exit();
+        record_agent_exit(exit_status(124));
+        write_translation_metrics(&case, &test_agent_key(), 10_800, false);
+        let before = std::fs::read_to_string(translation_metrics_path(&case)).unwrap();
+
+        // The joining thread carries some OTHER case's exit; it must not be borrowed.
+        record_agent_exit(exit_status(0));
+        let r = CaseResult::panicked("libpng".into(), &case, &test_agent_key(), Box::new("boom"));
+
+        assert!(!r.success);
+        assert_eq!(
+            std::fs::read_to_string(translation_metrics_path(&case)).unwrap(),
+            before,
+            "the real 3h/124 record must survive the panic report",
+        );
+    }
+
+    #[test]
+    fn a_panic_with_no_record_yet_writes_one_without_borrowing_an_exit_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let case = tmp.path().join("jansson");
+        clear_agent_exit();
+        // Belongs to whatever case this thread ran before, NOT to jansson.
+        record_agent_exit(exit_status(0));
+
+        CaseResult::panicked("jansson".into(), &case, &test_agent_key(), Box::new("boom"));
+
+        let m: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(translation_metrics_path(&case)).unwrap()).unwrap();
+        assert_eq!(m["success"], serde_json::json!(false), "the panic must leave a trace");
+        assert!(m.get("exit_code").is_none(), "another case's exit must not be attributed here");
         assert!(m.get("timed_out").is_none());
     }
 

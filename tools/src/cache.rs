@@ -220,16 +220,20 @@ impl ToolchainId {
             .output()
             .context("running `rustc -vV`")?;
         anyhow::ensure!(out.status.success(), "`rustc -vV` failed");
-        let text = String::from_utf8_lossy(&out.stdout);
-        let pick = |k: &str| {
-            text.lines()
-                .find_map(|l| l.strip_prefix(k))
-                .map(str::trim)
-                .unwrap_or("?")
-                .to_string()
-        };
-        Ok(Self(format!("{} {}", pick("release:"), pick("host:"))))
+        Ok(Self(parse_rustc_vv(&String::from_utf8_lossy(&out.stdout))?))
     }
+}
+
+/// Refuses output it cannot parse rather than substituting a placeholder, which would key
+/// two unidentifiable compilers alike — the failure this whole type exists to prevent.
+fn parse_rustc_vv(text: &str) -> Result<String> {
+    let pick = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .map(str::trim)
+            .with_context(|| format!("`rustc -vV` printed no `{k}` line"))
+    };
+    Ok(format!("{} {}", pick("release:")?, pick("host:")?))
 }
 
 /// Rewrite machine-specific paths to stable tokens. Applied to everything that enters
@@ -372,7 +376,9 @@ pub enum Mode {
     /// For sampling an agent's variance, where memoising would defeat the point.
     Bypass,
     /// Never read, but DO write, replacing any existing entry: `--force` means the
-    /// stored artifact is untrustworthy, so leaving the old one would be wrong.
+    /// stored artifact is untrustworthy, so leaving the old one would be wrong. The
+    /// replaced entry is quarantined, not deleted — it is the reason the operator
+    /// reached for `refresh`, so it is evidence.
     Refresh,
 }
 
@@ -456,8 +462,8 @@ impl Store {
         let key = inputs.key();
         let dir = self.entry_dir(inputs, &key);
 
-        if self.mode == Mode::ReadWrite {
-            match self.load(inputs, &key, &dir) {
+        match self.mode {
+            Mode::ReadWrite => match self.load(inputs, &key, &dir) {
                 Ok(Some(Loaded { sealed, provenance })) => {
                     return Ok(Some(Obtained { sealed, replayed: true, key, provenance }));
                 }
@@ -466,13 +472,11 @@ impl Store {
                     // A damaged entry is a miss, loudly — and quarantined rather than
                     // deleted, so the corruption can still be examined.
                     eprintln!("  cache: ignoring unusable entry {}: {e:#}", key.as_str());
-                    let bad = self.root.join("quarantine").join(key.as_str());
-                    if let Some(p) = bad.parent() {
-                        let _ = std::fs::create_dir_all(p);
-                    }
-                    let _ = std::fs::rename(&dir, &bad);
+                    self.quarantine(&key, &dir)?;
                 }
-            }
+            },
+            Mode::Refresh => self.quarantine(&key, &dir)?,
+            Mode::Bypass => {}
         }
 
         let Some(produced) = compute()? else { return Ok(None) };
@@ -486,6 +490,35 @@ impl Store {
             key,
             provenance: produced.provenance,
         }))
+    }
+
+    /// Move a suspect entry aside, keeping it readable for a post-mortem. Reports failure
+    /// rather than swallowing it: written as `let _ = rename(..)` this could not have
+    /// succeeded once — the entry is `0o555`, and a rename ACROSS parents needs write
+    /// permission on the moved directory itself, to update its `..`.
+    fn quarantine(&self, key: &CacheKey, dir: &Path) -> Result<()> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        let holding = self.root.join("quarantine");
+        std::fs::create_dir_all(&holding)
+            .with_context(|| format!("creating {}", holding.display()))?;
+        // A second copy of the same key must not land on the first: `rename` onto a
+        // non-empty directory fails, and the earlier copy is evidence too.
+        let dest = (1..1000)
+            .map(|n| match n {
+                1 => holding.join(key.as_str()),
+                n => holding.join(format!("{}.{n}", key.as_str())),
+            })
+            .find(|p| !p.exists())
+            .with_context(|| {
+                format!("{} already holds 999 copies of {}", holding.display(), key.as_str())
+            })?;
+        set_read_only(dir, false)?;
+        std::fs::rename(dir, &dest)
+            .with_context(|| format!("quarantining {} to {}", dir.display(), dest.display()))?;
+        eprintln!("  cache: quarantined the entry at {}", dest.display());
+        set_read_only(&dest, true)
     }
 
     /// Load and VALIDATE an entry. Re-comparing every key component against the recorded
@@ -524,10 +557,14 @@ impl Store {
              recomputed {:?}) — the entry has been corrupted or edited",
             sealed.digest().as_str()
         );
-        let provenance = std::fs::read_to_string(dir.join("agent").join("run.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or(serde_json::Value::Null);
+        // `store` always writes this, so a missing or unreadable one is a damaged entry —
+        // and defaulting to `Null` publishes a replay whose metrics.json has no duration or
+        // cost at all, which reads as a free run rather than as a broken store.
+        let provenance = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("agent").join("run.json"))
+                .context("reading agent/run.json")?,
+        )
+        .context("parsing agent/run.json")?;
         Ok(Some(Loaded { sealed, provenance }))
     }
 
@@ -542,9 +579,15 @@ impl Store {
         if let Some(p) = dest.parent() {
             std::fs::create_dir_all(p)?;
         }
+        // `fs::copy` carries the source's mode and the source is `0o444` in the store: the
+        // second unlock keeps the results tree writable for the next run's tee, and the
+        // first stops this failing EACCES on the second replay of the same case.
+        if dest.exists() {
+            set_read_only(dest, false)?;
+        }
         std::fs::copy(&src, dest)
             .with_context(|| format!("restoring cached transcript to {}", dest.display()))?;
-        Ok(())
+        set_read_only(dest, false)
     }
 
     /// Write an entry ATOMICALLY: stage under `tmp/`, then rename. A killed run leaves an
@@ -558,7 +601,14 @@ impl Store {
         produced: &Produced<P>,
     ) -> Result<()> {
         let staging = self.root.join("tmp").join(format!("{}.partial", key.as_str()));
-        let _ = std::fs::remove_dir_all(&staging);
+        if staging.exists() {
+            // A run killed between the lock below and the rename leaves a `0o555` orphan,
+            // and entries inside a `0o555` directory cannot be removed: ignoring that
+            // poisons this key for good, every later write failing EACCES on `code/`.
+            set_read_only(&staging, false)?;
+            std::fs::remove_dir_all(&staging)
+                .with_context(|| format!("clearing stale staging dir {}", staging.display()))?;
+        }
         std::fs::create_dir_all(staging.join("agent"))?;
 
         produced.sealed.export_into(&staging.join("code"))?;
@@ -591,7 +641,15 @@ impl Store {
         // after a kill. The old entry must be made writable to be removable at all.
         if dir.exists() {
             set_read_only(dir, false)?;
-            let _ = std::fs::remove_dir_all(dir);
+            if let Err(e) = std::fs::remove_dir_all(dir) {
+                // NotFound is such a writer getting there first; anything else would
+                // resurface below as a puzzling ENOTEMPTY from the rename.
+                anyhow::ensure!(
+                    e.kind() == std::io::ErrorKind::NotFound,
+                    "removing the entry being replaced at {}: {e}",
+                    dir.display()
+                );
+            }
         }
         std::fs::rename(&staging, dir)
             .with_context(|| format!("renaming {} into place", staging.display()))?;
@@ -600,42 +658,42 @@ impl Store {
         Ok(())
     }
 
-    /// Entry count and byte size, for `harvest-tools cache stats`.
+    /// Entry count and byte size of the servable entries, for `harvest-tools cache stats`:
+    /// quarantined and half-written trees sit outside the schema dir and are not counted.
+    /// A read failure is reported, never counted as zero — an unreadable store is not an
+    /// empty one.
     pub fn stats(&self) -> Result<(usize, u64)> {
-        fn walk(p: &Path, files: &mut u64) -> u64 {
+        /// A missing directory is an empty store, not a fault: nothing has been stored yet.
+        fn children(p: &Path) -> Result<Vec<PathBuf>> {
+            let rd = match std::fs::read_dir(p) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                other => other.with_context(|| format!("reading {}", p.display()))?,
+            };
+            rd.map(|e| Ok(e?.path()))
+                .collect::<Result<Vec<_>>>()
+                .with_context(|| format!("reading {}", p.display()))
+        }
+        fn bytes(p: &Path) -> Result<u64> {
             let mut total = 0;
-            if let Ok(rd) = std::fs::read_dir(p) {
-                for e in rd.flatten() {
-                    let path = e.path();
-                    if path.is_dir() {
-                        total += walk(&path, files);
-                    } else if let Ok(m) = e.metadata() {
-                        *files += 1;
-                        total += m.len();
-                    }
-                }
+            for child in children(p)? {
+                // `symlink_metadata`: a link to a directory must not send this into a loop.
+                let meta = std::fs::symlink_metadata(&child)
+                    .with_context(|| format!("reading {}", child.display()))?;
+                total += if meta.is_dir() { bytes(&child)? } else { meta.len() };
             }
-            total
+            Ok(total)
         }
         let mut entries = 0usize;
-        let mut files = 0u64;
-        let mut bytes = 0u64;
-        let schema_dir = self.root.join(SCHEMA.to_string());
-        if let Ok(phases) = std::fs::read_dir(&schema_dir) {
-            for phase in phases.flatten() {
-                if let Ok(agents) = std::fs::read_dir(phase.path()) {
-                    for agent in agents.flatten() {
-                        if let Ok(keys) = std::fs::read_dir(agent.path()) {
-                            for k in keys.flatten() {
-                                entries += 1;
-                                bytes += walk(&k.path(), &mut files);
-                            }
-                        }
-                    }
+        let mut total = 0u64;
+        for phase in children(&self.root.join(SCHEMA.to_string()))? {
+            for agent in children(&phase)? {
+                for key in children(&agent)? {
+                    entries += 1;
+                    total += bytes(&key)?;
                 }
             }
         }
-        Ok((entries, bytes))
+        Ok((entries, total))
     }
 }
 
@@ -794,6 +852,15 @@ mod tests {
         assert!(ModelId::new("").is_err());
         assert!(ModelId::new("x$(whoami)").is_err());
         assert!(ModelId::new("x'y").is_err());
+    }
+
+    #[test]
+    fn toolchain_id_refuses_output_it_cannot_parse() {
+        // A placeholder would give two unidentifiable compilers the same key.
+        let real = "rustc 1.94.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.94.0\n";
+        assert_eq!(parse_rustc_vv(real).unwrap(), "1.94.0 x86_64-unknown-linux-gnu");
+        let err = format!("{:#}", parse_rustc_vv("rustc 1.94.0\n").expect_err("must refuse"));
+        assert!(err.contains("release:"), "{err}");
     }
 
     #[test]
@@ -1119,6 +1186,175 @@ mod tests {
     }
 
     #[test]
+    fn refresh_keeps_the_entry_it_replaced() {
+        // An operator reaches for `--cache refresh` because they doubt the stored artifact,
+        // which makes it the evidence: deleting it destroys the only copy of the thing
+        // being disputed.
+        let f = fixture();
+        // Ported onto this branch's `Inputs` builder, which replaced the free
+        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
+        let held = Inputs::new();
+        let inputs = held.key_inputs();
+        let key = inputs.key();
+
+        let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        let old = rw
+            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() { /* suspect */ }"))))
+            .unwrap()
+            .unwrap();
+
+        Store::open(&f.repo, Mode::Refresh)
+            .unwrap()
+            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() { /* new */ }"))))
+            .unwrap()
+            .unwrap();
+
+        let kept = f.repo.join("results/.cache/quarantine").join(key.as_str());
+        assert!(kept.is_dir(), "the replaced entry must be kept for comparison: {kept:?}");
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(kept.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            meta["output_tree"].as_str(),
+            Some(old.sealed.digest().as_str()),
+            "and it must be the entry that was replaced, not the replacement"
+        );
+
+        // A second refresh must not land on the first copy, nor lose it.
+        Store::open(&f.repo, Mode::Refresh)
+            .unwrap()
+            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() { /* newer */ }"))))
+            .unwrap()
+            .unwrap();
+        assert!(kept.is_dir(), "the first copy must survive a second refresh");
+        assert!(
+            f.repo.join("results/.cache/quarantine").join(format!("{}.2", key.as_str())).is_dir(),
+            "and the second must be kept beside it"
+        );
+    }
+
+    #[test]
+    fn a_quarantined_entry_is_read_only_and_uncounted() {
+        let f = fixture();
+        // Ported onto this branch's `Inputs` builder, which replaced the free
+        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
+        let held = Inputs::new();
+        let inputs = held.key_inputs();
+        let key = inputs.key();
+
+        let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+        Store::open(&f.repo, Mode::Refresh)
+            .unwrap()
+            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() { /* new */ }"))))
+            .unwrap();
+
+        let kept = f.repo.join("results/.cache/quarantine").join(key.as_str());
+        // Without this the write below fails merely because nothing is there, which is how
+        // the quarantine came to be asserted by a test that never exercised it.
+        assert!(kept.join("code/Cargo.toml").is_file(), "nothing was quarantined: {kept:?}");
+        assert!(
+            std::fs::write(kept.join("code/Cargo.toml"), "tampered").is_err(),
+            "evidence must not be editable in place"
+        );
+        assert_eq!(
+            rw.stats().unwrap().0,
+            1,
+            "and must not be counted as a servable entry, or `cache stats` overstates the store"
+        );
+    }
+
+    #[test]
+    fn a_restored_transcript_is_writable_and_survives_a_second_replay() {
+        // `fs::copy` carries the store's 0o444 across, which left a read-only verify.log in
+        // the results tree and then failed EACCES on the next replay of the same case.
+        let f = fixture();
+        let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        // Ported onto this branch's `Inputs` builder, which replaced the free
+        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
+        let held = Inputs::new();
+        let inputs = held.key_inputs();
+        let key = inputs.key();
+
+        let log = f.repo.join("live-run.log");
+        std::fs::write(&log, "the transcript the invocation teed\n").unwrap();
+        store
+            .obtain(&inputs, || {
+                Ok(Some(Produced {
+                    sealed: seal_verify(&f.case, "pub fn a() {}"),
+                    log: log.clone(),
+                    provenance: serde_json::Value::Null,
+                }))
+            })
+            .unwrap();
+
+        let dest = crate::battery::phase_dir(&f.case, crate::battery::VERIFIED)
+            .join("logs")
+            .join("verify.log");
+        store.restore_log(&inputs, &key, &dest).unwrap();
+        store
+            .restore_log(&inputs, &key, &dest)
+            .expect("a second replay must not trip over the log the first one restored");
+        std::fs::write(&dest, "the next run tees over it")
+            .expect("a restored transcript must stay writable, or the next run cannot tee to it");
+    }
+
+    #[test]
+    fn an_entry_without_provenance_is_a_miss_rather_than_a_free_run() {
+        // A replay carrying `null` provenance publishes a metrics.json with no duration and
+        // no cost, which reads as an agent invocation that cost nothing.
+        let f = fixture();
+        let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        // Ported onto this branch's `Inputs` builder, which replaced the free
+        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
+        let held = Inputs::new();
+        let inputs = held.key_inputs();
+        let key = inputs.key();
+        store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+
+        let dir = store.entry_dir(&inputs, &key);
+        crate::artifact::set_read_only(&dir, false).unwrap();
+        std::fs::remove_file(dir.join("agent/run.json")).unwrap();
+        crate::artifact::set_read_only(&dir, true).unwrap();
+
+        let mut ran = false;
+        let got = store
+            .obtain(&inputs, || {
+                ran = true;
+                Ok(Some(produced(&f.case, "pub fn a() { /* honest */ }")))
+            })
+            .unwrap()
+            .unwrap();
+        assert!(ran, "an entry that cannot say what it cost must be recomputed");
+        assert_eq!(got.provenance["duration_secs"], 42);
+    }
+
+    #[test]
+    fn a_killed_write_does_not_poison_the_key() {
+        // A run killed between locking the staging tree and renaming it leaves a 0o555
+        // orphan, and entries inside a 0o555 directory cannot be removed.
+        let f = fixture();
+        let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        // Ported onto this branch's `Inputs` builder, which replaced the free
+        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
+        let held = Inputs::new();
+        let inputs = held.key_inputs();
+        let key = inputs.key();
+
+        let staging =
+            f.repo.join("results/.cache/tmp").join(format!("{}.partial", key.as_str()));
+        std::fs::create_dir_all(staging.join("code/src")).unwrap();
+        std::fs::write(staging.join("code/src/lib.rs"), "half-written").unwrap();
+        crate::artifact::set_read_only(&staging, true).unwrap();
+
+        store
+            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .expect("a stale locked staging dir must not block the write")
+            .unwrap();
+        assert!(store.obtain::<Verify>(&inputs, || panic!("must hit")).unwrap().unwrap().replayed);
+    }
+
+    #[test]
     fn a_stored_entry_is_read_only_on_disk() {
         // Binds what the types cannot see: a shell-out, a stray `cargo build
         // --manifest-path`, a future refactor.
@@ -1172,6 +1408,10 @@ mod tests {
         let dir = store.entry_dir(&inputs, &key);
         crate::artifact::set_read_only(&dir, false).unwrap();
         std::fs::write(dir.join("code/src/lib.rs"), "pub fn a() { /* smuggled */ }").unwrap();
+        // RE-LOCK: an entry found in the wild is 0o555, and quarantining one is a
+        // cross-parent rename, which needs write permission on the moved directory. Left
+        // unlocked, this test passes without the quarantine ever having worked.
+        crate::artifact::set_read_only(&dir, true).unwrap();
 
         let mut ran = false;
         let got = store

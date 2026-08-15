@@ -22,12 +22,21 @@ pub fn phase_dir(case_dir: &Path, phase: &str) -> PathBuf {
     case_dir.join(phase)
 }
 
+/// THE PHASE PREDICATE: did this phase produce a crate? ONE definition, enforced by
+/// `tests/architecture.rs` (A6), because a case falls between two spellings of it.
+/// `verified/` exists as soon as verify writes a log, so the old `is_dir()` said yes
+/// for pcre2 — logs, no crate — while every reader asked for `Cargo.toml` and
+/// `continue`d, taking pcre2 out of the harvest-bench denominator.
+pub fn has_crate(phase_dir: &Path) -> bool {
+    phase_dir.join("Cargo.toml").is_file()
+}
+
 /// THE READER RULE: every reader wanting a case's current state (score, LOC,
 /// unsafe, crate source) must come through here, so pre- and post-verify cases
 /// resolve uniformly.
 pub fn crate_dir(case_dir: &Path) -> PathBuf {
-    let verified = case_dir.join(VERIFIED);
-    if verified.is_dir() { verified } else { case_dir.join(TRANSLATED) }
+    let verified = phase_dir(case_dir, VERIFIED);
+    if has_crate(&verified) { verified } else { phase_dir(case_dir, TRANSLATED) }
 }
 
 /// The crate-dir name MIT `runtests` hardcodes (test-corpus/.../discovery/
@@ -645,6 +654,8 @@ pub struct Paths {
     /// every construction site that would otherwise silently get read-write
     /// caching.
     pub cache_mode: crate::cache::Mode,
+    /// Whether the operator accepted running without an enforceable sandbox.
+    pub allow_unsandboxed: bool,
 }
 
 impl Paths {
@@ -654,6 +665,7 @@ impl Paths {
         dataset: Dataset,
         model: Option<&str>,
         cache_mode: crate::cache::Mode,
+        allow_unsandboxed: bool,
     ) -> Result<Self> {
         // The same value the cache key and every `"agent"` field use: a second table
         // here is what let 208 result files record an agent name no `--agent` value
@@ -685,6 +697,7 @@ impl Paths {
             corpus_dir,
             results_dir,
             cache_mode,
+            allow_unsandboxed,
             prompts_dir,
             agent,
             agent_key,
@@ -754,6 +767,35 @@ mod tests {
         }
         assert_eq!(independent_count, 3, "should have 3 independent cases");
         assert_eq!(shared_count, 1, "should have 1 shared-source group");
+    }
+
+    /// Regression, pcre2: a `verified/` holding only logs used to shadow the crate.
+    #[test]
+    fn a_verified_dir_holding_only_logs_resolves_to_translated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let case = tmp.path().join("pcre2");
+        fs::create_dir_all(case.join("verified/logs")).unwrap();
+        fs::write(case.join("verified/logs/verify.log"), "transcript").unwrap();
+        fs::write(case.join("verified/verification.json"), "{}").unwrap();
+        fs::create_dir_all(case.join("translated")).unwrap();
+        fs::write(case.join("translated/Cargo.toml"), "[package]").unwrap();
+
+        assert!(case.join("verified").is_dir(), "fixture must retain the trap");
+        assert!(!has_crate(&case.join("verified")));
+        assert_eq!(crate_dir(&case), case.join("translated"),
+            "a phase that produced no crate must not shadow the one that did");
+        assert!(has_crate(&crate_dir(&case)), "the resolved dir must be scoreable");
+    }
+
+    #[test]
+    fn a_verified_crate_still_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let case = tmp.path().join("zstd");
+        for phase in [TRANSLATED, VERIFIED] {
+            fs::create_dir_all(case.join(phase)).unwrap();
+            fs::write(case.join(phase).join("Cargo.toml"), "[package]").unwrap();
+        }
+        assert_eq!(crate_dir(&case), case.join(VERIFIED));
     }
 
     #[test]

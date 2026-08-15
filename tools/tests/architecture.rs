@@ -14,6 +14,10 @@ fn src(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name)
 }
 
+fn file_name(path: &Path) -> String {
+    path.file_name().unwrap_or_default().to_string_lossy().into_owned()
+}
+
 fn parse(path: &Path) -> syn::File {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     syn::parse_file(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
@@ -241,6 +245,7 @@ fn compile_fail_cases_still_assert_what_they_were_written_for() {
         ("worktree_cannot_be_used_after_scrub", "E0382"), // scrub() consumed it
         ("phase_cannot_be_implemented_downstream", "E0277"), // sealed supertrait
         ("sealed_does_not_display", "E0277"),            // no Display impl
+        ("materialise_at_refuses_a_results_tree_path", "E0308"), // not a ScratchPath
     ]
     .into_iter()
     .collect();
@@ -280,14 +285,16 @@ fn compile_fail_cases_still_assert_what_they_were_written_for() {
 
 /// Nothing new may execute inside the results tree.
 ///
-/// Four sites do today, all in the test phase: scoring builds in the canonical
-/// phase dir and writes `target/` into it, so measuring an artifact mutates it.
-/// Fixing that needs the `c/`+`rust/` layout split, which is deliberately not in
-/// this change — so this is a ratchet on the count, not a clean gate. The
-/// allowlist is the to-do list.
+/// A ratchet, not a gate. It matches two sites, and only `build_harvest_bench_lib`
+/// is really in `results/`; the other reaches scratch through `translated_rust()`.
+/// It is also blind to the builds that matter most, which are spawned with a
+/// `--root` or `--target-dir` argument rather than a `current_dir` (MIT `runtests`,
+/// the gtest suite). A `Cwd` newtype only scratch can construct is the real fix.
+/// The `c/`+`rust/` layout split this comment used to demand is not (see
+/// `artifact.rs`): `runtests` pins the build output inside the case either way.
 #[test]
 fn nothing_new_runs_inside_the_results_tree() {
-    const KNOWN: usize = 4;
+    const KNOWN: usize = 2;
 
     struct V {
         current_fn: String,
@@ -402,5 +409,55 @@ fn an_agents_identity_is_never_its_debug_output() {
         "an agent is being formatted with Debug: {found:#?}\n\
          Use `cache::AgentKey` (and `Paths::agent_key`), which is clap's own name for the\n\
          variant and is what the results tree and the store are already keyed by."
+    );
+}
+
+/// "Did this phase produce a crate?" has exactly one spelling: `battery::has_crate`.
+///
+/// It had two — `crate_dir`'s `is_dir()` and its callers' `verified/Cargo.toml` — and
+/// pcre2 satisfied one and not the other, so it left the harvest-bench denominator
+/// instead of counting as a failure. Nothing else would catch a third spelling.
+#[test]
+fn only_battery_defines_the_has_crate_predicate() {
+    struct V {
+        file: String,
+        hits: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
+            if matches!(c.method.to_string().as_str(), "exists" | "is_file") {
+                if let syn::Expr::MethodCall(inner) = &*c.receiver {
+                    let joins_manifest = inner.method == "join"
+                        && inner.args.iter().any(|a| matches!(a,
+                            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. })
+                                if s.value() == "Cargo.toml"));
+                    if joins_manifest {
+                        self.hits.push(format!("{}: .join(\"Cargo.toml\").{}()", self.file, c.method));
+                    }
+                }
+            }
+            syn::visit::visit_expr_method_call(self, c);
+        }
+    }
+
+    let mut hits: Vec<String> = Vec::new();
+    for path in rust_sources() {
+        if file_name(&path) == "battery.rs" {
+            continue;
+        }
+        let mut v = V { file: file_name(&path), hits: Vec::new() };
+        v.visit_file(&parse(&path));
+        hits.extend(v.hits);
+    }
+    assert!(
+        hits.is_empty(),
+        "the phase predicate is spelled out again outside battery.rs: {hits:#?}\n\
+         Call `battery::has_crate(dir)`. Two spellings of \"this phase produced a crate\"\n\
+         is how a project vanished from a published denominator."
+    );
+    let battery = std::fs::read_to_string(src("battery.rs")).expect("battery.rs");
+    assert!(
+        battery.contains(r#"phase_dir.join("Cargo.toml").is_file()"#),
+        "battery::has_crate must still BE the predicate this rule redirects callers to"
     );
 }
