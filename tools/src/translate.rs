@@ -671,7 +671,7 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
             copy_dir_all(input_test_case, &c_src)?;
 
             if matches!(paths.agent, Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt) {
-                crate::sandbox::write_settings(&paths.repo_root, tmp.path(), tmp.path())?;
+                crate::sandbox::write_settings(&paths.repo_root, tmp.path(), tmp.path(), paths.allow_unsandboxed)?;
             }
 
             if matches!(paths.agent, Agent::OpenCode) {
@@ -987,6 +987,7 @@ pub fn agent_provenance(agent: Agent, duration_secs: u64) -> serde_json::Value {
         // Which harness code produced this; results are otherwise unattributable
         // after the fact.
         "harness": crate::provenance::harness_id(),
+        "sandboxed": crate::sandbox::is_enforceable(),
     });
     merge_agent_exit(&mut p);
     p

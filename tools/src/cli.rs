@@ -135,6 +135,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub allow_dirty: bool,
 
+    /// Launch agents even though the filesystem sandbox cannot be enforced.
+    ///
+    /// Without `bwrap` and `socat` the CLI degrades to unsandboxed, leaving the graded
+    /// oracle and every sibling work dir readable. Artifacts are stamped so such a run
+    /// cannot later be mistaken for a sandboxed one.
+    #[arg(long, global = true)]
+    pub allow_unsandboxed: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }

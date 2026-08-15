@@ -642,6 +642,8 @@ pub struct Paths {
     /// every construction site that would otherwise silently get read-write
     /// caching.
     pub cache_mode: crate::cache::Mode,
+    /// Whether the operator accepted running without an enforceable sandbox.
+    pub allow_unsandboxed: bool,
 }
 
 impl Paths {
@@ -651,6 +653,7 @@ impl Paths {
         dataset: Dataset,
         model: Option<&str>,
         cache_mode: crate::cache::Mode,
+        allow_unsandboxed: bool,
     ) -> Result<Self> {
         // Derived from --model (like Agent::Oneshot) so each evaluated model gets
         // its own dir. Owned because the match below borrows from it.
@@ -712,6 +715,7 @@ impl Paths {
             corpus_dir,
             results_dir,
             cache_mode,
+            allow_unsandboxed,
             prompts_dir,
             agent,
             model: model.map(String::from),
