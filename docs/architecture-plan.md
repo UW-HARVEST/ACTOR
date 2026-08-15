@@ -115,7 +115,8 @@ Three non-negotiables:
 | 0 | **Delete four shape rules** and their allowlists — **landed** | net removal | the lockstep tax on 3–9 | 10 rules still green |
 | 1 | `CorpusDir` + `SeedAt` + `SeededBy` | types | — | 3 new tests + 1 compile-fail case |
 | 2 | **Guards**: recursive `rust_sources()` + anti-vacuity, DAG rule w/ baseline, golden fingerprint | additions only | — | rule fails on a planted cycle |
-| 3 | `domain/` moves + layer-purity rule + `classify(text, …)` | move + 1 cut | `agent_health ↔ artifact` | purity rule; token-diff |
+| 3a | `domain/` + layer-purity rule; move only what is already pure | move | — | purity rule; token-diff |
+| 3b | the boundary cuts: `classify(text, …)`, `normalise(text, roots)` | 2 cuts | `agent_health ↔ artifact` | purity rule |
 | 4 | `io/` moves | move | — | token-diff |
 | 5 | `agents/`: session + opencode + `Invocation` out of verify | move + 1 cut | `translate ↔ verify`, `session ↔ translate`, `opencode ↔ translate` | DAG baseline drops 3 |
 | 6 | `run_cached<P>`; verify ported onto it | behaviour | — | golden digests identical |
@@ -168,9 +169,19 @@ input digest and replay each other's translation.
 **2 — Guards.** The prerequisite. Nothing may move until the shape rules can still see
 the code and the DAG rule is ratcheting.
 
-**3 — `domain/`.** The pure vocabulary. The one cut is `classify(text, …)`, which both
-breaks `agent_health ↔ artifact` and is the canonical example of moving a read to the
-edge.
+**3a and 3b — `domain/`.** Split in two, because measuring purity showed the layer cannot
+be populated by moving files. Only `scoring.rs` (81 lines) and `refusal.rs` (115) are
+already free of `std::fs`/`std::process`/`std::env`; `artifact.rs` has 36 `fs` references,
+`cache.rs` 38 plus 7 `env`, `battery.rs` 39, `agent_health.rs` 8. Everything else has to be
+*split*, not moved. (`cli.rs`'s seven `Command::` hits are clap's subcommand enum, not
+`std::process` — it is process-pure.)
+
+So **3a** creates `domain/` with the layer-purity rule and moves only what is already pure:
+`scoring.rs` → `domain/outcome.rs`, `Disposition`/`Carry`/`classify` → `domain/contents.rs`,
+`RelPath`, the `TreeDigest` newtype, `Agent`/`Dataset`/`LogFormat`. **3b** then makes the
+two boundary cuts — `agent_health::classify` taking text instead of a `&Path`, and
+`cache::normalise` taking its roots instead of reading `HOME` — each of which is the
+canonical "move the read to the edge" change and testable with no tempdir afterwards.
 
 **5 — `agents/`.** The highest-value cut. Those three cycles exist *only* because the
 shared invocation machinery lives inside `translate.rs`; extracting it breaks all three
@@ -226,6 +237,29 @@ sweep currently re-pays about $800 that a cache would return.
   measures (an absolute comment-line ceiling cannot be tripped by a deletion; a ratio
   can) is a deliberate decision to land as its own change, with the rationale recorded in
   `comment_budget.py`. A deletion PR must not widen it on the way past.
+
+  **What actually happened:** the reviewer above recommended landing the metric change
+  separately; PR 0 instead raised the flag 13 → 14 in the same commit, with the reasoning
+  recorded beside it in `.github/workflows/type-safety.yaml`. That was a deliberate call
+  by the operator, not the implementing agent — the agent correctly refused to touch the
+  gate and escalated. The reviewer's preference remains the better shape: replacing the
+  ratio with an absolute ceiling is still unlanded work.
+
+* **Three surviving rules key on the literal filename `"artifact.rs"`** —
+  `no_public_path_escapes_the_artifact_modules` and `digests_cannot_be_fabricated` iterate
+  `["artifact.rs", "cache.rs"]`, and `the_digest_path_is_lossless` names
+  `("artifact.rs", "hash_tree" | "digest_tree" | "scrub" | "classify")`. PR 2's recursive
+  `rust_sources()` does NOT fix these: they use `src("<name>.rs")` and literal tuples, not
+  the walk. Any PR that moves those functions out of `artifact.rs` must make these rules
+  module-path aware in the same commit, or they panic with "not found" — which reads like
+  a rule bug rather than the rename that caused it.
+
+* **`a_runner_that_errors_is_not_scored_from_the_file_it_left` is flaky, ~1 in 97 suite
+  runs**, failing with `ETXTBSY` from `src/test.rs`. The test writes `fake-runner`, chmods
+  it 0755 and execs it; with 180 tests in parallel another thread's fork can still hold a
+  write fd during the exec. Pre-existing and unrelated to this plan, but it makes the
+  autonomous pipeline report a false "not green", so it is worth fixing before relying on
+  unattended verdicts.
 * **`is_public()` counts `Visibility::Restricted`.** `pub(super)` reads as public to the
   typestate rule, so the state machine's fields stay fully private. (Child modules *can*
   see an ancestor's private fields, so this constrains visibility, not file count.)
