@@ -751,7 +751,11 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
             copy_dir_all(input_test_case, &c_src)?;
 
             if matches!(paths.agent, Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt) {
-                crate::sandbox::write_settings(&paths.repo_root, tmp.path(), tmp.path(), paths.allow_unsandboxed)?;
+                crate::sandbox::write_settings(crate::sandbox::Policy {
+                    repo_root: &paths.repo_root,
+                    work_root: tmp.path(),
+                    enforcement: paths.enforcement,
+                })?;
             }
 
             if matches!(paths.agent, Agent::OpenCode) {
@@ -1313,6 +1317,16 @@ struct LlmResponse {
     output_tokens: u64,
 }
 
+/// The two halves of a one-shot prompt, named. As two adjacent `&str` parameters they are
+/// transposable in silence: the model still answers, the run still records a translation,
+/// and the only evidence is that a different question was asked — in the path that
+/// produced the committed `oneshot` result files.
+#[derive(Copy, Clone)]
+struct Conversation<'a> {
+    system: &'a str,
+    user: &'a str,
+}
+
 const BEDROCK_MODEL_ID: &str = "moonshotai.kimi-k2.5";
 const BEDROCK_REGION: &str = "us-east-1";
 const BEDROCK_MAX_TOKENS: u32 = 16384;
@@ -1328,8 +1342,8 @@ fn oneshot_translate_case(paths: &Paths, battery: &str, name: &str, is_lib_hint:
         "--agent oneshot requires --model <provider>/<model-id> (should have been \
          rejected at startup)",
     )?;
-    oneshot_llm_translate(paths, battery, name, is_lib_hint, Some(model), |sys, usr, log| {
-        openrouter_converse(model, sys, usr, log)
+    oneshot_llm_translate(paths, battery, name, is_lib_hint, Some(model), |convo, log| {
+        openrouter_converse(model, convo, log)
     })
 }
 
@@ -1339,7 +1353,7 @@ fn oneshot_llm_translate(
     name: &str,
     is_lib_hint: bool,
     model: Option<&str>,
-    invoke_llm: impl FnOnce(&str, &str, &Path) -> Result<LlmResponse>,
+    invoke_llm: impl FnOnce(Conversation<'_>, &Path) -> Result<LlmResponse>,
 ) -> Result<()> {
     let case_dir = paths.case_dir(battery, name);
     if case_dir.exists() { std::fs::remove_dir_all(&case_dir)?; }
@@ -1368,7 +1382,7 @@ fn oneshot_llm_translate(
         "Please translate the following C project into a Rust project including Cargo manifest:\n\n{files_json}\n\nreturn as JSON"
     );
 
-    let resp = invoke_llm(&system_prompt, &user_msg, &log_path)?;
+    let resp = invoke_llm(Conversation { system: &system_prompt, user: &user_msg }, &log_path)?;
 
     let mut usage = serde_json::json!({
         "input_tokens": resp.input_tokens,
@@ -1414,11 +1428,11 @@ fn detect_is_library(dir: &Path) -> Option<bool> {
     }
 }
 
-fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) -> Result<LlmResponse> {
+fn bedrock_converse(convo: Conversation<'_>, log_path: &Path) -> Result<LlmResponse> {
     let request = serde_json::json!({
         "modelId": BEDROCK_MODEL_ID,
-        "system": [{"text": system_prompt}],
-        "messages": [{"role": "user", "content": [{"text": user_message}]}],
+        "system": [{"text": convo.system}],
+        "messages": [{"role": "user", "content": [{"text": convo.user}]}],
         "inferenceConfig": {"maxTokens": BEDROCK_MAX_TOKENS, "temperature": 0.0}
     });
 
@@ -1444,10 +1458,11 @@ fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) ->
 
     let log_content = format!(
         "=== BEDROCK REQUEST ===\nModel: {BEDROCK_MODEL_ID}\nRegion: {BEDROCK_REGION}\n\n\
-         === SYSTEM PROMPT ===\n{system_prompt}\n\n\
+         === SYSTEM PROMPT ===\n{}\n\n\
          === USER MESSAGE (first 2000 chars) ===\n{}\n\n\
          === STDERR ===\n{stderr}",
-        truncated(user_message, 2000)
+        convo.system,
+        truncated(convo.user, 2000)
     );
     let _ = std::fs::write(log_path, &log_content);
 
@@ -1470,15 +1485,15 @@ fn bedrock_converse(system_prompt: &str, user_message: &str, log_path: &Path) ->
     Ok(LlmResponse { content, input_tokens, output_tokens })
 }
 
-fn openrouter_converse(model: &str, system_prompt: &str, user_message: &str, log_path: &Path) -> Result<LlmResponse> {
+fn openrouter_converse(model: &str, convo: Conversation<'_>, log_path: &Path) -> Result<LlmResponse> {
     let api_key = std::env::var("OPENROUTER_API_KEY")
         .context("OPENROUTER_API_KEY env var not set")?;
 
     let request = serde_json::json!({
         "model": model,
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
+            {"role": "system", "content": convo.system},
+            {"role": "user", "content": convo.user}
         ],
         "temperature": 0,
         "response_format": {"type": "json_object"}
@@ -1504,10 +1519,11 @@ fn openrouter_converse(model: &str, system_prompt: &str, user_message: &str, log
 
     let log_content = format!(
         "=== OPENROUTER REQUEST ===\nModel: {model}\n\n\
-         === SYSTEM PROMPT ===\n{system_prompt}\n\n\
+         === SYSTEM PROMPT ===\n{}\n\n\
          === USER MESSAGE (first 2000 chars) ===\n{}\n\n\
          === RAW RESPONSE (first 2000 chars) ===\n{}",
-        truncated(user_message, 2000),
+        convo.system,
+        truncated(convo.user, 2000),
         truncated(&stdout, 2000)
     );
     let _ = std::fs::write(log_path, &log_content);
@@ -2349,7 +2365,8 @@ mod tests {
             Agent::OpenCode => Some("amazon-bedrock/us.anthropic.claude-sonnet-5"),
             _ => None,
         };
-        Paths::new(root, agent, dataset, model, crate::cache::Mode::Bypass, true).expect("Paths")
+        Paths::new(root, agent, dataset, model, crate::cache::Mode::Bypass,
+            crate::sandbox::Enforcement::AllowUnsandboxed).expect("Paths")
     }
 
     #[test]

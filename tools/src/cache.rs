@@ -12,7 +12,7 @@
 //! `OPENSSL_DIR` is deliberately excluded: it can only influence `build_ok`, which is
 //! decided in the test phase, and the test phase is not cached.
 
-use crate::artifact::{Phase, Sealed, TreeDigest};
+use crate::artifact::{Access, Phase, Sealed, TreeDigest};
 use crate::cli::Agent;
 use crate::session::Session;
 use anyhow::{Context, Result};
@@ -240,17 +240,23 @@ fn parse_rustc_vv(text: &str) -> Result<String> {
 /// a digest, so the same work yields the same key on another machine.
 pub fn normalise(text: &str, work_root: &Path, repo_root: &Path) -> String {
     let mut out = text.to_string();
-    // Longest first: the work root usually lives under the scratch base.
-    let mut subs: Vec<(String, &str)> = vec![
-        (work_root.to_string_lossy().into_owned(), "$WORK"),
-        (repo_root.to_string_lossy().into_owned(), "$REPO"),
-    ];
+    // `to_str`, never `to_string_lossy`: lossy mapping sends every invalid byte to
+    // U+FFFD, so two different roots can produce the same substitution string and two
+    // different prompts the same digest — a false cache *hit*, the one failure mode
+    // this key exists to prevent. Skipping a non-UTF-8 root instead leaves the literal
+    // path in the normalised text, which can only cost a miss.
+    let mut roots: Vec<(PathBuf, &str)> =
+        vec![(work_root.to_path_buf(), "$WORK"), (repo_root.to_path_buf(), "$REPO")];
     if let Ok(base) = crate::workdir::base() {
-        subs.push((base.to_string_lossy().into_owned(), "$WORKBASE"));
+        roots.push((base, "$WORKBASE"));
     }
     if let Some(home) = std::env::var_os("HOME") {
-        subs.push((home.to_string_lossy().into_owned(), "$HOME"));
+        roots.push((PathBuf::from(home), "$HOME"));
     }
+    let mut subs: Vec<(String, &str)> = roots
+        .iter()
+        .filter_map(|(p, token)| p.to_str().map(|s| (s.to_owned(), *token)))
+        .collect();
     subs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
     for (from, to) in subs {
         if !from.is_empty() {
@@ -532,11 +538,11 @@ impl Store {
             .with_context(|| {
                 format!("{} already holds 999 copies of {}", holding.display(), key.as_str())
             })?;
-        set_read_only(dir, false)?;
+        set_read_only(dir, Access::Writable)?;
         std::fs::rename(dir, &dest)
             .with_context(|| format!("quarantining {} to {}", dir.display(), dest.display()))?;
         eprintln!("  cache: quarantined the entry at {}", dest.display());
-        set_read_only(&dest, true)
+        set_read_only(&dest, Access::ReadOnly)
     }
 
     /// Load and VALIDATE an entry. Re-comparing every key component against the recorded
@@ -601,11 +607,11 @@ impl Store {
         // second unlock keeps the results tree writable for the next run's tee, and the
         // first stops this failing EACCES on the second replay of the same case.
         if dest.exists() {
-            set_read_only(dest, false)?;
+            set_read_only(dest, Access::Writable)?;
         }
         std::fs::copy(&src, dest)
             .with_context(|| format!("restoring cached transcript to {}", dest.display()))?;
-        set_read_only(dest, false)
+        set_read_only(dest, Access::Writable)
     }
 
     /// Write an entry ATOMICALLY: stage under `tmp/`, then rename. A killed run leaves an
@@ -623,7 +629,7 @@ impl Store {
             // A run killed between the lock below and the rename leaves a `0o555` orphan,
             // and entries inside a `0o555` directory cannot be removed: ignoring that
             // poisons this key for good, every later write failing EACCES on `code/`.
-            set_read_only(&staging, false)?;
+            set_read_only(&staging, Access::Writable)?;
             std::fs::remove_dir_all(&staging)
                 .with_context(|| format!("clearing stale staging dir {}", staging.display()))?;
         }
@@ -648,7 +654,7 @@ impl Store {
         // `rename(2)` on a directory must update that directory's own `..` entry and
         // fails with EACCES otherwise. The root is locked right after the move instead.
         for e in std::fs::read_dir(&staging)? {
-            set_read_only(&e?.path(), true)?;
+            set_read_only(&e?.path(), Access::ReadOnly)?;
         }
 
         if let Some(parent) = dir.parent() {
@@ -658,7 +664,7 @@ impl Store {
         // so last-writer-wins is safe and a lock would only add a stale-lock failure mode
         // after a kill. The old entry must be made writable to be removable at all.
         if dir.exists() {
-            set_read_only(dir, false)?;
+            set_read_only(dir, Access::Writable)?;
             if let Err(e) = std::fs::remove_dir_all(dir) {
                 // NotFound is such a writer getting there first; anything else would
                 // resurface below as a puzzling ENOTEMPTY from the rename.
@@ -672,7 +678,7 @@ impl Store {
         std::fs::rename(&staging, dir)
             .with_context(|| format!("renaming {} into place", staging.display()))?;
         // In place and needing no further moves, so the root can be closed now too.
-        set_read_only(dir, true)?;
+        set_read_only(dir, Access::ReadOnly)?;
         Ok(())
     }
 
@@ -1331,9 +1337,9 @@ mod tests {
         store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
 
         let dir = store.entry_dir(&inputs, &key);
-        crate::artifact::set_read_only(&dir, false).unwrap();
+        crate::artifact::set_read_only(&dir, Access::Writable).unwrap();
         std::fs::remove_file(dir.join("agent/run.json")).unwrap();
-        crate::artifact::set_read_only(&dir, true).unwrap();
+        crate::artifact::set_read_only(&dir, Access::ReadOnly).unwrap();
 
         let mut ran = false;
         let got = store
@@ -1363,7 +1369,7 @@ mod tests {
             f.repo.join("results/.cache/tmp").join(format!("{}.partial", key.as_str()));
         std::fs::create_dir_all(staging.join("code/src")).unwrap();
         std::fs::write(staging.join("code/src/lib.rs"), "half-written").unwrap();
-        crate::artifact::set_read_only(&staging, true).unwrap();
+        crate::artifact::set_read_only(&staging, Access::ReadOnly).unwrap();
 
         store
             .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
@@ -1424,12 +1430,12 @@ mod tests {
 
         // Defeat the read-only bit first: this is the scenario the digest check exists for.
         let dir = store.entry_dir(&inputs, &key);
-        crate::artifact::set_read_only(&dir, false).unwrap();
+        crate::artifact::set_read_only(&dir, Access::Writable).unwrap();
         std::fs::write(dir.join("code/src/lib.rs"), "pub fn a() { /* smuggled */ }").unwrap();
         // RE-LOCK: an entry found in the wild is 0o555, and quarantining one is a
         // cross-parent rename, which needs write permission on the moved directory. Left
         // unlocked, this test passes without the quarantine ever having worked.
-        crate::artifact::set_read_only(&dir, true).unwrap();
+        crate::artifact::set_read_only(&dir, Access::ReadOnly).unwrap();
 
         let mut ran = false;
         let got = store

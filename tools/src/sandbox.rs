@@ -76,11 +76,48 @@ pub fn denied_read_roots(repo_root: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-pub(crate) fn settings_json(repo_root: &Path, work_root: &Path) -> Result<serde_json::Value> {
-    let deny: Vec<String> = denied_read_roots(repo_root)?
+/// The two roots the policy is made of. As bare `&Path` parameters they are transposable,
+/// and transposed the policy denies the agent's work tree and *grants* the repo — the
+/// graded oracle, plus every other case's translation. With `bwrap` absent this file is the
+/// only sandbox, so nothing downstream would catch it.
+#[derive(Copy, Clone)]
+pub struct Policy<'a> {
+    pub repo_root: &'a Path,
+    /// Both the tree the agent may read and write, and where the policy file is written.
+    /// One field, not two: callers always passed the same value, and a difference would
+    /// launch the agent in a directory its own policy denies.
+    pub work_root: &'a Path,
+    /// Whether the operator accepted running without an enforceable sandbox. In the
+    /// struct, not a parameter, so a new call site cannot omit the decision.
+    pub enforcement: Enforcement,
+}
+
+/// Whether an unenforceable sandbox is fatal. A named enum because the polarity *is*
+/// the safety property: `write_settings(.., false)` reads as "not allowed to be
+/// unsandboxed" to one reader and "sandbox off" to another, and backwards it hands the
+/// agent the graded oracle.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Enforcement {
+    /// Refuse to launch unless the sandbox can actually be enforced.
+    Required,
+    /// `--allow-unsandboxed`: warn, stamp the artifacts, continue.
+    AllowUnsandboxed,
+}
+
+impl Enforcement {
+    /// The one bool→enum boundary, named for the flag that is its only source so the
+    /// polarity is checkable against `--help`.
+    pub fn from_allow_unsandboxed_flag(flag: bool) -> Self {
+        if flag { Enforcement::AllowUnsandboxed } else { Enforcement::Required }
+    }
+}
+
+pub(crate) fn settings_json(policy: Policy<'_>) -> Result<serde_json::Value> {
+    let deny: Vec<String> = denied_read_roots(policy.repo_root)?
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
+    let work_root = policy.work_root;
     Ok(serde_json::json!({
         "sandbox": {
             "enabled": true,
@@ -97,31 +134,23 @@ pub(crate) fn settings_json(repo_root: &Path, work_root: &Path) -> Result<serde_
     }))
 }
 
-/// `parent` is the directory the agent is launched *next to* — the work root for
-/// verify, the temp root for translate — not the agent's cwd.
-pub fn write_settings(
-    repo_root: &Path,
-    work_root: &Path,
-    parent: &Path,
-    allow_unsandboxed: bool,
-) -> Result<PathBuf> {
+/// Writes `<work_root>/.claude/settings.json`, which is where the agent is launched and
+/// so where `--settings` looks for it.
+pub fn write_settings(policy: Policy<'_>) -> Result<PathBuf> {
     // Scoped here rather than at startup: only the agents that receive a policy reach
     // this function, so c2rust/laertes/c2saferrust are not refused for lacking a shell.
-    if allow_unsandboxed {
-        if !is_enforceable() {
-            eprintln!(
-                "⚠️  --allow-unsandboxed: {:?} missing, so the agent runs with the graded \
-                 oracle readable. Artifacts are stamped unsandboxed.",
-                SANDBOX_BINARIES
-            );
-        }
-    } else {
-        require_enforceable()?;
+    match policy.enforcement {
+        Enforcement::AllowUnsandboxed if !is_enforceable() => eprintln!(
+            "⚠️  --allow-unsandboxed: {SANDBOX_BINARIES:?} missing, so the agent runs with \
+             the graded oracle readable. Artifacts are stamped unsandboxed."
+        ),
+        Enforcement::AllowUnsandboxed => {}
+        Enforcement::Required => require_enforceable()?,
     }
-    let dir = parent.join(".claude");
+    let dir = policy.work_root.join(".claude");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("settings.json");
-    std::fs::write(&path, settings_json(repo_root, work_root)?.to_string())?;
+    std::fs::write(&path, settings_json(policy)?.to_string())?;
     Ok(path)
 }
 
@@ -202,9 +231,8 @@ mod tests {
         let parent = tmp.path().join("root");
         std::fs::create_dir_all(&parent).unwrap();
         // The real function, not `policy`: base() needs HOME, which tests have.
-        // true: the test asserts the policy's CONTENT, and must not depend on whether the
-        // machine running it has bwrap installed.
-        let p = write_settings(Path::new("/repo"), &parent, &parent, true).expect("writes policy");
+        let p = write_settings(Policy { repo_root: Path::new("/repo"), work_root: &parent, enforcement: Enforcement::AllowUnsandboxed })
+            .expect("writes policy");
         assert_eq!(p, parent.join(".claude/settings.json"));
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
@@ -225,7 +253,7 @@ mod tests {
         // this machine can enforce is environmental, so assert the two directions
         // against the same predicate rather than hardcoding an expectation.
         let parent = tempfile::tempdir().unwrap();
-        let refused = write_settings(Path::new("/repo"), parent.path(), parent.path(), false);
+        let refused = write_settings(Policy { repo_root: Path::new("/repo"), work_root: parent.path(), enforcement: Enforcement::Required });
         assert_eq!(
             refused.is_ok(),
             is_enforceable(),
@@ -238,7 +266,7 @@ mod tests {
             assert!(msg.contains("--allow-unsandboxed"), "must name the escape hatch: {msg}");
         }
         // The escape hatch always proceeds, so an operator is never blocked outright.
-        assert!(write_settings(Path::new("/repo"), parent.path(), parent.path(), true).is_ok());
+        assert!(write_settings(Policy { repo_root: Path::new("/repo"), work_root: parent.path(), enforcement: Enforcement::AllowUnsandboxed }).is_ok());
     }
 
     #[test]

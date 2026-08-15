@@ -144,40 +144,59 @@ fn copy_carrying(src: &Path, dest: &Path, carry: Carry) -> Result<()> {
     .with_context(|| format!("copying {} to {}", src.display(), dest.display()))?;
     // `std::fs::copy` carries mode bits and cache entries are stored read-only, so
     // without this a replay would publish a read-only crate and later builds hit EACCES.
-    set_read_only(dest, false)
+    set_read_only(dest, Access::Writable)
+}
+
+/// Which way [`set_read_only`] goes. As a `bool` the call site read `set_read_only(dest,
+/// false)`, where `false` says nothing about which; backwards, it either leaves the store
+/// writable or publishes a crate later builds cannot write to.
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum Access {
+    ReadOnly,
+    Writable,
+}
+
+impl Access {
+    fn locked(self) -> bool {
+        self == Access::ReadOnly
+    }
 }
 
 /// Types stop *this crate* from executing in a stored artifact; `0o555`/`0o444` also
 /// binds what the types cannot see — a shell-out, a stray `cargo build --manifest-path` —
 /// which then fails with `EACCES` instead of quietly filling the store with `target/`
 /// dirs and mutating the artifact it was reading.
-pub(crate) fn set_read_only(root: &Path, ro: bool) -> Result<()> {
+pub(crate) fn set_read_only(root: &Path, access: Access) -> Result<()> {
     fn perms(mode: u32) -> std::fs::Permissions {
         use std::os::unix::fs::PermissionsExt;
         std::fs::Permissions::from_mode(mode)
     }
-    fn walk(p: &Path, ro: bool) -> Result<()> {
+    fn walk(p: &Path, access: Access) -> Result<()> {
         let meta = std::fs::symlink_metadata(p)?;
         if meta.is_dir() {
             // A `0o555` directory cannot have entries added or removed, so unlocking on
             // the way down and locking on the way out is what makes this reversible.
-            if !ro {
+            if !access.locked() {
                 std::fs::set_permissions(p, perms(0o755))?;
             }
             for e in std::fs::read_dir(p)? {
-                walk(&e?.path(), ro)?;
+                walk(&e?.path(), access)?;
             }
-            if ro {
+            if access.locked() {
                 std::fs::set_permissions(p, perms(0o555))?;
             }
         } else if !meta.file_type().is_symlink() {
             // chmod follows symlinks: locking one would lock a target outside this tree.
-            std::fs::set_permissions(p, perms(if ro { 0o444 } else { 0o644 }))?;
+            std::fs::set_permissions(p, perms(if access.locked() { 0o444 } else { 0o644 }))?;
         }
         Ok(())
     }
-    walk(root, ro).with_context(|| {
-        format!("making {} {}writable", root.display(), if ro { "non-" } else { "" })
+    walk(root, access).with_context(|| {
+        format!(
+            "making {} {}writable",
+            root.display(),
+            if access.locked() { "non-" } else { "" }
+        )
     })
 }
 
@@ -225,8 +244,10 @@ pub fn classify(rel: &RelPath, in_build_dir: bool) -> Disposition {
     }
 
     if in_build_dir || p.components().any(|c| {
-        let s = c.as_os_str().to_string_lossy();
-        BUILD_DIRS.contains(&s.as_ref()) || s.starts_with("cbuild")
+        // Bytes, not `to_string_lossy`: a lossy name maps every invalid byte to U+FFFD,
+        // so two different directories can compare equal here and be classified alike.
+        let s = c.as_os_str().as_encoded_bytes();
+        BUILD_DIRS.iter().any(|d| d.as_bytes() == s) || s.starts_with(b"cbuild")
     }) {
         return Disposition::BuildOutput;
     }
@@ -281,7 +302,10 @@ fn hash_tree(root: &Path, admits: &dyn Fn(Disposition) -> bool) -> Result<TreeDi
     let mut h = Sha256::new();
     feed(&mut h, b"harvest-tree-v1");
     for (rel, abs) in &files {
-        feed(&mut h, rel.as_path().to_string_lossy().as_bytes());
+        // `RelPath::new` validates relative/no-`..`/non-empty but NOT UTF-8, and a lossy
+        // name collapses every invalid byte to U+FFFD — so `a\xFF` and `a\xFE` would hash
+        // alike, losing the injectivity the rest of this digest rests on.
+        feed(&mut h, rel.as_path().as_os_str().as_encoded_bytes());
         let bytes = std::fs::read(abs).with_context(|| format!("reading {}", abs.display()))?;
         feed(&mut h, &bytes);
     }
@@ -374,7 +398,15 @@ impl<P: Phase> WorkTree<P> {
     /// `self`, so nothing can run again against a tree normalised for hashing.
     pub fn scrub(self) -> Result<Scrubbed<P>> {
         let base = crate::workdir::base()?;
-        let needles = [self.root.to_string_lossy().into_owned(), base.to_string_lossy().into_owned()];
+        // The files below are read as UTF-8, so a non-UTF-8 path cannot occur in one and
+        // there is nothing to rewrite — whereas its lossy form (U+FFFD per invalid byte)
+        // can occur, and would rewrite text that is not a path.
+        let needles: Vec<String> = [self.root.as_path(), base.as_path()]
+            .into_iter()
+            .filter_map(|p| p.to_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
         let mut rewritten = Vec::new();
 
         let artifact = self.crate_dir();
@@ -383,9 +415,7 @@ impl<P: Phase> WorkTree<P> {
             let Ok(text) = std::fs::read_to_string(abs) else { return Ok(()) }; // binary: skip
             let mut out = text.clone();
             for n in &needles {
-                if !n.is_empty() {
-                    out = out.replace(n.as_str(), "$HARVEST_WORKDIR");
-                }
+                out = out.replace(n.as_str(), "$HARVEST_WORKDIR");
             }
             if out != text {
                 std::fs::write(abs, out).with_context(|| format!("scrubbing {}", abs.display()))?;
@@ -644,6 +674,38 @@ mod tests {
         feed(&mut b, b"a");
         feed(&mut b, b"b");
         assert_ne!(format!("{:x}", a.finalize()), format!("{:x}", b.finalize()));
+    }
+
+    /// Pinned from the pre-`as_encoded_bytes` implementation. On Unix an `OsStr` *is* its
+    /// encoded bytes and lossy conversion of valid UTF-8 is the identity, so every digest
+    /// in `results/` must survive; this measures that rather than assuming it.
+    #[test]
+    fn lossless_path_encoding_does_not_change_an_existing_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = tmp.path();
+        std::fs::create_dir_all(r.join("src")).unwrap();
+        std::fs::write(r.join("Cargo.toml"), b"[package]\nname=\"x\"\n").unwrap();
+        std::fs::write(r.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
+        std::fs::create_dir_all(r.join("c_src/nested")).unwrap();
+        std::fs::write(r.join("c_src/nested/a.c"), b"int a;\n").unwrap();
+        assert_eq!(
+            digest_tree(r).unwrap().as_str(),
+            "sha256:bb95dbd7dfe0089c8568c8421bcca59e4d32bc0f406fb65d9f3bd8ab6302a6df"
+        );
+    }
+
+    /// The hole the lossy encoding left. `RelPath` does not validate UTF-8, so this is
+    /// reachable, and both trees used to digest alike — a cache hit across different work.
+    #[test]
+    fn paths_differing_only_outside_utf8_digest_differently() {
+        use std::os::unix::ffi::OsStrExt;
+        let digest_of = |name: &[u8]| {
+            let tmp = tempfile::tempdir().unwrap();
+            let f = tmp.path().join(std::ffi::OsStr::from_bytes(name));
+            std::fs::write(&f, b"same content").unwrap();
+            digest_tree(tmp.path()).unwrap().as_str().to_owned()
+        };
+        assert_ne!(digest_of(b"a\xff"), digest_of(b"a\xfe"));
     }
 
     #[test]

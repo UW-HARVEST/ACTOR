@@ -381,13 +381,13 @@ pub fn invoke(
     tmp_root: &Path,
     m: &Model,
 ) -> Result<()> {
-    let mut cmd = session.opencode_command(
-        work_dir,
+    let mut cmd = session.opencode_command(crate::session::OpencodeRun {
+        cwd: work_dir,
         prompt,
-        log_path,
-        &m.as_arg(),
-        &xdg_config_dir(tmp_root),
-    );
+        log: log_path,
+        model_arg: &m.as_arg(),
+        xdg_config_home: &xdg_config_dir(tmp_root),
+    });
 
     // WORKAROUND 2 — raise the 32k per-response cap to the registry limit.
     match load_model_limits(m) {

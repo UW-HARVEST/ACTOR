@@ -104,16 +104,26 @@ pub fn harness_id() -> String {
     }
 }
 
+/// What an unreproducible tree costs. Named rather than `bool` because this is the one
+/// switch that decides whether a run whose code no commit describes is allowed to produce
+/// numbers at all, and `require_reproducible(true)` at a call site says nothing about
+/// which way `true` points.
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub enum OnUnreproducible {
+    Refuse,
+    WarnAndStamp,
+}
+
 /// `--allow-dirty` downgrades the refusal to a warning for local iteration;
 /// `harness_id` then carries `-dirty` into every artifact, so a downgraded run cannot
 /// later be mistaken for a clean one.
-pub fn require_reproducible(allow_dirty: bool) -> Result<()> {
+pub fn require_reproducible(on_problem: OnUnreproducible) -> Result<()> {
     let head = head_sha();
     let dirty = dirty_file_count().unwrap_or(0);
     match assess(built_from(), head.as_deref(), dirty) {
         None => Ok(()),
         Some(problem) => {
-            if allow_dirty {
+            if on_problem == OnUnreproducible::WarnAndStamp {
                 eprintln!("⚠️  --allow-dirty: {problem}");
                 eprintln!(
                     "    Artifacts will be stamped `{}`; treat any number from this run as \

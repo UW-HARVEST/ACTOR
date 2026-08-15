@@ -305,7 +305,11 @@ impl Backend {
             // `--trust-all-tools` and no policy file: there is nothing to record.
             Backend::Kiro => None,
             Backend::Claude => Some(tokenise(
-                crate::sandbox::settings_json(&paths.repo_root, work_root)?.to_string(),
+                crate::sandbox::settings_json(crate::sandbox::Policy {
+                    repo_root: &paths.repo_root,
+                    work_root,
+                    enforcement: paths.enforcement,
+                })?.to_string(),
             )),
             Backend::OpenCode(_) => {
                 Some(tokenise(crate::opencode::permission_shape(work_root)))
@@ -445,12 +449,11 @@ fn run_verify_agent(
             // Denies the repo root (the graded oracle, plus results/) and the shared
             // scratch base holding sibling work dirs, then re-grants this run's own root.
             let settings_path =
-                crate::sandbox::write_settings(
-                    &paths.repo_root,
-                    work.root(),
-                    work.root(),
-                    paths.allow_unsandboxed,
-                )?;
+                crate::sandbox::write_settings(crate::sandbox::Policy {
+                    repo_root: &paths.repo_root,
+                    work_root: work.root(),
+                    enforcement: paths.enforcement,
+                })?;
             let status = inv
                 .session
                 .claude_command(&ClaudeRun {
@@ -591,9 +594,9 @@ mod tests {
             crate::cli::Dataset::TestCorpus,
             Some("openai/gpt-5.4"),
             cache::Mode::Bypass,
-            // true so the test asserts policy content rather than whether this machine
-            // happens to have bwrap installed.
-            true,
+            // AllowUnsandboxed so the test asserts policy content rather than whether
+            // this machine happens to have bwrap installed.
+            crate::sandbox::Enforcement::AllowUnsandboxed,
         )
         .unwrap();
         assert!(verify_invocation(&paths).unwrap().is_none());
@@ -610,9 +613,9 @@ mod tests {
             crate::cli::Dataset::TestCorpus,
             None,
             cache::Mode::Bypass,
-            // true so the test asserts policy content rather than whether this machine
-            // happens to have bwrap installed.
-            true,
+            // AllowUnsandboxed so the test asserts policy content rather than whether
+            // this machine happens to have bwrap installed.
+            crate::sandbox::Enforcement::AllowUnsandboxed,
         )
         .unwrap();
         let work = repo.path().join("work");

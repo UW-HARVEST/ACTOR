@@ -230,22 +230,31 @@ impl Session {
         c
     }
 
-    pub fn opencode_command(
-        &self,
-        cwd: &Path,
-        prompt: &str,
-        log: &Path,
-        model_arg: &str,
-        xdg_config_home: &Path,
-    ) -> Command {
+    pub fn opencode_command(&self, run: OpencodeRun<'_>) -> Command {
         let mut c = self.shell();
-        c.arg(model_arg)
-            .arg(prompt)
-            .arg(log)
-            .env("XDG_CONFIG_HOME", xdg_config_home)
-            .current_dir(cwd);
+        c.arg(run.model_arg)
+            .arg(run.prompt)
+            .arg(run.log)
+            .env("XDG_CONFIG_HOME", run.xdg_config_home)
+            .current_dir(run.cwd);
         c
     }
+}
+
+/// The per-case values an opencode session needs.
+///
+/// A struct rather than five positional parameters for the same reason [`ClaudeRun`]
+/// is one: three of them are `&Path` with no type distinction between them, so
+/// transposing `log` and `xdg_config_home` compiles and writes the agent's transcript
+/// where its config belongs.
+pub struct OpencodeRun<'a> {
+    pub cwd: &'a Path,
+    pub prompt: &'a str,
+    pub log: &'a Path,
+    pub model_arg: &'a str,
+    /// Per-case config root, so parallel opencode agents cannot share credentials
+    /// state.
+    pub xdg_config_home: &'a Path,
 }
 
 /// The per-case values a claude session needs, in one struct so the positional order
