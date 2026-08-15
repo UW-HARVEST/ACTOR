@@ -122,15 +122,16 @@ is a compile error rather than a convention.
 
 ### 3. The one driver
 
-The genuine duplication is orchestration, not types. One params struct (A7 forbids
-three interchangeable primitives; A10 hard-fails two bools with no allowlist), one
+The genuine duplication is orchestration, not types. One params struct — of its seven
+values two are `&Path` and two are `&TreeDigest`, so passed positionally
+`case_dir`/`log_path` and `input_tree`/`c_before` transpose with no type error — one
 generic function, one `store.obtain` call in the whole crate:
 
 ```rust
 /// Everything a cached agent phase needs, resolved BEFORE the agent starts so the key
-/// can name it. A struct because `(case_dir, log_path, prompt)` as parameters is three
-/// interchangeable primitives, which `no_function_takes_three_interchangeable_primitives`
-/// rejects.
+/// can name it. A struct because `case_dir` and `log_path` are both `&Path` and
+/// `input_tree` and `c_before` are both `&TreeDigest`: as positional parameters either
+/// pair transposes with no type error, and a transposed `input_tree` is a wrong key.
 pub struct PhaseRun<'a, P: Phase> {
     pub case_dir: &'a Path,
     pub work: WorkTree<P>,
@@ -257,8 +258,8 @@ Each step leaves `main` green and is independently reviewable.
    bit-identical — same keys, same replays. Architecture rule: exactly one
    `store.obtain` call site in the crate.
 7. **Port translate onto `run_cached`.** Collapse `dispatch_translate` and
-   `dispatch_translate_shared` into one call parameterised by `PromptKind`, deleting
-   their A10 `ALLOWED` entries in the same commit.
+   `dispatch_translate_shared` into one call parameterised by `PromptKind`. No
+   architecture rule names either function any longer; PR 0 deleted the lists that did.
 8. **`OPENSSL_DIR`** — key it or justify it, with the `SCHEMA` bump if keyed.
 
 Steps 2 and 3 are worth doing even if the rest is never built.
@@ -295,15 +296,21 @@ Ranked by how quietly they fail.
    Spelling the spawn as `.current_dir(work.crate_dir())` consumes the last slot; two
    such sites fail the build. Route through `session::ClaudeRun { cwd, .. }` as verify
    does and the rule never sees it.
-7. **A7 and A10 are shrink-only and checked in both directions.** Deleting or
-   re-signaturing `translate_case`, `verify_case`, `dispatch_translate`,
-   `post_process_independent`, `write_translation_metrics` and the rest requires
-   deleting the matching `ALLOWED` line in the **same** commit. Neither list may grow.
-8. **`write_translation_metrics` cannot gain a `replayed: bool`** — that makes it a
-   two-bool function and A10 hard-fails those with no allowlist escape. Use a named
-   enum, and merge the two metrics writers (only verify's carries
-   `replayed`/`cache_key`, which a replay must record so the original run's cost is not
-   read as this run's spend).
+7. **The `ALLOWED` lockstep tax is gone; do not go looking for it.** A7
+   `no_function_takes_three_interchangeable_primitives` and A10
+   `safety_gating_bools_are_named_enums` held shrink-only lists naming `translate_case`,
+   `verify_case`, `dispatch_translate`, `post_process_independent`,
+   `write_translation_metrics` and others, so every re-signaturing in the sequence above
+   used to require deleting the matching line in the same commit. PR 0 deleted both
+   rules. Nothing has to be kept in step — and nothing rejects those shapes either,
+   which is trap 8.
+8. **`write_translation_metrics` must not gain a `replayed: bool`.** It already takes
+   `success: bool` (`translate.rs:1247`), so the two would be adjacent and
+   interchangeable, and one transposed call site publishes a replay as a failure and a
+   failure as a replay. Since PR 0 this is a convention and not a gate: the build no
+   longer fails, so use a named enum because the transposition is real. Merge the two
+   metrics writers (only verify's carries `replayed`/`cache_key`, which a replay must
+   record so the original run's cost is not read as this run's spend).
 9. **Post-processing currently runs on the *published* tree**, after the artifact
    boundary. `Cargo.toml` is hashed, so sealing before post-processing means the
    recorded digest does not describe `translated/` on disk and a replay restores the

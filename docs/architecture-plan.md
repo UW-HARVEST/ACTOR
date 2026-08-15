@@ -112,7 +112,7 @@ Three non-negotiables:
 
 | # | PR | kind | breaks | verified by |
 |---|---|---|---|---|
-| 0 | **Delete four shape rules** and their allowlists | net removal | the lockstep tax on 3–9 | 10 rules still green |
+| 0 | **Delete four shape rules** and their allowlists — **landed** | net removal | the lockstep tax on 3–9 | 10 rules still green |
 | 1 | `CorpusDir` + `SeedAt` + `SeededBy` | types | — | 3 new tests + 1 compile-fail case |
 | 2 | **Guards**: recursive `rust_sources()` + anti-vacuity, DAG rule w/ baseline, golden fingerprint | additions only | — | rule fails on a planted cycle |
 | 3 | `domain/` moves + layer-purity rule + `classify(text, …)` | move + 1 cut | `agent_health ↔ artifact` | purity rule; token-diff |
@@ -126,17 +126,17 @@ Three non-negotiables:
 
 ### What each PR actually does
 
-**0 — Delete four shape rules.** 33% of the crate is checking code (5,450 lines against
-10,844 doing), and `tests/architecture.rs` is 1,272 lines for 14 rules. Four of them earn
-the least and cost the most:
+**0 — Delete four shape rules (landed).** 33% of the crate was checking code (5,450 lines
+against 10,844 doing), and `tests/architecture.rs` was 1,273 lines for 14 rules. Four of
+them earned the least and cost the most:
 
 | lines | rule |
 |---|---|
-| 147 | `money_amounts_cannot_be_substituted_for_one_another` |
-| 94 | `safety_gating_bools_are_named_enums` |
-| 58 | `no_function_takes_three_interchangeable_primitives` |
-| 42 | `a_tuple_return_may_not_repeat_an_element_type` |
-| **341** | plus `is_bool_to_enum_boundary`, `collect_enums_and_impls`, `PRIMITIVES` becoming dead |
+| 88 | `safety_gating_bools_are_named_enums` |
+| 72 | `money_amounts_cannot_be_substituted_for_one_another` |
+| 54 | `no_function_takes_three_interchangeable_primitives` |
+| 33 | `a_tuple_return_may_not_repeat_an_element_type` |
+| **408** | measured total, with `is_bool_to_enum_boundary`, `collect_enums_and_impls`, `PRIMITIVES`, `ty_key`, `params` and `Param` becoming dead |
 
 Three of them carry **closed, shrink-only `ALLOWED` lists checked in both directions**,
 naming `translate_case`, `verify_case`, `dispatch_translate`, `post_process_independent`,
@@ -145,9 +145,11 @@ those, so every PR from 3 to 9 must edit `architecture.rs` in lockstep or the st
 half fails. That tax is most of the friction in this plan, and it is paid to enforce
 signature patterns rather than structure.
 
-The syn helpers mostly stay — `ty_key`, `signatures`, `params`, `returned_ty`,
-`quote_min` and `is_pathish` are used by the ten rules we keep. It is the rule bodies and
-their allowlists that go: 1,272 lines to roughly 890.
+The syn helpers mostly stay — `signatures`, `method_calls`, `returned_ty`,
+`mentions_type`, `quote_min` and `is_pathish` are used by the ten rules we keep. `ty_key`,
+`params` and `Param` went too: the four rules were their only callers, so `warnings =
+"deny"` made keeping them a build error. Rule bodies, allowlists and the helpers that went
+with them: 1,273 lines down to 865.
 
 What replaces them is cheaper and catches more. The DAG rule and the layer-purity rule
 are ~20 lines each with no allowlist and no type analysis: a cycle, or an `std::fs` inside
@@ -208,6 +210,22 @@ sweep currently re-pays about $800 that a cache would return.
 * **The shrink-only `ALLOWED` lists.** Removed by PR 0, which is why PR 0 goes first. If
   it is skipped, every PR from 3 to 9 must edit `tests/architecture.rs` in the same commit
   or the staleness half of those rules fails.
+* **The comment budget is a whole-tree ratio with no headroom, so every deletion PR in
+  this plan fails it.** Measured with `tools/comment_budget.py`: `main` is 1,942 comment /
+  14,940 counted lines = 12.9987% against `--max 13`, i.e. it passes by 0.0013 percentage
+  points. PR 0 removes 26 comment and 351 code lines — 6.9% comment density against the
+  tree's 13.0% — which *raises* the ratio to 1,916 / 14,563 = 13.157% and makes the
+  required "Comment budget" CI step exit 1. Getting back under 13% needs 27 comment-only
+  lines deleted or 175 comment-free code lines added; the whole non-invariant surplus in
+  `tests/architecture.rs` (the `//!` header, the eight `// ── An ──` labels, two helper
+  doc lines) is 17 lines and still leaves 13.055%, and everything else countable is either
+  a rule's WHY documentation or outside PR 0's surface. Scoping tests out is worse, not
+  better: excluding `tools/tests/**` measures 1,775 / 13,416 = 13.231%. So the ratio was
+  being held under budget by the low-comment checking code this plan exists to delete, and
+  PRs 6 and 7 — "everything below deletes itself" — hit the same wall. What the budget
+  measures (an absolute comment-line ceiling cannot be tripped by a deletion; a ratio
+  can) is a deliberate decision to land as its own change, with the rationale recorded in
+  `comment_budget.py`. A deletion PR must not widen it on the way past.
 * **`is_public()` counts `Visibility::Restricted`.** `pub(super)` reads as public to the
   typestate rule, so the state machine's fields stay fully private. (Child modules *can*
   see an ancestor's private fields, so this constrains visibility, not file count.)
