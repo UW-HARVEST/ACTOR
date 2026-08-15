@@ -270,6 +270,7 @@ fn compile_fail_cases_still_assert_what_they_were_written_for() {
         ("worktree_cannot_be_used_after_scrub", "E0382"), // scrub() consumed it
         ("scrubbed_cannot_be_used_after_seal", "E0382"), // seal() consumed it
         ("materialise_at_refuses_a_results_tree_path", "E0308"), // needs a Cwd, not a Path
+        ("a_verification_cannot_seed_a_translation", "E0277"), // no such SeededBy impl
         ("phase_cannot_be_implemented_downstream", "E0277"), // sealed supertrait
         ("sealed_does_not_display", "E0277"),        // no Display impl
         ("materialise_at_refuses_a_results_tree_path", "E0308"), // not a ScratchPath
