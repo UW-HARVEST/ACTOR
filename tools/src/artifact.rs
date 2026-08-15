@@ -4,7 +4,11 @@
 //! * Nothing runs in a published artifact: `Command::current_dir` and `--target-dir`
 //!   both take `impl AsRef<Path>`, so "can obtain a path" *is* "can execute here", and
 //!   [`Sealed`] yields no path in any form. (`test.rs` still builds inside the tree it
-//!   scores; fixing that needs the `c/`+`rust/` layout split.)
+//!   scores. No layout *inside* `results/` fixes that: MIT `runtests` resolves each
+//!   crate at `<case>/translated_rust` and pins its build output to
+//!   `<that>/target` with an explicit `--target-dir`, and its `cando2` runner bakes
+//!   `CARGO_MANIFEST_DIR`. The build has to leave the tree, which is what
+//!   [`Scratch::subdir`] + [`Sealed::materialise_at`] exist for.)
 //! * An infra-failed run cannot be sealed: [`Scrubbed::seal`] demands a
 //!   [`crate::agent_health::Completed`], which only `classify_log` can mint.
 //! * A tree cannot be hashed before it is scrubbed: agent output embeds the random
@@ -16,6 +20,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 mod sealed_trait {
     pub trait Sealed {}
@@ -311,16 +316,38 @@ fn visit(
     Ok(())
 }
 
-/// Disk-backed, never tmpfs (see [`crate::workdir`]); removed on drop.
+/// Disk-backed, never tmpfs (see [`crate::workdir`]); removed once the last handle to
+/// it drops. Shared rather than solely owned so that a [`ScratchPath`] cut from it
+/// cannot name a directory the tempdir has already deleted.
 #[must_use]
 pub struct Scratch {
-    dir: tempfile::TempDir,
+    dir: Arc<tempfile::TempDir>,
 }
 
 impl Scratch {
     pub fn new(prefix: &str) -> Result<Self> {
-        Ok(Self { dir: crate::workdir::tempdir(prefix)? })
+        Ok(Self { dir: Arc::new(crate::workdir::tempdir(prefix)?) })
     }
+
+    /// Room for ONE case inside a root shared by many. [`Sealed::materialise_into`]
+    /// cannot serve a whole battery: it consumes the `Scratch` and roots the work tree
+    /// at the tempdir itself, so N cases would need N roots.
+    pub fn subdir(&self, name: impl AsRef<Path>) -> Result<ScratchPath> {
+        let rel = RelPath::new(name)?;
+        let root = self.dir.path().join(rel.as_path());
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("creating scratch subdir {}", root.display()))?;
+        Ok(ScratchPath { root, keep: Arc::clone(&self.dir) })
+    }
+}
+
+/// Where a case may be materialised. Hands out no path of its own, so the only thing a
+/// caller can do with one is pass it to [`Sealed::materialise_at`] — which is what stops
+/// that destination from being the results-tree phase dir being measured.
+#[must_use]
+pub struct ScratchPath {
+    root: PathBuf,
+    keep: Arc<tempfile::TempDir>,
 }
 
 /// A materialised, writable copy. The ONLY artifact type that yields a `Path`.
@@ -463,8 +490,22 @@ impl<P: Phase> Sealed<P> {
     #[must_use = "materialising and dropping the copy does nothing"]
     pub fn materialise_into<Q: Phase>(&self, scratch: Scratch) -> Result<WorkTree<Q>> {
         let root = scratch.dir.path().to_path_buf();
+        self.materialise(root, scratch)
+    }
+
+    /// As [`Self::materialise_into`], but into one slot of a scratch root the caller
+    /// keeps, so a battery of N cases needs one root and not N.
+    #[must_use = "materialising and dropping the copy does nothing"]
+    pub fn materialise_at<Q: Phase>(&self, at: ScratchPath) -> Result<WorkTree<Q>> {
+        let ScratchPath { root, keep } = at;
+        self.materialise(root, Scratch { dir: keep })
+    }
+
+    /// Both public entry points route here, so "what a work tree is seeded with" has one
+    /// answer whether the root is shared or owned.
+    fn materialise<Q: Phase>(&self, root: PathBuf, keep: Scratch) -> Result<WorkTree<Q>> {
         copy_carrying(&self.root, &root.join(crate::battery::TRANSLATED_RUST), Carry::IntoWorkTree)?;
-        Ok(WorkTree { root, _scratch: Some(scratch), _phase: PhantomData })
+        Ok(WorkTree { root, _scratch: Some(keep), _phase: PhantomData })
     }
 
     pub fn publish(&self, case_dir: &Path) -> Result<()> {
@@ -795,6 +836,38 @@ mod tests {
             "pub fn a() {}",
             "translated/ must be left untouched — verify is pure"
         );
+    }
+
+    /// One root, many cases — the shape `materialise_into` cannot express, and the
+    /// prerequisite for scoring a battery outside the tree it scores.
+    #[test]
+    fn one_scratch_root_holds_many_cases_and_outlives_each_of_them() {
+        let case = tempfile::tempdir().unwrap();
+        tree(
+            &case.path().join(crate::battery::TRANSLATED),
+            &[("Cargo.toml", "[package]"), ("src/lib.rs", "pub fn a() {}")],
+        );
+        let sealed = Sealed::<Translate>::adopt(case.path()).unwrap();
+
+        let root = Scratch::new("test-battery-").unwrap();
+        let a: WorkTree<Verify> = sealed.materialise_at(root.subdir("case-a").unwrap()).unwrap();
+        let b: WorkTree<Verify> = sealed.materialise_at(root.subdir("case-b").unwrap()).unwrap();
+
+        assert_eq!(a.path().parent(), b.path().parent(), "both cases must share the one root");
+        assert_ne!(a.path(), b.path(), "each case still needs a crate of its own to build in");
+        for w in [&a, &b] {
+            assert!(w.crate_dir().join("src/lib.rs").is_file(), "the crate must be copied");
+        }
+
+        let b_crate = b.crate_dir();
+        drop(b);
+        assert!(
+            b_crate.join("src/lib.rs").is_file(),
+            "one case ending must not delete the root the others are still building in"
+        );
+
+        assert!(root.subdir("/abs").is_err(), "a destination outside the root must be refused");
+        assert!(root.subdir("../up").is_err());
     }
 
     #[test]

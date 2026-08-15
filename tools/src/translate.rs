@@ -1589,31 +1589,46 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     let log_path = logs_dir.join("translation.log");
     let translated = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
 
-    copy_dir_filtered(&c2rust_original, &translated, &["target"])?;
+    // Staged in scratch like its c2saferrust neighbour: the container gets this mounted
+    // read-write, and the compile check writes `target/` plus a `Cargo.lock` that is part
+    // of the hashed artifact — so in `translated/` the arm mutated its own result.
+    let tmp = crate::workdir::tempdir("harvest-laertes-")
+        .context("creating laertes temp workspace")?;
+    let work = tmp.path().join("project");
+    copy_dir_filtered(&c2rust_original, &work, &["target"])?;
 
     let mut log = std::fs::File::create(&log_path)?;
     writeln!(log, "source: {}", c2rust_original.display())?;
 
     writeln!(log, "\n=== Laertes pre-process ===")?;
-    laertes_preprocess(&translated)?;
+    laertes_preprocess(&work)?;
     writeln!(log, "done")?;
 
     writeln!(log, "\n=== Laertes Docker ===")?;
-    let mount = format!("{}:/mnt/project", translated.display());
+    let mount = format!("{}:/mnt/project", work.display());
     let docker_out = Command::new("docker")
         .args(["run", "--rm", "-v", &mount, LAERTES_DOCKER_IMAGE, "bash", "-c", LAERTES_DOCKER_SCRIPT])
         .output()
         .context("running laertes docker container")?;
     log.write_all(&docker_out.stdout)?;
     log.write_all(&docker_out.stderr)?;
+    // Unchecked, a container that never ran (missing image, dead daemon) published the
+    // untouched c2rust input as this arm's translation, and the comparison silently
+    // measured c2rust twice.
+    anyhow::ensure!(
+        docker_out.status.success(),
+        "laertes container failed ({}), so this case has no laertes translation; see {}",
+        docker_out.status,
+        log_path.display()
+    );
 
     writeln!(log, "\n=== Laertes post-process ===")?;
-    laertes_postprocess(&translated)?;
+    laertes_postprocess(&work)?;
 
     let build = Command::new("cargo")
         .args(["+nightly", "build", "--release"])
         .env("RUSTFLAGS", "-Awarnings")
-        .current_dir(&translated)
+        .current_dir(&work)
         .output()
         .context("cargo build after laertes")?;
     log.write_all(&build.stdout)?;
@@ -1621,6 +1636,7 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     let ok = build.status.success();
     writeln!(log, "\nlaertes translation {}", if ok { "succeeded" } else { "FAILED to compile (non-fatal)" })?;
 
+    copy_dir_filtered(&work, &translated, &["target"])?;
     Ok(())
 }
 
