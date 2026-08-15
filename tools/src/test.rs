@@ -782,7 +782,7 @@ impl Enrichment {
     /// object): assigning through `json[key]` panics on any other value. Both
     /// in-process callers build their object here from a struct or a `json!`
     /// literal; the one caller that reads a `Value` off disk checks first, in
-    /// [`Self::enrich_file`].
+    /// `Self::enrich_file`.
     ///
     /// The `to_value` calls cannot fail: every field of `UnsafeCounts`,
     /// `LocCounts` and `AgentRunMeta` is a derived-`Serialize` struct of integers,

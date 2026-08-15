@@ -1,0 +1,5 @@
+# Commits that only reformat. GitHub's blame honours this file automatically;
+# locally: git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Format the tree with rustfmt, once
+dcff4d3850e13a41f6c357d506ed49205b0535dd

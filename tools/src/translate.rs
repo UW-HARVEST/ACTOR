@@ -1175,7 +1175,7 @@ pub fn agent_provenance(agent: Agent, duration_secs: u64) -> serde_json::Value {
     p
 }
 
-/// Verify-side sibling of [`write_translation_metrics`].
+/// Verify-side sibling of `write_translation_metrics`.
 ///
 /// `provenance` describes the invocation that produced the artifact, which on a
 /// replay is the ORIGINAL one — so `replayed` and `cache_key` are what stop its cost
@@ -2499,6 +2499,40 @@ mod tests {
             .arg(format!("exit {code}"))
             .status()
             .unwrap()
+    }
+
+    /// A shell `export` of one of these is invisible to [`crate::cache::Recipe`], so a
+    /// driver that kept its own copy could change agent behaviour without changing the
+    /// cache key — and `.envs()` means the copy never took effect in the first place.
+    #[test]
+    fn no_shell_script_names_an_agent_env_key() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("tools/ has a parent");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["ls-files", "-z", "--", "*.sh"])
+            .output()
+            .expect("git ls-files");
+        assert!(out.status.success(), "git ls-files: {}", out.status);
+        let listing = String::from_utf8(out.stdout).expect("paths are utf-8");
+        let scripts: Vec<&str> = listing.split('\0').filter(|s| !s.is_empty()).collect();
+        assert!(
+            !scripts.is_empty(),
+            "no committed *.sh found, so this rule would pass vacuously"
+        );
+        for rel in scripts {
+            let text = std::fs::read_to_string(root.join(rel)).expect(rel);
+            for (key, value) in AGENT_ENV {
+                assert!(
+                    !text.contains(key),
+                    "{rel} names {key}; AGENT_ENV owns it (={value}) and applies it via \
+                     .envs(), so a copy in the driver is at best dead and at worst a \
+                     divergent value the cache key cannot see"
+                );
+            }
+        }
     }
 
     #[test]

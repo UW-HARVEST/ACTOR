@@ -89,7 +89,7 @@ pub enum Dataset {
 }
 
 impl Dataset {
-    /// Auto-detect from target name: "HB/<project>" or "HB" → HarvestBench,
+    /// Auto-detect from target name: `HB/<project>` or `HB` → HarvestBench,
     /// else TestCorpus.
     pub fn detect(target: &str) -> Self {
         if target.eq_ignore_ascii_case("hb") || target.starts_with("HB/") {

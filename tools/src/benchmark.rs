@@ -29,7 +29,7 @@ pub trait Benchmark {
         parallel: usize,
     ) -> Result<()>;
 
-    /// Reached from `Run` only when [`verifies`] is true, but also invoked directly by
+    /// Reached from `Run` only when [`Self::verifies`] is true, but also invoked directly by
     /// the `verify` subcommand, so an impl cannot assume that gate ran.
     fn verify(
         &self,
