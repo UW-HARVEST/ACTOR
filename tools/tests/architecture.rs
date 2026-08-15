@@ -79,6 +79,20 @@ fn is_public(vis: &syn::Visibility) -> bool {
     matches!(vis, syn::Visibility::Public(_) | syn::Visibility::Restricted(_))
 }
 
+/// The type an `impl` block is for, by its last path segment. The rules below scan every
+/// module because the orphan rule permits the impl to live in any of them — and outside
+/// the defining module it must be spelled `crate::cache::CacheKey`, which no comparison
+/// against `"CacheKey"` would ever match.
+fn impl_target(ty: &syn::Type) -> String {
+    match ty {
+        syn::Type::Path(p) => {
+            p.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default()
+        }
+        syn::Type::Reference(r) => impl_target(&r.elem),
+        _ => String::new(),
+    }
+}
+
 // ── A1 ─────────────────────────────────────────────────────────────────────
 
 /// `Sealed<P>` may implement nothing that yields a path, directly or by deref.
@@ -93,7 +107,7 @@ fn sealed_implements_only_debug() {
     for path in rust_sources() {
         for item in parse(&path).items {
             let syn::Item::Impl(imp) = item else { continue };
-            if type_name(&imp.self_ty) != "Sealed" {
+            if impl_target(&imp.self_ty) != "Sealed" {
                 continue;
             }
             let name = match &imp.trait_ {
@@ -142,7 +156,7 @@ fn no_public_path_escapes_the_artifact_modules() {
         for item in parse(&path).items {
             match item {
                 syn::Item::Impl(imp) => {
-                    let self_ty = type_name(&imp.self_ty);
+                    let self_ty = impl_target(&imp.self_ty);
                     for it in imp.items {
                         let syn::ImplItem::Fn(f) = it else { continue };
                         if !is_public(&f.vis) {
@@ -183,13 +197,17 @@ fn no_public_path_escapes_the_artifact_modules() {
 ///
 /// A digest that can be constructed from an arbitrary string is a digest that can
 /// be wrong, and the cache compares them to decide whether to reuse an artifact.
+///
+/// Scans every module for the same reason A1 does: the orphan rule permits
+/// `impl From<String> for CacheKey` in any file of the crate.
 #[test]
 fn digests_cannot_be_fabricated() {
     const GUARDED: &[&str] = &["TreeDigest", "PromptDigest", "RecipeDigest", "CacheKey", "ToolchainId"];
     let mut bad: Vec<String> = Vec::new();
 
-    for module in ["artifact.rs", "cache.rs"] {
-        for item in parse(&src(module)).items {
+    for path in rust_sources() {
+        let module = path.file_name().unwrap().to_string_lossy().into_owned();
+        for item in parse(&path).items {
             match &item {
                 syn::Item::Struct(s) if GUARDED.contains(&s.ident.to_string().as_str()) => {
                     for f in &s.fields {
@@ -201,7 +219,7 @@ fn digests_cannot_be_fabricated() {
                 syn::Item::Impl(imp) => {
                     let Some((_, tr, _)) = &imp.trait_ else { continue };
                     let is_from = tr.segments.last().is_some_and(|s| s.ident == "From");
-                    let target = type_name(&imp.self_ty);
+                    let target = impl_target(&imp.self_ty);
                     if is_from && GUARDED.contains(&target.as_str()) {
                         bad.push(format!("{module}: impl From<..> for {target}"));
                     }
@@ -330,5 +348,119 @@ fn nothing_new_runs_inside_the_results_tree() {
          Build in a scratch copy instead — measuring an artifact must not mutate it.",
         v.hits.len(),
         v.hits
+    );
+}
+
+// ── A6 ─────────────────────────────────────────────────────────────────────
+
+/// Every function that composes a cache key must open by destructuring `Self`
+/// exhaustively, and must contain nothing that can ignore a binding.
+///
+/// That shape is what delegates the work to rustc: a field added to the struct is E0027
+/// at the pattern, and a field bound but never hashed is `unused_variables`, denied at
+/// package level. Each form rejected below quietly reopens the hole — `..` and
+/// `field: _` skip the field, an `_`-prefixed name suppresses the lint, `let _ = x` and
+/// `_ = x;` consume the binding without hashing it, and `#[allow]`/`#[expect]` switch
+/// the lint off. A key that ignores an input silently serves one invocation's artifact
+/// for another's — the failure the agent runtime env had while it lived in a shell
+/// driver the key could not see.
+#[test]
+fn the_key_functions_cannot_forget_a_field() {
+    const REQUIRED: &[(&str, &str)] =
+        &[("Recipe", "digest"), ("KeyInputs", "key"), ("KeyInputs", "meta")];
+
+    /// Rejects everything that makes a binding ignorable.
+    struct Escapes(Vec<String>);
+    impl<'ast> Visit<'ast> for Escapes {
+        fn visit_local(&mut self, l: &'ast syn::Local) {
+            if matches!(l.pat, syn::Pat::Wild(_)) {
+                self.0.push("`let _ = ...`".into());
+            }
+            syn::visit::visit_local(self, l);
+        }
+        fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
+            if matches!(*a.left, syn::Expr::Infer(_)) {
+                self.0.push("`_ = ...`".into());
+            }
+            syn::visit::visit_expr_assign(self, a);
+        }
+        fn visit_attribute(&mut self, a: &'ast syn::Attribute) {
+            for lint in ["allow", "expect"] {
+                if a.path().is_ident(lint) {
+                    self.0.push(format!("#[{lint}(..)]"));
+                }
+            }
+            syn::visit::visit_attribute(self, a);
+        }
+    }
+
+    /// The opening statement must bind every field of `Self` to a usable name.
+    fn opens_exhaustively(stmt: Option<&syn::Stmt>) -> Result<(), String> {
+        let Some(syn::Stmt::Local(local)) = stmt else {
+            return Err("does not open with a `let` destructuring".into());
+        };
+        let syn::Pat::Struct(pat) = &local.pat else {
+            return Err("opens with a `let` that does not destructure a struct".into());
+        };
+        if !pat.path.is_ident("Self") {
+            let spelled: Vec<String> =
+                pat.path.segments.iter().map(|s| s.ident.to_string()).collect();
+            return Err(format!("destructures `{}` rather than `Self`", spelled.join("::")));
+        }
+        if pat.rest.is_some() {
+            return Err("uses `..`, so a field added later is silently skipped".into());
+        }
+        for field in &pat.fields {
+            let name = match &field.member {
+                syn::Member::Named(i) => i.to_string(),
+                syn::Member::Unnamed(i) => i.index.to_string(),
+            };
+            match &*field.pat {
+                syn::Pat::Ident(id) if !id.ident.to_string().starts_with('_') => {}
+                _ => return Err(format!("field `{name}` is not bound to a name that must be used")),
+            }
+        }
+        Ok(())
+    }
+
+    let path = src("cache.rs");
+    let mut seen: Vec<(&str, &str)> = Vec::new();
+    let mut bad: Vec<String> = Vec::new();
+
+    for item in parse(&path).items {
+        let syn::Item::Impl(imp) = item else { continue };
+        let self_ty = impl_target(&imp.self_ty);
+        for it in imp.items {
+            let syn::ImplItem::Fn(f) = it else { continue };
+            let name = f.sig.ident.to_string();
+            let Some(&which) = REQUIRED.iter().find(|(t, n)| *t == self_ty && *n == name) else {
+                continue;
+            };
+            seen.push(which);
+            if let Err(why) = opens_exhaustively(f.block.stmts.first()) {
+                bad.push(format!("{self_ty}::{name} {why}"));
+            }
+            let mut escapes = Escapes(Vec::new());
+            escapes.visit_impl_item_fn(&f);
+            for e in escapes.0 {
+                bad.push(format!("{self_ty}::{name} contains {e}"));
+            }
+        }
+    }
+
+    for want in REQUIRED {
+        assert!(
+            seen.contains(want),
+            "{}::{} is gone, so nothing checks its shape any more. If it was renamed,\n\
+             update REQUIRED here deliberately; if it was deleted, so was this rule.",
+            want.0,
+            want.1
+        );
+    }
+    assert!(
+        bad.is_empty(),
+        "a cache-key function can now ignore one of its inputs: {bad:#?}\n\
+         Feed every binding instead. The whole point of the exhaustive pattern is that\n\
+         rustc, not a reviewer, notices the field nobody hashed."
     );
 }

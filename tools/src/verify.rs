@@ -290,14 +290,16 @@ fn verify_case(
     let toolchain = cache::ToolchainId::detect()?;
     let prompt_digest = cache::prompt_digest(&prompt, work.root(), &paths.repo_root);
     let recipe = cache::Recipe::for_verify(paths, work.root()).digest();
+    // The phase is inferred from what `run_verify_agent` produces, so the key and the
+    // artifact cannot describe different phases.
     let inputs = cache::KeyInputs {
-        phase: crate::battery::VERIFIED,
         agent: &agent_key,
         model: &model,
         toolchain: &toolchain,
         prompt: &prompt_digest,
         recipe: &recipe,
         input_tree: &input_tree,
+        phase: std::marker::PhantomData,
     };
 
     let obtained = store.obtain(&inputs, || {

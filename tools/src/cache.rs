@@ -15,6 +15,7 @@
 use crate::artifact::{Phase, Sealed, TreeDigest};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 /// Bump to invalidate every entry, e.g. if the key composition changes.
@@ -185,18 +186,31 @@ impl Recipe {
         }
     }
 
+    /// Opens by destructuring exhaustively, with no `..`: a field added to [`Recipe`] is
+    /// then E0027 here, and one bound but never fed is a denied `unused_variables`. A
+    /// forgotten field would silently let two different invocations share one entry.
     pub fn digest(&self) -> RecipeDigest {
+        let Self {
+            max_turns,
+            permission_mode,
+            timeout_secs,
+            ulimit_fsize_blocks,
+            ulimit_data_kb,
+            agents_json,
+            sandbox_shape,
+            agent_env,
+        } = self;
         let mut h = Sha256::new();
         feed(&mut h, b"recipe-v1");
-        feed(&mut h, &self.max_turns.to_le_bytes());
-        feed(&mut h, self.permission_mode.as_bytes());
-        feed(&mut h, &self.timeout_secs.to_le_bytes());
-        feed(&mut h, &self.ulimit_fsize_blocks.to_le_bytes());
-        feed(&mut h, &self.ulimit_data_kb.to_le_bytes());
-        feed(&mut h, self.agents_json.as_bytes());
-        feed(&mut h, self.sandbox_shape.as_bytes());
+        feed(&mut h, &max_turns.to_le_bytes());
+        feed(&mut h, permission_mode.as_bytes());
+        feed(&mut h, &timeout_secs.to_le_bytes());
+        feed(&mut h, &ulimit_fsize_blocks.to_le_bytes());
+        feed(&mut h, &ulimit_data_kb.to_le_bytes());
+        feed(&mut h, agents_json.as_bytes());
+        feed(&mut h, sandbox_shape.as_bytes());
         // Sorted, so a reordering of the constant is not a different recipe.
-        let mut env: Vec<_> = self.agent_env.to_vec();
+        let mut env: Vec<_> = agent_env.to_vec();
         env.sort_unstable();
         for (k, v) in env {
             feed(&mut h, k.as_bytes());
@@ -209,50 +223,69 @@ impl Recipe {
 /// Every input to a key. No `Default`, so adding a component is a compile error at
 /// every construction site: a forgotten one would let two different invocations share
 /// an entry, which is silent corruption rather than a visible failure.
-pub struct KeyInputs<'a> {
-    pub phase: &'static str,
+///
+/// The phase is the type parameter, not a field: a string could disagree with the
+/// [`Store::obtain`] it is handed to, and two helpers in this module's tests already
+/// disagreed with each other.
+pub struct KeyInputs<'a, P: Phase> {
     pub agent: &'a str,
     pub model: &'a ModelId,
     pub toolchain: &'a ToolchainId,
     pub prompt: &'a PromptDigest,
     pub recipe: &'a RecipeDigest,
     pub input_tree: &'a TreeDigest,
+    pub phase: PhantomData<P>,
 }
 
-impl KeyInputs<'_> {
+/// `P::DIR` reached *through* the marker field, so the destructuring in [`KeyInputs::key`]
+/// and [`KeyInputs::meta`] reads every binding it makes and none has to be spelled `_`.
+fn dir_of<P: Phase>(_marker: &PhantomData<P>) -> &'static str {
+    P::DIR
+}
+
+/// Recorded in `meta.json` for audit but deliberately NOT re-compared by [`Store::load`]:
+/// every harness commit would otherwise empty the cache, including commits that cannot
+/// affect an artifact. When a change genuinely alters what an artifact IS, bump [`SCHEMA`].
+const UNCOMPARED_META: &[&str] = &["harness"];
+
+impl<P: Phase> KeyInputs<'_, P> {
+    /// Opens by destructuring exhaustively, with no `..`, so a new field is E0027 here and
+    /// a field bound but not hashed is a denied `unused_variables` — the two ways a key
+    /// silently stops distinguishing two different invocations.
     pub fn key(&self) -> CacheKey {
+        let Self { agent, model, toolchain, prompt, recipe, input_tree, phase } = self;
         let mut h = Sha256::new();
         feed(&mut h, b"key-v1");
         feed(&mut h, &SCHEMA.to_le_bytes());
         for part in [
-            self.phase,
-            self.agent,
-            self.model.as_str(),
-            self.toolchain.as_str(),
-            self.prompt.as_str(),
-            self.recipe.as_str(),
-            self.input_tree.as_str(),
+            dir_of(phase),
+            *agent,
+            model.as_str(),
+            toolchain.as_str(),
+            prompt.as_str(),
+            recipe.as_str(),
+            input_tree.as_str(),
         ] {
             feed(&mut h, part.as_bytes());
         }
         CacheKey(format!("{:x}", h.finalize()))
     }
 
+    /// Exhaustively destructured for the same reason as [`Self::key`]: what `load`
+    /// re-compares is derived from these keys, so a component missing here would remove
+    /// the backstop that turns a key collision into a loud error.
     fn meta(&self, key: &CacheKey) -> serde_json::Value {
+        let Self { agent, model, toolchain, prompt, recipe, input_tree, phase } = self;
         serde_json::json!({
             "schema": SCHEMA,
             "key": key.as_str(),
-            "phase": self.phase,
-            "agent": self.agent,
-            "model": self.model.as_str(),
-            "toolchain": self.toolchain.as_str(),
-            "prompt": self.prompt.as_str(),
-            "recipe": self.recipe.as_str(),
-            "input_tree": self.input_tree.as_str(),
-            // Recorded for audit, deliberately NOT keyed and not among the fields
-            // `load` re-compares: every harness commit would otherwise empty the cache,
-            // including commits that cannot affect an artifact. When a change genuinely
-            // alters what an artifact IS, bump SCHEMA by hand.
+            "phase": dir_of(phase),
+            "agent": agent,
+            "model": model.as_str(),
+            "toolchain": toolchain.as_str(),
+            "prompt": prompt.as_str(),
+            "recipe": recipe.as_str(),
+            "input_tree": input_tree.as_str(),
             "harness": crate::provenance::harness_id(),
         })
     }
@@ -327,10 +360,10 @@ impl Store {
         Ok(Self { root, mode })
     }
 
-    fn entry_dir(&self, inputs: &KeyInputs<'_>, key: &CacheKey) -> PathBuf {
+    fn entry_dir<P: Phase>(&self, inputs: &KeyInputs<'_, P>, key: &CacheKey) -> PathBuf {
         self.root
             .join(SCHEMA.to_string())
-            .join(inputs.phase)
+            .join(P::DIR)
             .join(inputs.agent)
             .join(key.as_str())
     }
@@ -344,7 +377,7 @@ impl Store {
     /// a transient failure permanent and identical on every future run.
     pub fn obtain<P: Phase>(
         &self,
-        inputs: &KeyInputs<'_>,
+        inputs: &KeyInputs<'_, P>,
         compute: impl FnOnce() -> Result<Option<Produced<P>>>,
     ) -> Result<Option<Obtained<P>>> {
         let key = inputs.key();
@@ -389,7 +422,7 @@ impl Store {
     /// a corrupted or hand-edited entry cannot be served as if it were the original.
     fn load<P: Phase>(
         &self,
-        inputs: &KeyInputs<'_>,
+        inputs: &KeyInputs<'_, P>,
         key: &CacheKey,
         dir: &Path,
     ) -> Result<Option<Loaded<P>>> {
@@ -400,7 +433,11 @@ impl Store {
             serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json"))?)
                 .context("parsing meta.json")?;
         let want = inputs.meta(key);
-        for k in ["schema", "phase", "agent", "model", "toolchain", "prompt", "recipe", "input_tree"] {
+        // Derived from what `meta` records rather than a second hand-written list: a
+        // component added to the key but forgotten here would remove exactly the check
+        // that turns a key collision into a loud failure.
+        let recorded = want.as_object().context("computed meta is not a JSON object")?;
+        for k in recorded.keys().filter(|k| !UNCOMPARED_META.contains(&k.as_str())) {
             anyhow::ensure!(
                 meta.get(k) == want.get(k),
                 "meta.json disagrees on {k}: stored {:?}, computed {:?}",
@@ -428,7 +465,12 @@ impl Store {
     /// The "already verified" skip check keys on `verified/logs/verify.log` existing, so
     /// a replay must leave the same files behind as a fresh run or the next run redoes
     /// the work.
-    pub fn restore_log(&self, inputs: &KeyInputs<'_>, key: &CacheKey, dest: &Path) -> Result<()> {
+    pub fn restore_log<P: Phase>(
+        &self,
+        inputs: &KeyInputs<'_, P>,
+        key: &CacheKey,
+        dest: &Path,
+    ) -> Result<()> {
         let src = self.entry_dir(inputs, key).join("agent").join("run.log");
         if !src.is_file() {
             return Ok(());
@@ -446,7 +488,7 @@ impl Store {
     /// killed runs have already produced truncated logs that were then scored.
     fn store<P: Phase>(
         &self,
-        inputs: &KeyInputs<'_>,
+        inputs: &KeyInputs<'_, P>,
         key: &CacheKey,
         dir: &Path,
         produced: &Produced<P>,
@@ -537,14 +579,24 @@ impl Store {
 mod tests {
     use super::*;
 
-    fn inputs<'a>(
+    /// One helper for every test: while the phase was a string, there were two of these
+    /// and they passed different ones ("verify" against `battery::VERIFIED`).
+    fn inputs<'a, P: Phase>(
         m: &'a ModelId,
         t: &'a ToolchainId,
         p: &'a PromptDigest,
         r: &'a RecipeDigest,
         i: &'a TreeDigest,
-    ) -> KeyInputs<'a> {
-        KeyInputs { phase: "verify", agent: "claude", model: m, toolchain: t, prompt: p, recipe: r, input_tree: i }
+    ) -> KeyInputs<'a, P> {
+        KeyInputs {
+            agent: "claude",
+            model: m,
+            toolchain: t,
+            prompt: p,
+            recipe: r,
+            input_tree: i,
+            phase: PhantomData,
+        }
     }
 
     fn fixtures() -> (ModelId, ToolchainId, RecipeDigest) {
@@ -612,23 +664,21 @@ mod tests {
         let (m, t, r) = fixtures();
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:i");
-        let base = inputs(&m, &t, &p, &r, &i).key();
+        let base = inputs::<Verify>(&m, &t, &p, &r, &i).key();
 
         let m2 = ModelId::new("claude-sonnet-5").unwrap();
-        assert_ne!(base, inputs(&m2, &t, &p, &r, &i).key(), "model must matter");
+        assert_ne!(base, inputs::<Verify>(&m2, &t, &p, &r, &i).key(), "model must matter");
 
         let t2 = ToolchainId("1.97.1 x86_64-unknown-linux-gnu".into());
-        assert_ne!(base, inputs(&m, &t2, &p, &r, &i).key(), "toolchain must matter");
+        assert_ne!(base, inputs::<Verify>(&m, &t2, &p, &r, &i).key(), "toolchain must matter");
 
         let p2 = PromptDigest("sha256:p2".into());
-        assert_ne!(base, inputs(&m, &t, &p2, &r, &i).key(), "prompt must matter");
+        assert_ne!(base, inputs::<Verify>(&m, &t, &p2, &r, &i).key(), "prompt must matter");
 
         let i2 = TreeDigest::for_test("sha256:i2");
-        assert_ne!(base, inputs(&m, &t, &p, &r, &i2).key(), "input tree must matter");
+        assert_ne!(base, inputs::<Verify>(&m, &t, &p, &r, &i2).key(), "input tree must matter");
 
-        let mut ki = inputs(&m, &t, &p, &r, &i);
-        ki.phase = "translate";
-        assert_ne!(base, ki.key(), "phase must matter");
+        assert_ne!(base, inputs::<Translate>(&m, &t, &p, &r, &i).key(), "phase must matter");
     }
 
     #[test]
@@ -636,7 +686,27 @@ mod tests {
         let (m, t, r) = fixtures();
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:i");
-        assert_eq!(inputs(&m, &t, &p, &r, &i).key(), inputs(&m, &t, &p, &r, &i).key());
+        assert_eq!(
+            inputs::<Verify>(&m, &t, &p, &r, &i).key(),
+            inputs::<Verify>(&m, &t, &p, &r, &i).key()
+        );
+    }
+
+    /// The exact key for a fixed set of inputs, so a refactor of the composition cannot
+    /// quietly strand every entry already on disk: it would look like "caching does not
+    /// help here" rather than a failure. Measured on the parent commit of the change that
+    /// made the phase a type parameter.
+    #[test]
+    fn the_key_composition_is_pinned() {
+        let (m, t, r) = fixtures();
+        let p = PromptDigest("sha256:p".into());
+        let i = TreeDigest::for_test("sha256:i");
+        assert_eq!(
+            inputs::<Verify>(&m, &t, &p, &r, &i).key().as_str(),
+            "709aae417107c0fd61a588dce6b16b4e025b2d234dc8a4cf55e1dd43aa3c3fbe",
+            "the key composition changed, so every stored SCHEMA {SCHEMA} entry is now \
+             unreachable. If that is intended, bump SCHEMA and re-pin this value."
+        );
     }
 
     #[test]
@@ -707,24 +777,6 @@ mod tests {
         }
     }
 
-    fn key_inputs<'a>(
-        m: &'a ModelId,
-        t: &'a ToolchainId,
-        p: &'a PromptDigest,
-        r: &'a RecipeDigest,
-        i: &'a TreeDigest,
-    ) -> KeyInputs<'a> {
-        KeyInputs {
-            phase: crate::battery::VERIFIED,
-            agent: "claude",
-            model: m,
-            toolchain: t,
-            prompt: p,
-            recipe: r,
-            input_tree: i,
-        }
-    }
-
     /// THE load-bearing property: if the recorded digest and the one recomputed from the
     /// exported copy disagree, every hit fails validation, gets quarantined, and the cache
     /// silently never works while looking like it is enabled.
@@ -738,7 +790,7 @@ mod tests {
         let want = sealed.digest().clone();
 
         let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let inputs = inputs(&m, &t, &p, &r, &i);
         let key = inputs.key();
         store
             .store(
@@ -771,7 +823,7 @@ mod tests {
         let (m, t, r) = fixtures();
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let inputs = inputs(&m, &t, &p, &r, &i);
 
         let mut runs = 0;
         let first = store
@@ -800,6 +852,43 @@ mod tests {
         );
     }
 
+    /// Replaces a test that set `ki.phase = "translate"` on a `KeyInputs` about to be
+    /// handed to `obtain::<Verify>` — a disagreement the type parameter now makes
+    /// unrepresentable. What is left to prove is that the phase still separates entries.
+    #[test]
+    fn the_phases_do_not_share_an_entry() {
+        let f = fixture();
+        let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        let (m, t, r) = fixtures();
+        let p = PromptDigest("sha256:p".into());
+        let i = TreeDigest::for_test("sha256:in");
+
+        let translate = inputs::<Translate>(&m, &t, &p, &r, &i);
+        store
+            .obtain(&translate, || {
+                Ok(Some(Produced {
+                    sealed: Sealed::<Translate>::adopt(&f.case).unwrap(),
+                    log: PathBuf::from("/nonexistent"),
+                    provenance: serde_json::Value::Null,
+                }))
+            })
+            .unwrap()
+            .unwrap();
+
+        let verify = inputs::<Verify>(&m, &t, &p, &r, &i);
+        let mut ran = false;
+        let got = store
+            .obtain(&verify, || {
+                ran = true;
+                Ok(Some(produced(&f.case, "pub fn a() { /* fixed */ }")))
+            })
+            .unwrap()
+            .unwrap();
+        assert!(ran, "a stored translation must not be served to the verify phase");
+        assert!(!got.replayed);
+        assert_eq!(store.stats().unwrap().0, 2, "the two phases must occupy two entries");
+    }
+
     #[test]
     fn a_failed_invocation_is_not_stored() {
         // An API outage is a property of the moment, not of the inputs; memoising it
@@ -809,7 +898,7 @@ mod tests {
         let (m, t, r) = fixtures();
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let inputs = inputs(&m, &t, &p, &r, &i);
 
         let out = store.obtain::<Verify>(&inputs, || Ok(None)).unwrap();
         assert!(out.is_none());
@@ -832,7 +921,7 @@ mod tests {
         let (m, t, r) = fixtures();
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let inputs = inputs(&m, &t, &p, &r, &i);
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
@@ -858,7 +947,7 @@ mod tests {
         let (m, t, r) = fixtures();
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let inputs = inputs(&m, &t, &p, &r, &i);
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let old = rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() { /* old */ }"))))
@@ -890,7 +979,7 @@ mod tests {
         let (m, t, r) = fixtures();
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let inputs = inputs(&m, &t, &p, &r, &i);
         let key = inputs.key();
         store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
 
@@ -914,7 +1003,7 @@ mod tests {
         let (m, t, r) = fixtures();
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let inputs = inputs(&m, &t, &p, &r, &i);
         store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
 
         let replay = store.obtain::<Verify>(&inputs, || panic!("must hit")).unwrap().unwrap();
@@ -933,7 +1022,7 @@ mod tests {
         let (m, t, r) = fixtures();
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let inputs = inputs(&m, &t, &p, &r, &i);
         let key = inputs.key();
         store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
 
@@ -967,7 +1056,7 @@ mod tests {
         let (m, t, r) = fixtures();
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:in");
-        let inputs = key_inputs(&m, &t, &p, &r, &i);
+        let inputs = inputs(&m, &t, &p, &r, &i);
         store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
 
         let per_agent = f.repo.join("results/Test-Corpus/claude");
@@ -1025,15 +1114,53 @@ mod tests {
         let (m, t, r) = fixtures();
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:i");
-        let ki = inputs(&m, &t, &p, &r, &i);
+        let ki = inputs::<Verify>(&m, &t, &p, &r, &i);
         let meta = ki.meta(&ki.key());
-        assert!(
-            meta.get("harness").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()),
-            "the producing commit must be recorded: {meta:?}"
-        );
-        // `load` re-compares this exact list; `harness` must not be on it.
-        for k in ["schema", "phase", "agent", "model", "toolchain", "prompt", "recipe", "input_tree"] {
-            assert!(meta.get(k).is_some(), "{k} must be recorded");
+        for k in UNCOMPARED_META {
+            assert!(
+                meta.get(k).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()),
+                "{k} is excluded from validation, so it must at least be recorded: {meta:?}"
+            );
+        }
+    }
+
+    /// The backstop for a key collision: every field `meta` records is re-compared on
+    /// load, so two genuinely different invocations that hashed to one key produce a loud
+    /// error naming the field instead of one artifact standing in for the other. Derived
+    /// from `meta` rather than a hand-written list, which is how the two drifted apart.
+    #[test]
+    fn every_recorded_field_is_re_compared_on_load() {
+        let f = fixture();
+        let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        let (m, t, r) = fixtures();
+        let p = PromptDigest("sha256:p".into());
+        let i = TreeDigest::for_test("sha256:in");
+        let inputs = inputs(&m, &t, &p, &r, &i);
+        let key = inputs.key();
+        store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+
+        let dir = store.entry_dir(&inputs, &key);
+        crate::artifact::set_read_only(&dir, false).unwrap();
+        let meta_path = dir.join("meta.json");
+        let stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+
+        let fields: Vec<String> =
+            inputs.meta(&key).as_object().unwrap().keys().cloned().collect();
+        assert!(fields.len() > 1, "meta records nothing, so the loop below proves nothing");
+        for field in fields {
+            let mut tampered = stored.clone();
+            tampered[&field] = serde_json::json!("not what was recorded");
+            std::fs::write(&meta_path, serde_json::to_string(&tampered).unwrap()).unwrap();
+
+            let got = store.load::<Verify>(&inputs, &key, &dir);
+            if UNCOMPARED_META.contains(&field.as_str()) {
+                assert!(got.is_ok(), "{field} is audit-only and must not invalidate an entry");
+                continue;
+            }
+            let Err(e) = got else { panic!("a changed {field} must not be served as a hit") };
+            let err = format!("{e:#}");
+            assert!(err.contains(&field), "the error must name the field that differs: {err}");
         }
     }
 
