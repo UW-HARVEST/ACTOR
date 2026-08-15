@@ -9,5 +9,5 @@ error[E0308]: mismatched types
 note: method defined here
  --> src/artifact.rs
   |
-  |     pub fn materialise_at<Q: Phase>(&self, at: ScratchPath) -> Result<WorkTree<Q>> {
+  |     pub fn materialise_at<Q>(&self, at: ScratchPath) -> Result<WorkTree<Q>>
   |            ^^^^^^^^^^^^^^

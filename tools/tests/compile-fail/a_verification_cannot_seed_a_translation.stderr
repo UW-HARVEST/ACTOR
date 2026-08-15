@@ -1,0 +1,21 @@
+error[E0277]: the trait bound `harvest_tools::artifact::Translate: SeededBy<Sealed<harvest_tools::artifact::Verify>>` is not satisfied
+ --> tests/compile-fail/a_verification_cannot_seed_a_translation.rs:9:16
+  |
+9 |         sealed.materialise_into(scratch).unwrap();
+  |                ^^^^^^^^^^^^^^^^ the trait `SeededBy<Sealed<harvest_tools::artifact::Verify>>` is not implemented for `harvest_tools::artifact::Translate`
+  |
+help: the trait `SeededBy<Sealed<harvest_tools::artifact::Verify>>` is not implemented for `harvest_tools::artifact::Translate`
+      but trait `SeededBy<Corpus>` is implemented for it
+ --> src/artifact.rs
+  |
+  | impl SeededBy<Corpus> for Translate {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = help: for that trait implementation, expected `Corpus`, found `Sealed<harvest_tools::artifact::Verify>`
+note: required by a bound in `Sealed::<P>::materialise_into`
+ --> src/artifact.rs
+  |
+  |     pub fn materialise_into<Q>(&self, scratch: Scratch) -> Result<WorkTree<Q>>
+  |            ---------------- required by a bound in this associated function
+  |     where
+  |         Q: SeededBy<Self>,
+  |            ^^^^^^^^^^^^^^ required by this bound in `Sealed::<P>::materialise_into`

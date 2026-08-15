@@ -10,7 +10,7 @@
 //!   `CARGO_MANIFEST_DIR`. The build has to leave the tree, which is what
 //!   [`Scratch::subdir`] + [`Sealed::materialise_at`] exist for.)
 //! * An infra-failed run cannot be sealed: [`Scrubbed::seal`] demands a
-//!   [`crate::agent_health::Completed`], which only `classify_log` can mint.
+//!   [`crate::agent_health::Completed`], mintable only from a completed run.
 //! * A tree cannot be hashed before it is scrubbed: agent output embeds the random
 //!   scratch directory name, so a digest of raw output changes every run.
 
@@ -44,6 +44,95 @@ impl Phase for Translate {
 }
 impl Phase for Verify {
     const DIR: &'static str = crate::battery::VERIFIED;
+}
+
+/// Where a seed's contents land inside a work tree. Swapping these is silent: a corpus
+/// at the crate root would present C sources as the Rust crate, and a crate under
+/// `c_src/` would be graded as its own oracle.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SeedAt {
+    CrateRoot,
+    COracle,
+}
+
+/// `Self` is a phase whose work tree may be seeded from `S`. The impls below are the only
+/// legal transitions. On the phase MARKERS, never on [`Sealed`] (which implements only
+/// `Debug`).
+pub trait SeededBy<S>: Phase {
+    const AT: SeedAt;
+}
+
+impl SeededBy<Corpus> for Translate {
+    const AT: SeedAt = SeedAt::COracle;
+}
+
+/// Only from a *translation*: re-verifying a verification does not compile.
+impl SeededBy<Sealed<Translate>> for Verify {
+    const AT: SeedAt = SeedAt::CrateRoot;
+}
+
+/// The C sources an agent translates: an INPUT, never an output. Not a [`Phase`]: a
+/// `Sealed<Corpus>` would inherit [`Sealed::publish`], and with `DIR = "test_case"` that
+/// deletes the experiment's own input.
+pub struct Corpus {
+    c: CDir,
+}
+
+impl Corpus {
+    /// The only constructor. `is_dir` is what keeps [`CDir::digest`]'s fabricated
+    /// `sha256:absent` unreachable from a cache key.
+    pub fn adopt(dir: &Path) -> Result<Self> {
+        anyhow::ensure!(
+            dir.is_dir(),
+            "no C corpus at {}: an absent input would otherwise be keyed as a real one",
+            dir.display()
+        );
+        Ok(Self {
+            c: CDir(dir.to_path_buf()),
+        })
+    }
+
+    /// The corpus as the agent will see it. Through [`CDir`], never `digest_tree`: with
+    /// the corpus as hash root, `is_ignored` drops `*.bak`/`*.log`/`*.sha256` that ARE
+    /// hashed once seeded under `c_src/`. `doc/footer.html.bak` is real here, so two
+    /// corpora could otherwise share a digest and replay each other's translation.
+    pub fn digest(&self) -> Result<TreeDigest> {
+        self.c.digest()
+    }
+
+    #[must_use = "materialising and dropping the copy does nothing"]
+    pub fn materialise_into<Q>(&self, scratch: Scratch) -> Result<WorkTree<Q>>
+    where
+        Q: SeededBy<Corpus>,
+    {
+        let root = scratch.dir.path().to_path_buf();
+        seed(&self.c.0, root, scratch, Q::AT)
+    }
+
+    /// As [`Self::materialise_into`], into one slot of a scratch root the caller keeps.
+    #[must_use = "materialising and dropping the copy does nothing"]
+    pub fn materialise_at<Q>(&self, at: ScratchPath) -> Result<WorkTree<Q>>
+    where
+        Q: SeededBy<Corpus>,
+    {
+        let ScratchPath { root, keep } = at;
+        seed(&self.c.0, root, Scratch { dir: keep }, Q::AT)
+    }
+}
+
+/// THE seeding body: every way of obtaining a [`WorkTree`] routes here.
+fn seed<Q: Phase>(src: &Path, root: PathBuf, keep: Scratch, at: SeedAt) -> Result<WorkTree<Q>> {
+    let crate_root = root.join(crate::battery::TRANSLATED_RUST);
+    let dest = match at {
+        SeedAt::CrateRoot => crate_root,
+        SeedAt::COracle => crate_root.join(C_ORACLE_DIR),
+    };
+    copy_carrying(src, &dest, Carry::IntoWorkTree)?;
+    Ok(WorkTree {
+        root,
+        _scratch: Some(keep),
+        _phase: PhantomData,
+    })
 }
 
 /// A `sha256:<hex>` tree digest. No `From<String>`: the only way to obtain one is to
@@ -586,33 +675,25 @@ impl<P: Phase> Sealed<P> {
     }
 
     /// The only way to obtain something runnable: a writable copy elsewhere.
+    /// `Q: SeededBy<Self>` is the pairing constraint — see [`SeededBy`].
     #[must_use = "materialising and dropping the copy does nothing"]
-    pub fn materialise_into<Q: Phase>(&self, scratch: Scratch) -> Result<WorkTree<Q>> {
+    pub fn materialise_into<Q>(&self, scratch: Scratch) -> Result<WorkTree<Q>>
+    where
+        Q: SeededBy<Self>,
+    {
         let root = scratch.dir.path().to_path_buf();
-        self.materialise(root, scratch)
+        seed(&self.root, root, scratch, Q::AT)
     }
 
     /// As [`Self::materialise_into`], but into one slot of a scratch root the caller
     /// keeps, so a battery of N cases needs one root and not N.
     #[must_use = "materialising and dropping the copy does nothing"]
-    pub fn materialise_at<Q: Phase>(&self, at: ScratchPath) -> Result<WorkTree<Q>> {
+    pub fn materialise_at<Q>(&self, at: ScratchPath) -> Result<WorkTree<Q>>
+    where
+        Q: SeededBy<Self>,
+    {
         let ScratchPath { root, keep } = at;
-        self.materialise(root, Scratch { dir: keep })
-    }
-
-    /// Both public entry points route here, so "what a work tree is seeded with" has one
-    /// answer whether the root is shared or owned.
-    fn materialise<Q: Phase>(&self, root: PathBuf, keep: Scratch) -> Result<WorkTree<Q>> {
-        copy_carrying(
-            &self.root,
-            &root.join(crate::battery::TRANSLATED_RUST),
-            Carry::IntoWorkTree,
-        )?;
-        Ok(WorkTree {
-            root,
-            _scratch: Some(keep),
-            _phase: PhantomData,
-        })
+        seed(&self.root, root, Scratch { dir: keep }, Q::AT)
     }
 
     pub fn publish(&self, case_dir: &Path) -> Result<()> {
@@ -927,6 +1008,77 @@ mod tests {
         assert_eq!(
             classify(&rel("c_src/src/lib.c"), false),
             Disposition::StoreAndHash
+        );
+    }
+
+    #[test]
+    fn an_absent_corpus_is_refused_rather_than_keyed_as_absent() {
+        // Otherwise `sha256:absent` becomes a key every missing corpus shares.
+        let tmp = tempfile::tempdir().unwrap();
+        let err = Corpus::adopt(&tmp.path().join("nope"))
+            .err()
+            .expect("must refuse an absent corpus");
+        assert!(format!("{err:#}").contains("no C corpus at"), "{err:#}");
+    }
+
+    #[test]
+    fn two_corpora_differing_only_in_an_ignored_file_get_different_digests() {
+        // THE FALSE-HIT HAZARD — see `Corpus::digest`.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        tree(
+            &a,
+            &[
+                ("src/lib.c", "int f(void){return 1;}"),
+                ("doc/footer.html.bak", "one"),
+            ],
+        );
+        tree(
+            &b,
+            &[
+                ("src/lib.c", "int f(void){return 1;}"),
+                ("doc/footer.html.bak", "two"),
+            ],
+        );
+
+        let da = Corpus::adopt(&a).unwrap().digest().unwrap();
+        let db = Corpus::adopt(&b).unwrap().digest().unwrap();
+        assert_ne!(
+            da, db,
+            "an ignored-at-root file still changes what the agent sees"
+        );
+
+        // ...and the naive spelling really would have collided, so this is not vacuous.
+        assert_eq!(
+            digest_tree(&a).unwrap(),
+            digest_tree(&b).unwrap(),
+            "fixture assumption: digest_tree is the hashing that drops it"
+        );
+    }
+
+    #[test]
+    fn a_corpus_seeds_the_oracle_and_a_sealed_artifact_seeds_the_crate_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("corpus");
+        tree(&src, &[("src/lib.c", "int f(void){return 1;}")]);
+
+        let work: WorkTree<Translate> = Corpus::adopt(&src)
+            .unwrap()
+            .materialise_into(Scratch::new("t-").unwrap())
+            .unwrap();
+        assert!(
+            work.c().0.join("src/lib.c").is_file(),
+            "corpus lands under c_src/"
+        );
+        assert!(
+            !work.crate_dir().join("src/lib.c").is_file(),
+            "not at the crate root"
+        );
+        assert_eq!(<Translate as SeededBy<Corpus>>::AT, SeedAt::COracle);
+        assert_eq!(
+            <Verify as SeededBy<Sealed<Translate>>>::AT,
+            SeedAt::CrateRoot
         );
     }
 
