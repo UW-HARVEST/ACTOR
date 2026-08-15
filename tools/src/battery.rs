@@ -36,7 +36,11 @@ pub fn has_crate(phase_dir: &Path) -> bool {
 /// resolve uniformly.
 pub fn crate_dir(case_dir: &Path) -> PathBuf {
     let verified = phase_dir(case_dir, VERIFIED);
-    if has_crate(&verified) { verified } else { phase_dir(case_dir, TRANSLATED) }
+    if has_crate(&verified) {
+        verified
+    } else {
+        phase_dir(case_dir, TRANSLATED)
+    }
 }
 
 /// The crate-dir name MIT `runtests` hardcodes (test-corpus/.../discovery/
@@ -80,7 +84,11 @@ pub struct Battery {
 
 pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
     let public_tests = corpus_dir.join("Public-Tests");
-    anyhow::ensure!(public_tests.is_dir(), "Public-Tests not found: {}", public_tests.display());
+    anyhow::ensure!(
+        public_tests.is_dir(),
+        "Public-Tests not found: {}",
+        public_tests.display()
+    );
 
     let mut batteries: Vec<String> = std::fs::read_dir(&public_tests)?
         .filter_map(|e| e.ok())
@@ -94,7 +102,9 @@ pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
 pub fn has_shared_source_groups(corpus_dir: &Path, battery_name: &str) -> bool {
     let dir = corpus_dir.join("Public-Tests").join(battery_name);
     std::fs::read_dir(&dir).ok().is_some_and(|entries| {
-        entries.filter_map(|e| e.ok()).any(|e| e.path().join("test_case").is_symlink())
+        entries
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().join("test_case").is_symlink())
     })
 }
 
@@ -111,36 +121,67 @@ pub struct HarvestBenchProject {
 }
 
 impl HarvestBenchProject {
-    pub fn name(&self) -> &str { &self.name }
-    pub fn test_case(&self) -> &Path { &self.test_case }
-    pub fn gtest_suite(&self) -> &Path { &self.gtest_suite }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn test_case(&self) -> &Path {
+        &self.test_case
+    }
+    pub fn gtest_suite(&self) -> &Path {
+        &self.gtest_suite
+    }
 
     /// Resolve a single named project under `tests_dir` (= harvest-bench/tests).
     pub fn resolve(tests_dir: &Path, name: &str) -> Result<Self> {
         let root = tests_dir.join(name);
         let test_case = root.join("test_case");
         let gtest_suite = root.join("gtest_suite");
-        anyhow::ensure!(test_case.is_dir(), "harvest-bench test_case not found: {}", test_case.display());
-        anyhow::ensure!(gtest_suite.is_dir(), "harvest-bench gtest_suite not found: {}", gtest_suite.display());
-        Ok(Self { name: name.to_string(), test_case, gtest_suite })
+        anyhow::ensure!(
+            test_case.is_dir(),
+            "harvest-bench test_case not found: {}",
+            test_case.display()
+        );
+        anyhow::ensure!(
+            gtest_suite.is_dir(),
+            "harvest-bench gtest_suite not found: {}",
+            gtest_suite.display()
+        );
+        Ok(Self {
+            name: name.to_string(),
+            test_case,
+            gtest_suite,
+        })
     }
 
     pub fn discover(tests_dir: &Path) -> Result<Vec<Self>> {
-        anyhow::ensure!(tests_dir.is_dir(), "harvest-bench tests dir not found: {} (did you `git submodule update --init`?)", tests_dir.display());
+        anyhow::ensure!(
+            tests_dir.is_dir(),
+            "harvest-bench tests dir not found: {} (did you `git submodule update --init`?)",
+            tests_dir.display()
+        );
         let mut names: Vec<String> = std::fs::read_dir(tests_dir)?
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .filter(|e| e.path().join("test_case").is_dir() && e.path().join("gtest_suite").is_dir())
+            .filter(|e| {
+                e.path().join("test_case").is_dir() && e.path().join("gtest_suite").is_dir()
+            })
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        names.into_iter().map(|n| Self::resolve(tests_dir, &n)).collect()
+        names
+            .into_iter()
+            .map(|n| Self::resolve(tests_dir, &n))
+            .collect()
     }
 }
 
 pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> Result<Battery> {
     let input_dir = corpus_dir.join("Public-Tests").join(battery_name);
-    anyhow::ensure!(input_dir.is_dir(), "Battery not found: {}", input_dir.display());
+    anyhow::ensure!(
+        input_dir.is_dir(),
+        "Battery not found: {}",
+        input_dir.display()
+    );
 
     let filter_re = filter.map(Regex::new).transpose()?;
 
@@ -289,10 +330,7 @@ pub fn extract_lib_name(input_dir: &Path, case_name: &str) -> Option<String> {
 }
 
 /// Raw names first, then composite names like "sphincs-blake-128f".
-pub fn resolve_features(
-    cargo_toml_path: &Path,
-    raw_features: &[String],
-) -> Result<Vec<String>> {
+pub fn resolve_features(cargo_toml_path: &Path, raw_features: &[String]) -> Result<Vec<String>> {
     let content = std::fs::read_to_string(cargo_toml_path)?;
     let doc: toml_edit::DocumentMut = content.parse()?;
 
@@ -443,9 +481,8 @@ pub fn extract_agent_meta(log_path: &Path) -> Option<AgentRunMeta> {
     extract_kiro_meta(log_path).or_else(|| extract_stream_json_meta(log_path))
 }
 
-static KIRO_CREDITS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"Credits:\s*([0-9.]+).*?Time:\s*(.+)").expect("literal pattern")
-});
+static KIRO_CREDITS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Credits:\s*([0-9.]+).*?Time:\s*(.+)").expect("literal pattern"));
 
 /// Tail-only: the `Credits:` line is last, and this runs once per case over
 /// logs that reach 10+ MB.
@@ -454,7 +491,11 @@ fn extract_kiro_meta(log_path: &Path) -> Option<AgentRunMeta> {
     let caps = KIRO_CREDITS_RE.captures_iter(&data).last()?;
     let credits = Credits::new(caps[1].parse().ok()?);
     let wall_secs = parse_duration(&caps[2]);
-    Some(AgentRunMeta { credits, wall_secs, ..Default::default() })
+    Some(AgentRunMeta {
+        credits,
+        wall_secs,
+        ..Default::default()
+    })
 }
 
 /// Identity comes from the head `system`/`init` record, cost and effort from the
@@ -470,8 +511,14 @@ fn extract_stream_json_meta(log_path: &Path) -> Option<AgentRunMeta> {
         v.get("type").and_then(|t| t.as_str()) == Some("system")
             && v.get("subtype").and_then(|t| t.as_str()) == Some("init")
     }) {
-        m.model = init.get("model").and_then(|v| v.as_str()).map(str::to_owned);
-        m.cli_version = init.get("claude_code_version").and_then(|v| v.as_str()).map(str::to_owned);
+        m.model = init
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        m.cli_version = init
+            .get("claude_code_version")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
         found = true;
     }
 
@@ -480,7 +527,10 @@ fn extract_stream_json_meta(log_path: &Path) -> Option<AgentRunMeta> {
         v.get("type").and_then(|x| x.as_str()) == Some("result")
     }) {
         found = true;
-        m.terminal_reason = t.get("terminal_reason").and_then(|v| v.as_str()).map(str::to_owned);
+        m.terminal_reason = t
+            .get("terminal_reason")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
         // Present-but-null on success, so as_i64 yields None rather than 0.
         m.api_error_status = t.get("api_error_status").and_then(|v| v.as_i64());
         m.num_turns = t.get("num_turns").and_then(|v| v.as_u64());
@@ -521,7 +571,11 @@ fn extract_stream_json_meta(log_path: &Path) -> Option<AgentRunMeta> {
         })
         .and_then(|p| crate::agent_health::exit_code(&p));
 
-    if found { Some(m) } else { None }
+    if found {
+        Some(m)
+    } else {
+        None
+    }
 }
 
 /// First 256 KB. The `init` record is near the top, but a SessionStart hook can
@@ -543,9 +597,16 @@ fn find_record(
 ) -> Option<serde_json::Value> {
     let parse = |l: &str| serde_json::from_str::<serde_json::Value>(l).ok();
     if last {
-        hay.lines().rev().filter(|l| l.starts_with('{')).filter_map(parse).find(|v| pred(v))
+        hay.lines()
+            .rev()
+            .filter(|l| l.starts_with('{'))
+            .filter_map(parse)
+            .find(|v| pred(v))
     } else {
-        hay.lines().filter(|l| l.starts_with('{')).filter_map(parse).find(|v| pred(v))
+        hay.lines()
+            .filter(|l| l.starts_with('{'))
+            .filter_map(parse)
+            .find(|v| pred(v))
     }
 }
 
@@ -573,20 +634,28 @@ pub struct UnsafeCounts {
 
 pub fn count_unsafe(src_dir: &Path) -> UnsafeCounts {
     let mut counts = UnsafeCounts::default();
-    let Ok(entries) = std::fs::read_dir(src_dir) else { return counts };
+    let Ok(entries) = std::fs::read_dir(src_dir) else {
+        return counts;
+    };
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_dir() {
             let name = entry.file_name();
-            if name == "bin" || name == "tests" { continue; }
+            if name == "bin" || name == "tests" {
+                continue;
+            }
             let sub = count_unsafe(&path);
             counts.blocks += sub.blocks;
             counts.fns += sub.fns;
             counts.impls += sub.impls;
             counts.lines += sub.lines;
         } else if path.extension().is_some_and(|x| x == "rs") {
-            let Ok(src) = std::fs::read_to_string(&path) else { continue };
-            let Ok(file) = syn::parse_file(&src) else { continue };
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(file) = syn::parse_file(&src) else {
+                continue;
+            };
             let mut v = UnsafeVisitor::default();
             syn::visit::visit_file(&mut v, &file);
             counts.blocks += v.blocks;
@@ -606,17 +675,27 @@ pub struct LocCounts {
 
 pub fn count_loc(src_dir: &Path) -> LocCounts {
     let mut counts = LocCounts::default();
-    let Ok(entries) = std::fs::read_dir(src_dir) else { return counts };
+    let Ok(entries) = std::fs::read_dir(src_dir) else {
+        return counts;
+    };
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_dir() {
             let name = entry.file_name();
-            if name == "bin" || name == "tests" { continue; }
+            if name == "bin" || name == "tests" {
+                continue;
+            }
             counts.code += count_loc(&path).code;
         } else if path.extension().is_some_and(|x| x == "rs") {
-            let Ok(src) = std::fs::read_to_string(&path) else { continue };
-            counts.code += src.lines()
-                .filter(|l| { let t = l.trim(); !t.is_empty() && !t.starts_with("//") })
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            counts.code += src
+                .lines()
+                .filter(|l| {
+                    let t = l.trim();
+                    !t.is_empty() && !t.starts_with("//")
+                })
                 .count();
         }
     }
@@ -634,7 +713,11 @@ struct UnsafeVisitor {
 fn span_lines(open: proc_macro2::Span, close: proc_macro2::Span) -> usize {
     let start = open.start().line;
     let end = close.end().line;
-    if end >= start { end - start + 1 } else { 1 }
+    if end >= start {
+        end - start + 1
+    } else {
+        1
+    }
 }
 
 impl<'ast> syn::visit::Visit<'ast> for UnsafeVisitor {
@@ -707,22 +790,37 @@ impl Paths {
         let (corpus_dir, results_dir) = match dataset {
             Dataset::TestCorpus => (
                 repo_root.join("test-corpus"),
-                repo_root.join("results/Test-Corpus").join(agent_key.as_str()),
+                repo_root
+                    .join("results/Test-Corpus")
+                    .join(agent_key.as_str()),
             ),
             Dataset::HarvestBench => (
                 repo_root.join("harvest-bench/tests"),
-                repo_root.join("results/HarvestBench").join(agent_key.as_str()),
+                repo_root
+                    .join("results/HarvestBench")
+                    .join(agent_key.as_str()),
             ),
         };
         let prompts_dir = match agent {
-            Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::OpenCode => match dataset {
+            Agent::Claude
+            | Agent::ClaudeCombined
+            | Agent::ClaudeMinimal
+            | Agent::ClaudeNoIter
+            | Agent::ClaudeNoFeatures
+            | Agent::ClaudeNoSubtask
+            | Agent::ClaudeCrossPrompt
+            | Agent::CodexGpt55
+            | Agent::CodexGpt54
+            | Agent::OpenCode => match dataset {
                 // harvest-bench cases are libraries, which the test-corpus
                 // prompts already dispatch on; no separate prompt set needed.
                 Dataset::TestCorpus | Dataset::HarvestBench => repo_root.join("prompts/claude"),
             },
             Agent::Kimi | Agent::Oneshot => repo_root.join("prompts/oneshot"),
             _ => match dataset {
-                Dataset::TestCorpus | Dataset::HarvestBench => repo_root.join("prompts/kiro/test-corpus"),
+                Dataset::TestCorpus | Dataset::HarvestBench => {
+                    repo_root.join("prompts/kiro/test-corpus")
+                }
             },
         };
         Ok(Self {
@@ -813,11 +911,20 @@ mod tests {
         fs::create_dir_all(case.join("translated")).unwrap();
         fs::write(case.join("translated/Cargo.toml"), "[package]").unwrap();
 
-        assert!(case.join("verified").is_dir(), "fixture must retain the trap");
+        assert!(
+            case.join("verified").is_dir(),
+            "fixture must retain the trap"
+        );
         assert!(!has_crate(&case.join("verified")));
-        assert_eq!(crate_dir(&case), case.join("translated"),
-            "a phase that produced no crate must not shadow the one that did");
-        assert!(has_crate(&crate_dir(&case)), "the resolved dir must be scoreable");
+        assert_eq!(
+            crate_dir(&case),
+            case.join("translated"),
+            "a phase that produced no crate must not shadow the one that did"
+        );
+        assert!(
+            has_crate(&crate_dir(&case)),
+            "the resolved dir must be scoreable"
+        );
     }
 
     #[test]
@@ -863,7 +970,12 @@ mod tests {
         let result = discover(tmp.path(), "libtest", None).unwrap();
         for case in &result.cases {
             if let Case::Independent(c) = case {
-                assert_eq!(c.is_lib, c.name.ends_with("_lib"), "is_lib wrong for {}", c.name);
+                assert_eq!(
+                    c.is_lib,
+                    c.name.ends_with("_lib"),
+                    "is_lib wrong for {}",
+                    c.name
+                );
             }
         }
     }
@@ -876,7 +988,8 @@ mod tests {
         fs::write(
             runner.join("main.rs"),
             r#"fn main() { let lib = cando2::Library::new(library: "blake", path: "..."); }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = extract_lib_name(tmp.path(), "mycase");
         assert_eq!(result, Some("blake".to_string()));
@@ -930,7 +1043,10 @@ mod provenance_tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = log(tmp.path(), &format!("{INIT}\n{DONE}\n"));
         let m = extract_agent_meta(&p).expect("stream-json is recognised");
-        assert_eq!(m.model.as_deref(), Some("global.anthropic.claude-opus-5[1m]"));
+        assert_eq!(
+            m.model.as_deref(),
+            Some("global.anthropic.claude-opus-5[1m]")
+        );
         assert_eq!(m.cli_version.as_deref(), Some("2.1.231.653"));
     }
 
@@ -957,8 +1073,15 @@ mod provenance_tests {
         );
         let p = log(tmp.path(), &format!("{INIT}\n{two}\n"));
         let m = extract_agent_meta(&p).unwrap();
-        assert_eq!(m.models_billed, vec!["claude-haiku-4-5", "global.anthropic.claude-opus-5[1m]"]);
-        assert_eq!(m.model.as_deref(), Some("global.anthropic.claude-opus-5[1m]"), "requested stays distinct");
+        assert_eq!(
+            m.models_billed,
+            vec!["claude-haiku-4-5", "global.anthropic.claude-opus-5[1m]"]
+        );
+        assert_eq!(
+            m.model.as_deref(),
+            Some("global.anthropic.claude-opus-5[1m]"),
+            "requested stays distinct"
+        );
     }
 
     #[test]
@@ -974,8 +1097,17 @@ mod provenance_tests {
         assert!(m.model.is_none());
         assert!(m.tokens.is_none());
         let json = serde_json::to_string(&m).unwrap();
-        for k in ["total_cost_usd", "model", "tokens", "num_turns", "exit_code"] {
-            assert!(!json.contains(k), "{k} must be omitted, not zero-valued: {json}");
+        for k in [
+            "total_cost_usd",
+            "model",
+            "tokens",
+            "num_turns",
+            "exit_code",
+        ] {
+            assert!(
+                !json.contains(k),
+                "{k} must be omitted, not zero-valued: {json}"
+            );
         }
     }
 
@@ -984,7 +1116,10 @@ mod provenance_tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = log(tmp.path(), &format!("{INIT}\n{DONE}\n"));
         let m = extract_agent_meta(&p).unwrap();
-        assert!(m.api_error_status.is_none(), "present-but-null must not become 0");
+        assert!(
+            m.api_error_status.is_none(),
+            "present-but-null must not become 0"
+        );
         assert_eq!(m.terminal_reason.as_deref(), Some("completed"));
     }
 
@@ -1008,9 +1143,14 @@ mod provenance_tests {
         std::fs::write(
             tmp.path().join("verified/verification.json"),
             r#"{"exit_code":1,"success":true,"duration_secs":4569}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let m = extract_agent_meta(&p).unwrap();
-        assert_eq!(m.exit_code, Some(1), "already on disk, previously read by nothing");
+        assert_eq!(
+            m.exit_code,
+            Some(1),
+            "already on disk, previously read by nothing"
+        );
     }
 
     #[test]
@@ -1019,7 +1159,10 @@ mod provenance_tests {
         let body = format!("warning: bwrap not installed\n{INIT}\nnote: noise\n{DONE}\n");
         let p = log(tmp.path(), &body);
         let m = extract_agent_meta(&p).unwrap();
-        assert_eq!(m.model.as_deref(), Some("global.anthropic.claude-opus-5[1m]"));
+        assert_eq!(
+            m.model.as_deref(),
+            Some("global.anthropic.claude-opus-5[1m]")
+        );
         assert_eq!(m.num_turns, Some(56));
     }
 
@@ -1027,6 +1170,9 @@ mod provenance_tests {
     fn a_log_in_neither_format_yields_none() {
         let tmp = tempfile::tempdir().unwrap();
         let p = log(tmp.path(), "just some prose, no credits, no json\n");
-        assert!(extract_agent_meta(&p).is_none(), "must not fabricate a zero record");
+        assert!(
+            extract_agent_meta(&p).is_none(),
+            "must not fabricate a zero record"
+        );
     }
 }

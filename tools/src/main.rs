@@ -1,10 +1,9 @@
-
 use anyhow::Result;
 // Never re-declare these with `mod` here; see the note in lib.rs.
+use harvest_tools::cli::{Cli, Command, Dataset};
 use harvest_tools::{
     agent_health, battery, benchmark, cache, cli, opencode, provenance, report, test,
 };
-use harvest_tools::cli::{Cli, Command, Dataset};
 
 fn main() -> Result<()> {
     let cli = Cli::parse_args();
@@ -31,7 +30,11 @@ fn main() -> Result<()> {
             "--model is required with --agent {}\n  \
              oneshot:  --model openai/gpt-5.4\n  \
              opencode: --model amazon-bedrock/us.anthropic.claude-sonnet-5",
-            if agent == cli::Agent::Oneshot { "oneshot" } else { "opencode" },
+            if agent == cli::Agent::Oneshot {
+                "oneshot"
+            } else {
+                "opencode"
+            },
         );
     }
     if !model_driven && model.is_some() {
@@ -50,17 +53,39 @@ fn main() -> Result<()> {
             parallel,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into(),
-                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(cli.allow_unsandboxed))?;
+            let paths = battery::Paths::new(
+                &repo_root,
+                agent,
+                dataset,
+                model,
+                cache.into(),
+                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(
+                    cli.allow_unsandboxed,
+                ),
+            )?;
             let inner = Dataset::strip_prefix(target);
             let bench = benchmark::for_dataset(dataset);
 
             bench.translate(&paths, inner, include_regex.as_deref(), parallel)?;
             if !no_verify && bench.verifies(agent) {
-                bench.verify(&repo_root, &paths, inner, include_regex.as_deref(), false, parallel)?;
+                bench.verify(
+                    &repo_root,
+                    &paths,
+                    inner,
+                    include_regex.as_deref(),
+                    false,
+                    parallel,
+                )?;
             }
             // `Update` covers enrichment and table regeneration; no separate steps.
-            run_test(&repo_root, bench.as_ref(), &paths, inner, test::TestMode::Update, false)?;
+            run_test(
+                &repo_root,
+                bench.as_ref(),
+                &paths,
+                inner,
+                test::TestMode::Update,
+                false,
+            )?;
         }
         Command::Translate {
             ref target,
@@ -68,11 +93,23 @@ fn main() -> Result<()> {
             parallel,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into(),
-                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(cli.allow_unsandboxed))?;
+            let paths = battery::Paths::new(
+                &repo_root,
+                agent,
+                dataset,
+                model,
+                cache.into(),
+                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(
+                    cli.allow_unsandboxed,
+                ),
+            )?;
             let inner = Dataset::strip_prefix(target);
-            benchmark::for_dataset(dataset)
-                .translate(&paths, inner, include_regex.as_deref(), parallel)?;
+            benchmark::for_dataset(dataset).translate(
+                &paths,
+                inner,
+                include_regex.as_deref(),
+                parallel,
+            )?;
         }
         Command::Verify {
             ref target,
@@ -81,8 +118,16 @@ fn main() -> Result<()> {
             parallel,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into(),
-                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(cli.allow_unsandboxed))?;
+            let paths = battery::Paths::new(
+                &repo_root,
+                agent,
+                dataset,
+                model,
+                cache.into(),
+                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(
+                    cli.allow_unsandboxed,
+                ),
+            )?;
             let inner = Dataset::strip_prefix(target);
             let bench = benchmark::for_dataset(dataset);
             // At startup, not per case: this agent has no C-as-oracle verify phase, and
@@ -93,7 +138,14 @@ fn main() -> Result<()> {
                  to verify. Its `translated/` result is what gets scored (`test`).",
                 format!("{agent:?}").to_lowercase(),
             );
-            bench.verify(&repo_root, &paths, inner, include_regex.as_deref(), force, parallel)?;
+            bench.verify(
+                &repo_root,
+                &paths,
+                inner,
+                include_regex.as_deref(),
+                force,
+                parallel,
+            )?;
         }
         Command::Cache { action } => match action {
             cli::CacheAction::Stats => {
@@ -114,8 +166,16 @@ fn main() -> Result<()> {
             allow_infra_failures,
         } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into(),
-                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(cli.allow_unsandboxed))?;
+            let paths = battery::Paths::new(
+                &repo_root,
+                agent,
+                dataset,
+                model,
+                cache.into(),
+                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(
+                    cli.allow_unsandboxed,
+                ),
+            )?;
             let inner = Dataset::strip_prefix(target);
             let mode = if update {
                 test::TestMode::Update
@@ -125,12 +185,27 @@ fn main() -> Result<()> {
                 test::TestMode::Run
             };
 
-            run_test(&repo_root, benchmark::for_dataset(dataset).as_ref(), &paths, inner, mode, allow_infra_failures)?;
+            run_test(
+                &repo_root,
+                benchmark::for_dataset(dataset).as_ref(),
+                &paths,
+                inner,
+                mode,
+                allow_infra_failures,
+            )?;
         }
         Command::Enrich { ref target } => {
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(&repo_root, agent, dataset, model, cache.into(),
-                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(cli.allow_unsandboxed))?;
+            let paths = battery::Paths::new(
+                &repo_root,
+                agent,
+                dataset,
+                model,
+                cache.into(),
+                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(
+                    cli.allow_unsandboxed,
+                ),
+            )?;
             let inner = Dataset::strip_prefix(target);
             benchmark::for_dataset(dataset).enrich(&paths, inner)?;
         }

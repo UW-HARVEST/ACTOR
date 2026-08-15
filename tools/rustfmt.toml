@@ -1,0 +1,6 @@
+# Both keys are already rustfmt's effective defaults here; they are pinned so a
+# toolchain or edition bump cannot silently reflow the whole tree and bury a real
+# diff. `style_edition` otherwise tracks `edition`, so `edition = "2024"` in
+# Cargo.toml would change formatting on its own.
+max_width = 100
+style_edition = "2021"

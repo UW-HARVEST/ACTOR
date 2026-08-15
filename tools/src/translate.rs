@@ -40,8 +40,8 @@ pub const AGENT_ENV: &[(&str, &str)] = &[
 pub const CLAUDE_MODEL_DEFAULT: &str = "global.anthropic.claude-opus-5[1m]";
 
 pub fn claude_model() -> Result<crate::cache::ModelId> {
-    let raw = std::env::var("HARVEST_CLAUDE_MODEL")
-        .unwrap_or_else(|_| CLAUDE_MODEL_DEFAULT.to_string());
+    let raw =
+        std::env::var("HARVEST_CLAUDE_MODEL").unwrap_or_else(|_| CLAUDE_MODEL_DEFAULT.to_string());
     crate::cache::ModelId::new(raw)
 }
 
@@ -117,7 +117,11 @@ pub struct Semaphore {
 
 impl Semaphore {
     pub fn new(max: usize) -> Self {
-        Self { state: Mutex::new(0), cvar: Condvar::new(), max }
+        Self {
+            state: Mutex::new(0),
+            cvar: Condvar::new(),
+            max,
+        }
     }
     /// Poison is recovered, not propagated: a `usize` is never half-updated and the
     /// panicking worker's guard still ran, so the count is sound — while propagating
@@ -195,7 +199,9 @@ impl CaseResult {
 /// was expected, so the message spells the layout out rather than reporting
 /// "0/0 translated".
 fn ensure_cases_found(count: usize, paths: &Paths, battery_name: &str) -> Result<()> {
-    if count > 0 { return Ok(()); }
+    if count > 0 {
+        return Ok(());
+    }
     let input_dir = paths.input_dir(battery_name);
     let agent = crate::cli::cli_name(paths.agent)?;
     anyhow::bail!(
@@ -211,7 +217,12 @@ fn ensure_cases_found(count: usize, paths: &Paths, battery_name: &str) -> Result
     );
 }
 
-pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, parallel: usize) -> Result<()> {
+pub fn run_test_corpus(
+    paths: &Paths,
+    battery_name: &str,
+    filter: Option<&str>,
+    parallel: usize,
+) -> Result<()> {
     preflight_check(paths.agent)?;
 
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
@@ -233,17 +244,25 @@ pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, 
     // ── Parallel: independent cases ────────────────────────────────────
     let sem = Semaphore::new(parallel);
     let ind_results: Vec<CaseResult> = std::thread::scope(|s| {
-        let handles: Vec<(String, _)> = independent.iter().map(|c| {
-            // Paired with the handle so a panicked join still names its case.
-            (c.name.clone(), s.spawn(|| {
-                let _permit = sem.acquire();
-                translate_one_independent(paths, &output_dir, battery_name, c)
-            }))
-        }).collect();
-        handles.into_iter()
+        let handles: Vec<(String, _)> = independent
+            .iter()
+            .map(|c| {
+                // Paired with the handle so a panicked join still names its case.
+                (
+                    c.name.clone(),
+                    s.spawn(|| {
+                        let _permit = sem.acquire();
+                        translate_one_independent(paths, &output_dir, battery_name, c)
+                    }),
+                )
+            })
+            .collect();
+        handles
+            .into_iter()
             .map(|(name, h)| {
                 let case_dir = output_dir.join(&name);
-                h.join().unwrap_or_else(|e| CaseResult::panicked(name, &case_dir, &paths.agent_key, e))
+                h.join()
+                    .unwrap_or_else(|e| CaseResult::panicked(name, &case_dir, &paths.agent_key, e))
             })
             .collect()
     });
@@ -259,7 +278,10 @@ pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, 
             println!("[{current}/{total}] ⏭️  {} (already done)", r.name);
         } else if r.success {
             translated += 1;
-            println!("  ✅ {} ({}s) [{translated} translated, {failed} failed of {current}/{total}]", r.name, r.elapsed_secs);
+            println!(
+                "  ✅ {} ({}s) [{translated} translated, {failed} failed of {current}/{total}]",
+                r.name, r.elapsed_secs
+            );
         } else {
             failed += 1;
             let err = r.error.as_deref().unwrap_or("unknown error");
@@ -288,7 +310,10 @@ pub fn run_test_corpus(paths: &Paths, battery_name: &str, filter: Option<&str>, 
 
         for cfg in &group.configs {
             current += 1;
-            if crate::battery::has_crate(&crate::battery::phase_dir(&output_dir.join(&cfg.name), crate::battery::TRANSLATED)) {
+            if crate::battery::has_crate(&crate::battery::phase_dir(
+                &output_dir.join(&cfg.name),
+                crate::battery::TRANSLATED,
+            )) {
                 translated += 1;
                 println!("[{current}/{total}] ⏭️  {} (already done)", cfg.name);
                 continue;
@@ -319,18 +344,34 @@ fn translate_one_independent(
     battery_name: &str,
     case: &battery::IndependentCase,
 ) -> CaseResult {
-    if crate::battery::has_crate(&crate::battery::phase_dir(&output_dir.join(&case.name), crate::battery::TRANSLATED)) {
-        return CaseResult { name: case.name.clone(), elapsed_secs: 0, success: true, error: None, skipped: true };
+    if crate::battery::has_crate(&crate::battery::phase_dir(
+        &output_dir.join(&case.name),
+        crate::battery::TRANSLATED,
+    )) {
+        return CaseResult {
+            name: case.name.clone(),
+            elapsed_secs: 0,
+            success: true,
+            error: None,
+            skipped: true,
+        };
     }
 
-    run_and_record(&case.name, &output_dir.join(&case.name), &paths.agent_key,
+    run_and_record(
+        &case.name,
+        &output_dir.join(&case.name),
+        &paths.agent_key,
         || dispatch_translate(paths, battery_name, &case.name, case.is_lib),
         || {
             if paths.agent == Agent::ClaudeCrossPrompt {
                 // E4: the agent's lib-vs-bin choice IS the experiment, so it must not
                 // be overridden here; `[workspace]` is still needed so cargo does not
                 // absorb each case into a parent workspace.
-                let cargo_path = crate::battery::phase_dir(&paths.case_dir(battery_name, &case.name), crate::battery::TRANSLATED).join("Cargo.toml");
+                let cargo_path = crate::battery::phase_dir(
+                    &paths.case_dir(battery_name, &case.name),
+                    crate::battery::TRANSLATED,
+                )
+                .join("Cargo.toml");
                 if cargo_path.exists() {
                     if let Ok(mut cargo) = CargoToml::open(&cargo_path) {
                         cargo.add_workspace();
@@ -352,22 +393,48 @@ fn translate_one_shared(
     group: &battery::SharedSourceGroup,
 ) -> CaseResult {
     let real_dir = output_dir.join(&group.real_case);
-    if crate::battery::has_crate(&crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED)) {
-        return CaseResult { name: group.real_case.clone(), elapsed_secs: 0, success: true, error: None, skipped: true };
+    if crate::battery::has_crate(&crate::battery::phase_dir(
+        &real_dir,
+        crate::battery::TRANSLATED,
+    )) {
+        return CaseResult {
+            name: group.real_case.clone(),
+            elapsed_secs: 0,
+            success: true,
+            error: None,
+            skipped: true,
+        };
     }
 
-    println!("Translating: {} (shared-source, {} configs)", group.real_case, group.configs.len());
-    run_and_record(&group.real_case, &real_dir, &paths.agent_key,
+    println!(
+        "Translating: {} (shared-source, {} configs)",
+        group.real_case,
+        group.configs.len()
+    );
+    run_and_record(
+        &group.real_case,
+        &real_dir,
+        &paths.agent_key,
         || dispatch_translate_shared(paths, battery_name, &group.real_case),
         || {
-            if let Ok(mut cargo) = CargoToml::open(&crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED).join("Cargo.toml")) {
+            if let Ok(mut cargo) = CargoToml::open(
+                &crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED)
+                    .join("Cargo.toml"),
+            ) {
                 cargo.add_workspace();
                 let features = battery::extract_features_from_path(
-                    &paths.input_dir(battery_name).join(&group.real_case).join("CMakePresets.json"),
-                ).unwrap_or_default();
+                    &paths
+                        .input_dir(battery_name)
+                        .join(&group.real_case)
+                        .join("CMakePresets.json"),
+                )
+                .unwrap_or_default();
                 let resolved = battery::resolve_features(
-                    &crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED).join("Cargo.toml"), &features,
-                ).unwrap_or_default();
+                    &crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED)
+                        .join("Cargo.toml"),
+                    &features,
+                )
+                .unwrap_or_default();
                 if !resolved.is_empty() {
                     cargo.set_default_features(&resolved);
                 }
@@ -396,12 +463,24 @@ fn run_and_record(
             let elapsed = start.elapsed().as_secs();
             write_translation_metrics(case_dir, agent, elapsed, true);
             let _ = post_process_fn();
-            CaseResult { name: name.to_owned(), elapsed_secs: elapsed, success: true, error: None, skipped: false }
+            CaseResult {
+                name: name.to_owned(),
+                elapsed_secs: elapsed,
+                success: true,
+                error: None,
+                skipped: false,
+            }
         }
         Err(e) => {
             let elapsed = start.elapsed().as_secs();
             write_translation_metrics(case_dir, agent, elapsed, false);
-            CaseResult { name: name.to_owned(), elapsed_secs: elapsed, success: false, error: Some(e.to_string()), skipped: false }
+            CaseResult {
+                name: name.to_owned(),
+                elapsed_secs: elapsed,
+                success: false,
+                error: Some(e.to_string()),
+                skipped: false,
+            }
         }
     }
 }
@@ -418,12 +497,20 @@ pub enum PromptKind {
 
 impl PromptKind {
     pub fn independent(is_lib: bool) -> Self {
-        if is_lib { PromptKind::Library } else { PromptKind::Executable }
+        if is_lib {
+            PromptKind::Library
+        } else {
+            PromptKind::Executable
+        }
     }
 
     #[cfg(test)]
-    const ALL: &'static [PromptKind] =
-        &[PromptKind::Library, PromptKind::Executable, PromptKind::Shared, PromptKind::Verify];
+    const ALL: &'static [PromptKind] = &[
+        PromptKind::Library,
+        PromptKind::Executable,
+        PromptKind::Shared,
+        PromptKind::Verify,
+    ];
 }
 
 /// The one place a prompt file is chosen, relative to [`Paths::prompts_dir`].
@@ -510,11 +597,17 @@ pub fn prompt_file_for(agent: Agent, kind: PromptKind) -> Option<&'static str> {
 /// empty prompt invokes the agent with nothing to do and the result is then recorded
 /// as a measurement.
 pub fn read_prompt(paths: &Paths, kind: PromptKind) -> Result<Option<String>> {
-    let Some(file) = prompt_file_for(paths.agent, kind) else { return Ok(None) };
+    let Some(file) = prompt_file_for(paths.agent, kind) else {
+        return Ok(None);
+    };
     let path = paths.prompts_dir.join(file);
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading the {kind:?} prompt {}", path.display()))?;
-    anyhow::ensure!(!text.trim().is_empty(), "the prompt {} is empty", path.display());
+    anyhow::ensure!(
+        !text.trim().is_empty(),
+        "the prompt {} is empty",
+        path.display()
+    );
     Ok(Some(text))
 }
 
@@ -570,7 +663,11 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
 /// Translate every harvest-bench project's `test_case/` into a Rust crate that
 /// builds a cdylib with the same C ABI: the test phase builds it into a `.so` and
 /// runs the upstream gtest suite against it.
-pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject], parallel: usize) -> Result<()> {
+pub fn run_harvest_bench(
+    paths: &Paths,
+    projects: &[battery::HarvestBenchProject],
+    parallel: usize,
+) -> Result<()> {
     preflight_check(paths.agent)?;
 
     // A harvest-bench test_case/ is always a C library the suite links by ABI, so the
@@ -578,27 +675,37 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
     // for the agents that are handed no prompt at all (see `prompt_file_for`).
     let prompt = read_prompt(paths, PromptKind::Library)?.unwrap_or_default();
 
-    anyhow::ensure!(!projects.is_empty(),
+    anyhow::ensure!(
+        !projects.is_empty(),
         "No harvest-bench projects to translate. Targets are `HB` (all) or \
          `HB/<project>`; each project is a dir under harvest-bench/tests/ with \
-         both a `test_case/` and a `gtest_suite/`. Did you `git submodule update --init`?");
+         both a `test_case/` and a `gtest_suite/`. Did you `git submodule update --init`?"
+    );
     let total = projects.len();
     let sem = Semaphore::new(parallel);
 
     let results: Vec<CaseResult> = std::thread::scope(|s| {
-        let handles: Vec<(String, _)> = projects.iter().map(|p| {
-            let prompt = &prompt;
-            let sem = &sem;
-            let name = p.name().to_owned(); // see run_test_corpus
-            (name, s.spawn(move || {
-                let _permit = sem.acquire();
-                translate_one_harvest_bench(paths, p, prompt)
-            }))
-        }).collect();
-        handles.into_iter()
+        let handles: Vec<(String, _)> = projects
+            .iter()
+            .map(|p| {
+                let prompt = &prompt;
+                let sem = &sem;
+                let name = p.name().to_owned(); // see run_test_corpus
+                (
+                    name,
+                    s.spawn(move || {
+                        let _permit = sem.acquire();
+                        translate_one_harvest_bench(paths, p, prompt)
+                    }),
+                )
+            })
+            .collect();
+        handles
+            .into_iter()
             .map(|(name, h)| {
                 let case_dir = paths.output_dir(&name);
-                h.join().unwrap_or_else(|e| CaseResult::panicked(name, &case_dir, &paths.agent_key, e))
+                h.join()
+                    .unwrap_or_else(|e| CaseResult::panicked(name, &case_dir, &paths.agent_key, e))
             })
             .collect()
     });
@@ -624,27 +731,47 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
     Ok(())
 }
 
-fn translate_one_harvest_bench(paths: &Paths, project: &battery::HarvestBenchProject, prompt: &str) -> CaseResult {
+fn translate_one_harvest_bench(
+    paths: &Paths,
+    project: &battery::HarvestBenchProject,
+    prompt: &str,
+) -> CaseResult {
     let name = project.name();
     let case_dir = paths.output_dir(name);
 
-    if crate::battery::has_crate(&crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED)) {
-        return CaseResult { name: name.into(), elapsed_secs: 0, success: true, error: None, skipped: true };
+    if crate::battery::has_crate(&crate::battery::phase_dir(
+        &case_dir,
+        crate::battery::TRANSLATED,
+    )) {
+        return CaseResult {
+            name: name.into(),
+            elapsed_secs: 0,
+            success: true,
+            error: None,
+            skipped: true,
+        };
     }
 
-    run_and_record(name, &case_dir, &paths.agent_key,
+    run_and_record(
+        name,
+        &case_dir,
+        &paths.agent_key,
         || translate_case_at(paths, project.test_case(), &case_dir, prompt),
         || {
             // The lib name must be the project name: the suite links `lib<name>.so`
             // by ABI, not by crate name.
-            let cargo_path = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml");
+            let cargo_path =
+                crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml");
             if cargo_path.exists() {
                 let mut cargo = CargoToml::open(&cargo_path)?;
                 cargo.add_workspace();
                 cargo.remove_bin();
                 cargo.set_lib(name);
                 cargo.save()?;
-                cargo_toml::strip_for_lib(&crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED))?;
+                cargo_toml::strip_for_lib(&crate::battery::phase_dir(
+                    &case_dir,
+                    crate::battery::TRANSLATED,
+                ))?;
             }
             Ok(())
         },
@@ -656,7 +783,13 @@ fn translate_one_harvest_bench(paths: &Paths, project: &battery::HarvestBenchPro
 fn preflight_check(agent: Agent) -> Result<()> {
     let (cmd, version_args): (&str, &[&str]) = match agent {
         Agent::Kiro => ("kiro-cli", &["--version"]),
-        Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt => ("claude", &["--version"]),
+        Agent::Claude
+        | Agent::ClaudeCombined
+        | Agent::ClaudeMinimal
+        | Agent::ClaudeNoIter
+        | Agent::ClaudeNoFeatures
+        | Agent::ClaudeNoSubtask
+        | Agent::ClaudeCrossPrompt => ("claude", &["--version"]),
         Agent::CodexGpt55 | Agent::CodexGpt54 => ("codex", &["--version"]),
         Agent::OpenCode => ("opencode", &["--version"]),
         Agent::C2rust => ("c2rust", &["--version"]),
@@ -685,11 +818,21 @@ fn preflight_check(agent: Agent) -> Result<()> {
         println!("  {line}");
     }
 
-    if matches!(agent, Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt) {
+    if matches!(
+        agent,
+        Agent::Claude
+            | Agent::ClaudeCombined
+            | Agent::ClaudeMinimal
+            | Agent::ClaudeNoIter
+            | Agent::ClaudeNoFeatures
+            | Agent::ClaudeNoSubtask
+            | Agent::ClaudeCrossPrompt
+    ) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         // `claude --version` prints either "2.1.150.280 ..." or "claude 2.1.158.312 ...",
         // depending on version, so scan for the first line carrying digits.
-        let version_str = stdout.lines()
+        let version_str = stdout
+            .lines()
             .find(|l| l.chars().any(|c| c.is_ascii_digit()))
             .unwrap_or("");
         let parts: Vec<u32> = version_str
@@ -697,7 +840,10 @@ fn preflight_check(agent: Agent) -> Result<()> {
             .filter(|s| !s.is_empty())
             .filter_map(|s| s.parse().ok())
             .collect();
-        let (major, minor) = (parts.first().copied().unwrap_or(0), parts.get(1).copied().unwrap_or(0));
+        let (major, minor) = (
+            parts.first().copied().unwrap_or(0),
+            parts.get(1).copied().unwrap_or(0),
+        );
         if major < 2 || (major == 2 && minor < 1) {
             anyhow::bail!(
                 "Claude Code version {version_str} is too old (need >= 2.1).\n\
@@ -722,7 +868,12 @@ fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Res
 /// workspace, invokes the agent there, and on success copies the produced crate to
 /// `<out_case_dir>/translated_rust`. Paths are explicit so it serves any dataset
 /// layout.
-pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &Path, prompt: &str) -> Result<()> {
+pub fn translate_case_at(
+    paths: &Paths,
+    input_test_case: &Path,
+    out_case_dir: &Path,
+    prompt: &str,
+) -> Result<()> {
     let case_dir = out_case_dir;
 
     if case_dir.exists() {
@@ -742,7 +893,23 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
     // it leaves the match directly: recovering it as `work_dir.parent()` turned a known
     // root into an `Option` that three call sites below then had to guess at.
     let (work_root, work_dir, _tmp_guard) = match paths.agent {
-        Agent::Kiro | Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::OpenCode | Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot => {
+        Agent::Kiro
+        | Agent::Claude
+        | Agent::ClaudeCombined
+        | Agent::ClaudeMinimal
+        | Agent::ClaudeNoIter
+        | Agent::ClaudeNoFeatures
+        | Agent::ClaudeNoSubtask
+        | Agent::ClaudeCrossPrompt
+        | Agent::CodexGpt55
+        | Agent::CodexGpt54
+        | Agent::OpenCode
+        | Agent::C2rust
+        | Agent::Laertes
+        | Agent::C2SaferRust
+        | Agent::SmartC2Rust
+        | Agent::Kimi
+        | Agent::Oneshot => {
             let tmp = crate::workdir::tempdir("harvest-translate-")
                 .context("creating isolated temp dir")?;
             let work = tmp.path().join(crate::battery::TRANSLATED_RUST);
@@ -750,7 +917,16 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
             std::fs::create_dir_all(&c_src)?;
             copy_dir_all(input_test_case, &c_src)?;
 
-            if matches!(paths.agent, Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt) {
+            if matches!(
+                paths.agent,
+                Agent::Claude
+                    | Agent::ClaudeCombined
+                    | Agent::ClaudeMinimal
+                    | Agent::ClaudeNoIter
+                    | Agent::ClaudeNoFeatures
+                    | Agent::ClaudeNoSubtask
+                    | Agent::ClaudeCrossPrompt
+            ) {
                 crate::sandbox::write_settings(crate::sandbox::Policy {
                     repo_root: &paths.repo_root,
                     work_root: tmp.path(),
@@ -793,7 +969,13 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                 .context("invoking kiro-cli")?;
             record_agent_exit(status);
         }
-        Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt => {
+        Agent::Claude
+        | Agent::ClaudeCombined
+        | Agent::ClaudeMinimal
+        | Agent::ClaudeNoIter
+        | Agent::ClaudeNoFeatures
+        | Agent::ClaudeNoSubtask
+        | Agent::ClaudeCrossPrompt => {
             // The same builder verify uses, so the two phases cannot drift into
             // different flags for the same CLI.
             let model = claude_model()?;
@@ -843,7 +1025,8 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
                     context_label: "translate",
                 },
                 &crate::session::Session::opencode(
-                    crate::opencode::Phase::Translate, TRANSLATE_TIMEOUT_SECS,
+                    crate::opencode::Phase::Translate,
+                    TRANSLATE_TIMEOUT_SECS,
                 ),
                 &work_root,
                 &opencode_model(paths)?,
@@ -872,7 +1055,9 @@ pub fn translate_case_at(paths: &Paths, input_test_case: &Path, out_case_dir: &P
 // ── Post-processing ────────────────────────────────────────────────────
 
 fn post_process_independent(paths: &Paths, battery: &str, name: &str, is_lib: bool) -> Result<()> {
-    let cargo_path = crate::battery::phase_dir(&paths.case_dir(battery, name), crate::battery::TRANSLATED).join("Cargo.toml");
+    let cargo_path =
+        crate::battery::phase_dir(&paths.case_dir(battery, name), crate::battery::TRANSLATED)
+            .join("Cargo.toml");
     if !cargo_path.exists() {
         return Ok(());
     }
@@ -884,7 +1069,10 @@ fn post_process_independent(paths: &Paths, battery: &str, name: &str, is_lib: bo
         let lib_name = battery::extract_lib_name(&paths.input_dir(battery), name);
         cargo.set_lib(lib_name.as_deref().unwrap_or(name));
         cargo.save()?;
-        cargo_toml::strip_for_lib(&crate::battery::phase_dir(&paths.case_dir(battery, name), crate::battery::TRANSLATED))?;
+        cargo_toml::strip_for_lib(&crate::battery::phase_dir(
+            &paths.case_dir(battery, name),
+            crate::battery::TRANSLATED,
+        ))?;
     } else {
         cargo.set_bin_driver();
         cargo.save()?;
@@ -906,7 +1094,9 @@ pub fn propagate_config_phase(
 ) -> Result<()> {
     let real_dir = crate::battery::phase_dir(&paths.case_dir(battery, real_case), phase);
     // An agent with no verify phase produces no verified/ to copy.
-    if !real_dir.is_dir() { return Ok(()); }
+    if !real_dir.is_dir() {
+        return Ok(());
+    }
     let cfg_dir = paths.case_dir(battery, &cfg.name);
     let translated = crate::battery::phase_dir(&cfg_dir, phase);
 
@@ -993,11 +1183,13 @@ thread_local! {
 
 pub fn record_agent_exit(status: std::process::ExitStatus) {
     let code = status.code();
-    LAST_AGENT_EXIT.with(|c| c.set(AgentExit {
-        exit_code: code,
-        timed_out: code == Some(124), // `timeout` exits 124 when it kills the child
-        recorded: true,
-    }));
+    LAST_AGENT_EXIT.with(|c| {
+        c.set(AgentExit {
+            exit_code: code,
+            timed_out: code == Some(124), // `timeout` exits 124 when it kills the child
+            recorded: true,
+        })
+    });
 }
 
 /// Call at the start of a case: a non-CLI agent on a re-used thread must not inherit
@@ -1070,7 +1262,7 @@ pub fn agent_provenance(agent: &crate::cache::AgentKey, duration_secs: u64) -> s
     p
 }
 
-/// Verify-side sibling of [`write_translation_metrics`].
+/// Verify-side sibling of `write_translation_metrics`.
 ///
 /// `provenance` describes the invocation that produced the artifact, which on a
 /// replay is the ORIGINAL one — so `replayed` and `cache_key` are what stop its cost
@@ -1094,19 +1286,21 @@ pub fn write_verification_metrics(
 }
 
 fn count_cases(battery: &battery::Battery) -> usize {
-    battery.cases.iter().map(|c| match c {
-        Case::Independent(_) => 1,
-        Case::SharedSource(g) => 1 + g.configs.len(),
-    }).sum()
+    battery
+        .cases
+        .iter()
+        .map(|c| match c {
+            Case::Independent(_) => 1,
+            Case::SharedSource(g) => 1 + g.configs.len(),
+        })
+        .sum()
 }
 
 // ── Utilities ──────────────────────────────────────────────────────────
 
 pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)
-        .with_context(|| format!("reading dir {}", src.display()))?
-    {
+    for entry in std::fs::read_dir(src).with_context(|| format!("reading dir {}", src.display()))? {
         let entry = entry?;
         let dst_path = dst.join(entry.file_name());
         let ft = entry.file_type()?;
@@ -1114,8 +1308,10 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
             let target = std::fs::metadata(entry.path());
             match target {
                 Ok(m) if m.is_dir() => copy_dir_all(&entry.path(), &dst_path)?,
-                Ok(m) if m.is_file() => { std::fs::copy(entry.path(), &dst_path)?; }
-                Ok(_) => continue, // non-regular target (pipe, socket, etc.)
+                Ok(m) if m.is_file() => {
+                    std::fs::copy(entry.path(), &dst_path)?;
+                }
+                Ok(_) => continue,  // non-regular target (pipe, socket, etc.)
                 Err(_) => continue, // dangling symlink
             }
         } else if ft.is_dir() {
@@ -1131,9 +1327,7 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 /// `skip` applies to top-level directories only.
 pub fn copy_dir_filtered(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
     std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)
-        .with_context(|| format!("reading dir {}", src.display()))?
-    {
+    for entry in std::fs::read_dir(src).with_context(|| format!("reading dir {}", src.display()))? {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
@@ -1147,7 +1341,9 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
                         copy_dir_all(&entry.path(), &dst_path)?;
                     }
                 }
-                Ok(m) if m.is_file() => { std::fs::copy(entry.path(), &dst_path)?; }
+                Ok(m) if m.is_file() => {
+                    std::fs::copy(entry.path(), &dst_path)?;
+                }
                 Ok(_) => continue, // non-regular target (pipe, socket, etc.), skip
                 Err(_) => continue, // dangling symlink, skip
             }
@@ -1190,7 +1386,11 @@ impl IsolatedWorkDir {
         let input = translated.digest().clone();
         let work = translated.materialise_into::<crate::artifact::Verify>(scratch)?;
         let c_before = work.c().digest()?;
-        Ok(Self { work, input, c_before })
+        Ok(Self {
+            work,
+            input,
+            c_before,
+        })
     }
 
     pub fn translated_rust(&self) -> PathBuf {
@@ -1251,7 +1451,10 @@ fn c2rust_translate(work_dir: &Path, log_path: &Path) -> Result<()> {
     log.write_all(&cmake_out.stdout)?;
     log.write_all(&cmake_out.stderr)?;
     if !cmake_out.status.success() {
-        anyhow::bail!("cmake failed: {}", String::from_utf8_lossy(&cmake_out.stderr));
+        anyhow::bail!(
+            "cmake failed: {}",
+            String::from_utf8_lossy(&cmake_out.stderr)
+        );
     }
 
     let cc_json = build_dir.join("compile_commands.json");
@@ -1261,15 +1464,23 @@ fn c2rust_translate(work_dir: &Path, log_path: &Path) -> Result<()> {
 
     let c2r_out = Command::new("c2rust")
         .args([
-            "transpile", "--emit-build-files", "--binary", "main",
-            &cc_json.to_string_lossy(), "--output-dir", &work_dir.to_string_lossy(),
+            "transpile",
+            "--emit-build-files",
+            "--binary",
+            "main",
+            &cc_json.to_string_lossy(),
+            "--output-dir",
+            &work_dir.to_string_lossy(),
         ])
         .output()
         .context("running c2rust transpile")?;
     log.write_all(&c2r_out.stdout)?;
     log.write_all(&c2r_out.stderr)?;
     if !c2r_out.status.success() {
-        anyhow::bail!("c2rust transpile failed: {}", String::from_utf8_lossy(&c2r_out.stderr));
+        anyhow::bail!(
+            "c2rust transpile failed: {}",
+            String::from_utf8_lossy(&c2r_out.stderr)
+        );
     }
 
     let cargo_path = work_dir.join("Cargo.toml");
@@ -1277,7 +1488,9 @@ fn c2rust_translate(work_dir: &Path, log_path: &Path) -> Result<()> {
         let mut cargo = std::fs::read_to_string(&cargo_path)?;
         cargo = cargo.replace("name = \"main\"", "name = \"driver\"");
         cargo = cargo.replace("name = \"rust_out\"", "name = \"driver\"");
-        cargo = C2RUST_CRATE_NAME_RE.replace_all(&cargo, r#"name = "driver""#).into_owned();
+        cargo = C2RUST_CRATE_NAME_RE
+            .replace_all(&cargo, r#"name = "driver""#)
+            .into_owned();
         for entry in walkdir(work_dir)? {
             if entry.extension().is_some_and(|e| e == "rs") {
                 let content = std::fs::read_to_string(&entry)?;
@@ -1295,7 +1508,10 @@ fn c2rust_translate(work_dir: &Path, log_path: &Path) -> Result<()> {
         std::fs::write(&cargo_path, cargo)?;
     }
 
-    std::fs::write(work_dir.join("rust-toolchain.toml"), "[toolchain]\nchannel = \"nightly\"\n")?;
+    std::fs::write(
+        work_dir.join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"nightly\"\n",
+    )?;
 
     let build_out = Command::new("cargo")
         .args(["+nightly", "build", "--release"])
@@ -1304,7 +1520,15 @@ fn c2rust_translate(work_dir: &Path, log_path: &Path) -> Result<()> {
         .context("cargo build")?;
     log.write_all(&build_out.stdout)?;
     log.write_all(&build_out.stderr)?;
-    writeln!(log, "\nc2rust translation {}", if build_out.status.success() { "succeeded" } else { "FAILED to compile" })?;
+    writeln!(
+        log,
+        "\nc2rust translation {}",
+        if build_out.status.success() {
+            "succeeded"
+        } else {
+            "FAILED to compile"
+        }
+    )?;
 
     Ok(())
 }
@@ -1331,20 +1555,29 @@ const BEDROCK_MODEL_ID: &str = "moonshotai.kimi-k2.5";
 const BEDROCK_REGION: &str = "us-east-1";
 const BEDROCK_MAX_TOKENS: u32 = 16384;
 
-
 fn kimi_translate_case(paths: &Paths, battery: &str, name: &str, is_lib_hint: bool) -> Result<()> {
     oneshot_llm_translate(paths, battery, name, is_lib_hint, None, bedrock_converse)
 }
 
-fn oneshot_translate_case(paths: &Paths, battery: &str, name: &str, is_lib_hint: bool) -> Result<()> {
+fn oneshot_translate_case(
+    paths: &Paths,
+    battery: &str,
+    name: &str,
+    is_lib_hint: bool,
+) -> Result<()> {
     // As in `opencode_model`: main rejects a missing --model, but this runs per case.
     let model = paths.model.as_deref().context(
         "--agent oneshot requires --model <provider>/<model-id> (should have been \
          rejected at startup)",
     )?;
-    oneshot_llm_translate(paths, battery, name, is_lib_hint, Some(model), |convo, log| {
-        openrouter_converse(model, convo, log)
-    })
+    oneshot_llm_translate(
+        paths,
+        battery,
+        name,
+        is_lib_hint,
+        Some(model),
+        |convo, log| openrouter_converse(model, convo, log),
+    )
 }
 
 fn oneshot_llm_translate(
@@ -1356,7 +1589,9 @@ fn oneshot_llm_translate(
     invoke_llm: impl FnOnce(Conversation<'_>, &Path) -> Result<LlmResponse>,
 ) -> Result<()> {
     let case_dir = paths.case_dir(battery, name);
-    if case_dir.exists() { std::fs::remove_dir_all(&case_dir)?; }
+    if case_dir.exists() {
+        std::fs::remove_dir_all(&case_dir)?;
+    }
 
     let logs_dir = case_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
@@ -1382,15 +1617,25 @@ fn oneshot_llm_translate(
         "Please translate the following C project into a Rust project including Cargo manifest:\n\n{files_json}\n\nreturn as JSON"
     );
 
-    let resp = invoke_llm(Conversation { system: &system_prompt, user: &user_msg }, &log_path)?;
+    let resp = invoke_llm(
+        Conversation {
+            system: &system_prompt,
+            user: &user_msg,
+        },
+        &log_path,
+    )?;
 
     let mut usage = serde_json::json!({
         "input_tokens": resp.input_tokens,
         "output_tokens": resp.output_tokens,
     });
-    if let Some(m) = model { usage["model"] = serde_json::json!(m); }
-    let _ = std::fs::write(logs_dir.join("usage.json"),
-        serde_json::to_string_pretty(&usage).unwrap_or_default() + "\n");
+    if let Some(m) = model {
+        usage["model"] = serde_json::json!(m);
+    }
+    let _ = std::fs::write(
+        logs_dir.join("usage.json"),
+        serde_json::to_string_pretty(&usage).unwrap_or_default() + "\n",
+    );
 
     write_llm_files(&resp.content, &translated)?;
 
@@ -1403,25 +1648,39 @@ fn oneshot_llm_translate(
 /// Collect all files under `dir` as a JSON object: `{"files": [{"path": "...", "contents": "..."}]}`.
 fn collect_c_files_json(dir: &Path) -> Result<String> {
     #[derive(serde::Serialize)]
-    struct FileEntry { path: String, contents: String }
+    struct FileEntry {
+        path: String,
+        contents: String,
+    }
     #[derive(serde::Serialize)]
-    struct FilesPayload { files: Vec<FileEntry> }
+    struct FilesPayload {
+        files: Vec<FileEntry>,
+    }
 
     let mut files = Vec::new();
     for path in walkdir(dir)? {
         let rel = path.strip_prefix(dir)?.to_string_lossy().to_string();
-        let contents = std::fs::read_to_string(&path)
-            .unwrap_or_else(|_| String::from("<binary file>"));
-        files.push(FileEntry { path: rel, contents });
+        let contents =
+            std::fs::read_to_string(&path).unwrap_or_else(|_| String::from("<binary file>"));
+        files.push(FileEntry {
+            path: rel,
+            contents,
+        });
     }
     Ok(serde_json::to_string(&FilesPayload { files })?)
 }
 
 fn detect_is_library(dir: &Path) -> Option<bool> {
     let cmake = std::fs::read_to_string(dir.join("CMakeLists.txt")).ok()?;
-    if cmake.lines().any(|l| l.trim_start().starts_with("add_library(")) {
+    if cmake
+        .lines()
+        .any(|l| l.trim_start().starts_with("add_library("))
+    {
         Some(true)
-    } else if cmake.lines().any(|l| l.trim_start().starts_with("add_executable(")) {
+    } else if cmake
+        .lines()
+        .any(|l| l.trim_start().starts_with("add_executable("))
+    {
         Some(false)
     } else {
         None
@@ -1440,10 +1699,15 @@ fn bedrock_converse(convo: Conversation<'_>, log_path: &Path) -> Result<LlmRespo
     std::fs::write(&request_file, serde_json::to_string_pretty(&request)?)?;
 
     let output = Command::new("aws")
-        .args(["bedrock-runtime", "converse",
-            "--region", BEDROCK_REGION,
-            "--cli-read-timeout", "300",
-            "--cli-input-json", &format!("file://{}", request_file.display()),
+        .args([
+            "bedrock-runtime",
+            "converse",
+            "--region",
+            BEDROCK_REGION,
+            "--cli-read-timeout",
+            "300",
+            "--cli-input-json",
+            &format!("file://{}", request_file.display()),
         ])
         .output()
         .context("failed to invoke aws bedrock-runtime converse")?;
@@ -1470,8 +1734,12 @@ fn bedrock_converse(convo: Conversation<'_>, log_path: &Path) -> Result<LlmRespo
         anyhow::bail!("bedrock converse failed: {stderr}");
     }
 
-    let resp: serde_json::Value = serde_json::from_str(&stdout)
-        .with_context(|| format!("failed to parse Bedrock response: {}", truncated(&stdout, 500)))?;
+    let resp: serde_json::Value = serde_json::from_str(&stdout).with_context(|| {
+        format!(
+            "failed to parse Bedrock response: {}",
+            truncated(&stdout, 500)
+        )
+    })?;
 
     let content = resp["output"]["message"]["content"][0]["text"]
         .as_str()
@@ -1482,12 +1750,20 @@ fn bedrock_converse(convo: Conversation<'_>, log_path: &Path) -> Result<LlmRespo
     let input_tokens = resp["usage"]["inputTokens"].as_u64().unwrap_or(0);
     let output_tokens = resp["usage"]["outputTokens"].as_u64().unwrap_or(0);
 
-    Ok(LlmResponse { content, input_tokens, output_tokens })
+    Ok(LlmResponse {
+        content,
+        input_tokens,
+        output_tokens,
+    })
 }
 
-fn openrouter_converse(model: &str, convo: Conversation<'_>, log_path: &Path) -> Result<LlmResponse> {
-    let api_key = std::env::var("OPENROUTER_API_KEY")
-        .context("OPENROUTER_API_KEY env var not set")?;
+fn openrouter_converse(
+    model: &str,
+    convo: Conversation<'_>,
+    log_path: &Path,
+) -> Result<LlmResponse> {
+    let api_key =
+        std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY env var not set")?;
 
     let request = serde_json::json!({
         "model": model,
@@ -1503,11 +1779,19 @@ fn openrouter_converse(model: &str, convo: Conversation<'_>, log_path: &Path) ->
     std::fs::write(&request_file, serde_json::to_string_pretty(&request)?)?;
 
     let output = Command::new("curl")
-        .args(["-s", "--max-time", "600",
-            "-X", "POST", "https://openrouter.ai/api/v1/chat/completions",
-            "-H", &format!("Authorization: Bearer {api_key}"),
-            "-H", "Content-Type: application/json",
-            "-d", &format!("@{}", request_file.display()),
+        .args([
+            "-s",
+            "--max-time",
+            "600",
+            "-X",
+            "POST",
+            "https://openrouter.ai/api/v1/chat/completions",
+            "-H",
+            &format!("Authorization: Bearer {api_key}"),
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &format!("@{}", request_file.display()),
         ])
         .output()
         .context("failed to invoke curl for OpenRouter")?;
@@ -1532,8 +1816,12 @@ fn openrouter_converse(model: &str, convo: Conversation<'_>, log_path: &Path) ->
         anyhow::bail!("curl failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
-    let resp: serde_json::Value = serde_json::from_str(&stdout)
-        .with_context(|| format!("failed to parse OpenRouter response: {}", truncated(&stdout, 500)))?;
+    let resp: serde_json::Value = serde_json::from_str(&stdout).with_context(|| {
+        format!(
+            "failed to parse OpenRouter response: {}",
+            truncated(&stdout, 500)
+        )
+    })?;
 
     if let Some(err) = resp.get("error") {
         anyhow::bail!("OpenRouter error: {err}");
@@ -1547,7 +1835,11 @@ fn openrouter_converse(model: &str, convo: Conversation<'_>, log_path: &Path) ->
     let input_tokens = resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
     let output_tokens = resp["usage"]["completion_tokens"].as_u64().unwrap_or(0);
 
-    Ok(LlmResponse { content, input_tokens, output_tokens })
+    Ok(LlmResponse {
+        content,
+        input_tokens,
+        output_tokens,
+    })
 }
 
 /// Truncate to at most `max` **bytes**, ending on a UTF-8 character boundary.
@@ -1570,9 +1862,14 @@ fn truncated(s: &str, max: usize) -> &str {
 /// Parse a JSON response `{"files": [{"path": "...", "contents": "..."}]}` and write files.
 fn write_llm_files(json_response: &str, output_dir: &Path) -> Result<()> {
     #[derive(serde::Deserialize)]
-    struct FileEntry { path: String, contents: String }
+    struct FileEntry {
+        path: String,
+        contents: String,
+    }
     #[derive(serde::Deserialize)]
-    struct FilesPayload { files: Vec<FileEntry> }
+    struct FilesPayload {
+        files: Vec<FileEntry>,
+    }
 
     // Models wrap the object in prose or a markdown fence, so cut to the outermost
     // brace pair rather than parsing the response as-is.
@@ -1583,7 +1880,13 @@ fn write_llm_files(json_response: &str, output_dir: &Path) -> Result<()> {
         for (i, c) in from_brace.char_indices() {
             match c {
                 '{' => depth += 1,
-                '}' => { depth -= 1; if depth == 0 { end = i + 1; break; } }
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1592,8 +1895,12 @@ fn write_llm_files(json_response: &str, output_dir: &Path) -> Result<()> {
         json_response
     };
 
-    let payload: FilesPayload = serde_json::from_str(json_str)
-        .with_context(|| format!("failed to parse LLM JSON response: {}", truncated(json_str, 500)))?;
+    let payload: FilesPayload = serde_json::from_str(json_str).with_context(|| {
+        format!(
+            "failed to parse LLM JSON response: {}",
+            truncated(json_str, 500)
+        )
+    })?;
 
     for file in &payload.files {
         let dest = output_dir.join(&file.path);
@@ -1645,15 +1952,24 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     use std::io::Write;
 
     // c2rust never runs a verify phase, so its translated/ IS the crate to consume.
-    let c2rust_case = paths.results_dir
-        .parent().context("no parent for results_dir")?
-        .join("c2rust").join(battery).join(name);
+    let c2rust_case = paths
+        .results_dir
+        .parent()
+        .context("no parent for results_dir")?
+        .join("c2rust")
+        .join(battery)
+        .join(name);
     let c2rust_original = crate::battery::phase_dir(&c2rust_case, crate::battery::TRANSLATED);
-    anyhow::ensure!(c2rust_original.is_dir(),
-        "c2rust translated/ crate not found: {}", c2rust_original.display());
+    anyhow::ensure!(
+        c2rust_original.is_dir(),
+        "c2rust translated/ crate not found: {}",
+        c2rust_original.display()
+    );
 
     let case_dir = paths.case_dir(battery, name);
-    if case_dir.exists() { std::fs::remove_dir_all(&case_dir)?; }
+    if case_dir.exists() {
+        std::fs::remove_dir_all(&case_dir)?;
+    }
     let logs_dir = case_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
     let log_path = logs_dir.join("translation.log");
@@ -1662,8 +1978,8 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     // Staged in scratch like its c2saferrust neighbour: the container gets this mounted
     // read-write, and the compile check writes `target/` plus a `Cargo.lock` that is part
     // of the hashed artifact — so in `translated/` the arm mutated its own result.
-    let tmp = crate::workdir::tempdir("harvest-laertes-")
-        .context("creating laertes temp workspace")?;
+    let tmp =
+        crate::workdir::tempdir("harvest-laertes-").context("creating laertes temp workspace")?;
     let work = tmp.path().join("project");
     copy_dir_filtered(&c2rust_original, &work, &["target"])?;
 
@@ -1677,7 +1993,16 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     writeln!(log, "\n=== Laertes Docker ===")?;
     let mount = format!("{}:/mnt/project", work.display());
     let docker_out = Command::new("docker")
-        .args(["run", "--rm", "-v", &mount, LAERTES_DOCKER_IMAGE, "bash", "-c", LAERTES_DOCKER_SCRIPT])
+        .args([
+            "run",
+            "--rm",
+            "-v",
+            &mount,
+            LAERTES_DOCKER_IMAGE,
+            "bash",
+            "-c",
+            LAERTES_DOCKER_SCRIPT,
+        ])
         .output()
         .context("running laertes docker container")?;
     log.write_all(&docker_out.stdout)?;
@@ -1704,7 +2029,15 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     log.write_all(&build.stdout)?;
     log.write_all(&build.stderr)?;
     let ok = build.status.success();
-    writeln!(log, "\nlaertes translation {}", if ok { "succeeded" } else { "FAILED to compile (non-fatal)" })?;
+    writeln!(
+        log,
+        "\nlaertes translation {}",
+        if ok {
+            "succeeded"
+        } else {
+            "FAILED to compile (non-fatal)"
+        }
+    )?;
 
     copy_dir_filtered(&work, &translated, &["target"])?;
     Ok(())
@@ -1714,8 +2047,7 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
 
 const C2SAFERRUST_DOCKER_IMAGE: &str = "c2saferrust:latest";
 const C2SAFERRUST_MODEL: &str = "bedrock-gpt54";
-const C2SAFERRUST_DEFAULT_BASE_URL: &str =
-    "https://bedrock-mantle.us-west-2.api.aws/openai/v1";
+const C2SAFERRUST_DEFAULT_BASE_URL: &str = "https://bedrock-mantle.us-west-2.api.aws/openai/v1";
 
 /// Runs against the workspace bind-mounted at /work, reshaped crate at /work/rust,
 /// result at /work/rust_WIP. The non-root container user needs a writable HOME +
@@ -1747,10 +2079,14 @@ const BEDROCK_TOKEN_REFRESH_AFTER: Duration = Duration::from_secs(6 * 3600);
 /// minted token.
 fn bedrock_token(region: &str) -> Result<String> {
     if let Ok(t) = std::env::var("BEDROCK_API_KEY") {
-        if !t.trim().is_empty() { return Ok(t); }
+        if !t.trim().is_empty() {
+            return Ok(t);
+        }
     }
     if let Ok(t) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
-        if !t.trim().is_empty() { return Ok(t); }
+        if !t.trim().is_empty() {
+            return Ok(t);
+        }
     }
 
     // Replaced only wholesale, so no panic can leave it half-written; propagating the
@@ -1778,8 +2114,10 @@ fn mint_bedrock_token(region: &str) -> Result<String> {
         .env_remove("AWS_PROFILE")
         .env_remove("AWS_DEFAULT_PROFILE")
         .output()
-        .context("minting Bedrock token (is aws_bedrock_token_generator installed \
-                  and are `default`-profile creds valid? run `aws-creds <account>`)")?;
+        .context(
+            "minting Bedrock token (is aws_bedrock_token_generator installed \
+                  and are `default`-profile creds valid? run `aws-creds <account>`)",
+        )?;
     anyhow::ensure!(
         out.status.success(),
         "Bedrock token mint failed: {}",
@@ -1788,7 +2126,8 @@ fn mint_bedrock_token(region: &str) -> Result<String> {
     let tok = String::from_utf8(out.stdout)?.trim().to_string();
     anyhow::ensure!(
         tok.starts_with("bedrock-api-key-"),
-        "unexpected token format from provide_token (got {} chars)", tok.len()
+        "unexpected token format from provide_token (got {} chars)",
+        tok.len()
     );
     Ok(tok)
 }
@@ -1799,29 +2138,43 @@ fn mint_bedrock_token(region: &str) -> Result<String> {
 /// Blind by design (no `--test_dir`): compile-gated only, which is what makes its
 /// numbers comparable to ACTOR self-verified. `BEDROCK_BASE_URL` may override the
 /// default us-west-2 mantle endpoint.
-fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib: bool) -> Result<()> {
+fn c2saferrust_translate_case(
+    paths: &Paths,
+    battery: &str,
+    name: &str,
+    _is_lib: bool,
+) -> Result<()> {
     use std::io::Write;
 
     // c2rust never runs a verify phase, so its translated/ IS the crate to consume.
-    let c2rust_case = paths.results_dir
-        .parent().context("no parent for results_dir")?
-        .join("c2rust").join(battery).join(name);
+    let c2rust_case = paths
+        .results_dir
+        .parent()
+        .context("no parent for results_dir")?
+        .join("c2rust")
+        .join(battery)
+        .join(name);
     let c2rust_original = crate::battery::phase_dir(&c2rust_case, crate::battery::TRANSLATED);
-    anyhow::ensure!(c2rust_original.is_dir(),
+    anyhow::ensure!(
+        c2rust_original.is_dir(),
         "c2rust translated/ crate not found (run the c2rust agent first): {}",
-        c2rust_original.display());
+        c2rust_original.display()
+    );
 
     let base_url = std::env::var("BEDROCK_BASE_URL")
         .unwrap_or_else(|_| C2SAFERRUST_DEFAULT_BASE_URL.to_string());
     let region = base_url
-        .split("bedrock-mantle.").nth(1)
+        .split("bedrock-mantle.")
+        .nth(1)
         .and_then(|s| s.split('.').next())
         .unwrap_or("us-west-2")
         .to_string();
     let token = bedrock_token(&region)?;
 
     let case_dir = paths.case_dir(battery, name);
-    if case_dir.exists() { std::fs::remove_dir_all(&case_dir)?; }
+    if case_dir.exists() {
+        std::fs::remove_dir_all(&case_dir)?;
+    }
     let logs_dir = case_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
     let log_path = logs_dir.join("translation.log");
@@ -1829,8 +2182,8 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
 
     // Bind-mounted into the container: the tool reshapes <work>/rust in place and
     // writes <work>/rust_WIP.
-    let tmp = crate::workdir::tempdir("harvest-c2sr-")
-        .context("creating c2saferrust temp workspace")?;
+    let tmp =
+        crate::workdir::tempdir("harvest-c2sr-").context("creating c2saferrust temp workspace")?;
     let work_rust = tmp.path().join("rust");
     copy_dir_filtered(&c2rust_original, &work_rust, &["target", "c_src"])?;
     let _ = std::fs::remove_file(work_rust.join("Cargo.lock"));
@@ -1849,13 +2202,24 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
     let gid = unsafe { libc_getgid() };
     let mount = format!("{}:/work", tmp.path().display());
     let docker_out = Command::new("docker")
-        .args(["run", "--rm",
-               "--user", &format!("{uid}:{gid}"),
-               "-e", "C2SR_MODEL",
-               "-e", &format!("BEDROCK_API_KEY={token}"),
-               "-e", &format!("BEDROCK_BASE_URL={base_url}"),
-               "-v", &mount,
-               C2SAFERRUST_DOCKER_IMAGE, "bash", "-c", C2SAFERRUST_DOCKER_SCRIPT])
+        .args([
+            "run",
+            "--rm",
+            "--user",
+            &format!("{uid}:{gid}"),
+            "-e",
+            "C2SR_MODEL",
+            "-e",
+            &format!("BEDROCK_API_KEY={token}"),
+            "-e",
+            &format!("BEDROCK_BASE_URL={base_url}"),
+            "-v",
+            &mount,
+            C2SAFERRUST_DOCKER_IMAGE,
+            "bash",
+            "-c",
+            C2SAFERRUST_DOCKER_SCRIPT,
+        ])
         .env("C2SR_MODEL", C2SAFERRUST_MODEL)
         .output()
         .context("running c2saferrust docker container")?;
@@ -1871,13 +2235,23 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
         writeln!(log, "\nrust_WIP produced; collecting C2SaferRust output")?;
         wip.clone()
     } else {
-        writeln!(log, "\nNo rust_WIP produced (C2Rust input failed to compile under \
+        writeln!(
+            log,
+            "\nNo rust_WIP produced (C2Rust input failed to compile under \
                        nightly-2022-08-08, or translation failed). Falling back to the \
-                       unmodified C2Rust input so the case is counted as a failure.")?;
+                       unmodified C2Rust input so the case is counted as a failure."
+        )?;
         work_rust.clone()
     };
     copy_dir_filtered(&source_dir, &translated, &["target"])?;
-    for junk in ["callgraph.dot", "callgraph.pdf", "slices.json", "log.txt", "prompts.txt", "ordering.txt"] {
+    for junk in [
+        "callgraph.dot",
+        "callgraph.pdf",
+        "slices.json",
+        "log.txt",
+        "prompts.txt",
+        "ordering.txt",
+    ] {
         let _ = std::fs::remove_file(translated.join(junk));
     }
     // The tool leaves .old rollback files behind.
@@ -1897,7 +2271,11 @@ fn c2saferrust_translate_case(paths: &Paths, battery: &str, name: &str, _is_lib:
         let _ = std::fs::copy(wip.join("log.txt"), logs_dir.join("c2saferrust_log.txt"));
     }
 
-    writeln!(log, "\nc2saferrust translation collected into {}", translated.display())?;
+    writeln!(
+        log,
+        "\nc2saferrust translation collected into {}",
+        translated.display()
+    )?;
     Ok(())
 }
 
@@ -1914,7 +2292,9 @@ fn c2saferrust_preprocess(work_dir: &Path) -> Result<()> {
     if cargo.exists() {
         let mut s = std::fs::read_to_string(&cargo)?;
         if CRATE_TYPE_RE.is_match(&s) {
-            s = CRATE_TYPE_RE.replace(&s, r#"crate-type = ["staticlib","rlib"]"#).into_owned();
+            s = CRATE_TYPE_RE
+                .replace(&s, r#"crate-type = ["staticlib","rlib"]"#)
+                .into_owned();
         }
         std::fs::write(&cargo, s)?;
     }
@@ -1940,16 +2320,26 @@ extern "C" {
     fn getuid() -> u32;
     fn getgid() -> u32;
 }
-unsafe fn libc_getuid() -> u32 { getuid() }
-unsafe fn libc_getgid() -> u32 { getgid() }
+unsafe fn libc_getuid() -> u32 {
+    getuid()
+}
+unsafe fn libc_getgid() -> u32 {
+    getgid()
+}
 
 /// Adapt c2rust output for Laertes' nightly-2020-10-15 toolchain.
 fn laertes_preprocess(work_dir: &Path) -> Result<()> {
     for path in walkdir(work_dir)? {
-        if path.extension().is_none_or(|e| e != "rs") { continue; }
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
         let mut src = std::fs::read_to_string(&path)?;
-        let changed = src.contains("::core::ffi::") || src.contains("::core::ptr") || src.contains("::core::mem");
-        if !changed && !path.ends_with("lib.rs") { continue; }
+        let changed = src.contains("::core::ffi::")
+            || src.contains("::core::ptr")
+            || src.contains("::core::mem");
+        if !changed && !path.ends_with("lib.rs") {
+            continue;
+        }
 
         src = src.replace("::core::ffi::", "libc::");
         src = src.replace("::core::ptr", "std::ptr");
@@ -1991,11 +2381,17 @@ static LIBC_INTERNAL_PATH_RE: std::sync::LazyLock<regex::Regex> = std::sync::Laz
 /// Restore modern-toolchain compatibility after Laertes rewrites.
 fn laertes_postprocess(work_dir: &Path) -> Result<()> {
     for path in walkdir(work_dir)? {
-        if path.extension().is_none_or(|e| e != "rs") { continue; }
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
         let src = std::fs::read_to_string(&path)?;
         let mut out = src.replace("extern crate libc;\n", "");
-        out = LIBC_INTERNAL_PATH_RE.replace_all(&out, "libc::$1").into_owned();
-        if out != src { std::fs::write(&path, out)?; }
+        out = LIBC_INTERNAL_PATH_RE
+            .replace_all(&out, "libc::$1")
+            .into_owned();
+        if out != src {
+            std::fs::write(&path, out)?;
+        }
     }
 
     let lib_rs = work_dir.join("lib.rs");
@@ -2046,7 +2442,12 @@ fn invoke_codex_with_retry(
     region: &str,
     openssl_dir: &str,
 ) -> Result<()> {
-    let RetrySession { prompt, log_path, work_dir, context_label } = session;
+    let RetrySession {
+        prompt,
+        log_path,
+        work_dir,
+        context_label,
+    } = session;
     const MAX_RETRIES: u32 = 3;
     const RETRY_BACKOFF_SECS: u64 = 30;
 
@@ -2154,7 +2555,12 @@ fn invoke_opencode_with_retry(
     tmp_root: &Path,
     model: &crate::opencode::Model,
 ) -> Result<()> {
-    let RetrySession { prompt, log_path, work_dir, context_label } = retry;
+    let RetrySession {
+        prompt,
+        log_path,
+        work_dir,
+        context_label,
+    } = retry;
     const MAX_RETRIES: u32 = 3;
     const RETRY_BACKOFF_SECS: u64 = 30;
 
@@ -2194,7 +2600,11 @@ mod tests {
     }
 
     fn exit_status(code: i32) -> std::process::ExitStatus {
-        Command::new("sh").arg("-c").arg(format!("exit {code}")).status().unwrap()
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {code}"))
+            .status()
+            .unwrap()
     }
 
     #[test]
@@ -2237,7 +2647,10 @@ mod tests {
         clear_agent_exit();
         let mut m = serde_json::json!({"success": true});
         merge_agent_exit(&mut m);
-        assert!(m.get("exit_code").is_none(), "exit_code must be absent when no CLI agent ran");
+        assert!(
+            m.get("exit_code").is_none(),
+            "exit_code must be absent when no CLI agent ran"
+        );
         assert!(m.get("timed_out").is_none());
     }
 
@@ -2251,9 +2664,17 @@ mod tests {
         record_agent_exit(exit_status(124));
         write_translation_metrics(&case, &test_agent_key(), 10_800, false);
 
-        let expected = case.join(crate::battery::TRANSLATED).join("translation.json");
-        assert!(expected.is_file(), "the reader path must be the writer path");
-        assert!(!case.join("translation.json").exists(), "and nothing may be left at the case root");
+        let expected = case
+            .join(crate::battery::TRANSLATED)
+            .join("translation.json");
+        assert!(
+            expected.is_file(),
+            "the reader path must be the writer path"
+        );
+        assert!(
+            !case.join("translation.json").exists(),
+            "and nothing may be left at the case root"
+        );
         let m: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&expected).unwrap()).unwrap();
         assert_eq!(m["exit_code"], serde_json::json!(124));
@@ -2297,18 +2718,30 @@ mod tests {
         CaseResult::panicked("jansson".into(), &case, &test_agent_key(), Box::new("boom"));
 
         let m: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(translation_metrics_path(&case)).unwrap()).unwrap();
-        assert_eq!(m["success"], serde_json::json!(false), "the panic must leave a trace");
-        assert!(m.get("exit_code").is_none(), "another case's exit must not be attributed here");
+            &std::fs::read_to_string(translation_metrics_path(&case)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            m["success"],
+            serde_json::json!(false),
+            "the panic must leave a trace"
+        );
+        assert!(
+            m.get("exit_code").is_none(),
+            "another case's exit must not be attributed here"
+        );
         assert!(m.get("timed_out").is_none());
     }
 
     #[test]
     fn take_agent_exit_clears_so_next_case_starts_fresh() {
         record_agent_exit(exit_status(1));
-        let _ = take_agent_exit();          // consume
-        let second = take_agent_exit();     // must be empty now
-        assert!(!second.recorded, "exit must not leak into the next case on a reused thread");
+        let _ = take_agent_exit(); // consume
+        let second = take_agent_exit(); // must be empty now
+        assert!(
+            !second.recorded,
+            "exit must not leak into the next case on a reused thread"
+        );
     }
 
     fn write_log(body: &str) -> tempfile::NamedTempFile {
@@ -2345,7 +2778,8 @@ mod tests {
         assert_eq!(scan_opencode_log_for_transient_error(clean.path()), None);
         // A non-transient error must not be retried: retrying cannot fix it and
         // burns hours.
-        let hard = write_log(r#"{"type":"error","error":{"message":"ValidationException: bad request"}}"#);
+        let hard =
+            write_log(r#"{"type":"error","error":{"message":"ValidationException: bad request"}}"#);
         assert_eq!(scan_opencode_log_for_transient_error(hard.path()), None);
     }
 
@@ -2359,14 +2793,23 @@ mod tests {
     }
 
     fn paths_for(agent: Agent, dataset: crate::cli::Dataset) -> Paths {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("tools/ has a parent");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("tools/ has a parent");
         let model = match agent {
             Agent::Oneshot => Some("openai/gpt-5.4"),
             Agent::OpenCode => Some("amazon-bedrock/us.anthropic.claude-sonnet-5"),
             _ => None,
         };
-        Paths::new(root, agent, dataset, model, crate::cache::Mode::Bypass,
-            crate::sandbox::Enforcement::AllowUnsandboxed).expect("Paths")
+        Paths::new(
+            root,
+            agent,
+            dataset,
+            model,
+            crate::cache::Mode::Bypass,
+            crate::sandbox::Enforcement::AllowUnsandboxed,
+        )
+        .expect("Paths")
     }
 
     #[test]
@@ -2374,7 +2817,10 @@ mod tests {
         // The whole point of naming the file separately from reading it: a rename used
         // to surface as an empty prompt handed to a live agent, mid-sweep.
         use clap::ValueEnum;
-        for dataset in [crate::cli::Dataset::TestCorpus, crate::cli::Dataset::HarvestBench] {
+        for dataset in [
+            crate::cli::Dataset::TestCorpus,
+            crate::cli::Dataset::HarvestBench,
+        ] {
             for agent in Agent::value_variants() {
                 let paths = paths_for(*agent, dataset);
                 for kind in PromptKind::ALL {
@@ -2383,8 +2829,45 @@ mod tests {
                     }
                     let text = read_prompt(&paths, *kind)
                         .unwrap_or_else(|e| panic!("{agent:?} {kind:?} {dataset:?}: {e:#}"));
-                    assert!(text.is_some_and(|t| t.len() > 100), "{agent:?} {kind:?}: too short to be a prompt");
+                    assert!(
+                        text.is_some_and(|t| t.len() > 100),
+                        "{agent:?} {kind:?}: too short to be a prompt"
+                    );
                 }
+            }
+        }
+    }
+
+    /// A shell `export` of one of these is invisible to [`crate::cache::Recipe`], so a
+    /// driver that kept its own copy could change agent behaviour without changing the
+    /// cache key — and `.envs()` means the copy never took effect in the first place.
+    #[test]
+    fn no_shell_script_names_an_agent_env_key() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("tools/ has a parent");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["ls-files", "-z", "--", "*.sh"])
+            .output()
+            .expect("git ls-files");
+        assert!(out.status.success(), "git ls-files: {}", out.status);
+        let listing = String::from_utf8(out.stdout).expect("paths are utf-8");
+        let scripts: Vec<&str> = listing.split('\0').filter(|s| !s.is_empty()).collect();
+        assert!(
+            !scripts.is_empty(),
+            "no committed *.sh found, so this rule would pass vacuously"
+        );
+        for rel in scripts {
+            let text = std::fs::read_to_string(root.join(rel)).expect(rel);
+            for (key, value) in AGENT_ENV {
+                assert!(
+                    !text.contains(key),
+                    "{rel} names {key}; AGENT_ENV owns it (={value}) and applies it via \
+                     .envs(), so a copy in the driver is at best dead and at worst a \
+                     divergent value the cache key cannot see"
+                );
             }
         }
     }
@@ -2408,18 +2891,41 @@ mod tests {
         let claude = |k| prompt_file_for(Agent::Claude, k);
 
         // E4: libraries get the executable prompt and vice versa — the swap IS the arm.
-        assert_eq!(prompt_file_for(Agent::ClaudeCrossPrompt, Library), claude(Executable));
-        assert_eq!(prompt_file_for(Agent::ClaudeCrossPrompt, Executable), claude(Library));
-        assert_eq!(prompt_file_for(Agent::ClaudeCrossPrompt, Shared), claude(Shared));
+        assert_eq!(
+            prompt_file_for(Agent::ClaudeCrossPrompt, Library),
+            claude(Executable)
+        );
+        assert_eq!(
+            prompt_file_for(Agent::ClaudeCrossPrompt, Executable),
+            claude(Library)
+        );
+        assert_eq!(
+            prompt_file_for(Agent::ClaudeCrossPrompt, Shared),
+            claude(Shared)
+        );
 
         // E2 and E6 vary the shared-source prompt only; their independent cases must be
         // byte-identical to claude's or the arm measures more than one change.
         for (agent, shared) in [
-            (Agent::ClaudeNoFeatures, "ablations/translate-no-features-shared.md"),
-            (Agent::ClaudeNoSubtask, "ablations/translate-no-subtask-shared.md"),
+            (
+                Agent::ClaudeNoFeatures,
+                "ablations/translate-no-features-shared.md",
+            ),
+            (
+                Agent::ClaudeNoSubtask,
+                "ablations/translate-no-subtask-shared.md",
+            ),
         ] {
-            assert_eq!(prompt_file_for(agent, Library), claude(Library), "{agent:?}");
-            assert_eq!(prompt_file_for(agent, Executable), claude(Executable), "{agent:?}");
+            assert_eq!(
+                prompt_file_for(agent, Library),
+                claude(Library),
+                "{agent:?}"
+            );
+            assert_eq!(
+                prompt_file_for(agent, Executable),
+                claude(Executable),
+                "{agent:?}"
+            );
             assert_eq!(prompt_file_for(agent, Shared), Some(shared));
         }
 
@@ -2432,7 +2938,12 @@ mod tests {
         }
 
         // Kiro, OpenCode and Codex are portability arms: same prompts, different harness.
-        for agent in [Agent::Kiro, Agent::OpenCode, Agent::CodexGpt55, Agent::CodexGpt54] {
+        for agent in [
+            Agent::Kiro,
+            Agent::OpenCode,
+            Agent::CodexGpt55,
+            Agent::CodexGpt54,
+        ] {
             for k in [Library, Executable, Shared] {
                 assert_eq!(prompt_file_for(agent, k), claude(k), "{agent:?} {k:?}");
             }

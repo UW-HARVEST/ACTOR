@@ -36,14 +36,21 @@ mod tests {
     use super::*;
 
     fn outcome(built: bool, tests_ok: u32, tests_failed: u32) -> ProjectOutcome {
-        ProjectOutcome { built, tests_ok, tests_failed }
+        ProjectOutcome {
+            built,
+            tests_ok,
+            tests_failed,
+        }
     }
 
     #[test]
     fn build_but_zero_tests_is_not_a_pass() {
         let o = outcome(true, 0, 0);
         assert!(o.built());
-        assert!(!o.passed(), "0 passing / 0 failing must NOT count as a pass");
+        assert!(
+            !o.passed(),
+            "0 passing / 0 failing must NOT count as a pass"
+        );
     }
 
     #[test]

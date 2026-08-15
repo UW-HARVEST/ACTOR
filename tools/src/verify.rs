@@ -14,7 +14,13 @@ pub(crate) const VERIFY_TIMEOUT_SECS: u64 = 10800;
 
 const KIRO_VERIFY_TIMEOUT_SECS: u64 = 2700;
 
-pub fn run(paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, parallel: usize) -> Result<()> {
+pub fn run(
+    paths: &Paths,
+    battery_name: &str,
+    filter: Option<&str>,
+    force: bool,
+    parallel: usize,
+) -> Result<()> {
     let sem = Arc::new(Semaphore::new(parallel));
     run_with_semaphore(paths, battery_name, filter, force, &sem)
 }
@@ -23,18 +29,22 @@ pub fn run_all(paths: &Paths, batteries: &[String], force: bool, parallel: usize
     let sem = Arc::new(Semaphore::new(parallel));
 
     let errors: Vec<anyhow::Error> = std::thread::scope(|s| {
-        let handles: Vec<_> = batteries.iter().map(|bat| {
-            let sem = sem.clone();
-            s.spawn(move || -> Result<()> {
-                run_with_semaphore(paths, bat, None, force, &sem)
+        let handles: Vec<_> = batteries
+            .iter()
+            .map(|bat| {
+                let sem = sem.clone();
+                s.spawn(move || -> Result<()> { run_with_semaphore(paths, bat, None, force, &sem) })
             })
-        }).collect();
+            .collect();
 
-        handles.into_iter().filter_map(|h| match h.join() {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(e),
-            Err(_) => Some(anyhow::anyhow!("verify thread panicked")),
-        }).collect()
+        handles
+            .into_iter()
+            .filter_map(|h| match h.join() {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e),
+                Err(_) => Some(anyhow::anyhow!("verify thread panicked")),
+            })
+            .collect()
     });
 
     if let Some(first) = errors.into_iter().next() {
@@ -43,7 +53,13 @@ pub fn run_all(paths: &Paths, batteries: &[String], force: bool, parallel: usize
     Ok(())
 }
 
-fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, force: bool, sem: &Arc<Semaphore>) -> Result<()> {
+fn run_with_semaphore(
+    paths: &Paths,
+    battery_name: &str,
+    filter: Option<&str>,
+    force: bool,
+    sem: &Arc<Semaphore>,
+) -> Result<()> {
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
     let store = cache::Store::open(&paths.repo_root, paths.cache_mode)?;
@@ -61,35 +77,55 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
     println!("=== Verifying {battery_name} ({total} cases) ===");
 
     let ind_results: Vec<(String, Option<bool>, bool)> = std::thread::scope(|s| {
-        let handles: Vec<_> = independent.iter().map(|c| {
-            let handle = s.spawn(|| {
-                let _permit = sem.acquire();
-                let case_dir = output_dir.join(&c.name);
-                if !crate::battery::has_crate(&crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED)) {
-                    return (c.name.clone(), None);
-                }
-                if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
-                    return (c.name.clone(), None);
-                }
-                let cmake_flags = get_cmake_flags(paths, battery_name, &c.name);
-                let outcome = verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths, &store);
-                (c.name.clone(), Some(crate::refusal::record(&c.name, outcome)))
-            });
-            (c.name.clone(), handle)
-        }).collect();
+        let handles: Vec<_> = independent
+            .iter()
+            .map(|c| {
+                let handle = s.spawn(|| {
+                    let _permit = sem.acquire();
+                    let case_dir = output_dir.join(&c.name);
+                    if !crate::battery::has_crate(&crate::battery::phase_dir(
+                        &case_dir,
+                        crate::battery::TRANSLATED,
+                    )) {
+                        return (c.name.clone(), None);
+                    }
+                    if !force
+                        && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED)
+                            .join("logs/verify.log")
+                            .exists()
+                    {
+                        return (c.name.clone(), None);
+                    }
+                    let cmake_flags = get_cmake_flags(paths, battery_name, &c.name);
+                    let outcome =
+                        verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths, &store);
+                    (
+                        c.name.clone(),
+                        Some(crate::refusal::record(&c.name, outcome)),
+                    )
+                });
+                (c.name.clone(), handle)
+            })
+            .collect();
         // A panicking worker is that one case's failure, not the sweep's: the name is kept
         // outside the thread so the remaining cases still report. The panic is collected
         // rather than swallowed — see the bail below.
-        handles.into_iter().map(|(name, h)| match h.join() {
-            Ok((n, r)) => (n, r, false),
-            Err(_) => {
-                eprintln!("  ⚠️  {name}: verify thread panicked — counting as failed");
-                (name, Some(false), true)
-            }
-        }).collect()
+        handles
+            .into_iter()
+            .map(|(name, h)| match h.join() {
+                Ok((n, r)) => (n, r, false),
+                Err(_) => {
+                    eprintln!("  ⚠️  {name}: verify thread panicked — counting as failed");
+                    (name, Some(false), true)
+                }
+            })
+            .collect()
     });
-    let panicked: Vec<&str> =
-        ind_results.iter().filter(|(_, _, p)| *p).map(|(n, _, _)| n.as_str()).collect();
+    let panicked: Vec<&str> = ind_results
+        .iter()
+        .filter(|(_, _, p)| *p)
+        .map(|(n, _, _)| n.as_str())
+        .collect();
 
     let mut verified = 0usize;
     let mut failed = 0usize;
@@ -98,8 +134,14 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
         current += 1;
         match result {
             None => println!("[{current}/{total}] ⏭️  {name} (skipped)"),
-            Some(true) => { verified += 1; println!("[{current}/{total}] ✅ {name}"); }
-            Some(false) => { failed += 1; println!("[{current}/{total}] ❌ {name}"); }
+            Some(true) => {
+                verified += 1;
+                println!("[{current}/{total}] ✅ {name}");
+            }
+            Some(false) => {
+                failed += 1;
+                println!("[{current}/{total}] ❌ {name}");
+            }
         }
     }
 
@@ -107,28 +149,65 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
         current += 1;
         let real_dir = output_dir.join(&group.real_case);
 
-        if !crate::battery::has_crate(&crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED)) {
+        if !crate::battery::has_crate(&crate::battery::phase_dir(
+            &real_dir,
+            crate::battery::TRANSLATED,
+        )) {
             continue;
         }
 
-        if !force && crate::battery::phase_dir(&real_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
-            println!("[{current}/{total}] ⏭️  {} (already verified)", group.real_case);
+        if !force
+            && crate::battery::phase_dir(&real_dir, crate::battery::VERIFIED)
+                .join("logs/verify.log")
+                .exists()
+        {
+            println!(
+                "[{current}/{total}] ⏭️  {} (already verified)",
+                group.real_case
+            );
         } else {
-            println!("[{current}/{total}] 🔬 {} (shared-source, {} configs)", group.real_case, group.configs.len());
+            println!(
+                "[{current}/{total}] 🔬 {} (shared-source, {} configs)",
+                group.real_case,
+                group.configs.len()
+            );
             let cmake_flags = get_cmake_flags(paths, battery_name, &group.real_case);
             let configs_text = build_configs_text(paths, battery_name, group);
-            let ok = verify_case(&real_dir, &prompt_template, &cmake_flags, &configs_text, paths, &store)?;
+            let ok = verify_case(
+                &real_dir,
+                &prompt_template,
+                &cmake_flags,
+                &configs_text,
+                paths,
+                &store,
+            )?;
 
-            if ok { verified += 1; println!("[{current}/{total}] ✅ {} — verified", group.real_case); }
-            else { failed += 1; println!("[{current}/{total}] ❌ {} — verification incomplete", group.real_case); }
+            if ok {
+                verified += 1;
+                println!("[{current}/{total}] ✅ {} — verified", group.real_case);
+            } else {
+                failed += 1;
+                println!(
+                    "[{current}/{total}] ❌ {} — verification incomplete",
+                    group.real_case
+                );
+            }
         }
 
         // Unconditional: without it runtests scores only the real case as verified,
         // never the config followers.
-        println!("Re-propagating verified fixes from {} to {} configs...", group.real_case, group.configs.len());
+        println!(
+            "Re-propagating verified fixes from {} to {} configs...",
+            group.real_case,
+            group.configs.len()
+        );
         for cfg in &group.configs {
             crate::translate::propagate_config_phase(
-                paths, battery_name, &group.real_case, cfg, crate::battery::VERIFIED,
+                paths,
+                battery_name,
+                &group.real_case,
+                cfg,
+                crate::battery::VERIFIED,
             )?;
         }
         println!("Propagated to {} cases", group.configs.len());
@@ -154,7 +233,12 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
 /// Deliberately shares `verify.md` and `verify_case` with Test-Corpus so both
 /// benchmarks are graded with the same rigor. HB has no per-project cmake flags or
 /// configs, hence the empty strings passed through.
-pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject], parallel: usize, force: bool) -> Result<()> {
+pub fn run_harvest_bench(
+    paths: &Paths,
+    projects: &[battery::HarvestBenchProject],
+    parallel: usize,
+    force: bool,
+) -> Result<()> {
     let sem = Arc::new(Semaphore::new(parallel));
     let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))
         .context("reading verify.md")?;
@@ -164,51 +248,75 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
     println!("=== Verifying harvest-bench ({total} projects) ===");
 
     let results: Vec<(String, Option<bool>, bool)> = std::thread::scope(|s| {
-        let handles: Vec<_> = projects.iter().map(|p| {
-            let sem = sem.clone();
-            let prompt = &prompt_template;
-            let store = &store;
-            let name = p.name().to_string();
-            let handle = s.spawn({
-                let name = name.clone();
-                move || {
-                    let _permit = sem.acquire();
-                    let case_dir = paths.output_dir(&name);
-                    if !crate::battery::has_crate(&crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED)) {
-                        return (name, None);
+        let handles: Vec<_> = projects
+            .iter()
+            .map(|p| {
+                let sem = sem.clone();
+                let prompt = &prompt_template;
+                let store = &store;
+                let name = p.name().to_string();
+                let handle = s.spawn({
+                    let name = name.clone();
+                    move || {
+                        let _permit = sem.acquire();
+                        let case_dir = paths.output_dir(&name);
+                        if !crate::battery::has_crate(&crate::battery::phase_dir(
+                            &case_dir,
+                            crate::battery::TRANSLATED,
+                        )) {
+                            return (name, None);
+                        }
+                        if !force
+                            && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED)
+                                .join("logs/verify.log")
+                                .exists()
+                        {
+                            return (name, None);
+                        }
+                        let ok = crate::refusal::record(
+                            &name,
+                            verify_case(&case_dir, prompt, "", "", paths, store),
+                        );
+                        (name, Some(ok))
                     }
-                    if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
-                        return (name, None);
-                    }
-                    let ok = crate::refusal::record(
-                        &name,
-                        verify_case(&case_dir, prompt, "", "", paths, store),
-                    );
-                    (name, Some(ok))
-                }
-            });
-            (name, handle)
-        }).collect();
+                });
+                (name, handle)
+            })
+            .collect();
         // A panicking worker is that one project's failure, not the sweep's: the name is
         // kept outside the thread so the remaining projects still report.
-        handles.into_iter().map(|(name, h)| match h.join() {
-            Ok((n, r)) => (n, r, false),
-            Err(_) => {
-                eprintln!("  ⚠️  {name}: verify thread panicked — counting as failed");
-                (name, Some(false), true)
-            }
-        }).collect()
+        handles
+            .into_iter()
+            .map(|(name, h)| match h.join() {
+                Ok((n, r)) => (n, r, false),
+                Err(_) => {
+                    eprintln!("  ⚠️  {name}: verify thread panicked — counting as failed");
+                    (name, Some(false), true)
+                }
+            })
+            .collect()
     });
-    let panicked: Vec<&str> =
-        results.iter().filter(|(_, _, p)| *p).map(|(n, _, _)| n.as_str()).collect();
+    let panicked: Vec<&str> = results
+        .iter()
+        .filter(|(_, _, p)| *p)
+        .map(|(n, _, _)| n.as_str())
+        .collect();
 
     let (mut verified, mut failed) = (0usize, 0usize);
     for (i, (name, result, _)) in results.iter().enumerate() {
         let n = i + 1;
         match result {
-            None => println!("[{n}/{total}] ⏭️  {name} (skipped: no translated/ or already verified)"),
-            Some(true) => { verified += 1; println!("[{n}/{total}] ✅ {name}"); }
-            Some(false) => { failed += 1; println!("[{n}/{total}] ❌ {name}"); }
+            None => {
+                println!("[{n}/{total}] ⏭️  {name} (skipped: no translated/ or already verified)")
+            }
+            Some(true) => {
+                verified += 1;
+                println!("[{n}/{total}] ✅ {name}");
+            }
+            Some(false) => {
+                failed += 1;
+                println!("[{n}/{total}] ❌ {name}");
+            }
         }
     }
     println!("\nHB verify: {verified}/{total} verified, {failed} failed");
@@ -287,10 +395,20 @@ fn verify_invocation(paths: &Paths) -> Result<Option<Invocation>> {
         // prompt-sensitivity ablations (E2/E3/E4/E6) are translate-only by design;
         // Codex is excluded because it over-fixates on irrelevant linker symbols
         // during C-as-oracle verification.
-        Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust
-        | Agent::Kimi | Agent::Oneshot | Agent::ClaudeCombined | Agent::ClaudeMinimal
-        | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask
-        | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 => return Ok(None),
+        Agent::C2rust
+        | Agent::Laertes
+        | Agent::C2SaferRust
+        | Agent::SmartC2Rust
+        | Agent::Kimi
+        | Agent::Oneshot
+        | Agent::ClaudeCombined
+        | Agent::ClaudeMinimal
+        | Agent::ClaudeNoIter
+        | Agent::ClaudeNoFeatures
+        | Agent::ClaudeNoSubtask
+        | Agent::ClaudeCrossPrompt
+        | Agent::CodexGpt55
+        | Agent::CodexGpt54 => return Ok(None),
     };
     Ok(Some(inv))
 }
@@ -309,11 +427,10 @@ impl Backend {
                     repo_root: &paths.repo_root,
                     work_root,
                     enforcement: paths.enforcement,
-                })?.to_string(),
+                })?
+                .to_string(),
             )),
-            Backend::OpenCode(_) => {
-                Some(tokenise(crate::opencode::permission_shape(work_root)))
-            }
+            Backend::OpenCode(_) => Some(tokenise(crate::opencode::permission_shape(work_root))),
         })
     }
 }
@@ -400,7 +517,10 @@ fn verify_case(
     };
 
     if obtained.replayed {
-        println!("  ♻️  replayed a stored verification ({:?})", obtained.sealed.digest());
+        println!(
+            "  ♻️  replayed a stored verification ({:?})",
+            obtained.sealed.digest()
+        );
         // A replay must leave behind the same verify.log a fresh run tees, or the skip
         // check misses this case and the next sweep pays for it again.
         store.restore_log(&inputs, &obtained.key, &log_path)?;
@@ -448,12 +568,11 @@ fn run_verify_agent(
         Backend::Claude => {
             // Denies the repo root (the graded oracle, plus results/) and the shared
             // scratch base holding sibling work dirs, then re-grants this run's own root.
-            let settings_path =
-                crate::sandbox::write_settings(crate::sandbox::Policy {
-                    repo_root: &paths.repo_root,
-                    work_root: work.root(),
-                    enforcement: paths.enforcement,
-                })?;
+            let settings_path = crate::sandbox::write_settings(crate::sandbox::Policy {
+                repo_root: &paths.repo_root,
+                work_root: work.root(),
+                enforcement: paths.enforcement,
+            })?;
             let status = inv
                 .session
                 .claude_command(&ClaudeRun {
@@ -473,11 +592,17 @@ fn run_verify_agent(
             // The compaction plugin restores SYMBOLS/ERRORS/CONFIGS.md, which
             // verify.md's Phases B/C are gated on.
             crate::opencode::materialize_config(
-                work.root(), crate::opencode::Phase::Verify, oc_model,
+                work.root(),
+                crate::opencode::Phase::Verify,
+                oc_model,
             )?;
             crate::opencode::invoke(
-                &inv.session, prompt, log_path,
-                &work.translated_rust(), work.root(), oc_model,
+                &inv.session,
+                prompt,
+                log_path,
+                &work.translated_rust(),
+                work.root(),
+                oc_model,
             )?;
         }
     }
@@ -524,7 +649,10 @@ fn build_configs_text(paths: &Paths, battery: &str, group: &battery::SharedSourc
     let mut lines = Vec::new();
 
     let real_flags = get_cmake_flags(paths, battery, &group.real_case);
-    let real_presets = paths.input_dir(battery).join(&group.real_case).join("CMakePresets.json");
+    let real_presets = paths
+        .input_dir(battery)
+        .join(&group.real_case)
+        .join("CMakePresets.json");
     let real_features = battery::extract_features_from_path(&real_presets).unwrap_or_default();
     let real_key: Vec<String> = real_features.to_vec();
     if seen.insert(real_key) && !real_flags.is_empty() {
@@ -559,7 +687,10 @@ fn build_configs_text(paths: &Paths, battery: &str, group: &battery::SharedSourc
 }
 
 fn get_cmake_flags(paths: &Paths, battery: &str, case_name: &str) -> String {
-    let presets = paths.input_dir(battery).join(case_name).join("CMakePresets.json");
+    let presets = paths
+        .input_dir(battery)
+        .join(case_name)
+        .join("CMakePresets.json");
     if !presets.exists() {
         return String::new();
     }
@@ -569,7 +700,10 @@ fn get_cmake_flags(paths: &Paths, battery: &str, case_name: &str) -> String {
     let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) else {
         return String::new();
     };
-    let Some(cv) = data.pointer("/configurePresets/1/cacheVariables").and_then(|v| v.as_object()) else {
+    let Some(cv) = data
+        .pointer("/configurePresets/1/cacheVariables")
+        .and_then(|v| v.as_object())
+    else {
         return String::new();
     };
     cv.iter()
@@ -621,9 +755,14 @@ mod tests {
         let work = repo.path().join("work");
 
         let claude = Backend::Claude.policy_shape(&paths, &work).unwrap();
-        assert!(claude.as_deref().is_some_and(|p| p.contains("denyRead")), "{claude:?}");
         assert!(
-            claude.as_deref().is_some_and(|p| !p.contains(&*repo.path().to_string_lossy())),
+            claude.as_deref().is_some_and(|p| p.contains("denyRead")),
+            "{claude:?}"
+        );
+        assert!(
+            claude
+                .as_deref()
+                .is_some_and(|p| !p.contains(&*repo.path().to_string_lossy())),
             "the literal paths must be tokenised or no key is portable: {claude:?}"
         );
 
@@ -632,7 +771,11 @@ mod tests {
         let oc = Backend::OpenCode(crate::opencode::parse_model("p/m").unwrap())
             .policy_shape(&paths, &work)
             .unwrap();
-        assert!(oc.as_deref().is_some_and(|p| p.contains("external_directory")), "{oc:?}");
+        assert!(
+            oc.as_deref()
+                .is_some_and(|p| p.contains("external_directory")),
+            "{oc:?}"
+        );
         assert_ne!(oc, claude);
     }
 }

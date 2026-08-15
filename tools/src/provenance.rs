@@ -170,7 +170,9 @@ fn repo_root() -> PathBuf {
 }
 
 fn head_sha() -> Option<String> {
-    git(&repo_root(), &["rev-parse", "HEAD"]).ok().filter(|s| !s.is_empty())
+    git(&repo_root(), &["rev-parse", "HEAD"])
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// The paths an edit to which can change what this binary does: its own sources, the
@@ -180,8 +182,12 @@ fn head_sha() -> Option<String> {
 /// own OUTPUT, which a half-finished sweep has necessarily written — counting those
 /// refused the documented resume path and left `--allow-dirty`, which stamps every
 /// artifact unpublishable, as the only way through.
-const BEHAVIOUR_PATHS: &[&str] =
-    &["tools/", "prompts/", "rust-toolchain.toml", ".cargo/config.toml"];
+const BEHAVIOUR_PATHS: &[&str] = &[
+    "tools/",
+    "prompts/",
+    "rust-toolchain.toml",
+    ".cargo/config.toml",
+];
 
 /// `None` when git could not answer, which `assess` already treats as "outside a
 /// repository" — the same case as an absent HEAD.
@@ -197,10 +203,18 @@ fn dirty_file_count() -> Option<usize> {
 /// an untracked file cannot change the behaviour of the compiled binary. Submodules
 /// likewise: none of the four is a build input of this crate.
 fn count_dirty_in(dir: &Path) -> Result<usize> {
-    let mut args =
-        vec!["status", "--porcelain", "--untracked-files=no", "--ignore-submodules=all", "--"];
+    let mut args = vec![
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
+        "--ignore-submodules=all",
+        "--",
+    ];
     args.extend_from_slice(BEHAVIOUR_PATHS);
-    Ok(git(dir, &args)?.lines().filter(|l| !l.trim().is_empty()).count())
+    Ok(git(dir, &args)?
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count())
 }
 
 #[cfg(test)]
@@ -209,7 +223,11 @@ mod tests {
 
     #[test]
     fn a_stale_binary_is_refused() {
-        let p = assess("1d2afa1aaaaa", Some("2cdc503bbbbbccccddddeeeeffff000011112222"), 0);
+        let p = assess(
+            "1d2afa1aaaaa",
+            Some("2cdc503bbbbbccccddddeeeeffff000011112222"),
+            0,
+        );
         assert_eq!(
             p,
             Some(Unreproducible::StaleBinary {
@@ -223,25 +241,44 @@ mod tests {
     #[test]
     fn a_matching_prefix_is_accepted() {
         // build.rs stamps --short=12; rev-parse HEAD is 40 chars.
-        assert_eq!(assess("2cdc503bbbbb", Some("2cdc503bbbbbccccddddeeeeffff000011112222"), 0), None);
+        assert_eq!(
+            assess(
+                "2cdc503bbbbb",
+                Some("2cdc503bbbbbccccddddeeeeffff000011112222"),
+                0
+            ),
+            None
+        );
     }
 
     #[test]
     fn a_dirty_tree_is_refused_and_says_how_many() {
-        assert_eq!(assess("abc123abc123", Some("abc123abc123ff"), 4), Some(Unreproducible::DirtyTree { files: 4 }));
+        assert_eq!(
+            assess("abc123abc123", Some("abc123abc123ff"), 4),
+            Some(Unreproducible::DirtyTree { files: 4 })
+        );
     }
 
     #[test]
     fn dirtiness_outranks_staleness() {
         // A rebuild cannot help while the tree is dirty: no commit to rebuild to.
         let p = assess("aaaaaaaaaaaa", Some("bbbbbbbbbbbb"), 2);
-        assert!(matches!(p, Some(Unreproducible::DirtyTree { .. })), "got {p:?}");
+        assert!(
+            matches!(p, Some(Unreproducible::DirtyTree { .. })),
+            "got {p:?}"
+        );
     }
 
     #[test]
     fn an_unstamped_binary_is_refused_rather_than_assumed_fine() {
-        assert_eq!(assess("unknown", Some("abc123abc123"), 0), Some(Unreproducible::UnknownProvenance));
-        assert_eq!(assess("unknown", None, 0), Some(Unreproducible::UnknownProvenance));
+        assert_eq!(
+            assess("unknown", Some("abc123abc123"), 0),
+            Some(Unreproducible::UnknownProvenance)
+        );
+        assert_eq!(
+            assess("unknown", None, 0),
+            Some(Unreproducible::UnknownProvenance)
+        );
     }
 
     #[test]
@@ -253,9 +290,14 @@ mod tests {
     #[test]
     fn every_scoped_path_is_still_in_the_checkout() {
         // A rename or a move would leave the gate silently covering nothing.
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("tools/ has a parent");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("tools/ has a parent");
         for p in BEHAVIOUR_PATHS {
-            assert!(root.join(p).exists(), "{p} is gone; the dirty-tree gate now covers nothing");
+            assert!(
+                root.join(p).exists(),
+                "{p} is gone; the dirty-tree gate now covers nothing"
+            );
         }
     }
 
@@ -270,13 +312,21 @@ mod tests {
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         run(&["init", "--quiet"]);
         run(&["config", "user.email", "t@example.invalid"]);
         run(&["config", "user.name", "t"]);
-        let files =
-            ["tools/src/verify.rs", "prompts/claude/verify.md", "rust-toolchain.toml", "tables/results.md"];
+        let files = [
+            "tools/src/verify.rs",
+            "prompts/claude/verify.md",
+            "rust-toolchain.toml",
+            "tables/results.md",
+        ];
         for f in files {
             let p = root.join(f);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -285,12 +335,23 @@ mod tests {
         // --force: a developer's global excludes file may ignore `rust-toolchain.toml`,
         // which would leave it untracked here and the assertion below vacuous.
         run(&["add", "--force", "-A"]);
-        run(&["-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "base"]);
+        run(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "base",
+        ]);
         assert_eq!(count_dirty_in(root).unwrap(), 0, "a clean tree");
 
         // Five of the nine lines that refused the resume path were regenerated tables.
         std::fs::write(root.join("tables/results.md"), "after\n").unwrap();
-        assert_eq!(count_dirty_in(root).unwrap(), 0, "harness output must not refuse a resume");
+        assert_eq!(
+            count_dirty_in(root).unwrap(),
+            0,
+            "harness output must not refuse a resume"
+        );
 
         for f in &files[..3] {
             std::fs::write(root.join(f), "after\n").unwrap();
@@ -307,7 +368,11 @@ mod tests {
         // Guards build.rs itself: if the stamp silently became empty, every check
         // above would still pass while proving nothing.
         assert!(!built_from().is_empty());
-        assert_ne!(built_from(), "unknown", "built inside the repo, so a SHA must be stamped");
+        assert_ne!(
+            built_from(),
+            "unknown",
+            "built inside the repo, so a SHA must be stamped"
+        );
         assert_ne!(built_from(), VERGEN_PLACEHOLDER);
         let v = version_string();
         assert!(v.contains(built_from()) && v.contains("rustc"), "{v}");

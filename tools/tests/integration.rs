@@ -43,17 +43,38 @@ mod battery_discovery {
         }
 
         // macrodepth_add_5 is real, mul_4 and sub_6 are symlinked
-        assert!(shared.contains(&"macrodepth_add_5".to_string()), "real case missing");
-        assert!(shared.contains(&"macrodepth_mul_4".to_string()), "symlinked config missing");
-        assert!(shared.contains(&"macrodepth_sub_6".to_string()), "symlinked config missing");
+        assert!(
+            shared.contains(&"macrodepth_add_5".to_string()),
+            "real case missing"
+        );
+        assert!(
+            shared.contains(&"macrodepth_mul_4".to_string()),
+            "symlinked config missing"
+        );
+        assert!(
+            shared.contains(&"macrodepth_sub_6".to_string()),
+            "symlinked config missing"
+        );
 
         // All other cases must be independent — NOT in shared
-        assert!(independent.contains(&"strcmp".to_string()), "strcmp should be independent");
-        assert!(independent.contains(&"arity_lib".to_string()), "arity_lib should be independent");
-        assert!(!independent.contains(&"macrodepth_add_5".to_string()), "real case should not be independent");
+        assert!(
+            independent.contains(&"strcmp".to_string()),
+            "strcmp should be independent"
+        );
+        assert!(
+            independent.contains(&"arity_lib".to_string()),
+            "arity_lib should be independent"
+        );
+        assert!(
+            !independent.contains(&"macrodepth_add_5".to_string()),
+            "real case should not be independent"
+        );
 
         // Total should match
-        assert_eq!(independent.len() + shared.len(), battery::all_case_names(&battery).len());
+        assert_eq!(
+            independent.len() + shared.len(),
+            battery::all_case_names(&battery).len()
+        );
     }
 
     /// P01_sphincs_plus: ALL cases share source (1 real + 127 symlinked).
@@ -61,7 +82,11 @@ mod battery_discovery {
     fn p01_all_shared_source() {
         let battery = battery::discover(&corpus_dir(), "P01_sphincs_plus", None).unwrap();
 
-        assert_eq!(battery.cases.len(), 1, "should be exactly 1 SharedSource group");
+        assert_eq!(
+            battery.cases.len(),
+            1,
+            "should be exactly 1 SharedSource group"
+        );
         if let Case::SharedSource(g) = &battery.cases[0] {
             assert_eq!(g.configs.len(), 127, "should have 127 symlinked configs");
             // Total: 1 real + 127 configs = 128
@@ -77,7 +102,10 @@ mod battery_discovery {
         let battery = battery::discover(&corpus_dir(), "B01_organic", None).unwrap();
 
         for case in &battery.cases {
-            assert!(matches!(case, Case::Independent(_)), "B01_organic should have no shared source");
+            assert!(
+                matches!(case, Case::Independent(_)),
+                "B01_organic should have no shared source"
+            );
         }
         assert_eq!(battery::all_case_names(&battery).len(), 38);
     }
@@ -88,7 +116,9 @@ mod battery_discovery {
         let battery = battery::discover(&corpus_dir(), "B02_synthetic", Some("_lib$")).unwrap();
         for case in &battery.cases {
             match case {
-                Case::Independent(c) => assert!(c.name.ends_with("_lib"), "{} doesn't match filter", c.name),
+                Case::Independent(c) => {
+                    assert!(c.name.ends_with("_lib"), "{} doesn't match filter", c.name)
+                }
                 Case::SharedSource(_) => {} // shared source configs may or may not match
             }
         }
@@ -97,7 +127,7 @@ mod battery_discovery {
 
 mod cargo_toml_manipulation {
     use super::*;
-    use harvest_tools::cargo_toml::{CargoToml, strip_for_lib};
+    use harvest_tools::cargo_toml::{strip_for_lib, CargoToml};
 
     /// Test post-processing on a real P01 translation's Cargo.toml.
     #[test]
@@ -143,10 +173,14 @@ mod cargo_toml_manipulation {
         for entry in std::fs::read_dir(&results).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with("_lib") { continue; }
+            if !name.ends_with("_lib") {
+                continue;
+            }
             // The translated/ phase dir is the immutable pre-verify crate.
             let original = entry.path().join("translated");
-            if !original.exists() { continue; }
+            if !original.exists() {
+                continue;
+            }
 
             // Copy to temp and strip
             let tmp = tempfile::tempdir().unwrap();
@@ -160,9 +194,18 @@ mod cargo_toml_manipulation {
 
             strip_for_lib(&dst).unwrap();
 
-            assert!(!dst.join("src/main.rs").exists(), "main.rs should be stripped for {name}");
-            assert!(!dst.join("tests").exists(), "tests/ should be stripped for {name}");
-            assert!(dst.join("src").exists(), "src/ should still exist for {name}");
+            assert!(
+                !dst.join("src/main.rs").exists(),
+                "main.rs should be stripped for {name}"
+            );
+            assert!(
+                !dst.join("tests").exists(),
+                "tests/ should be stripped for {name}"
+            );
+            assert!(
+                dst.join("src").exists(),
+                "src/ should still exist for {name}"
+            );
             return; // one case is enough
         }
         eprintln!("Skipping: no lib case with _original found");
@@ -188,10 +231,7 @@ mod test_artifacts {
                 "{name} missing test_vectors/"
             );
             if name.ends_with("_lib") {
-                assert!(
-                    path.join("runner").is_dir(),
-                    "{name} (lib) missing runner/"
-                );
+                assert!(path.join("runner").is_dir(), "{name} (lib) missing runner/");
             }
         }
     }
@@ -206,17 +246,24 @@ mod test_artifacts {
         for entry in std::fs::read_dir(&corpus).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with("_lib") { continue; }
+            if !name.ends_with("_lib") {
+                continue;
+            }
 
             let runner_main = entry.path().join("runner/src/main.rs");
-            if !runner_main.exists() { continue; }
+            if !runner_main.exists() {
+                continue;
+            }
 
             let lib_name = harvest_tools::battery::extract_lib_name(&corpus, &name);
             if lib_name.is_some() {
                 found += 1;
             }
         }
-        assert!(found > 0, "should have found at least one lib case with library: pattern");
+        assert!(
+            found > 0,
+            "should have found at least one lib case with library: pattern"
+        );
     }
 
     /// Verify CMakePresets.json feature extraction on real P01 cases.
@@ -232,9 +279,8 @@ mod test_artifacts {
             return;
         }
 
-        let data: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&presets).unwrap()
-        ).unwrap();
+        let data: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&presets).unwrap()).unwrap();
 
         let cv = data.pointer("/configurePresets/1/cacheVariables").unwrap();
         assert!(cv.get("HASH_BACKEND").is_some(), "should have HASH_BACKEND");

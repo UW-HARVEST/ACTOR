@@ -5,17 +5,15 @@
 # already translated+verified, so this is resume-friendly.
 set -uo pipefail
 
-cd /local/home/scheschb/research/ACTOR
+# Derived, never hardcoded: this script must stay at the repo root.
+cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" || exit 1
 
 # Toolchain: cmake 3.28 (HB needs >=3.24), python 3.12 (runtests match syntax),
 # cargo, claude. Order matters — these must precede system paths.
-export PATH="/tmp/cmake-3.28.6-linux-x86_64/bin:/home/scheschb/.local/share/mise/installs/python/3.12.13/bin:$HOME/.cargo/bin:$HOME/.nix-profile/bin:$HOME/.local/bin:$PATH"
+export PATH="/tmp/cmake-3.28.6-linux-x86_64/bin:$HOME/.local/share/mise/installs/python/3.12.13/bin:$HOME/.cargo/bin:$HOME/.nix-profile/bin:$HOME/.local/bin:$PATH"
 
-# Harden against API instability on long agentic sessions (inherited by claude).
-export API_TIMEOUT_MS="1200000"             # 20 min per-request
-export API_FORCE_IDLE_TIMEOUT="0"           # disable 5-min streaming idle abort
-export CLAUDE_CODE_MAX_RETRIES="20"
-export CLAUDE_CODE_RETRY_WATCHDOG="1"
+# The agent-runtime settings are deliberately NOT exported here: translate::AGENT_ENV
+# applies them, and the cache key can only hash them from there. See its doc comment.
 
 BIN=./tools/target/release/harvest-tools
 LOGDIR=/tmp/hb_run

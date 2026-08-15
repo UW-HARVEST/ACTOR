@@ -5,15 +5,15 @@
 
 pub mod agent_health;
 pub mod artifact;
-pub mod cache;
-pub mod provenance;
-pub mod refusal;
-pub mod report;
 pub mod battery;
 pub mod benchmark;
+pub mod cache;
 pub mod cargo_toml;
 pub mod cli;
 pub mod opencode;
+pub mod provenance;
+pub mod refusal;
+pub mod report;
 pub mod sandbox;
 pub mod scoring;
 pub mod session;

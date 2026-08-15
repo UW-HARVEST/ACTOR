@@ -15,7 +15,10 @@ fn src(name: &str) -> PathBuf {
 }
 
 fn file_name(path: &Path) -> String {
-    path.file_name().unwrap_or_default().to_string_lossy().into_owned()
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn parse(path: &Path) -> syn::File {
@@ -57,7 +60,6 @@ mod quote_min {
                 syn::Type::Reference(r) => format!("&{}", r.elem.to_text()),
                 syn::Type::Slice(s) => format!("[{}]", s.elem.to_text()),
                 _ => String::new(), // only Type::Path is load-bearing below
-
             }
         }
     }
@@ -69,7 +71,10 @@ fn is_pathish(ty: &syn::Type) -> bool {
     struct V<'a>(&'a mut bool);
     impl<'ast> Visit<'ast> for V<'_> {
         fn visit_path_segment(&mut self, s: &'ast syn::PathSegment) {
-            if matches!(s.ident.to_string().as_str(), "Path" | "PathBuf" | "OsStr" | "OsString") {
+            if matches!(
+                s.ident.to_string().as_str(),
+                "Path" | "PathBuf" | "OsStr" | "OsString"
+            ) {
                 *self.0 = true;
             }
             syn::visit::visit_path_segment(self, s);
@@ -80,7 +85,10 @@ fn is_pathish(ty: &syn::Type) -> bool {
 }
 
 fn is_public(vis: &syn::Visibility) -> bool {
-    matches!(vis, syn::Visibility::Public(_) | syn::Visibility::Restricted(_))
+    matches!(
+        vis,
+        syn::Visibility::Public(_) | syn::Visibility::Restricted(_)
+    )
 }
 
 // ── A1 ─────────────────────────────────────────────────────────────────────
@@ -102,7 +110,11 @@ fn sealed_implements_only_debug() {
             }
             let name = match &imp.trait_ {
                 None => continue, // the inherent impl is where the API lives
-                Some((_, p, _)) => p.segments.last().map(|s| s.ident.to_string()).unwrap_or_default(),
+                Some((_, p, _)) => p
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default(),
             };
             if !ALLOWED.contains(&name.as_str()) {
                 let file = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -152,20 +164,26 @@ fn no_public_path_escapes_the_artifact_modules() {
                         if !is_public(&f.vis) {
                             continue;
                         }
-                        let syn::ReturnType::Type(_, ret) = &f.sig.output else { continue };
+                        let syn::ReturnType::Type(_, ret) = &f.sig.output else {
+                            continue;
+                        };
                         let name = f.sig.ident.to_string();
-                        if is_pathish(ret)
-                            && !ALLOWED.contains(&(self_ty.as_str(), name.as_str()))
+                        if is_pathish(ret) && !ALLOWED.contains(&(self_ty.as_str(), name.as_str()))
                         {
-                            leaks.push(format!("{module}: {self_ty}::{name} -> {}", type_name(ret)));
+                            leaks
+                                .push(format!("{module}: {self_ty}::{name} -> {}", type_name(ret)));
                         }
                     }
                 }
                 syn::Item::Struct(s) if is_public(&s.vis) => {
                     for f in s.fields {
                         if is_public(&f.vis) && is_pathish(&f.ty) {
-                            let fname = f.ident.map(|i| i.to_string()).unwrap_or_else(|| "0".into());
-                            leaks.push(format!("{module}: {}.{fname} is a public path field", s.ident));
+                            let fname =
+                                f.ident.map(|i| i.to_string()).unwrap_or_else(|| "0".into());
+                            leaks.push(format!(
+                                "{module}: {}.{fname} is a public path field",
+                                s.ident
+                            ));
                         }
                     }
                 }
@@ -193,8 +211,13 @@ fn no_public_path_escapes_the_artifact_modules() {
 #[test]
 fn digests_cannot_be_fabricated() {
     const GUARDED: &[&str] = &[
-        "TreeDigest", "PromptDigest", "RecipeDigest", "CacheKey", "ToolchainId",
-        "AgentKey", "CliVersion",
+        "TreeDigest",
+        "PromptDigest",
+        "RecipeDigest",
+        "CacheKey",
+        "ToolchainId",
+        "AgentKey",
+        "CliVersion",
     ];
     let mut bad: Vec<String> = Vec::new();
 
@@ -209,7 +232,9 @@ fn digests_cannot_be_fabricated() {
                     }
                 }
                 syn::Item::Impl(imp) => {
-                    let Some((_, tr, _)) = &imp.trait_ else { continue };
+                    let Some((_, tr, _)) = &imp.trait_ else {
+                        continue;
+                    };
                     let is_from = tr.segments.last().is_some_and(|s| s.ident == "From");
                     let target = type_name(&imp.self_ty);
                     if is_from && GUARDED.contains(&target.as_str()) {
@@ -238,15 +263,15 @@ fn digests_cannot_be_fabricated() {
 #[test]
 fn compile_fail_cases_still_assert_what_they_were_written_for() {
     let expected: BTreeMap<&str, &str> = [
-        ("sealed_has_no_path", "E0599"),                // no method named `path`
-        ("sealed_is_not_a_command_cwd", "E0277"),        // AsRef<Path> not satisfied
-        ("phases_are_not_interchangeable", "E0308"),     // mismatched types
-        ("completed_cannot_be_forged", "E0603"),         // private constructor
+        ("sealed_has_no_path", "E0599"),             // no method named `path`
+        ("sealed_is_not_a_command_cwd", "E0277"),    // AsRef<Path> not satisfied
+        ("phases_are_not_interchangeable", "E0308"), // mismatched types
+        ("completed_cannot_be_forged", "E0603"),     // private constructor
         ("worktree_cannot_be_used_after_scrub", "E0382"), // scrub() consumed it
-        ("scrubbed_cannot_be_used_after_seal", "E0382"),  // seal() consumed it
+        ("scrubbed_cannot_be_used_after_seal", "E0382"), // seal() consumed it
         ("materialise_at_refuses_a_results_tree_path", "E0308"), // needs a Cwd, not a Path
         ("phase_cannot_be_implemented_downstream", "E0277"), // sealed supertrait
-        ("sealed_does_not_display", "E0277"),            // no Display impl
+        ("sealed_does_not_display", "E0277"),        // no Display impl
         ("materialise_at_refuses_a_results_tree_path", "E0308"), // not a ScratchPath
     ]
     .into_iter()
@@ -280,7 +305,11 @@ fn compile_fail_cases_still_assert_what_they_were_written_for() {
              re-record, which would leave the case passing while asserting nothing."
         );
     }
-    assert_eq!(cases.len(), expected.len(), "a pinned case disappeared: {cases:?}");
+    assert_eq!(
+        cases.len(),
+        expected.len(),
+        "a pinned case disappeared: {cases:?}"
+    );
 }
 
 // ── A5 ─────────────────────────────────────────────────────────────────────
@@ -335,7 +364,10 @@ fn nothing_new_runs_inside_the_results_tree() {
         }
     }
 
-    let mut v = V { current_fn: "<top>".into(), hits: Vec::new() };
+    let mut v = V {
+        current_fn: "<top>".into(),
+        hits: Vec::new(),
+    };
     for path in rust_sources() {
         v.visit_file(&parse(&path));
     }
@@ -391,13 +423,26 @@ fn an_agents_identity_is_never_its_debug_output() {
     struct V(Vec<String>);
     impl<'ast> Visit<'ast> for V {
         fn visit_macro(&mut self, m: &'ast syn::Macro) {
-            let name = m.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+            let name = m
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
             // Diagnostic macros are exempt: their Debug output is a message a human reads
             // when a test or invariant fails, never a persisted identity.
             let diagnostic = name.starts_with("assert")
-                || matches!(name.as_str(), "panic" | "unreachable" | "todo" | "ensure" | "bail");
+                || matches!(
+                    name.as_str(),
+                    "panic" | "unreachable" | "todo" | "ensure" | "bail"
+                );
             if !diagnostic && debugs_an_agent(m.tokens.clone()) {
-                let name = m.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+                let name = m
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
                 self.0.push(format!("{name}!"));
             }
             syn::visit::visit_macro(self, m);
@@ -435,11 +480,16 @@ fn only_battery_defines_the_has_crate_predicate() {
             if matches!(c.method.to_string().as_str(), "exists" | "is_file") {
                 if let syn::Expr::MethodCall(inner) = &*c.receiver {
                     let joins_manifest = inner.method == "join"
-                        && inner.args.iter().any(|a| matches!(a,
+                        && inner.args.iter().any(|a| {
+                            matches!(a,
                             syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. })
-                                if s.value() == "Cargo.toml"));
+                                if s.value() == "Cargo.toml")
+                        });
                     if joins_manifest {
-                        self.hits.push(format!("{}: .join(\"Cargo.toml\").{}()", self.file, c.method));
+                        self.hits.push(format!(
+                            "{}: .join(\"Cargo.toml\").{}()",
+                            self.file, c.method
+                        ));
                     }
                 }
             }
@@ -452,7 +502,10 @@ fn only_battery_defines_the_has_crate_predicate() {
         if file_name(&path) == "battery.rs" {
             continue;
         }
-        let mut v = V { file: file_name(&path), hits: Vec::new() };
+        let mut v = V {
+            file: file_name(&path),
+            hits: Vec::new(),
+        };
         v.visit_file(&parse(&path));
         hits.extend(v.hits);
     }
@@ -499,8 +552,18 @@ fn the_key_deriving_functions_keep_their_exhaustive_patterns() {
             }
             let mut note = |what: &str| bad.push(format!("{owner}::{name}: {what}"));
             if f.attrs.iter().any(|a| {
-                let p = a.path().segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>().join("::");
-                let t = a.meta.require_list().map(|l| l.tokens.to_string()).unwrap_or_default();
+                let p = a
+                    .path()
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                let t = a
+                    .meta
+                    .require_list()
+                    .map(|l| l.tokens.to_string())
+                    .unwrap_or_default();
                 p.contains("allow") && t.contains("unused_variables")
             }) {
                 note("#[allow(unused_variables)]");
@@ -512,7 +575,11 @@ fn the_key_deriving_functions_keep_their_exhaustive_patterns() {
                             if ps.rest.is_some() {
                                 note("`..` in the destructuring pattern");
                             }
-                            if ps.fields.iter().any(|fp| matches!(&*fp.pat, syn::Pat::Wild(_))) {
+                            if ps
+                                .fields
+                                .iter()
+                                .any(|fp| matches!(&*fp.pat, syn::Pat::Wild(_)))
+                            {
                                 note("a field bound to `_`");
                             }
                         }
@@ -567,11 +634,18 @@ fn ty_key(ty: &syn::Type) -> String {
             out
         }
         syn::Type::Reference(r) => {
-            format!("&{}{}", if r.mutability.is_some() { "mut " } else { "" }, ty_key(&r.elem))
+            format!(
+                "&{}{}",
+                if r.mutability.is_some() { "mut " } else { "" },
+                ty_key(&r.elem)
+            )
         }
         syn::Type::Slice(s) => format!("[{}]", ty_key(&s.elem)),
         syn::Type::Tuple(t) => {
-            format!("({})", t.elems.iter().map(ty_key).collect::<Vec<_>>().join(","))
+            format!(
+                "({})",
+                t.elems.iter().map(ty_key).collect::<Vec<_>>().join(",")
+            )
         }
         syn::Type::Paren(p) => ty_key(&p.elem),
         syn::Type::ImplTrait(_) => "impl".into(),
@@ -599,7 +673,11 @@ fn signatures() -> Vec<Func> {
         v.visit_file(&parse(&path));
         let file = path.file_name().unwrap().to_string_lossy().into_owned();
         for sig in v.0 {
-            out.push(Func { file: file.clone(), name: sig.ident.to_string(), sig });
+            out.push(Func {
+                file: file.clone(),
+                name: sig.ident.to_string(),
+                sig,
+            });
         }
     }
     out
@@ -634,12 +712,19 @@ fn method_calls() -> BTreeMap<(String, String), Vec<String>> {
                         }
                     }
                 }
-                self.out.entry((self.file.clone(), func.clone())).or_default().push(name);
+                self.out
+                    .entry((self.file.clone(), func.clone()))
+                    .or_default()
+                    .push(name);
             }
             syn::visit::visit_expr_method_call(self, c);
         }
     }
-    let mut v = V { file: String::new(), enclosing: Vec::new(), out: BTreeMap::new() };
+    let mut v = V {
+        file: String::new(),
+        enclosing: Vec::new(),
+        out: BTreeMap::new(),
+    };
     for path in rust_sources() {
         v.file = path.file_name().unwrap().to_string_lossy().into_owned();
         v.visit_file(&parse(&path));
@@ -676,7 +761,10 @@ fn params(sig: &syn::Signature) -> Vec<Param> {
                     syn::Pat::Ident(i) => i.ident.to_string(),
                     _ => "_".to_string(),
                 };
-                Some(Param { name, ty: ty_key(&t.ty) })
+                Some(Param {
+                    name,
+                    ty: ty_key(&t.ty),
+                })
             }
             syn::FnArg::Receiver(_) => None,
         })
@@ -684,17 +772,25 @@ fn params(sig: &syn::Signature) -> Vec<Param> {
 }
 
 fn returned_ty(sig: &syn::Signature) -> Option<&syn::Type> {
-    let syn::ReturnType::Type(_, ty) = &sig.output else { return None };
+    let syn::ReturnType::Type(_, ty) = &sig.output else {
+        return None;
+    };
     let mut ty: &syn::Type = ty;
     loop {
-        let syn::Type::Path(p) = ty else { return Some(ty) };
+        let syn::Type::Path(p) = ty else {
+            return Some(ty);
+        };
         let last = p.path.segments.last()?;
         if !matches!(last.ident.to_string().as_str(), "Result" | "Option") {
             return Some(ty);
         }
-        let syn::PathArguments::AngleBracketed(a) = &last.arguments else { return Some(ty) };
-        let Some(syn::GenericArgument::Type(inner)) =
-            a.args.iter().find(|g| matches!(g, syn::GenericArgument::Type(_)))
+        let syn::PathArguments::AngleBracketed(a) = &last.arguments else {
+            return Some(ty);
+        };
+        let Some(syn::GenericArgument::Type(inner)) = a
+            .args
+            .iter()
+            .find(|g| matches!(g, syn::GenericArgument::Type(_)))
         else {
             return Some(ty);
         };
@@ -709,7 +805,9 @@ fn a_tuple_return_may_not_repeat_an_element_type() {
     let mut bad: Vec<String> = Vec::new();
     let mut seen = 0usize;
     for f in signatures() {
-        let Some(ret) = returned_ty(&f.sig) else { continue };
+        let Some(ret) = returned_ty(&f.sig) else {
+            continue;
+        };
         let syn::Type::Tuple(t) = ret else { continue };
         if t.elems.is_empty() {
             continue; // `()`
@@ -730,14 +828,17 @@ fn a_tuple_return_may_not_repeat_an_element_type() {
          the compiler and lands in a table relabelled. Return a struct with named fields."
     );
     // Guards against the extractor silently matching nothing and the rule passing vacuously.
-    assert!(seen > 0, "no tuple returns found at all — the return-type extractor is broken");
+    assert!(
+        seen > 0,
+        "no tuple returns found at all — the return-type extractor is broken"
+    );
 }
 
 // ── A7 ─────────────────────────────────────────────────────────────────────
 
 const PRIMITIVES: &[&str] = &[
-    "&str", "String", "&Path", "PathBuf", "bool", "u8", "u16", "u32", "u64", "usize", "i8",
-    "i16", "i32", "i64", "f32", "f64", "&OsStr", "OsString", "char",
+    "&str", "String", "&Path", "PathBuf", "bool", "u8", "u16", "u32", "u64", "usize", "i8", "i16",
+    "i32", "i64", "f32", "f64", "&OsStr", "OsString", "char",
 ];
 
 #[test]
@@ -762,7 +863,11 @@ fn no_function_takes_three_interchangeable_primitives() {
         }
         for (ty, names) in by_ty {
             if names.len() >= 3 {
-                hits.push((f.file.clone(), f.name.clone(), format!("{}x {ty} ({})", names.len(), names.join(", "))));
+                hits.push((
+                    f.file.clone(),
+                    f.name.clone(),
+                    format!("{}x {ty} ({})", names.len(), names.join(", ")),
+                ));
             }
         }
     }
@@ -818,7 +923,9 @@ fn the_digest_path_is_lossless() {
              renamed or removed. Repoint it at the code that now handles the path bytes."
         );
         let empty = Vec::new();
-        let found = calls.get(&(file.to_string(), func.to_string())).unwrap_or(&empty);
+        let found = calls
+            .get(&(file.to_string(), func.to_string()))
+            .unwrap_or(&empty);
         for banned in BANNED {
             if found.iter().any(|c| c == banned) {
                 bad.push(format!("{file}: {func} calls {banned}"));
@@ -862,13 +969,22 @@ fn money_amounts_cannot_be_substituted_for_one_another() {
                     }
                 }
                 syn::Item::Impl(imp) => {
-                    let Some((_, tr, _)) = &imp.trait_ else { continue };
-                    let name = tr.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+                    let Some((_, tr, _)) = &imp.trait_ else {
+                        continue;
+                    };
+                    let name = tr
+                        .segments
+                        .last()
+                        .map(|s| s.ident.to_string())
+                        .unwrap_or_default();
                     let target = type_name(&imp.self_ty);
                     // `From`/`Deref`/`Add` between the two, or from a bare float, would
                     // restore exactly the implicit conversion the newtypes remove.
                     if MONEY.contains(&target.as_str())
-                        && matches!(name.as_str(), "From" | "Deref" | "DerefMut" | "Add" | "Sub" | "Mul")
+                        && matches!(
+                            name.as_str(),
+                            "From" | "Deref" | "DerefMut" | "Add" | "Sub" | "Mul"
+                        )
                     {
                         bad.push(format!("{file}: impl {name} for {target}"));
                     }
@@ -878,7 +994,10 @@ fn money_amounts_cannot_be_substituted_for_one_another() {
         }
     }
     for want in MONEY {
-        assert!(defined.iter().any(|d| d == want), "the {want} newtype is gone");
+        assert!(
+            defined.iter().any(|d| d == want),
+            "the {want} newtype is gone"
+        );
     }
     assert!(
         bad.is_empty(),
@@ -890,7 +1009,12 @@ fn money_amounts_cannot_be_substituted_for_one_another() {
     // One definition and one use: the rate cannot be re-applied, or applied twice, anywhere else.
     let uses: usize = rust_sources()
         .iter()
-        .map(|p| std::fs::read_to_string(p).unwrap().matches("USD_PER_CREDIT").count())
+        .map(|p| {
+            std::fs::read_to_string(p)
+                .unwrap()
+                .matches("USD_PER_CREDIT")
+                .count()
+        })
         .sum();
     assert_eq!(
         uses, 2,
@@ -923,7 +1047,9 @@ fn is_bool_to_enum_boundary(f: &Func) -> bool {
         }
     }
 
-    let Some(ret) = returned_ty(&f.sig) else { return false };
+    let Some(ret) = returned_ty(&f.sig) else {
+        return false;
+    };
     let ret = ty_key(ret).trim_start_matches('&').to_string();
     if ret == "Self" {
         return on_enum.contains(&(f.file.clone(), f.name.clone()));
@@ -957,7 +1083,11 @@ fn collect_enums_and_impls(
             // Enums nested in an inline module still belong to the crate.
             syn::Item::Mod(m) => {
                 if let Some((_, items)) = &m.content {
-                    let inner = syn::File { shebang: None, attrs: Vec::new(), items: items.clone() };
+                    let inner = syn::File {
+                        shebang: None,
+                        attrs: Vec::new(),
+                        items: items.clone(),
+                    };
                     collect_enums_and_impls(&inner, file, enums, impls);
                 }
             }
@@ -1044,10 +1174,15 @@ fn safety_gating_bools_are_named_enums() {
     let stale: Vec<&(&str, &str, &str)> = ALLOWED
         .iter()
         .filter(|(file, name, p)| {
-            !hits.iter().any(|(f, n, hp)| f == file && n == name && hp == p)
+            !hits
+                .iter()
+                .any(|(f, n, hp)| f == file && n == name && hp == p)
         })
         .collect();
-    assert!(stale.is_empty(), "these bool parameters are gone; delete them from ALLOWED: {stale:?}");
+    assert!(
+        stale.is_empty(),
+        "these bool parameters are gone; delete them from ALLOWED: {stale:?}"
+    );
 }
 
 // ── A11 ────────────────────────────────────────────────────────────────────
@@ -1063,13 +1198,21 @@ fn typestates_have_private_fields_and_consuming_transitions() {
         let file = path.file_name().unwrap().to_string_lossy().into_owned();
         for item in parse(&path).items {
             let syn::Item::Struct(s) = item else { continue };
-            if !s.fields.iter().any(|f| type_name(&f.ty).ends_with("PhantomData")) {
+            if !s
+                .fields
+                .iter()
+                .any(|f| type_name(&f.ty).ends_with("PhantomData"))
+            {
                 continue;
             }
             family.push(s.ident.to_string());
             for f in &s.fields {
                 if is_public(&f.vis) {
-                    let fname = f.ident.as_ref().map(|i| i.to_string()).unwrap_or_else(|| "0".into());
+                    let fname = f
+                        .ident
+                        .as_ref()
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| "0".into());
                     leaks.push(format!("{file}: {}.{fname} is not private", s.ident));
                 }
             }
@@ -1094,10 +1237,14 @@ fn typestates_have_private_fields_and_consuming_transitions() {
         let file = path.file_name().unwrap().to_string_lossy().into_owned();
         for item in parse(&path).items {
             let syn::Item::Impl(imp) = item else { continue };
-            let Some(from) = rank(&type_name(&imp.self_ty)) else { continue };
+            let Some(from) = rank(&type_name(&imp.self_ty)) else {
+                continue;
+            };
             for it in imp.items {
                 let syn::ImplItem::Fn(f) = it else { continue };
-                let Some(ret) = returned_ty(&f.sig) else { continue };
+                let Some(ret) = returned_ty(&f.sig) else {
+                    continue;
+                };
                 let consumes = matches!(
                     f.sig.inputs.first(),
                     Some(syn::FnArg::Receiver(r)) if r.reference.is_none()
@@ -1107,7 +1254,11 @@ fn typestates_have_private_fields_and_consuming_transitions() {
                     .enumerate()
                     .any(|(to, name)| to > from && mentions_type(ret, name));
                 if forward && !consumes {
-                    borrowing.push(format!("{file}: {}::{}", type_name(&imp.self_ty), f.sig.ident));
+                    borrowing.push(format!(
+                        "{file}: {}::{}",
+                        type_name(&imp.self_ty),
+                        f.sig.ident
+                    ));
                 }
             }
         }

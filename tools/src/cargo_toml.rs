@@ -9,8 +9,8 @@ pub struct CargoToml {
 
 impl CargoToml {
     pub fn open(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let doc: DocumentMut = content
             .parse()
             .with_context(|| format!("parsing {}", path.display()))?;
@@ -26,9 +26,10 @@ impl CargoToml {
     }
 
     pub fn set_lib(&mut self, name: &str) {
-        let lib = self.doc.entry("lib").or_insert_with(|| {
-            Item::Table(Table::new())
-        });
+        let lib = self
+            .doc
+            .entry("lib")
+            .or_insert_with(|| Item::Table(Table::new()));
         if let Some(t) = lib.as_table_mut() {
             t.insert("name", toml_edit::value(name));
             let mut arr = Array::new();
@@ -38,7 +39,11 @@ impl CargoToml {
     }
 
     pub fn set_bin_driver(&mut self) {
-        if let Some(bins) = self.doc.get_mut("bin").and_then(|b| b.as_array_of_tables_mut()) {
+        if let Some(bins) = self
+            .doc
+            .get_mut("bin")
+            .and_then(|b| b.as_array_of_tables_mut())
+        {
             if let Some(bin) = bins.iter_mut().next() {
                 bin.insert("name", toml_edit::value("driver"));
                 return;
@@ -63,9 +68,10 @@ impl CargoToml {
     }
 
     pub fn set_default_features(&mut self, features: &[String]) {
-        let feat = self.doc.entry("features").or_insert_with(|| {
-            Item::Table(Table::new())
-        });
+        let feat = self
+            .doc
+            .entry("features")
+            .or_insert_with(|| Item::Table(Table::new()));
         if let Some(t) = feat.as_table_mut() {
             let mut arr = Array::new();
             for f in features {
@@ -116,7 +122,10 @@ mod tests {
     #[test]
     fn set_lib_name_and_cdylib() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = write_cargo_toml(tmp.path(), "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n");
+        let path = write_cargo_toml(
+            tmp.path(),
+            "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n",
+        );
         let mut cargo = CargoToml::open(&path).unwrap();
         cargo.set_lib("blake");
         cargo.save().unwrap();
@@ -141,7 +150,10 @@ mod tests {
     #[test]
     fn remove_bin_section() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = write_cargo_toml(tmp.path(), "[package]\nname = \"mylib\"\n\n[[bin]]\nname = \"driver\"\npath = \"src/main.rs\"\n");
+        let path = write_cargo_toml(
+            tmp.path(),
+            "[package]\nname = \"mylib\"\n\n[[bin]]\nname = \"driver\"\npath = \"src/main.rs\"\n",
+        );
         let mut cargo = CargoToml::open(&path).unwrap();
         cargo.remove_bin();
         cargo.save().unwrap();
@@ -166,7 +178,10 @@ mod tests {
     #[test]
     fn set_default_features() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = write_cargo_toml(tmp.path(), "[package]\nname = \"test\"\n\n[features]\nblake = []\nsha2 = []\n\"128f\" = []\n");
+        let path = write_cargo_toml(
+            tmp.path(),
+            "[package]\nname = \"test\"\n\n[features]\nblake = []\nsha2 = []\n\"128f\" = []\n",
+        );
         let mut cargo = CargoToml::open(&path).unwrap();
         cargo.set_default_features(&["blake".into(), "128f".into()]);
         cargo.save().unwrap();

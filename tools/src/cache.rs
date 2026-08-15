@@ -245,8 +245,10 @@ pub fn normalise(text: &str, work_root: &Path, repo_root: &Path) -> String {
     // different prompts the same digest — a false cache *hit*, the one failure mode
     // this key exists to prevent. Skipping a non-UTF-8 root instead leaves the literal
     // path in the normalised text, which can only cost a miss.
-    let mut roots: Vec<(PathBuf, &str)> =
-        vec![(work_root.to_path_buf(), "$WORK"), (repo_root.to_path_buf(), "$REPO")];
+    let mut roots: Vec<(PathBuf, &str)> = vec![
+        (work_root.to_path_buf(), "$WORK"),
+        (repo_root.to_path_buf(), "$REPO"),
+    ];
     if let Ok(base) = crate::workdir::base() {
         roots.push((base, "$WORKBASE"));
     }
@@ -297,7 +299,10 @@ pub struct Recipe<'a> {
 impl<'a> Recipe<'a> {
     pub fn new(session: &'a Session, policy_shape: Option<String>) -> Result<Self> {
         session.assert_declares()?;
-        Ok(Self { session, policy_shape })
+        Ok(Self {
+            session,
+            policy_shape,
+        })
     }
 
     /// Opens with an EXHAUSTIVE pattern, deliberately. Adding a field to `Recipe` then
@@ -305,7 +310,10 @@ impl<'a> Recipe<'a> {
     /// binding one without feeding it is an `unused variable` error under
     /// `warnings = "deny"`. Do not reintroduce `..`.
     pub fn digest(&self) -> RecipeDigest {
-        let Self { session, policy_shape } = self;
+        let Self {
+            session,
+            policy_shape,
+        } = self;
         let mut h = Sha256::new();
         feed(&mut h, b"recipe-v2");
         feed(&mut h, session.shape().as_bytes());
@@ -342,7 +350,16 @@ impl KeyInputs<'_> {
     /// Exhaustive pattern, for the reason on `Recipe::digest`: a component added to
     /// `KeyInputs` and forgotten here would let two different invocations share an entry.
     pub fn key(&self) -> CacheKey {
-        let Self { phase, agent, model, cli, toolchain, prompt, recipe, input_tree } = self;
+        let Self {
+            phase,
+            agent,
+            model,
+            cli,
+            toolchain,
+            prompt,
+            recipe,
+            input_tree,
+        } = self;
         let mut h = Sha256::new();
         feed(&mut h, b"key-v1");
         feed(&mut h, &SCHEMA.to_le_bytes());
@@ -366,12 +383,28 @@ impl KeyInputs<'_> {
     /// silently removes the backstop that turns a forgotten field into a loud
     /// "meta.json disagrees on X".
     pub(crate) const VALIDATED: &'static [&'static str] = &[
-        "schema", "phase", "agent", "model", "cli", "toolchain", "prompt", "recipe",
+        "schema",
+        "phase",
+        "agent",
+        "model",
+        "cli",
+        "toolchain",
+        "prompt",
+        "recipe",
         "input_tree",
     ];
 
     fn meta(&self, key: &CacheKey) -> serde_json::Value {
-        let Self { phase, agent, model, cli, toolchain, prompt, recipe, input_tree } = self;
+        let Self {
+            phase,
+            agent,
+            model,
+            cli,
+            toolchain,
+            prompt,
+            recipe,
+            input_tree,
+        } = self;
         serde_json::json!({
             "schema": SCHEMA,
             "key": key.as_str(),
@@ -417,7 +450,11 @@ pub struct Produced<P: Phase> {
 
 impl<P: Phase> Produced<P> {
     pub fn new(sealed: Sealed<P>, log: PathBuf, provenance: serde_json::Value) -> Self {
-        Self { sealed, log, provenance }
+        Self {
+            sealed,
+            log,
+            provenance,
+        }
     }
 }
 
@@ -489,7 +526,12 @@ impl Store {
         match self.mode {
             Mode::ReadWrite => match self.load(inputs, &key, &dir) {
                 Ok(Some(Loaded { sealed, provenance })) => {
-                    return Ok(Some(Obtained { sealed, replayed: true, key, provenance }));
+                    return Ok(Some(Obtained {
+                        sealed,
+                        replayed: true,
+                        key,
+                        provenance,
+                    }));
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -503,7 +545,9 @@ impl Store {
             Mode::Bypass => {}
         }
 
-        let Some(produced) = compute()? else { return Ok(None) };
+        let Some(produced) = compute()? else {
+            return Ok(None);
+        };
         if self.mode != Mode::Bypass {
             self.store(inputs, &key, &dir, &produced)
                 .with_context(|| format!("storing cache entry {}", key.as_str()))?;
@@ -536,7 +580,11 @@ impl Store {
             })
             .find(|p| !p.exists())
             .with_context(|| {
-                format!("{} already holds 999 copies of {}", holding.display(), key.as_str())
+                format!(
+                    "{} already holds 999 copies of {}",
+                    holding.display(),
+                    key.as_str()
+                )
             })?;
         set_read_only(dir, Access::Writable)?;
         std::fs::rename(dir, &dest)
@@ -624,7 +672,10 @@ impl Store {
         dir: &Path,
         produced: &Produced<P>,
     ) -> Result<()> {
-        let staging = self.root.join("tmp").join(format!("{}.partial", key.as_str()));
+        let staging = self
+            .root
+            .join("tmp")
+            .join(format!("{}.partial", key.as_str()));
         if staging.exists() {
             // A run killed between the lock below and the rename leaves a `0o555` orphan,
             // and entries inside a `0o555` directory cannot be removed: ignoring that
@@ -647,7 +698,10 @@ impl Store {
         // a read can prove the artifact is the one that was written.
         let mut meta = inputs.meta(key);
         meta["output_tree"] = serde_json::json!(produced.sealed.digest().as_str());
-        std::fs::write(staging.join("meta.json"), serde_json::to_string_pretty(&meta)? + "\n")?;
+        std::fs::write(
+            staging.join("meta.json"),
+            serde_json::to_string_pretty(&meta)? + "\n",
+        )?;
 
         // Lock the CONTENTS before the rename, so no file is ever writable while visible
         // at the entry's final path — but leave the staging root itself writable, because
@@ -703,7 +757,11 @@ impl Store {
                 // `symlink_metadata`: a link to a directory must not send this into a loop.
                 let meta = std::fs::symlink_metadata(&child)
                     .with_context(|| format!("reading {}", child.display()))?;
-                total += if meta.is_dir() { bytes(&child)? } else { meta.len() };
+                total += if meta.is_dir() {
+                    bytes(&child)?
+                } else {
+                    meta.len()
+                };
             }
             Ok(total)
         }
@@ -726,7 +784,9 @@ mod tests {
     use super::*;
 
     fn recipe(session: &Session, policy: Option<&str>) -> RecipeDigest {
-        Recipe::new(session, policy.map(str::to_string)).unwrap().digest()
+        Recipe::new(session, policy.map(str::to_string))
+            .unwrap()
+            .digest()
     }
 
     /// Owns every key component, so a test can vary exactly one and borrow a
@@ -810,7 +870,10 @@ mod tests {
         assert_eq!(gemini.as_str(), "gemini-3.1-pro-preview");
         assert_ne!(gpt, gemini);
 
-        let oc = AgentKey::new(Agent::OpenCode, Some("amazon-bedrock/us.anthropic.claude-sonnet-5"));
+        let oc = AgentKey::new(
+            Agent::OpenCode,
+            Some("amazon-bedrock/us.anthropic.claude-sonnet-5"),
+        );
         assert_eq!(oc.unwrap().as_str(), "opencode-claude-sonnet-5");
     }
 
@@ -836,18 +899,31 @@ mod tests {
     #[test]
     fn a_cli_version_must_be_observed_rather_than_assumed() {
         let d = tempfile::tempdir().unwrap();
-        let ok = fake_cli(d.path(), "ok", "echo '2.1.232.657 (Claude Code)'; echo 'trailing note'");
+        let ok = fake_cli(
+            d.path(),
+            "ok",
+            "echo '2.1.232.657 (Claude Code)'; echo 'trailing note'",
+        );
         assert_eq!(
             CliVersion::probe(&ok).unwrap().as_str(),
             "2.1.232.657 (Claude Code)",
             "the first line only, so a changelog banner is not the version"
         );
 
-        assert!(CliVersion::probe("harvest-no-such-program").is_err(), "a missing CLI must refuse");
+        assert!(
+            CliVersion::probe("harvest-no-such-program").is_err(),
+            "a missing CLI must refuse"
+        );
         let broken = fake_cli(d.path(), "broken", "echo 1.0; exit 3");
-        assert!(CliVersion::probe(&broken).is_err(), "a failing probe must refuse");
+        assert!(
+            CliVersion::probe(&broken).is_err(),
+            "a failing probe must refuse"
+        );
         let mute = fake_cli(d.path(), "mute", "exit 0");
-        assert!(CliVersion::probe(&mute).is_err(), "an unreportable version must refuse");
+        assert!(
+            CliVersion::probe(&mute).is_err(),
+            "an unreportable version must refuse"
+        );
     }
 
     #[test]
@@ -867,7 +943,10 @@ mod tests {
     fn a_cli_version_covers_the_build_the_transcript_reports() {
         let probed = CliVersion("2.1.232.657 (Claude Code)".into());
         assert!(probed.covers("2.1.232.657"));
-        assert!(!probed.covers("2.1.231.653"), "the other build on this machine");
+        assert!(
+            !probed.covers("2.1.231.653"),
+            "the other build on this machine"
+        );
     }
 
     #[test]
@@ -882,8 +961,14 @@ mod tests {
     fn toolchain_id_refuses_output_it_cannot_parse() {
         // A placeholder would give two unidentifiable compilers the same key.
         let real = "rustc 1.94.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.94.0\n";
-        assert_eq!(parse_rustc_vv(real).unwrap(), "1.94.0 x86_64-unknown-linux-gnu");
-        let err = format!("{:#}", parse_rustc_vv("rustc 1.94.0\n").expect_err("must refuse"));
+        assert_eq!(
+            parse_rustc_vv(real).unwrap(),
+            "1.94.0 x86_64-unknown-linux-gnu"
+        );
+        let err = format!(
+            "{:#}",
+            parse_rustc_vv("rustc 1.94.0\n").expect_err("must refuse")
+        );
         assert!(err.contains("release:"), "{err}");
     }
 
@@ -894,7 +979,10 @@ mod tests {
         let text = format!("cd {} && ls {}/prompts", work.display(), repo.display());
         let n = normalise(&text, work, repo);
         assert!(!n.contains("alice"), "no username may survive: {n}");
-        assert!(!n.contains("harvest-work-AbCdEf"), "no scratch name may survive: {n}");
+        assert!(
+            !n.contains("harvest-work-AbCdEf"),
+            "no scratch name may survive: {n}"
+        );
         assert!(n.contains("$WORK") && n.contains("$REPO"), "{n}");
     }
 
@@ -911,14 +999,20 @@ mod tests {
             Path::new("/local/home/bob/.harvest/work/w-2"),
             Path::new("/local/home/bob/repo/ACTOR"),
         );
-        assert_eq!(a, b, "prompt digest must not depend on where anything lives");
+        assert_eq!(
+            a, b,
+            "prompt digest must not depend on where anything lives"
+        );
     }
 
     #[test]
     fn prompt_digest_changes_when_the_prompt_changes() {
         let w = Path::new("/w");
         let r = Path::new("/r");
-        assert_ne!(prompt_digest("verify X", w, r), prompt_digest("verify Y", w, r));
+        assert_ne!(
+            prompt_digest("verify X", w, r),
+            prompt_digest("verify Y", w, r)
+        );
     }
 
     #[test]
@@ -969,7 +1063,11 @@ mod tests {
         // sweeps computed an identical key and the second published the first's
         // artifact, stamped `replayed: true`, with every log and check agreeing.
         let mut sonnet = Inputs::new();
-        sonnet.agent = AgentKey::new(Agent::OpenCode, Some("amazon-bedrock/us.anthropic.claude-sonnet-5")).unwrap();
+        sonnet.agent = AgentKey::new(
+            Agent::OpenCode,
+            Some("amazon-bedrock/us.anthropic.claude-sonnet-5"),
+        )
+        .unwrap();
         sonnet.model = ModelId::new("amazon-bedrock/us.anthropic.claude-sonnet-5").unwrap();
 
         let mut gpt = Inputs::new();
@@ -994,7 +1092,10 @@ mod tests {
         // for kiro, which really runs `timeout 2700` with no turn limit.
         let claude = recipe(&Session::claude(10_800), Some("deny=$REPO allow=$WORK"));
         let kiro = recipe(&Session::kiro(2_700), None);
-        let oc = recipe(&Session::opencode(crate::opencode::Phase::Verify, 10_800), Some("allow=$WORK"));
+        let oc = recipe(
+            &Session::opencode(crate::opencode::Phase::Verify, 10_800),
+            Some("allow=$WORK"),
+        );
         assert_ne!(claude, kiro);
         assert_ne!(claude, oc);
         assert_ne!(kiro, oc);
@@ -1004,7 +1105,10 @@ mod tests {
     fn recipe_digest_covers_the_sandbox_policy() {
         let narrow = recipe(&Session::claude(10_800), Some("allow=$WORK"));
         let wide = recipe(&Session::claude(10_800), Some("allow=$WORK,$REPO"));
-        assert_ne!(narrow, wide, "a wider sandbox can change what the agent produces");
+        assert_ne!(
+            narrow, wide,
+            "a wider sandbox can change what the agent produces"
+        );
         assert_ne!(
             recipe(&Session::claude(10_800), None),
             recipe(&Session::claude(10_800), Some("")),
@@ -1039,14 +1143,19 @@ mod tests {
             std::fs::write(p, body).unwrap();
         }
         let path = repo.path().to_path_buf();
-        Fixture { _repo: repo, repo: path, case }
+        Fixture {
+            _repo: repo,
+            repo: path,
+            case,
+        }
     }
 
     /// `edit` stands in for the agent's change to the crate.
     fn seal_verify(case: &Path, edit: &str) -> Sealed<Verify> {
         let translated = Sealed::<Translate>::adopt(case).unwrap();
-        let work: WorkTree<Verify> =
-            translated.materialise_into(Scratch::new("cache-test-").unwrap()).unwrap();
+        let work: WorkTree<Verify> = translated
+            .materialise_into(Scratch::new("cache-test-").unwrap())
+            .unwrap();
         let c_before = work.c().digest().unwrap();
         std::fs::write(work.crate_dir().join("src/lib.rs"), edit).unwrap();
         work.scrub()
@@ -1125,7 +1234,10 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        assert!(second.replayed, "the second obtain must be served from the store");
+        assert!(
+            second.replayed,
+            "the second obtain must be served from the store"
+        );
         assert_eq!(runs, 1, "compute must have run exactly once");
         assert_eq!(first.sealed.digest(), second.sealed.digest());
         assert_eq!(
@@ -1145,7 +1257,11 @@ mod tests {
 
         let out = store.obtain::<Verify>(&inputs, || Ok(None)).unwrap();
         assert!(out.is_none());
-        assert_eq!(store.stats().unwrap().0, 0, "nothing may be stored for a failure");
+        assert_eq!(
+            store.stats().unwrap().0,
+            0,
+            "nothing may be stored for a failure"
+        );
 
         let mut ran = false;
         store
@@ -1155,7 +1271,10 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        assert!(ran, "a later run must get another chance, not a cached failure");
+        assert!(
+            ran,
+            "a later run must get another chance, not a cached failure"
+        );
     }
 
     #[test]
@@ -1165,7 +1284,8 @@ mod tests {
         let inputs = owned.key_inputs();
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+        rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .unwrap();
         assert_eq!(rw.stats().unwrap().0, 1);
 
         let off = Store::open(&f.repo, Mode::Bypass).unwrap();
@@ -1179,7 +1299,11 @@ mod tests {
             .unwrap();
         assert!(ran, "bypass must not read");
         assert!(!got.replayed);
-        assert_eq!(off.stats().unwrap().0, 1, "bypass must not write, so the count is unchanged");
+        assert_eq!(
+            off.stats().unwrap().0,
+            1,
+            "bypass must not write, so the count is unchanged"
+        );
     }
 
     #[test]
@@ -1189,19 +1313,28 @@ mod tests {
         let inputs = owned.key_inputs();
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        let old = rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() { /* old */ }"))))
-            .unwrap().unwrap();
+        let old = rw
+            .obtain(&inputs, || {
+                Ok(Some(produced(&f.case, "pub fn a() { /* old */ }")))
+            })
+            .unwrap()
+            .unwrap();
 
         let refresh = Store::open(&f.repo, Mode::Refresh).unwrap();
         let new = refresh
-            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() { /* new */ }"))))
+            .obtain(&inputs, || {
+                Ok(Some(produced(&f.case, "pub fn a() { /* new */ }")))
+            })
             .unwrap()
             .unwrap();
         assert!(!new.replayed, "refresh must re-run");
         assert_ne!(old.sealed.digest(), new.sealed.digest());
 
         // The point of --cache refresh is that the suspect entry is GONE, not shadowed.
-        let after = rw.obtain::<Verify>(&inputs, || panic!("must hit")).unwrap().unwrap();
+        let after = rw
+            .obtain::<Verify>(&inputs, || panic!("must hit"))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             after.sealed.digest(),
             new.sealed.digest(),
@@ -1223,18 +1356,25 @@ mod tests {
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let old = rw
-            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() { /* suspect */ }"))))
+            .obtain(&inputs, || {
+                Ok(Some(produced(&f.case, "pub fn a() { /* suspect */ }")))
+            })
             .unwrap()
             .unwrap();
 
         Store::open(&f.repo, Mode::Refresh)
             .unwrap()
-            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() { /* new */ }"))))
+            .obtain(&inputs, || {
+                Ok(Some(produced(&f.case, "pub fn a() { /* new */ }")))
+            })
             .unwrap()
             .unwrap();
 
         let kept = f.repo.join("results/.cache/quarantine").join(key.as_str());
-        assert!(kept.is_dir(), "the replaced entry must be kept for comparison: {kept:?}");
+        assert!(
+            kept.is_dir(),
+            "the replaced entry must be kept for comparison: {kept:?}"
+        );
         let meta: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(kept.join("meta.json")).unwrap())
                 .unwrap();
@@ -1247,12 +1387,20 @@ mod tests {
         // A second refresh must not land on the first copy, nor lose it.
         Store::open(&f.repo, Mode::Refresh)
             .unwrap()
-            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() { /* newer */ }"))))
+            .obtain(&inputs, || {
+                Ok(Some(produced(&f.case, "pub fn a() { /* newer */ }")))
+            })
             .unwrap()
             .unwrap();
-        assert!(kept.is_dir(), "the first copy must survive a second refresh");
         assert!(
-            f.repo.join("results/.cache/quarantine").join(format!("{}.2", key.as_str())).is_dir(),
+            kept.is_dir(),
+            "the first copy must survive a second refresh"
+        );
+        assert!(
+            f.repo
+                .join("results/.cache/quarantine")
+                .join(format!("{}.2", key.as_str()))
+                .is_dir(),
             "and the second must be kept beside it"
         );
     }
@@ -1267,16 +1415,22 @@ mod tests {
         let key = inputs.key();
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+        rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .unwrap();
         Store::open(&f.repo, Mode::Refresh)
             .unwrap()
-            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() { /* new */ }"))))
+            .obtain(&inputs, || {
+                Ok(Some(produced(&f.case, "pub fn a() { /* new */ }")))
+            })
             .unwrap();
 
         let kept = f.repo.join("results/.cache/quarantine").join(key.as_str());
         // Without this the write below fails merely because nothing is there, which is how
         // the quarantine came to be asserted by a test that never exercised it.
-        assert!(kept.join("code/Cargo.toml").is_file(), "nothing was quarantined: {kept:?}");
+        assert!(
+            kept.join("code/Cargo.toml").is_file(),
+            "nothing was quarantined: {kept:?}"
+        );
         assert!(
             std::fs::write(kept.join("code/Cargo.toml"), "tampered").is_err(),
             "evidence must not be editable in place"
@@ -1334,7 +1488,9 @@ mod tests {
         let held = Inputs::new();
         let inputs = held.key_inputs();
         let key = inputs.key();
-        store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+        store
+            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .unwrap();
 
         let dir = store.entry_dir(&inputs, &key);
         crate::artifact::set_read_only(&dir, Access::Writable).unwrap();
@@ -1349,7 +1505,10 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        assert!(ran, "an entry that cannot say what it cost must be recomputed");
+        assert!(
+            ran,
+            "an entry that cannot say what it cost must be recomputed"
+        );
         assert_eq!(got.provenance["duration_secs"], 42);
     }
 
@@ -1365,8 +1524,10 @@ mod tests {
         let inputs = held.key_inputs();
         let key = inputs.key();
 
-        let staging =
-            f.repo.join("results/.cache/tmp").join(format!("{}.partial", key.as_str()));
+        let staging = f
+            .repo
+            .join("results/.cache/tmp")
+            .join(format!("{}.partial", key.as_str()));
         std::fs::create_dir_all(staging.join("code/src")).unwrap();
         std::fs::write(staging.join("code/src/lib.rs"), "half-written").unwrap();
         crate::artifact::set_read_only(&staging, Access::ReadOnly).unwrap();
@@ -1375,7 +1536,13 @@ mod tests {
             .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
             .expect("a stale locked staging dir must not block the write")
             .unwrap();
-        assert!(store.obtain::<Verify>(&inputs, || panic!("must hit")).unwrap().unwrap().replayed);
+        assert!(
+            store
+                .obtain::<Verify>(&inputs, || panic!("must hit"))
+                .unwrap()
+                .unwrap()
+                .replayed
+        );
     }
 
     #[test]
@@ -1387,7 +1554,9 @@ mod tests {
         let owned = Inputs::new();
         let inputs = owned.key_inputs();
         let key = inputs.key();
-        store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+        store
+            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .unwrap();
 
         let code = store.entry_dir(&inputs, &key).join("code");
         assert!(
@@ -1408,15 +1577,23 @@ mod tests {
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let owned = Inputs::new();
         let inputs = owned.key_inputs();
-        store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+        store
+            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .unwrap();
 
-        let replay = store.obtain::<Verify>(&inputs, || panic!("must hit")).unwrap().unwrap();
+        let replay = store
+            .obtain::<Verify>(&inputs, || panic!("must hit"))
+            .unwrap()
+            .unwrap();
         assert!(replay.replayed);
         replay.sealed.publish(&f.case).unwrap();
 
         let published = crate::battery::phase_dir(&f.case, crate::battery::VERIFIED);
-        std::fs::write(published.join("src/lib.rs"), "pub fn a() { /* editable */ }")
-            .expect("a replayed artifact must be writable once published, or scoring cannot build");
+        std::fs::write(
+            published.join("src/lib.rs"),
+            "pub fn a() { /* editable */ }",
+        )
+        .expect("a replayed artifact must be writable once published, or scoring cannot build");
     }
 
     #[test]
@@ -1426,7 +1603,9 @@ mod tests {
         let owned = Inputs::new();
         let inputs = owned.key_inputs();
         let key = inputs.key();
-        store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+        store
+            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .unwrap();
 
         // Defeat the read-only bit first: this is the scenario the digest check exists for.
         let dir = store.entry_dir(&inputs, &key);
@@ -1448,7 +1627,10 @@ mod tests {
         assert!(ran, "a corrupted entry must be recomputed, never served");
         assert!(!got.replayed);
         assert!(
-            f.repo.join("results/.cache/quarantine").join(key.as_str()).exists(),
+            f.repo
+                .join("results/.cache/quarantine")
+                .join(key.as_str())
+                .exists(),
             "and the corruption must be preserved for inspection, not destroyed"
         );
     }
@@ -1461,7 +1643,9 @@ mod tests {
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let owned = Inputs::new();
         let inputs = owned.key_inputs();
-        store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
+        store
+            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .unwrap();
 
         let per_agent = f.repo.join("results/Test-Corpus/claude");
         let walked: Vec<String> = std::fs::read_dir(&per_agent)
@@ -1473,7 +1657,10 @@ mod tests {
             !walked.iter().any(|n| n.contains("cache")),
             "the store must not be reachable from the per-agent results dir: {walked:?}"
         );
-        assert!(f.repo.join("results/.cache").is_dir(), "it lives two levels above instead");
+        assert!(
+            f.repo.join("results/.cache").is_dir(),
+            "it lives two levels above instead"
+        );
     }
 
     #[test]
@@ -1484,7 +1671,9 @@ mod tests {
         let ki = owned.key_inputs();
         let meta = ki.meta(&ki.key());
         assert!(
-            meta.get("harness").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()),
+            meta.get("harness")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
             "the producing commit must be recorded: {meta:?}"
         );
         // `load` re-compares this exact list; `harness` must not be on it.

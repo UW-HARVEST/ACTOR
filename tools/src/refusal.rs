@@ -93,12 +93,16 @@ mod tests {
         // The join site sees the error only after `?` has carried it up through
         // `.context(..)`; if downcast did not see through those, every refusal would
         // arrive as an ordinary failure again.
-        let err = anyhow::Error::from(Refusal::ToolchainOverridden { value: "1.97.1".into() })
-            .context("verifying libpng")
-            .context("harvest-bench sweep");
+        let err = anyhow::Error::from(Refusal::ToolchainOverridden {
+            value: "1.97.1".into(),
+        })
+        .context("verifying libpng")
+        .context("harvest-bench sweep");
         assert_eq!(
             Refusal::in_chain(&err),
-            Some(&Refusal::ToolchainOverridden { value: "1.97.1".into() }),
+            Some(&Refusal::ToolchainOverridden {
+                value: "1.97.1".into()
+            }),
             "{err:#}"
         );
         assert!(format!("{err:#}").contains("RUSTUP_TOOLCHAIN"));
@@ -109,4 +113,3 @@ mod tests {
         assert!(Refusal::in_chain(&anyhow::anyhow!("no Cargo.toml produced")).is_none());
     }
 }
-

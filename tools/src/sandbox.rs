@@ -108,7 +108,11 @@ impl Enforcement {
     /// The one bool→enum boundary, named for the flag that is its only source so the
     /// polarity is checkable against `--help`.
     pub fn from_allow_unsandboxed_flag(flag: bool) -> Self {
-        if flag { Enforcement::AllowUnsandboxed } else { Enforcement::Required }
+        if flag {
+            Enforcement::AllowUnsandboxed
+        } else {
+            Enforcement::Required
+        }
     }
 }
 
@@ -180,7 +184,10 @@ mod tests {
         // Denying something *under* results/ leaves the corpus readable.
         let p = policy("/repo", "/scratch/base/harvest-work-x");
         let deny = p["sandbox"]["filesystem"]["denyRead"].as_array().unwrap();
-        assert!(deny.iter().any(|d| d == "/repo"), "repo root must be denied: {deny:?}");
+        assert!(
+            deny.iter().any(|d| d == "/repo"),
+            "repo root must be denied: {deny:?}"
+        );
         assert!(
             !deny.iter().any(|d| d.as_str().unwrap().contains("results")),
             "deny root must not be a results subdirectory: {deny:?}"
@@ -193,7 +200,10 @@ mod tests {
         // denied a case could read a sibling case's tree.
         let p = policy("/repo", "/scratch/base/harvest-work-x");
         let deny = p["sandbox"]["filesystem"]["denyRead"].as_array().unwrap();
-        assert!(deny.iter().any(|d| d == "/scratch/base"), "scratch base must be denied: {deny:?}");
+        assert!(
+            deny.iter().any(|d| d == "/scratch/base"),
+            "scratch base must be denied: {deny:?}"
+        );
     }
 
     #[test]
@@ -209,8 +219,7 @@ mod tests {
         let tc = policy("/repo", "/scratch/base/w1");
         let hb = policy("/repo", "/scratch/base/w2");
         assert_eq!(
-            tc["sandbox"]["filesystem"]["denyRead"],
-            hb["sandbox"]["filesystem"]["denyRead"],
+            tc["sandbox"]["filesystem"]["denyRead"], hb["sandbox"]["filesystem"]["denyRead"],
             "deny list must not depend on how deep the case dir happens to be"
         );
     }
@@ -221,7 +230,10 @@ mod tests {
         assert_eq!(p["sandbox"]["enabled"], true);
         assert_eq!(p["sandbox"]["allowUnsandboxedCommands"], false);
         for k in ["denyRead", "allowRead", "allowWrite"] {
-            assert!(p["sandbox"]["filesystem"][k].is_array(), "{k} must be an array");
+            assert!(
+                p["sandbox"]["filesystem"][k].is_array(),
+                "{k} must be an array"
+            );
         }
     }
 
@@ -231,8 +243,12 @@ mod tests {
         let parent = tmp.path().join("root");
         std::fs::create_dir_all(&parent).unwrap();
         // The real function, not `policy`: base() needs HOME, which tests have.
-        let p = write_settings(Policy { repo_root: Path::new("/repo"), work_root: &parent, enforcement: Enforcement::AllowUnsandboxed })
-            .expect("writes policy");
+        let p = write_settings(Policy {
+            repo_root: Path::new("/repo"),
+            work_root: &parent,
+            enforcement: Enforcement::AllowUnsandboxed,
+        })
+        .expect("writes policy");
         assert_eq!(p, parent.join(".claude/settings.json"));
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
@@ -253,7 +269,11 @@ mod tests {
         // this machine can enforce is environmental, so assert the two directions
         // against the same predicate rather than hardcoding an expectation.
         let parent = tempfile::tempdir().unwrap();
-        let refused = write_settings(Policy { repo_root: Path::new("/repo"), work_root: parent.path(), enforcement: Enforcement::Required });
+        let refused = write_settings(Policy {
+            repo_root: Path::new("/repo"),
+            work_root: parent.path(),
+            enforcement: Enforcement::Required,
+        });
         assert_eq!(
             refused.is_ok(),
             is_enforceable(),
@@ -263,10 +283,18 @@ mod tests {
         if let Err(e) = refused {
             let msg = format!("{e:#}");
             assert!(msg.contains("cannot be enforced"), "{msg}");
-            assert!(msg.contains("--allow-unsandboxed"), "must name the escape hatch: {msg}");
+            assert!(
+                msg.contains("--allow-unsandboxed"),
+                "must name the escape hatch: {msg}"
+            );
         }
         // The escape hatch always proceeds, so an operator is never blocked outright.
-        assert!(write_settings(Policy { repo_root: Path::new("/repo"), work_root: parent.path(), enforcement: Enforcement::AllowUnsandboxed }).is_ok());
+        assert!(write_settings(Policy {
+            repo_root: Path::new("/repo"),
+            work_root: parent.path(),
+            enforcement: Enforcement::AllowUnsandboxed
+        })
+        .is_ok());
     }
 
     #[test]

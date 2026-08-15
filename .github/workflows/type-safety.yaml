@@ -46,6 +46,20 @@ jobs:
           rustup component list --installed | grep -qx 'rust-src' \
             || { echo "::error::rust-src missing; compile-fail expectations need std source"; exit 1; }
 
+      - name: No hardcoded home paths
+        # Ordered ahead of anything that compiles, since it needs no toolchain at all.
+        # Scoped to committed `*.sh` and `.github/**`; `tools/src/**` is excluded because
+        # `cache.rs` and `workdir.rs` use absolute home paths as `#[cfg(test)]` fixtures,
+        # where being foreign to the machine running the test is the point.
+        run: python3 tools/check_paths.py
+
+      - name: Formatting
+        # No `--locked`: cargo-fmt reads no lockfile and rejects the flag. Deliberately
+        # ahead of the cache restore -- it needs no dependencies, and the only way to
+        # make it green is to run `cargo fmt`. tools/rustfmt.toml pins the settings so a
+        # toolchain bump cannot reflow the tree and bury a real diff.
+        run: cargo fmt --manifest-path tools/Cargo.toml --check
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: tools
@@ -53,33 +67,41 @@ jobs:
           # restoring that would let cargo call harvest-tools fresh and run nothing.
           cache-targets: false
 
+      # `--locked` on every invocation below: without it cargo silently updates
+      # Cargo.lock to satisfy a semver-compatible release, so CI would stop testing the
+      # dependency set that `validate.yaml` builds the published numbers with.
       - name: Unit tests (lib + bin)
         # `--bin harvest-tools` is load-bearing: `report.rs` and `benchmark.rs` are declared
         # only in main.rs, so a bare `--lib` compiles neither.
-        run: cargo test --manifest-path tools/Cargo.toml --lib --bin harvest-tools
+        run: cargo test --locked --manifest-path tools/Cargo.toml --lib --bin harvest-tools
 
       - name: Compile-fail tests (the type invariants)
-        run: cargo test --manifest-path tools/Cargo.toml --test compile_fail
+        run: cargo test --locked --manifest-path tools/Cargo.toml --test compile_fail
 
       - name: Architecture rules
         # Shape rules over the source, for invariants enforced by ABSENCE. A trybuild
         # case proves today's code rejects a misuse; only these catch someone ADDING
         # the impl that makes the misuse compile.
-        run: cargo test --manifest-path tools/Cargo.toml --test architecture
+        run: cargo test --locked --manifest-path tools/Cargo.toml --test architecture
+
+      - name: Docs
+        # No RUSTDOCFLAGS: `warnings = "deny"` in the [lints.rust] table reaches rustdoc
+        # too, so a broken intra-doc link or an unclosed HTML tag is already an error.
+        run: cargo doc --locked --no-deps --manifest-path tools/Cargo.toml
 
       - name: Comment budget
         # tokei and scc score `///` and `//!` as code, which reports this repo at 11%
         # and could never fire -- the bloat is in `//!` module headers. tools/
         # comment_budget.py lexes string literals and counts doc comments.
-        run: python3 tools/comment_budget.py --max 15
+        run: python3 tools/comment_budget.py --max 13
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is
         # scoped to `--lib --bins` because test modules use `panic!` to assert unreachable
         # branches (cache.rs: the agent is never invoked on a cache hit).
         run: |
-          cargo clippy --manifest-path tools/Cargo.toml --all-targets
-          cargo clippy --manifest-path tools/Cargo.toml --lib --bins -- -D clippy::panic
+          cargo clippy --locked --manifest-path tools/Cargo.toml --all-targets
+          cargo clippy --locked --manifest-path tools/Cargo.toml --lib --bins -- -D clippy::panic
 
       - name: Show the recorded stderr of each invariant
         if: always()

@@ -84,7 +84,9 @@ impl Model {
     /// The `:suffix` routing hint must go to OpenCode verbatim but is absent
     /// from registry metadata, so limit lookups must match on the bare id.
     fn metadata_id(&self) -> &str {
-        self.model_id.split_once(':').map_or(&self.model_id, |(id, _)| id)
+        self.model_id
+            .split_once(':')
+            .map_or(&self.model_id, |(id, _)| id)
     }
 
     fn is_bedrock(&self) -> bool {
@@ -189,10 +191,7 @@ fn project_config(tmp_root: &Path, m: &Model) -> String {
             .ok()
             .filter(|r| !r.is_empty())
             .unwrap_or_else(|| DEFAULT_BEDROCK_REGION.to_string());
-        let mut opts = vec![format!(
-            "        \"region\": {}",
-            json_str(&region)
-        )];
+        let mut opts = vec![format!("        \"region\": {}", json_str(&region))];
         if let Some(profile) = std::env::var("AWS_PROFILE").ok().filter(|p| !p.is_empty()) {
             opts.push(format!("        \"profile\": {}", json_str(&profile)));
         }
@@ -351,7 +350,9 @@ fn extract_limits(output: &str, provider: &str, model_id: &str) -> Option<ModelL
         buf.clear();
         depth = 0;
 
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&joined) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&joined) else {
+            continue;
+        };
         let matches_model = v.get("providerID").and_then(|x| x.as_str()) == Some(provider)
             && v.get("id").and_then(|x| x.as_str()) == Some(model_id);
         if !matches_model {
@@ -445,8 +446,13 @@ mod tests {
     fn results_slug_drops_region_and_vendor_prefixes() {
         // The same model in two regions must NOT produce two results dirs.
         for region in ["us.", "eu.", "global.", "au.", "jp."] {
-            let m = parse_model(&format!("amazon-bedrock/{region}anthropic.claude-sonnet-5")).unwrap();
-            assert_eq!(results_slug(&m), "opencode-claude-sonnet-5", "region {region}");
+            let m =
+                parse_model(&format!("amazon-bedrock/{region}anthropic.claude-sonnet-5")).unwrap();
+            assert_eq!(
+                results_slug(&m),
+                "opencode-claude-sonnet-5",
+                "region {region}"
+            );
         }
         let gpt = parse_model("amazon-bedrock/openai.gpt-5.5").unwrap();
         assert_eq!(results_slug(&gpt), "opencode-gpt-5.5");
@@ -459,7 +465,9 @@ mod tests {
         // LAST-MATCH-WINS: a deny emitted after the allow denies everything.
         let cfg = project_config(Path::new("/tmp/harvest-xyz"), &bedrock_sonnet());
         let deny = cfg.find(r#""*": "deny""#).expect("catch-all deny present");
-        let allow = cfg.find("/tmp/harvest-xyz/**").expect("tempdir allow present");
+        let allow = cfg
+            .find("/tmp/harvest-xyz/**")
+            .expect("tempdir allow present");
         assert!(deny < allow, "deny must precede allow, got:\n{cfg}");
     }
 
@@ -467,10 +475,13 @@ mod tests {
     fn project_config_is_valid_json_with_bedrock_block() {
         let cfg = project_config(Path::new("/tmp/harvest-xyz"), &bedrock_sonnet());
         let v: serde_json::Value = serde_json::from_str(&cfg).expect("valid JSON");
-        let opts = v.pointer("/provider/amazon-bedrock/options").expect("bedrock options");
+        let opts = v
+            .pointer("/provider/amazon-bedrock/options")
+            .expect("bedrock options");
         assert!(opts.get("region").and_then(|r| r.as_str()).is_some());
         assert_eq!(
-            v.pointer("/permission/external_directory/*").and_then(|d| d.as_str()),
+            v.pointer("/permission/external_directory/*")
+                .and_then(|d| d.as_str()),
             Some("deny"),
         );
     }
@@ -517,7 +528,9 @@ mod tests {
         assert!(root.join(".opencode/agents/harvest-translate.md").is_file());
         assert!(root.join(".opencode-xdg").is_dir(), "XDG isolation dir");
         assert!(
-            !root.join(".opencode/plugin/compaction-recovery.js").exists(),
+            !root
+                .join(".opencode/plugin/compaction-recovery.js")
+                .exists(),
             "translate has no artifacts to recover",
         );
 
@@ -525,7 +538,10 @@ mod tests {
         let plugin = std::fs::read_to_string(root.join(".opencode/plugin/compaction-recovery.js"))
             .expect("verify writes the compaction plugin");
         assert!(plugin.contains("cat SYMBOLS.md ERRORS.md CONFIGS.md"));
-        assert!(!plugin.contains("{RECOVERY_CMD}"), "placeholder substituted");
+        assert!(
+            !plugin.contains("{RECOVERY_CMD}"),
+            "placeholder substituted"
+        );
     }
 
     #[test]
@@ -548,15 +564,25 @@ mod tests {
 "#;
         assert_eq!(
             extract_limits(pretty, "amazon-bedrock", "us.anthropic.claude-sonnet-5"),
-            Some(ModelLimits { context: 200000, output: Some(64000) }),
+            Some(ModelLimits {
+                context: 200000,
+                output: Some(64000)
+            }),
         );
 
-        let single = r#"{"providerID":"amazon-bedrock","id":"openai.gpt-5.5","limit":{"context":400000}}"#;
+        let single =
+            r#"{"providerID":"amazon-bedrock","id":"openai.gpt-5.5","limit":{"context":400000}}"#;
         assert_eq!(
             extract_limits(single, "amazon-bedrock", "openai.gpt-5.5"),
-            Some(ModelLimits { context: 400000, output: None }),
+            Some(ModelLimits {
+                context: 400000,
+                output: None
+            }),
         );
 
-        assert_eq!(extract_limits(pretty, "amazon-bedrock", "openai.gpt-5.5"), None);
+        assert_eq!(
+            extract_limits(pretty, "amazon-bedrock", "openai.gpt-5.5"),
+            None
+        );
     }
 }

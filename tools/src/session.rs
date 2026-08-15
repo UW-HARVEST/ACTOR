@@ -124,7 +124,10 @@ impl Session {
         // `set -o pipefail` on every backend: without it the pipeline's status is
         // tee's, so `timeout`'s 124 never reaches `record_agent_exit` and a killed
         // session is recorded as a clean exit.
-        format!("{ulimit}set -o pipefail; timeout {} {}", self.timeout_secs, self.program)
+        format!(
+            "{ulimit}set -o pipefail; timeout {} {}",
+            self.timeout_secs, self.program
+        )
     }
 
     fn session_flags(&self) -> String {
@@ -199,7 +202,10 @@ impl Session {
             .arg(&self.script)
             // `$0` for the script, so the values below start at `$1`.
             .arg("--")
-            .env("OPENSSL_DIR", std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into()))
+            .env(
+                "OPENSSL_DIR",
+                std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into()),
+            )
             .envs(self.agent_env.iter().copied());
         c
     }
@@ -306,7 +312,10 @@ mod tests {
         let claude = Session::claude(10_800);
         assert!(claude.shape().contains("max_turns=1000"));
         assert!(claude.shape().contains("permission_mode=bypassPermissions"));
-        for s in [Session::kiro(2_700), Session::opencode(crate::opencode::Phase::Verify, 10_800)] {
+        for s in [
+            Session::kiro(2_700),
+            Session::opencode(crate::opencode::Phase::Verify, 10_800),
+        ] {
             let shape = s.shape();
             assert!(!shape.contains("max_turns"), "{}: {shape}", s.program);
             assert!(!shape.contains("permission_mode"), "{}: {shape}", s.program);
@@ -327,7 +336,11 @@ mod tests {
     /// The env is a session constant now, so the two properties below moved here from
     /// `cache::Recipe`'s tests, where it used to be a settable field.
     fn shape_with_env(env: &'static [(&'static str, &'static str)]) -> String {
-        Session { agent_env: env, ..Session::kiro(1) }.shape()
+        Session {
+            agent_env: env,
+            ..Session::kiro(1)
+        }
+        .shape()
     }
 
     #[test]
@@ -357,8 +370,14 @@ mod tests {
         // A cap or a retry policy changes what the agent can produce, so changing the
         // constant must change the key.
         let shape = Session::claude(10_800).shape();
-        assert!(shape.contains(&crate::workdir::AGENT_FSIZE_BLOCKS.to_string()), "{shape}");
-        assert!(shape.contains(&crate::workdir::AGENT_DATA_KB.to_string()), "{shape}");
+        assert!(
+            shape.contains(&crate::workdir::AGENT_FSIZE_BLOCKS.to_string()),
+            "{shape}"
+        );
+        assert!(
+            shape.contains(&crate::workdir::AGENT_DATA_KB.to_string()),
+            "{shape}"
+        );
         for (k, v) in crate::translate::AGENT_ENV {
             assert!(shape.contains(&format!("env:{k}={v}")), "{shape}");
         }
@@ -387,7 +406,12 @@ mod tests {
     fn every_pipeline_sets_pipefail_so_a_timeout_is_visible() {
         // Without it the status is tee's 0 and a killed session records a clean exit.
         for s in all() {
-            assert!(s.script.contains("set -o pipefail"), "{}: {}", s.program, s.script);
+            assert!(
+                s.script.contains("set -o pipefail"),
+                "{}: {}",
+                s.program,
+                s.script
+            );
         }
     }
 }
