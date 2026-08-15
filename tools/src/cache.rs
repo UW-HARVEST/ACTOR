@@ -1,6 +1,12 @@
-//! Memoisation of agent phases. There is no cached-vs-uncached fork: every phase
+//! Memoisation of the verify phase. There is no cached-vs-uncached fork: the phase
 //! runs through [`Store::obtain`], and `--no-cache` is a [`Mode`] of the store rather
 //! than an `if` at the call site, so the two paths cannot drift.
+//!
+//! **Verify only.** Translate and test are not memoised. Verify is ~92% of the
+//! available saving, and translate's input is the C corpus rather than a [`Sealed`], so
+//! it needs an input digest this module does not compute. Said here because the phrase
+//! "every phase runs through `Store::obtain`" used to appear above and is not true: it
+//! led a 3h20m sweep to be launched expecting translation to populate the store.
 //!
 //! [`Produced`] is constructible only from a [`Sealed`], which requires
 //! [`crate::agent_health::Completed`], so "never cache an infra failure" is

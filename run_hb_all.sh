@@ -17,6 +17,12 @@ cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" || exit 1
 # suite and scored every project zero.
 export PATH="$HOME/.local/opt/cmake-3.28.6-linux-x86_64/bin:$HOME/.local/share/mise/installs/python/3.12.13/bin:$HOME/.cargo/bin:$HOME/.nix-profile/bin:$HOME/.local/bin:$PATH"
 
+# RUSTUP_TOOLCHAIN silently overrides rust-toolchain.toml, and harvest-tools refuses
+# rather than measure under a compiler the cache key does not describe. It is exported
+# in some login shells, so on 2026-08-15 all 7 translations completed (3h20m) and all 7
+# verifies were refused for this alone. Unset here so the driver cannot inherit it.
+unset RUSTUP_TOOLCHAIN
+
 # Refuse before the money, not after: a too-old cmake or a missing runner is an infra
 # failure that scores as a legitimate zero.
 require_version() {  # name  minimum  actual
