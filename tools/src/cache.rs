@@ -273,8 +273,16 @@ pub enum Mode {
 /// Constructible only from a [`Sealed`], hence only with a `Completed` proof.
 pub struct Produced<P: Phase> {
     pub sealed: Sealed<P>,
-    pub log: PathBuf,
+    /// Private: a public path field is a path escaping the module, and the shape rule
+    /// in tests/architecture.rs treats it as one.
+    log: PathBuf,
     pub provenance: serde_json::Value,
+}
+
+impl<P: Phase> Produced<P> {
+    pub fn new(sealed: Sealed<P>, log: PathBuf, provenance: serde_json::Value) -> Self {
+        Self { sealed, log, provenance }
+    }
 }
 
 pub struct Obtained<P: Phase> {

@@ -420,11 +420,11 @@ fn run_verify_agent(
     }
     println!("  verified artifact {:?}", sealed.digest());
 
-    Ok(Some(cache::Produced {
+    Ok(Some(cache::Produced::new(
         sealed,
-        log: log_path.to_path_buf(),
-        provenance: crate::translate::agent_provenance(agent, start.elapsed().as_secs()),
-    }))
+        log_path.to_path_buf(),
+        crate::translate::agent_provenance(agent, start.elapsed().as_secs()),
+    )))
 }
 
 fn build_configs_text(paths: &Paths, battery: &str, group: &battery::SharedSourceGroup) -> String {
