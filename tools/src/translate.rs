@@ -1202,6 +1202,27 @@ fn take_agent_exit() -> AgentExit {
     LAST_AGENT_EXIT.with(|c| c.replace(AgentExit::default()))
 }
 
+/// The observed exit, WITHOUT consuming it.
+///
+/// `merge_agent_exit` must be called exactly once per invocation because it takes the
+/// thread-local, and it runs later, when the metrics are written. The classifier needs
+/// the same observation first, so this peeks. `Copy` on [`AgentExit`] is what makes that
+/// a read rather than a second claim on it.
+pub fn observed_exit() -> crate::agent_health::Exit {
+    use crate::agent_health::Exit;
+    let e = LAST_AGENT_EXIT.with(|c| c.get());
+    if !e.recorded {
+        return Exit::Unobserved;
+    }
+    if e.timed_out {
+        return Exit::Timeout;
+    }
+    match e.exit_code {
+        Some(0) => Exit::Success,
+        code => Exit::Failure { code },
+    }
+}
+
 /// Shared by translate and verify so both report agent process health identically.
 fn merge_agent_exit(metrics: &mut serde_json::Value) {
     let e = take_agent_exit();
