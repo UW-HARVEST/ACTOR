@@ -609,7 +609,15 @@ fn run_verify_agent(
 
     // Same discriminator the scoring gate uses: an api_error run is not a measurement,
     // so its output must become neither `verified/` nor a cache entry.
-    let health = crate::agent_health::classify_log(log_path);
+    //
+    // The backend's log format is an argument rather than a guess: kiro writes prose, so
+    // classifying its log as stream-json made `completed()` return None every time and
+    // this function could never publish a kiro verification at all.
+    let health = crate::agent_health::classify(
+        log_path,
+        paths.agent.log_format(),
+        crate::translate::observed_exit(),
+    );
     let Some(proof) = health.completed() else {
         eprintln!(
             "  {} — not publishing verified/: the agent did not complete ({:?})",

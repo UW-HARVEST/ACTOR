@@ -23,6 +23,38 @@ use std::path::{Path, PathBuf};
 /// KB of final prose.
 const TAIL_BYTES: u64 = 16 * 1024;
 
+/// What a backend's log can prove about completion ON ITS OWN.
+///
+/// Named, because the two kinds make the *same* observation mean opposite things: a
+/// missing terminal record is a truncated run for a stream-json backend and no
+/// evidence at all for a prose one. Conflating them is why 9 of 16 translate
+/// backends could not be sealed — [`classify_log`] called a perfectly healthy
+/// c2rust or docker log `Infra { reason: "truncated" }`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LogFormat {
+    /// stream-json carrying a terminal record. Its ABSENCE means truncation.
+    StreamJson,
+    /// Prose (kiro, kimi, oneshot) or tool output (c2rust, laertes, c2saferrust).
+    /// Proves nothing about completion, so the exit status is the only evidence.
+    Opaque,
+}
+
+/// The harness's LIVE observation of how the agent process ended.
+///
+/// [`Exit::Unobserved`] is deliberately distinct from [`Exit::Failure`]: it means
+/// nobody watched, not that anything went wrong. An after-the-fact audit of a
+/// results tree has no observation, and must not manufacture one.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Exit {
+    Success,
+    Failure {
+        code: Option<i32>,
+    },
+    /// `timeout` killed the child — it reports 124.
+    Timeout,
+    Unobserved,
+}
+
 /// PROOF that an agent invocation ran to completion.
 ///
 /// The private unit field makes [`Health::completed`] the only way to obtain one,
@@ -63,6 +95,53 @@ impl Health {
     }
 }
 
+/// Classify a run the harness just watched.
+///
+/// This is the seal-time classifier: the caller knows which backend it launched and
+/// how the process ended, so both are arguments rather than guesses. [`classify_log`]
+/// is the after-the-fact counterpart for auditing a results tree, where neither is
+/// available.
+///
+/// For [`LogFormat::StreamJson`] the terminal record is authoritative and `exit` is
+/// deliberately ignored — see the module docs on `SIGXFSZ`: the agent runs under
+/// `ulimit -f`/`-d`, so a test binary killed by a signal fails commands inside a
+/// session that is itself fine, and that is a *result*.
+pub fn classify(log: &Path, format: LogFormat, exit: Exit) -> Health {
+    match format {
+        LogFormat::StreamJson => classify_log(log),
+        // An opaque log cannot distinguish "finished" from "killed", so the exit
+        // status carries the whole burden of proof.
+        LogFormat::Opaque => match exit {
+            Exit::Success => Health::Completed,
+            // The run was cut off: there is no measurement, exactly as a truncated
+            // stream-json log has none.
+            Exit::Timeout => Health::Infra {
+                reason: "timeout".into(),
+                detail: format!("{} — the agent was killed at the wall clock", log.display()),
+            },
+            // The tool ran and failed. That is a RESULT, not an infra failure, and
+            // must stay in the denominator — treating it as infra is how a project
+            // silently leaves the denominator and inflates the score. There is also
+            // nothing to seal, so no proof is needed.
+            Exit::Failure { code } => Health::Unknown {
+                why: format!(
+                    "opaque log, agent exited {}",
+                    code.map(|c| c.to_string())
+                        .unwrap_or_else(|| "by signal".into())
+                ),
+            },
+            Exit::Unobserved => Health::Unknown {
+                why: "opaque log and no observed exit status".into(),
+            },
+        },
+    }
+}
+
+/// Classify from the log alone, with no live observation.
+///
+/// Used by [`audit`] over a finished results tree. It cannot mint a [`Completed`] for
+/// an opaque log, because nothing in such a log distinguishes a finished run from a
+/// killed one — that is what [`classify`] exists for.
 pub fn classify_log(log: &Path) -> Health {
     let tail = match read_tail(log) {
         Ok(t) => t,
@@ -441,6 +520,120 @@ mod tests {
         assert_eq!(a[0].exit_code, Some(1));
         // `success:true` here is the cargo-check gate, NOT agent health.
         assert!(a[0].health.is_infra());
+    }
+
+    #[test]
+    fn an_opaque_log_that_exited_cleanly_can_be_sealed() {
+        // THE DEFECT: a c2rust cmake/cargo log or a kiro prose log carries no terminal
+        // record, so classify_log calls it Infra/truncated or Unknown and
+        // `completed()` returns None. `Scrubbed::seal` demands a Completed, so 9 of 16
+        // translate backends could never publish, and kiro's verify phase never could
+        // either.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = write(
+            tmp.path(),
+            "t.log",
+            "Finished release [optimized] target(s)\n",
+        );
+        assert_eq!(
+            classify(&log, LogFormat::Opaque, Exit::Success),
+            Health::Completed
+        );
+        assert!(
+            classify(&log, LogFormat::Opaque, Exit::Success)
+                .completed()
+                .is_some(),
+            "the proof seal() needs must be obtainable"
+        );
+        // ...and the old path really did refuse it, so this test is not vacuous.
+        assert!(classify_log(&log).completed().is_none());
+    }
+
+    #[test]
+    fn an_opaque_log_is_never_sealed_on_a_failure_or_without_an_observation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = write(tmp.path(), "t.log", "error: could not compile\n");
+        for exit in [
+            Exit::Failure { code: Some(1) },
+            Exit::Failure { code: None },
+            Exit::Timeout,
+            Exit::Unobserved,
+        ] {
+            assert!(
+                classify(&log, LogFormat::Opaque, exit)
+                    .completed()
+                    .is_none(),
+                "must not mint a proof for {exit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_tool_stays_in_the_denominator_but_a_timeout_does_not() {
+        // A tool that ran and could not translate is a RESULT and must be scored;
+        // calling it infra is how a project silently leaves the denominator and
+        // inflates the published rate. A timeout genuinely has no measurement.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = write(tmp.path(), "t.log", "c2rust: unsupported construct\n");
+        assert!(
+            !classify(&log, LogFormat::Opaque, Exit::Failure { code: Some(1) }).is_infra(),
+            "a failed translation is a result, not an infra failure"
+        );
+        assert!(classify(&log, LogFormat::Opaque, Exit::Timeout).is_infra());
+    }
+
+    #[test]
+    fn a_stream_json_verdict_is_never_overridden_by_the_exit_code() {
+        // The agent runs under `ulimit -f`/`-d`, so a test binary killed by SIGXFSZ
+        // fails commands inside a session that is itself fine — a result, not an infra
+        // failure. And an api_error run must stay infra however cleanly the shell exited.
+        let tmp = tempfile::tempdir().unwrap();
+        let clean = write(tmp.path(), "c.log", CLEAN);
+        let dead = write(tmp.path(), "d.log", DEAD);
+        for exit in [
+            Exit::Success,
+            Exit::Failure { code: Some(137) },
+            Exit::Timeout,
+            Exit::Unobserved,
+        ] {
+            assert_eq!(
+                classify(&clean, LogFormat::StreamJson, exit),
+                Health::Completed,
+                "terminal record is authoritative for {exit:?}"
+            );
+            assert!(classify(&dead, LogFormat::StreamJson, exit).is_infra());
+        }
+    }
+
+    #[test]
+    fn every_agent_declares_a_log_format_and_the_prose_ones_are_opaque() {
+        use crate::cli::Agent;
+        // Guards the table against a new variant defaulting to the wrong classifier.
+        for a in [
+            Agent::Claude,
+            Agent::ClaudeCombined,
+            Agent::ClaudeMinimal,
+            Agent::ClaudeNoIter,
+            Agent::ClaudeNoFeatures,
+            Agent::ClaudeNoSubtask,
+            Agent::ClaudeCrossPrompt,
+            Agent::CodexGpt55,
+            Agent::CodexGpt54,
+            Agent::OpenCode,
+        ] {
+            assert_eq!(a.log_format(), LogFormat::StreamJson, "{a:?}");
+        }
+        for a in [
+            Agent::Kiro,
+            Agent::C2rust,
+            Agent::Laertes,
+            Agent::C2SaferRust,
+            Agent::SmartC2Rust,
+            Agent::Kimi,
+            Agent::Oneshot,
+        ] {
+            assert_eq!(a.log_format(), LogFormat::Opaque, "{a:?}");
+        }
     }
 
     #[test]
