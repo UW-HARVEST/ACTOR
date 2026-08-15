@@ -61,6 +61,12 @@ jobs:
       - name: Compile-fail tests (the type invariants)
         run: cargo test --manifest-path tools/Cargo.toml --test compile_fail
 
+      - name: Architecture rules
+        # Shape rules over the source, for invariants enforced by ABSENCE. A trybuild
+        # case proves today's code rejects a misuse; only these catch someone ADDING
+        # the impl that makes the misuse compile.
+        run: cargo test --manifest-path tools/Cargo.toml --test architecture
+
       - name: Comment budget
         # tokei and scc score `///` and `//!` as code, which reports this repo at 11%
         # and could never fire -- the bloat is in `//!` module headers. tools/

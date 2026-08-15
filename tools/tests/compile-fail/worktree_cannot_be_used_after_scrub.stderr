@@ -1,0 +1,16 @@
+error[E0382]: borrow of moved value: `work`
+  --> tests/compile-fail/worktree_cannot_be_used_after_scrub.rs:11:13
+   |
+ 8 |     let work: harvest_tools::artifact::WorkTree<harvest_tools::artifact::Verify> =
+   |         ---- move occurs because `work` has type `WorkTree<harvest_tools::artifact::Verify>`, which does not implement the `Copy` trait
+ 9 |         sealed.materialise_into(scratch).unwrap();
+10 |     let _scrubbed = work.scrub().unwrap();
+   |                          ------- `work` moved due to this method call
+11 |     let _ = work.path();
+   |             ^^^^ value borrowed here after move
+   |
+note: `WorkTree::<P>::scrub` takes ownership of the receiver `self`, which moves `work`
+  --> src/artifact.rs
+   |
+   |     pub fn scrub(self) -> Result<Scrubbed<P>> {
+   |                  ^^^^
