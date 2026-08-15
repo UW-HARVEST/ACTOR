@@ -1,0 +1,10 @@
+error[E0382]: borrow of moved value: `scrubbed`
+  --> tests/compile-fail/scrubbed_cannot_be_used_after_seal.rs:22:13
+   |
+19 |     let scrubbed = work.scrub().unwrap();
+   |         -------- move occurs because `scrubbed` has type `Scrubbed<harvest_tools::artifact::Verify>`, which does not implement the `Copy` trait
+20 |     let c_before = sealed.digest();
+21 |     let _sealed = scrubbed.seal(proof(), c_before).unwrap();
+   |                   -------- value moved here
+22 |     let _ = scrubbed.rewritten();
+   |             ^^^^^^^^ value borrowed here after move

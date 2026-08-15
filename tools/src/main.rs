@@ -16,7 +16,11 @@ fn main() -> Result<()> {
     // Before, not after, a run that can take hours: a binary that does not match the
     // checkout cannot produce an attributable measurement.
     if cli.command.produces_artifacts() {
-        provenance::require_reproducible(cli.allow_dirty)?;
+        provenance::require_reproducible(if cli.allow_dirty {
+            provenance::OnUnreproducible::WarnAndStamp
+        } else {
+            provenance::OnUnreproducible::Refuse
+        })?;
     }
 
     // Only these two take a model id at runtime; every other agent has its model fixed

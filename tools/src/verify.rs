@@ -382,7 +382,10 @@ fn run_verify_agent(
             // Denies the repo root (the graded oracle, plus results/) and the shared
             // scratch base holding sibling work dirs, then re-grants this run's own root.
             let settings_path =
-                crate::sandbox::write_settings(&paths.repo_root, work.root(), work.root())?;
+                crate::sandbox::write_settings(crate::sandbox::Policy {
+                    repo_root: &paths.repo_root,
+                    work_root: work.root(),
+                })?;
             let agent_tmp = crate::workdir::agent_tmp(work.root())?;
             let status = Command::new("bash")
                 .arg("-c")

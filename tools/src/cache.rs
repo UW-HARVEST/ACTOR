@@ -112,22 +112,24 @@ impl ToolchainId {
 /// a digest, so the same work yields the same key on another machine.
 pub fn normalise(text: &str, work_root: &Path, repo_root: &Path) -> String {
     let mut out = text.to_string();
+    // `to_str`, not `to_string_lossy`: `text` is UTF-8, so a path that is not cannot
+    // occur in it — but its lossy form (U+FFFD per invalid byte) can, and substituting
+    // that would rewrite text that is not a path and change a digest for no reason.
+    let base = crate::workdir::base().ok();
+    let home = std::env::var_os("HOME");
+    let mut subs: Vec<(&str, &str)> = [
+        (work_root.to_str(), "$WORK"),
+        (repo_root.to_str(), "$REPO"),
+        (base.as_deref().and_then(Path::to_str), "$WORKBASE"),
+        (home.as_deref().and_then(std::ffi::OsStr::to_str), "$HOME"),
+    ]
+    .into_iter()
+    .filter_map(|(from, to)| from.filter(|s| !s.is_empty()).map(|s| (s, to)))
+    .collect();
     // Longest first: the work root usually lives under the scratch base.
-    let mut subs: Vec<(String, &str)> = vec![
-        (work_root.to_string_lossy().into_owned(), "$WORK"),
-        (repo_root.to_string_lossy().into_owned(), "$REPO"),
-    ];
-    if let Ok(base) = crate::workdir::base() {
-        subs.push((base.to_string_lossy().into_owned(), "$WORKBASE"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        subs.push((home.to_string_lossy().into_owned(), "$HOME"));
-    }
     subs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
     for (from, to) in subs {
-        if !from.is_empty() {
-            out = out.replace(&from, to);
-        }
+        out = out.replace(from, to);
     }
     out
 }
@@ -176,9 +178,12 @@ impl Recipe {
             // The real policy, tokenised: a hand-written summary would drift, and the
             // literal directory names are machine-specific and must not enter the key.
             sandbox_shape: normalise(
-                &crate::sandbox::settings_json(&paths.repo_root, work_root)
-                    .map(|v| v.to_string())
-                    .unwrap_or_default(),
+                &crate::sandbox::settings_json(crate::sandbox::Policy {
+                    repo_root: &paths.repo_root,
+                    work_root,
+                })
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
                 work_root,
                 &paths.repo_root,
             ),
@@ -310,7 +315,7 @@ pub struct Store {
     mode: Mode,
 }
 
-use crate::artifact::set_read_only;
+use crate::artifact::{set_read_only, Access};
 
 impl Store {
     /// Open the store at `<repo>/results/.cache/`.
@@ -474,7 +479,7 @@ impl Store {
         // `rename(2)` on a directory must update that directory's own `..` entry and
         // fails with EACCES otherwise. The root is locked right after the move instead.
         for e in std::fs::read_dir(&staging)? {
-            set_read_only(&e?.path(), true)?;
+            set_read_only(&e?.path(), Access::ReadOnly)?;
         }
 
         if let Some(parent) = dir.parent() {
@@ -484,13 +489,13 @@ impl Store {
         // so last-writer-wins is safe and a lock would only add a stale-lock failure mode
         // after a kill. The old entry must be made writable to be removable at all.
         if dir.exists() {
-            set_read_only(dir, false)?;
+            set_read_only(dir, Access::Writable)?;
             let _ = std::fs::remove_dir_all(dir);
         }
         std::fs::rename(&staging, dir)
             .with_context(|| format!("renaming {} into place", staging.display()))?;
         // In place and needing no further moves, so the root can be closed now too.
-        set_read_only(dir, true)?;
+        set_read_only(dir, Access::ReadOnly)?;
         Ok(())
     }
 
@@ -939,7 +944,7 @@ mod tests {
 
         // Defeat the read-only bit first: this is the scenario the digest check exists for.
         let dir = store.entry_dir(&inputs, &key);
-        crate::artifact::set_read_only(&dir, false).unwrap();
+        crate::artifact::set_read_only(&dir, Access::Writable).unwrap();
         std::fs::write(dir.join("code/src/lib.rs"), "pub fn a() { /* smuggled */ }").unwrap();
 
         let mut ran = false;

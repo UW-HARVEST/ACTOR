@@ -21,11 +21,25 @@ pub fn denied_read_roots(repo_root: &Path) -> Result<Vec<PathBuf>> {
     Ok(vec![repo_root.to_path_buf(), crate::workdir::base()?])
 }
 
-pub(crate) fn settings_json(repo_root: &Path, work_root: &Path) -> Result<serde_json::Value> {
-    let deny: Vec<String> = denied_read_roots(repo_root)?
+/// The two roots the policy is made of. As bare `&Path` parameters they are transposable,
+/// and transposed the policy denies the agent's work tree and *grants* the repo — the
+/// graded oracle, plus every other case's translation. With `bwrap` absent this file is the
+/// only sandbox, so nothing downstream would catch it.
+#[derive(Copy, Clone)]
+pub struct Policy<'a> {
+    pub repo_root: &'a Path,
+    /// Both the tree the agent may read and write, and where the policy file is written.
+    /// One field, not two: callers always passed the same value, and a difference would
+    /// launch the agent in a directory its own policy denies.
+    pub work_root: &'a Path,
+}
+
+pub(crate) fn settings_json(policy: Policy<'_>) -> Result<serde_json::Value> {
+    let deny: Vec<String> = denied_read_roots(policy.repo_root)?
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
+    let work_root = policy.work_root;
     Ok(serde_json::json!({
         "sandbox": {
             "enabled": true,
@@ -39,13 +53,13 @@ pub(crate) fn settings_json(repo_root: &Path, work_root: &Path) -> Result<serde_
     }))
 }
 
-/// `parent` is the directory the agent is launched *next to* — the work root for
-/// verify, the temp root for translate — not the agent's cwd.
-pub fn write_settings(repo_root: &Path, work_root: &Path, parent: &Path) -> Result<PathBuf> {
-    let dir = parent.join(".claude");
+/// Writes `<work_root>/.claude/settings.json`, which is where the agent is launched and
+/// so where `--settings` looks for it.
+pub fn write_settings(policy: Policy<'_>) -> Result<PathBuf> {
+    let dir = policy.work_root.join(".claude");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("settings.json");
-    std::fs::write(&path, settings_json(repo_root, work_root)?.to_string())?;
+    std::fs::write(&path, settings_json(policy)?.to_string())?;
     Ok(path)
 }
 
@@ -126,7 +140,8 @@ mod tests {
         let parent = tmp.path().join("root");
         std::fs::create_dir_all(&parent).unwrap();
         // The real function, not `policy`: base() needs HOME, which tests have.
-        let p = write_settings(Path::new("/repo"), &parent, &parent).expect("writes policy");
+        let p = write_settings(Policy { repo_root: Path::new("/repo"), work_root: &parent })
+            .expect("writes policy");
         assert_eq!(p, parent.join(".claude/settings.json"));
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();

@@ -333,9 +333,42 @@ pub fn all_case_names(battery: &Battery) -> Vec<String> {
     names
 }
 
-/// LLM API credits consumed by a single agent invocation.
+/// The Kiro Power add-on rate, and the only bridge between the two money types below.
+const USD_PER_CREDIT: f64 = 0.04;
+
+/// LLM API credits consumed by a single agent invocation. The field is private so the
+/// only way to read the number is [`Credits::as_f64`], which cannot be reached by
+/// accident where a dollar amount was meant.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
-pub struct Credits(pub f64);
+pub struct Credits(f64);
+
+/// US dollars — deliberately NOT the same type as [`Credits`]. Both end up in the paper's
+/// cost table and they differ by 25x, so a bare `f64` for each makes a 25x error a
+/// type-correct expression.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Usd(f64);
+
+impl Credits {
+    pub fn new(credits: f64) -> Self {
+        Self(credits)
+    }
+
+    pub fn as_f64(self) -> f64 {
+        self.0
+    }
+
+    /// The single place the rate is applied, so no other expression in the crate can
+    /// produce a dollar figure and none can spell a dollar figure as a credit count.
+    pub fn to_usd(self) -> Usd {
+        Usd(self.0 * USD_PER_CREDIT)
+    }
+}
+
+impl Usd {
+    pub fn as_f64(self) -> f64 {
+        self.0
+    }
+}
 
 /// Every field is as the provider reported it; none is derived.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -410,7 +443,7 @@ static KIRO_CREDITS_RE: LazyLock<Regex> = LazyLock::new(|| {
 fn extract_kiro_meta(log_path: &Path) -> Option<AgentRunMeta> {
     let data = crate::agent_health::read_tail(log_path).ok()?;
     let caps = KIRO_CREDITS_RE.captures_iter(&data).last()?;
-    let credits = Credits(caps[1].parse().ok()?);
+    let credits = Credits::new(caps[1].parse().ok()?);
     let wall_secs = parse_duration(&caps[2]);
     Some(AgentRunMeta { credits, wall_secs, ..Default::default() })
 }
@@ -919,7 +952,7 @@ mod provenance_tests {
         // newline, so a two-line fixture silently fails to match.
         let p = log(tmp.path(), "▸ Credits: 1.25 • Time: 3m 4s\n");
         let m = extract_agent_meta(&p).expect("kiro log is recognised");
-        assert_eq!(m.credits.0, 1.25);
+        assert_eq!(m.credits.as_f64(), 1.25);
         assert_eq!(m.wall_secs, 184);
         assert!(m.total_cost_usd.is_none(), "no dollar cost for kiro");
         assert!(m.model.is_none());

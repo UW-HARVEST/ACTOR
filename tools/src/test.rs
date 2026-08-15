@@ -740,8 +740,8 @@ fn check_enrichment(
             Some(stored) => {
                 let sc = stored.get("credits").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let sw = stored.get("wall_secs").and_then(|v| v.as_u64()).unwrap_or(0);
-                if (sc - live.credits.0).abs() > 0.001 {
-                    diffs.push(format!("{key}.credits expected={sc} actual={}", live.credits.0));
+                if (sc - live.credits.as_f64()).abs() > 0.001 {
+                    diffs.push(format!("{key}.credits expected={sc} actual={}", live.credits.as_f64()));
                 }
                 if sw != live.wall_secs {
                     diffs.push(format!("{key}.wall_secs expected={sw} actual={}", live.wall_secs));
@@ -803,9 +803,13 @@ fn build_harvest_bench_lib(crate_dir: &Path, name: &str) -> (Option<PathBuf>, St
     if so.is_file() { (Some(so), stderr) } else { (None, stderr) }
 }
 
+/// Returns the whole [`HarvestBenchResult`] rather than a `(usize, usize, usize)` the
+/// caller re-labels: `passed()` is `tests_ok > 0 && tests_failed == 0`, so transposing the
+/// failed and skipped counts turns a project with failures and no skips into a PASS.
+/// `build_ok` is true by construction — this is only reached once the cdylib linked.
 fn score_harvest_bench_suite(
     runner: &Path, suite_dir: &Path, lib: &Path, report_json: &Path,
-) -> Result<(usize, usize, usize)> {
+) -> Result<HarvestBenchResult> {
     // Suite build dir is per-result so parallel/rerun don't collide.
     let build_dir = report_json.parent().unwrap_or(Path::new(".")).join("gtest_build");
     let _ = Command::new(runner)
@@ -820,26 +824,28 @@ fn score_harvest_bench_suite(
     // A missing or malformed report (gtest suite failed to build, cdylib
     // incompatible, cmake choked) must record a zero-score case, not abort the
     // whole sweep with an error.
+    let no_tests =
+        || HarvestBenchResult { tests_ok: 0, tests_failed: 0, tests_skipped: 0, build_ok: true };
     let Ok(data) = std::fs::read_to_string(report_json) else {
         eprintln!("⚠️  harvest-bench runner produced no report {} — recording 0 tests", report_json.display());
-        return Ok((0, 0, 0));
+        return Ok(no_tests());
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
         eprintln!("⚠️  harvest-bench runner report at {} is not valid JSON — recording 0 tests", report_json.display());
-        return Ok((0, 0, 0));
+        return Ok(no_tests());
     };
     let verdicts = json.pointer("/run/verdicts").and_then(|v| v.as_array());
-    let Some(verdicts) = verdicts else { return Ok((0, 0, 0)) };
+    let Some(verdicts) = verdicts else { return Ok(no_tests()) };
 
-    let mut ok = 0usize; let mut failed = 0usize; let mut skipped = 0usize;
+    let mut res = no_tests();
     for v in verdicts {
         let passed = v.get("passed").and_then(|b| b.as_bool()).unwrap_or(false);
         let skip = v.get("skipped").and_then(|b| b.as_bool()).unwrap_or(false);
-        if skip { skipped += 1; }
-        else if passed { ok += 1; }
-        else { failed += 1; }
+        if skip { res.tests_skipped += 1; }
+        else if passed { res.tests_ok += 1; }
+        else { res.tests_failed += 1; }
     }
-    Ok((ok, failed, skipped))
+    Ok(res)
 }
 
 /// Load stored harvest-bench result.json files as a baseline for --check.
@@ -894,13 +900,15 @@ pub fn run_harvest_bench_test(
             }
             Some(so) => {
                 let report = crate_dir.join("harvest_bench_report.json");
-                let (ok, fail, skip) = score_harvest_bench_suite(&runner, project.gtest_suite(), &so, &report)?;
-                let res = HarvestBenchResult { tests_ok: ok, tests_failed: fail, tests_skipped: skip, build_ok: true };
+                let res = score_harvest_bench_suite(&runner, project.gtest_suite(), &so, &report)?;
                 if res.passed() {
                     passed += 1;
-                    println!("  ✅ {name}: {ok} ok, {skip} skipped");
-                } else if fail > 0 {
-                    println!("  ⚠️  {name}: {ok} ok, {fail} FAILED, {skip} skipped");
+                    println!("  ✅ {name}: {} ok, {} skipped", res.tests_ok, res.tests_skipped);
+                } else if res.tests_failed > 0 {
+                    println!(
+                        "  ⚠️  {name}: {} ok, {} FAILED, {} skipped",
+                        res.tests_ok, res.tests_failed, res.tests_skipped
+                    );
                 } else {
                     println!("  ⚠️  {name}: no tests passed");
                 }
