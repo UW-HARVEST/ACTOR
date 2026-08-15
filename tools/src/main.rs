@@ -1,7 +1,6 @@
 
 use anyhow::Result;
-// The binary is a thin shell over the library; see the note in lib.rs for why it must
-// not re-declare these with `mod`.
+// Never re-declare these with `mod` here; see the note in lib.rs.
 use harvest_tools::{
     agent_health, battery, benchmark, cache, cli, opencode, provenance, report, test,
 };
@@ -14,17 +13,14 @@ fn main() -> Result<()> {
     let model = cli.model.as_deref();
     let cache = cli.cache;
 
-    // Refuse, in the first second, to produce a measurement whose code cannot be
-    // identified. On 2026-08-14 a twelve-hour $625 sweep ran a binary built seven
-    // commits behind main, containing none of the gates it was meant to exercise;
-    // nothing noticed, because nothing compared the binary to the checkout.
+    // Before, not after, a run that can take hours: a binary that does not match the
+    // checkout cannot produce an attributable measurement.
     if cli.command.produces_artifacts() {
         provenance::require_reproducible(cli.allow_dirty)?;
     }
 
-    // Two agents pick their model at runtime: `oneshot` (an OpenRouter model id)
-    // and `opencode` (an OpenCode `provider/model` id). Every other agent has its
-    // model fixed by the variant, so a `--model` there would be silently ignored.
+    // Only these two take a model id at runtime; every other agent has its model fixed
+    // by the variant, so a `--model` there would be silently ignored.
     let model_driven = matches!(agent, cli::Agent::Oneshot | cli::Agent::OpenCode);
     if model_driven && model.is_none() {
         anyhow::bail!(
@@ -54,14 +50,11 @@ fn main() -> Result<()> {
             let inner = Dataset::strip_prefix(target);
             let bench = benchmark::for_dataset(dataset);
 
-            // The ONE lifecycle: translate → [verify?] → enrich → score.
-            // `verifies` folds the old nine-clause skip `if` into a property.
             bench.translate(&paths, inner, include_regex.as_deref(), parallel)?;
             if !no_verify && bench.verifies(agent) {
                 bench.verify(&repo_root, &paths, inner, include_regex.as_deref(), false, parallel)?;
             }
-            // `test --update` folds enrichment in; it is never a separate step,
-            // and run_test regenerates the tables so they never drift.
+            // `Update` covers enrichment and table regeneration; no separate steps.
             run_test(&repo_root, bench.as_ref(), &paths, inner, test::TestMode::Update, false)?;
         }
         Command::Translate {
@@ -89,7 +82,7 @@ fn main() -> Result<()> {
         }
         Command::Cache { action } => match action {
             cli::CacheAction::Stats => {
-                // Bypass: `cache stats` must never create or mutate an entry.
+                // Bypass, not the operator's --cache: `stats` must never create an entry.
                 let store = cache::Store::open(&repo_root, cache::Mode::Bypass)?;
                 let (entries, bytes) = store.stats()?;
                 println!(
@@ -131,13 +124,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Score a target, then — in `--update` mode — regenerate the report tables so
-/// `tables/` always reflect what has just been run. This is the single seam
-/// that keeps scored data and the generated tables from drifting: there is no
-/// separate `report` step to remember. `report::generate` reads every agent's
-/// data from disk, so the tables reflect the whole current state (not just the
-/// slice re-run), and it self-guards (skips results.md if the corpus submodule
-/// is absent, bails on inconsistency), so a partial run can't clobber tables.
+/// The only path into scoring and table regeneration, so the health gate below can
+/// live here rather than in each dataset's scorer.
 fn run_test(
     repo_root: &std::path::Path,
     bench: &dyn benchmark::Benchmark,
@@ -146,11 +134,8 @@ fn run_test(
     mode: test::TestMode,
     allow_infra_failures: bool,
 ) -> Result<()> {
-    // Gate BEFORE scoring, not after: `bench.test` writes result.json and
-    // `report::generate` rewrites every file in tables/, so by the time a
-    // warning printed the damage would already be on disk. This is the only
-    // path into either, which is why the check lives here rather than in each
-    // dataset's scorer.
+    // Must precede scoring: `bench.test` writes result.json and `report::generate`
+    // rewrites all of tables/, so a warning afterwards comes too late to help.
     let audit = agent_health::audit(&paths.results_dir)?;
     if let Some(report) = agent_health::describe_infra_failures(&audit) {
         agent_health::record_infra_failures(&paths.results_dir, &audit)?;
@@ -172,13 +157,8 @@ fn run_test(
 
     let outcome = bench.test(paths, target, mode)?;
     if matches!(mode, test::TestMode::Update) {
-        // Regenerate tables from the current on-disk state. The tables are a
-        // whole-corpus roll-up with cross-agent invariants (report::generate
-        // bails if, say, an agent dir is missing), so on a partial/in-progress
-        // tree it can legitimately fail — that must NOT fail the score run the
-        // user asked for. Treat regeneration as best-effort: succeed silently
-        // when the tree is complete, warn (don't error) when it isn't, so a
-        // single-tool rerun always works and never silently leaves stale tables.
+        // Best-effort: the tables are a whole-corpus roll-up, so `report::generate`
+        // legitimately fails on a partial tree and must not fail the score run.
         match report::generate(repo_root) {
             Ok(()) => println!("📊 Tables regenerated (tables/)"),
             Err(e) => eprintln!(
@@ -191,7 +171,6 @@ fn run_test(
     Ok(())
 }
 
-/// Print a test outcome and exit non-zero on `--check` mismatch.
 fn report_test_outcome(outcome: test::TestOutcome) {
     if let test::TestOutcome::Failed(ref mismatches) = outcome {
         eprintln!("\n❌ {} battery(ies) mismatched:", mismatches.len());

@@ -1,49 +1,25 @@
-//! Canonical project scoring — the SINGLE source of the pass/build rule.
-//!
-//! A scored project reduces to three facts: did the translated crate compile,
-//! how many ground-truth tests passed, and how many failed. Every dataset's
-//! scorer normalizes its own on-disk `result.json` shape into this
-//! [`ProjectOutcome`] and then asks ONE predicate, [`ProjectOutcome::passed`],
-//! for the verdict.
-//!
-//! That indirection exists because it was once absent. Each call site inlined
-//! its own verdict and they diverged: one path scored `build_ok &&
-//! tests_failed == 0` — so a crate that compiled but ran ZERO ground-truth
-//! tests counted as a pass — while another scored `ok > 0 && fail == 0`. The
-//! first rule is strictly more generous, which scored our own system more
-//! leniently than the systems it was compared against. Keeping the rule in one
-//! place, applied by every scorer, is what removes that possibility.
+//! Canonical project scoring — the SINGLE source of the pass/build rule, applied by
+//! every dataset's scorer. Inlined per-call-site verdicts once diverged: one counted a
+//! crate that compiled but ran ZERO ground-truth tests as a pass, scoring our own system
+//! more leniently than the systems it was compared against.
 
-/// A per-project outcome, normalized so a single pass/build rule can be applied
-/// uniformly to every system and dataset.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProjectOutcome {
-    /// The translated crate compiled.
     pub built: bool,
-    /// Ground-truth tests that passed.
     pub tests_ok: u32,
-    /// Ground-truth tests that failed.
     pub tests_failed: u32,
 }
 
 impl ProjectOutcome {
-    /// THE canonical pass rule, applied identically to every system: at least
-    /// one ground-truth test passed and none failed. A crate that compiles but
-    /// runs zero tests (an empty or mis-structured translation with no runnable
-    /// test target) is NOT a pass — this is what keeps every system on exactly
-    /// equal footing.
+    /// A crate that compiles but runs zero tests (empty or mis-structured translation,
+    /// no runnable test target) is deliberately NOT a pass.
     pub fn passed(&self) -> bool {
         self.tests_ok > 0 && self.tests_failed == 0
     }
 
-    /// Whether the crate compiled (the "Builds" column). Distinct from
-    /// [`passed`](Self::passed) on purpose: "compiles" and "is correct" are
-    /// separate measurements and a report must never conflate them.
-    // `allow`, not `expect`: `dead_code` fires for this method in the BIN target (where
-    // `scoring` is a private module) but not in the LIB target (where `built` is `pub` and
-    // reachable from the crate root). An `expect` is therefore unfulfilled in one of the
-    // two builds, and an unfulfilled expectation is itself a warning. A reason is still
-    // mandatory -- see `allow_attributes_without_reason` in Cargo.toml.
+    // `allow`, not `expect`: `dead_code` fires in the BIN target (where `scoring` is a
+    // private module) but not in the LIB target, so an `expect` would be unfulfilled in
+    // one of the two builds — itself a warning.
     #[allow(
         dead_code,
         reason = "the Builds column is reported per-dataset today, but the rule that \
@@ -59,14 +35,12 @@ impl ProjectOutcome {
 mod tests {
     use super::*;
 
-    /// Build a candidate outcome the way a scorer does.
     fn outcome(built: bool, tests_ok: u32, tests_failed: u32) -> ProjectOutcome {
         ProjectOutcome { built, tests_ok, tests_failed }
     }
 
     #[test]
     fn build_but_zero_tests_is_not_a_pass() {
-        // The exact degenerate case: compiles, runs 0 tests.
         let o = outcome(true, 0, 0);
         assert!(o.built());
         assert!(!o.passed(), "0 passing / 0 failing must NOT count as a pass");
@@ -93,8 +67,6 @@ mod tests {
 
     #[test]
     fn built_and_passed_are_independent() {
-        // A crate that compiled but ran zero tests counts for Builds, never for
-        // Tests. Conflating the two is the drift this module exists to prevent.
         let compiled_no_tests = outcome(true, 0, 0);
         assert!(compiled_no_tests.built());
         assert!(!compiled_no_tests.passed());

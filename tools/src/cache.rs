@@ -1,35 +1,16 @@
-//! Memoisation of agent phases — **the** execution path, not an optional layer.
+//! Memoisation of agent phases. There is no cached-vs-uncached fork: every phase
+//! runs through [`Store::obtain`], and `--no-cache` is a [`Mode`] of the store rather
+//! than an `if` at the call site, so the two paths cannot drift.
 //!
-//! There is deliberately no cached-vs-uncached fork. Every agent phase runs through
-//! [`Store::obtain`], which is given the work as a closure and invokes it only when
-//! no stored result matches. A hit and a miss therefore share one publish path, one
-//! provenance record, and one place that decides identity. `--no-cache` is a
-//! [`Mode`] of the store, not an `if` at the call site, so it cannot drift from the
-//! caching path.
+//! [`Produced`] is constructible only from a [`Sealed`], which requires
+//! [`crate::agent_health::Completed`], so "never cache an infra failure" is
+//! unrepresentable rather than checked.
 //!
-//! # What the type system gives us for free
-//!
-//! [`Produced`] can only be constructed from a [`Sealed`], and sealing requires
-//! [`crate::agent_health::Completed`] — so an infra-failed run cannot even be
-//! offered to the store. The rule "never cache a 403" is not a check here; it is
-//! unrepresentable.
-//!
-//! # Identity
-//!
-//! A key covers everything that could change the output:
-//!
-//! ```text
-//! schema · phase · agent · model · toolchain · prompt · recipe · input tree
-//! ```
-//!
-//! and is **machine-independent**: no absolute path enters it. Paths are rewritten
-//! to `$WORK` / `$REPO` tokens before hashing, and the `prompt_digest_is_machine_independent`
-//! test asserts it, because a leak would mean a colleague's cache silently never
-//! hits and they would have no way to tell that from "caching does not help here".
-//!
-//! `OPENSSL_DIR` is deliberately **excluded**: it is a machine property whose only
-//! influence is on whether openssl links, i.e. on `build_ok`, which is decided in
-//! the test phase — and the test phase is not cached.
+//! Keys are machine-independent: paths are rewritten to `$WORK` / `$REPO` tokens
+//! before hashing, because a leaked absolute path would make a colleague's cache
+//! silently never hit, indistinguishable from "caching does not help here".
+//! `OPENSSL_DIR` is deliberately excluded: it can only influence `build_ok`, which is
+//! decided in the test phase, and the test phase is not cached.
 
 use crate::artifact::{Phase, Sealed, TreeDigest};
 use anyhow::{Context, Result};
@@ -38,8 +19,6 @@ use std::path::{Path, PathBuf};
 
 /// Bump to invalidate every entry, e.g. if the key composition changes.
 pub const SCHEMA: u32 = 1;
-
-// ── Newtypes ───────────────────────────────────────────────────────────────
 
 macro_rules! digest_newtype {
     ($(#[$m:meta])* $name:ident) => {
@@ -59,24 +38,17 @@ macro_rules! digest_newtype {
 
 digest_newtype! {
     /// Digest of the FINAL prompt text sent to the agent, after substitution and
-    /// path normalisation. The template alone is not enough: a case's cmake flags
-    /// are interpolated in, so two cases sharing `verify.md` can be different
-    /// invocations. This is also what makes a prompt edit correctly invalidate
-    /// every affected case — the property that would have scoped the #62/#63
-    /// reruns mechanically instead of by hand.
+    /// path normalisation. The template alone is not enough: a case's cmake flags are
+    /// interpolated in, so two cases sharing `verify.md` can be different invocations.
     PromptDigest
 }
 digest_newtype! {
-    /// Digest of *how* we invoke the agent: turn limit, permission mode, timeouts,
-    /// resource caps, the agent definition, the sandbox policy shape.
     RecipeDigest
 }
 digest_newtype! {
-    /// The resolved compiler, from `rustc -vV`. `build_ok` is a function of it, and
-    /// the agent iterates with `cargo build` during verify, so it belongs in the
-    /// key. Includes the host triple, so entries are not shared across
-    /// architectures — correct, since the same prompt on a different target is a
-    /// different experiment.
+    /// The resolved compiler, from `rustc -vV`, host triple included: `build_ok` is a
+    /// function of it and the agent iterates with `cargo build` during verify, so
+    /// entries must not be shared across compiler versions or architectures.
     ToolchainId
 }
 digest_newtype! {
@@ -84,12 +56,10 @@ digest_newtype! {
     CacheKey
 }
 
-/// The model the agent will actually use.
-///
-/// Must be known BEFORE the run, which is why it has to be pinned: `--agent claude`
-/// passes no `--model`, so the resolved model appears only in the log's `init`
-/// record — after the fact. A key that omitted it could hand back output produced
-/// by a different model, and the CLI auto-updates.
+/// The model the agent will actually use. Must be pinned before the run: `--agent
+/// claude` passes no `--model`, so the resolved model appears only in the log's `init`
+/// record, after the fact — and the CLI auto-updates, so an unkeyed model could hand
+/// back output produced by a different one.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ModelId(String);
 
@@ -97,8 +67,8 @@ impl ModelId {
     pub fn new(s: impl Into<String>) -> Result<Self> {
         let s = s.into();
         anyhow::ensure!(!s.trim().is_empty(), "model id must not be empty");
-        // It reaches a `bash -lc` command line, and `[1m]` is a bracket glob, so it
-        // must be single-quoted there. Refuse anything that could break out.
+        // It reaches a `bash -lc` command line single-quoted (`[1m]` is a bracket
+        // glob), so refuse anything that could break out of those quotes.
         anyhow::ensure!(
             !s.contains('\'') && !s.contains('`') && !s.contains('$') && !s.contains('\n'),
             "model id contains shell metacharacters: {s}"
@@ -111,9 +81,9 @@ impl ModelId {
 }
 
 impl ToolchainId {
-    /// Read the resolved compiler. Refuses if `RUSTUP_TOOLCHAIN` is set, because it
-    /// silently overrides `rust-toolchain.toml` — the current results tree contains
-    /// 676 crates built with 1.97.1 next to 11 built with the pinned 1.94.0.
+    /// Refuses if `RUSTUP_TOOLCHAIN` is set, because it silently overrides
+    /// `rust-toolchain.toml` — the current results tree holds 676 crates built with
+    /// 1.97.1 next to 11 built with the pinned 1.94.0.
     pub fn detect() -> Result<Self> {
         anyhow::ensure!(
             std::env::var_os("RUSTUP_TOOLCHAIN").is_none(),
@@ -138,10 +108,8 @@ impl ToolchainId {
     }
 }
 
-// ── Path normalisation ─────────────────────────────────────────────────────
-
-/// Rewrite machine-specific paths to stable tokens. Applied to anything that goes
-/// into a digest, so the same work yields the same key on another machine.
+/// Rewrite machine-specific paths to stable tokens. Applied to everything that enters
+/// a digest, so the same work yields the same key on another machine.
 pub fn normalise(text: &str, work_root: &Path, repo_root: &Path) -> String {
     let mut out = text.to_string();
     // Longest first: the work root usually lives under the scratch base.
@@ -169,7 +137,6 @@ fn feed(h: &mut Sha256, bytes: &[u8]) {
     h.update(bytes);
 }
 
-/// Digest the final prompt, after normalisation.
 pub fn prompt_digest(prompt: &str, work_root: &Path, repo_root: &Path) -> PromptDigest {
     let mut h = Sha256::new();
     feed(&mut h, b"prompt-v1");
@@ -177,11 +144,8 @@ pub fn prompt_digest(prompt: &str, work_root: &Path, repo_root: &Path) -> Prompt
     PromptDigest(format!("sha256:{:x}", h.finalize()))
 }
 
-// ── Recipe ─────────────────────────────────────────────────────────────────
-
-/// How the agent is invoked. An explicit struct rather than the raw argv, because
-/// argv contains the scratch path — a nonce — and hashing it would make every key
-/// unique.
+/// How the agent is invoked. An explicit struct rather than the raw argv, because argv
+/// contains the scratch path — a nonce — and hashing it would make every key unique.
 pub struct Recipe {
     pub max_turns: u32,
     pub permission_mode: &'static str,
@@ -191,17 +155,15 @@ pub struct Recipe {
     pub agents_json: &'static str,
     /// Shape of the sandbox policy with paths tokenised.
     pub sandbox_shape: String,
-    /// Agent-runtime environment (retries, request timeouts). Previously set by the
-    /// shell driver, so the key could not see it: two sweeps with different retry
-    /// policy shared an entry. See [`crate::translate::AGENT_ENV`].
+    /// Agent-runtime environment (retries, request timeouts). Keyed because retry
+    /// policy changes how a throttled session ends. See [`crate::translate::AGENT_ENV`].
     pub agent_env: &'static [(&'static str, &'static str)],
 }
 
 impl Recipe {
-    /// The verify phase's recipe, read from the same constants the invocation uses
-    /// rather than restated — so raising a resource cap or the turn limit changes
-    /// the key automatically, instead of silently reusing output produced under the
-    /// old limits.
+    /// Reads the same constants the invocation uses rather than restating them, so
+    /// raising a resource cap or the turn limit changes the key instead of silently
+    /// reusing output produced under the old limits.
     pub fn for_verify(paths: &crate::battery::Paths, work_root: &Path) -> Self {
         Self {
             max_turns: 1000,
@@ -210,11 +172,9 @@ impl Recipe {
             ulimit_fsize_blocks: crate::workdir::AGENT_FSIZE_BLOCKS,
             ulimit_data_kb: crate::workdir::AGENT_DATA_KB,
             agents_json: crate::translate::CLAUDE_PLAIN_AGENT_JSON,
-            // The REAL policy, tokenised — not a hand-written summary of it, which
-            // would be one more thing to keep in step. What can change the agent's
-            // behaviour is the set of deny/allow decisions; the literal directory
-            // names are this machine's business and must not enter the key.
             agent_env: crate::translate::AGENT_ENV,
+            // The real policy, tokenised: a hand-written summary would drift, and the
+            // literal directory names are machine-specific and must not enter the key.
             sandbox_shape: normalise(
                 &crate::sandbox::settings_json(&paths.repo_root, work_root)
                     .map(|v| v.to_string())
@@ -246,12 +206,9 @@ impl Recipe {
     }
 }
 
-// ── Key ────────────────────────────────────────────────────────────────────
-
-/// Every input to a key. All fields are public and required, and there is no
-/// `Default`: adding a component is then a compile error at every construction
-/// site. Forgetting one would let two different invocations share an entry, which
-/// is silent corruption rather than a visible failure.
+/// Every input to a key. No `Default`, so adding a component is a compile error at
+/// every construction site: a forgotten one would let two different invocations share
+/// an entry, which is silent corruption rather than a visible failure.
 pub struct KeyInputs<'a> {
     pub phase: &'static str,
     pub agent: &'a str,
@@ -292,67 +249,55 @@ impl KeyInputs<'_> {
             "prompt": self.prompt.as_str(),
             "recipe": self.recipe.as_str(),
             "input_tree": self.input_tree.as_str(),
-            // Recorded for audit, and deliberately NOT part of the key nor of the
-            // fields `load` re-compares. Keying on it would invalidate every entry
-            // on each harness commit — including commits that cannot affect an
-            // artifact, like a doc change — which would leave the cache permanently
-            // empty and worthless. When a change genuinely alters what an artifact
-            // IS, bump SCHEMA by hand. That is a deliberate judgement call, and the
-            // stamp is here so a wrong call is at least diagnosable after the fact.
+            // Recorded for audit, deliberately NOT keyed and not among the fields
+            // `load` re-compares: every harness commit would otherwise empty the cache,
+            // including commits that cannot affect an artifact. When a change genuinely
+            // alters what an artifact IS, bump SCHEMA by hand.
             "harness": crate::provenance::harness_id(),
         })
     }
 }
 
-// ── Store ──────────────────────────────────────────────────────────────────
-
 /// How the store behaves. Chosen once, at the top level, so no call site branches.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
-    /// Read and write. The default.
+    /// The default.
     ReadWrite,
-    /// Never read, never write. For sampling an agent's variance, where memoising
-    /// would defeat the point.
+    /// For sampling an agent's variance, where memoising would defeat the point.
     Bypass,
-    /// Never read, but DO write, replacing any existing entry. What `--force`
-    /// means: the operator forces because the stored artifact is untrustworthy, so
-    /// leaving the old one would be wrong.
+    /// Never read, but DO write, replacing any existing entry: `--force` means the
+    /// stored artifact is untrustworthy, so leaving the old one would be wrong.
     Refresh,
 }
 
-/// What a phase produced. Constructible only from a [`Sealed`], hence only with a
-/// `Completed` proof — so an infra-failed run cannot reach the store.
+/// Constructible only from a [`Sealed`], hence only with a `Completed` proof.
 pub struct Produced<P: Phase> {
     pub sealed: Sealed<P>,
     pub log: PathBuf,
     pub provenance: serde_json::Value,
 }
 
-/// The result of [`Store::obtain`], however it was obtained.
 pub struct Obtained<P: Phase> {
     pub sealed: Sealed<P>,
-    /// True if this replayed a stored result and no agent ran. Callers must not
-    /// report a replay as fresh spend: the stored provenance records what the
-    /// original run cost, which is not what this run cost.
+    /// True if a stored result was replayed and no agent ran. Callers must not report a
+    /// replay as fresh spend: the provenance records what the ORIGINAL run cost.
     pub replayed: bool,
     pub key: CacheKey,
-    /// The provenance of the invocation that produced this artifact — the current
-    /// one on a miss, the original one on a replay.
+    /// Provenance of the producing invocation: this run on a miss, the original on a
+    /// replay.
     pub provenance: serde_json::Value,
 }
 
-/// Everything about a stored entry other than the artifact.
 struct Loaded<P: Phase> {
     sealed: Sealed<P>,
     provenance: serde_json::Value,
 }
 
 pub struct Store {
-    /// Never escapes this module. `entry_dir` is private, `load` hands back a
-    /// [`Sealed`] (which yields no path), and `stats` hands back numbers — so there
-    /// is no expression outside `cache.rs` that produces a path into the store, and
-    /// therefore none that can run a command in one. Same argument as [`Sealed`],
-    /// and it needs no new type to make it: module privacy already says it.
+    /// Never escapes this module: `entry_dir` is private, `load` hands back a
+    /// [`Sealed`] (which yields no path), and `stats` hands back numbers — so no
+    /// expression outside `cache.rs` can produce a path into the store, and therefore
+    /// none can run a command in one.
     root: PathBuf,
     mode: Mode,
 }
@@ -362,15 +307,11 @@ use crate::artifact::set_read_only;
 impl Store {
     /// Open the store at `<repo>/results/.cache/`.
     ///
-    /// The level matters and is not cosmetic. Every tree-walker in the harness is
-    /// handed `results/<dataset>/<agent>` or deeper — `test::discover_batteries`
-    /// treats each child as a battery, `stage_phase_for_runtests` symlinks each
-    /// grandchild for scoring. Placing the store two levels above all of them means
-    /// no scorer can reach it by walking, so a cached crate can never be staged,
-    /// built, or graded as if it were a case. Putting it under the per-agent results
-    /// dir instead would put it directly in `discover_batteries`' path, where today
-    /// it would be skipped only by the accident of not containing a `translated/`
-    /// child.
+    /// The level is load-bearing: every tree-walker is handed
+    /// `results/<dataset>/<agent>` or deeper (`test::discover_batteries` treats each
+    /// child as a battery, `stage_phase_for_runtests` symlinks each grandchild), so
+    /// sitting two levels above them all is what stops a cached crate being staged,
+    /// built, or graded as if it were a case.
     pub fn open(repo_root: &Path, mode: Mode) -> Result<Self> {
         let root = repo_root.join("results").join(".cache");
         std::fs::create_dir_all(root.join("tmp"))
@@ -386,16 +327,13 @@ impl Store {
             .join(key.as_str())
     }
 
-    /// **The** execution path for an agent phase.
+    /// **The** execution path for an agent phase: a hit and a miss return the same type
+    /// and are published identically, so the two cannot drift.
     ///
-    /// `compute` runs only when nothing usable is stored. A hit and a miss return
-    /// the same type and are published identically, so the two cannot drift.
-    ///
-    /// `compute` returning `Ok(None)` means "this invocation produced nothing worth
-    /// keeping" — the agent did not complete, or this agent has no such phase. That
-    /// is stored as nothing at all, deliberately: a failure is a property of the
-    /// moment (an API outage, a timeout), not of the inputs, so memoising it would
-    /// make a transient failure permanent and identical on every future run.
+    /// `compute` returning `Ok(None)` — the agent did not complete, or this agent has no
+    /// such phase — stores nothing at all, deliberately: a failure is a property of the
+    /// moment (an API outage, a timeout), not of the inputs, so memoising it would make
+    /// a transient failure permanent and identical on every future run.
     pub fn obtain<P: Phase>(
         &self,
         inputs: &KeyInputs<'_>,
@@ -411,9 +349,8 @@ impl Store {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    // A damaged entry is a miss, loudly. Never silently trusted, and
-                    // never silently deleted either: quarantine it so the corruption
-                    // can be examined rather than destroying the evidence.
+                    // A damaged entry is a miss, loudly — and quarantined rather than
+                    // deleted, so the corruption can still be examined.
                     eprintln!("  cache: ignoring unusable entry {}: {e:#}", key.as_str());
                     let bad = self.root.join("quarantine").join(key.as_str());
                     if let Some(p) = bad.parent() {
@@ -437,15 +374,11 @@ impl Store {
         }))
     }
 
-    /// Load and VALIDATE an entry.
-    ///
-    /// Every key component is re-compared against the recorded meta. That catches
-    /// hash collisions, but far more usefully it catches key-construction bugs: if
-    /// two genuinely different invocations ever compute the same key, this turns
-    /// silent cross-contamination into a loud error naming the field that differs.
-    ///
-    /// The stored artifact's own digest is re-derived and compared too, so a
-    /// corrupted or hand-edited entry cannot be served as if it were the original.
+    /// Load and VALIDATE an entry. Re-comparing every key component against the recorded
+    /// meta catches key-construction bugs: if two genuinely different invocations ever
+    /// compute the same key, this is a loud error naming the field that differs instead
+    /// of silent cross-contamination. The stored artifact's digest is re-derived too, so
+    /// a corrupted or hand-edited entry cannot be served as if it were the original.
     fn load<P: Phase>(
         &self,
         inputs: &KeyInputs<'_>,
@@ -484,11 +417,9 @@ impl Store {
         Ok(Some(Loaded { sealed, provenance }))
     }
 
-    /// Restore the stored agent transcript to `dest`.
-    ///
-    /// A replay must leave the same files behind as a fresh run, or the "already
-    /// verified" skip check — which keys on `verified/logs/verify.log` existing —
-    /// would not see it and the next run would redo the work.
+    /// The "already verified" skip check keys on `verified/logs/verify.log` existing, so
+    /// a replay must leave the same files behind as a fresh run or the next run redoes
+    /// the work.
     pub fn restore_log(&self, inputs: &KeyInputs<'_>, key: &CacheKey, dest: &Path) -> Result<()> {
         let src = self.entry_dir(inputs, key).join("agent").join("run.log");
         if !src.is_file() {
@@ -502,11 +433,9 @@ impl Store {
         Ok(())
     }
 
-    /// Write an entry ATOMICALLY: stage under `tmp/`, fsync, then rename. A killed
-    /// run therefore leaves an orphan under `tmp/`, never a half-written entry that
-    /// a later read would trust. This is the failure mode with precedent: on
-    /// 2026-08-13 three runs were killed mid-flight and left truncated logs that
-    /// were skipped-then-scored.
+    /// Write an entry ATOMICALLY: stage under `tmp/`, then rename. A killed run leaves an
+    /// orphan under `tmp/`, never a half-written entry that a later read would trust —
+    /// killed runs have already produced truncated logs that were then scored.
     fn store<P: Phase>(
         &self,
         inputs: &KeyInputs<'_>,
@@ -526,19 +455,16 @@ impl Store {
             staging.join("agent").join("run.json"),
             serde_json::to_string_pretty(&produced.provenance)? + "\n",
         )?;
-        // `output_tree` is NOT a key component — it is the result, so it cannot be.
-        // It is recorded so a read can prove the artifact is the one that was
-        // written, which is what makes `load` an integrity check and not just a
-        // lookup.
+        // `output_tree` is the result, so it cannot be a key component; it is recorded so
+        // a read can prove the artifact is the one that was written.
         let mut meta = inputs.meta(key);
         meta["output_tree"] = serde_json::json!(produced.sealed.digest().as_str());
         std::fs::write(staging.join("meta.json"), serde_json::to_string_pretty(&meta)? + "\n")?;
 
-        // Lock the CONTENTS before the rename, so no file is ever writable while
-        // visible at the entry's final path — but leave the staging root itself
-        // writable, because `rename(2)` on a directory has to update that
-        // directory's own `..` entry and fails with EACCES otherwise. The root is
-        // locked immediately after the move instead.
+        // Lock the CONTENTS before the rename, so no file is ever writable while visible
+        // at the entry's final path — but leave the staging root itself writable, because
+        // `rename(2)` on a directory must update that directory's own `..` entry and
+        // fails with EACCES otherwise. The root is locked right after the move instead.
         for e in std::fs::read_dir(&staging)? {
             set_read_only(&e?.path(), true)?;
         }
@@ -546,17 +472,16 @@ impl Store {
         if let Some(parent) = dir.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Refresh replaces; a concurrent writer with the same key wrote identical
-        // content by construction, so last-writer-wins is safe and a lock would
-        // only add a stale-lock failure mode after a kill. The old entry must be
-        // made writable again first — we just made it un-removable.
+        // A concurrent writer with the same key wrote identical content by construction,
+        // so last-writer-wins is safe and a lock would only add a stale-lock failure mode
+        // after a kill. The old entry must be made writable to be removable at all.
         if dir.exists() {
             set_read_only(dir, false)?;
             let _ = std::fs::remove_dir_all(dir);
         }
         std::fs::rename(&staging, dir)
             .with_context(|| format!("renaming {} into place", staging.display()))?;
-        // Now that it is in place and needs no further moves, close the root too.
+        // In place and needing no further moves, so the root can be closed now too.
         set_read_only(dir, true)?;
         Ok(())
     }
@@ -634,7 +559,6 @@ mod tests {
 
     #[test]
     fn model_id_refuses_shell_metacharacters() {
-        // It reaches a `bash -lc` command line; `[1m]` is fine quoted, `$(..)` is not.
         assert!(ModelId::new("claude-opus-5[1m]").is_ok());
         assert!(ModelId::new("").is_err());
         assert!(ModelId::new("x$(whoami)").is_err());
@@ -654,7 +578,6 @@ mod tests {
 
     #[test]
     fn prompt_digest_is_machine_independent() {
-        // THE portability property: same prompt, two machines' paths, one digest.
         // A leak here means a colleague's cache silently never hits.
         let a = prompt_digest(
             "work in /home/alice/.harvest/work/w-1 on /home/alice/src/ACTOR",
@@ -725,11 +648,8 @@ mod tests {
         assert_ne!(base, changed, "a different cap can change what the agent produces");
     }
 
-    // ── Store behaviour ────────────────────────────────────────────────────
-    //
-    // These need a real `Sealed<Verify>`, which needs a `Completed` proof — so the
-    // fixture walks the actual lifecycle rather than fabricating one. That is the
-    // point of the type: there is no shortcut, in tests either.
+    // These need a real `Sealed<Verify>`, which needs a `Completed` proof, so the
+    // fixtures below walk the actual lifecycle rather than fabricating one.
 
     use crate::artifact::{Scratch, Sealed, Translate, Verify, WorkTree};
 
@@ -739,8 +659,8 @@ mod tests {
         case: PathBuf,
     }
 
-    /// A results tree with one case that has a `translated/` phase, laid out exactly
-    /// as `Store::open` and `assemble_into` expect to find it.
+    /// A results tree with one case, laid out as `Store::open` and `assemble_into`
+    /// expect to find it.
     fn fixture() -> Fixture {
         let repo = tempfile::tempdir().unwrap();
         let case = repo.path().join("results/Test-Corpus/claude/P00_case");
@@ -758,8 +678,7 @@ mod tests {
         Fixture { _repo: repo, repo: path, case }
     }
 
-    /// Run the lifecycle to a sealed verify artifact, applying `edit` as the agent's
-    /// change to the crate.
+    /// `edit` stands in for the agent's change to the crate.
     fn seal_verify(case: &Path, edit: &str) -> Sealed<Verify> {
         let translated = Sealed::<Translate>::adopt(case).unwrap();
         let work: WorkTree<Verify> =
@@ -798,10 +717,9 @@ mod tests {
         }
     }
 
-    /// THE load-bearing property. `store` records the artifact's digest and `load`
-    /// recomputes it from the exported copy; if those two disagree, every hit fails
-    /// validation, gets quarantined, and the cache silently never works while
-    /// looking like it is enabled.
+    /// THE load-bearing property: if the recorded digest and the one recomputed from the
+    /// exported copy disagree, every hit fails validation, gets quarantined, and the cache
+    /// silently never works while looking like it is enabled.
     #[test]
     fn a_digest_survives_the_round_trip_through_the_store() {
         let f = fixture();
@@ -876,9 +794,8 @@ mod tests {
 
     #[test]
     fn a_failed_invocation_is_not_stored() {
-        // An API outage is a property of the moment, not of the inputs. Memoising it
-        // would turn one bad afternoon into a permanent, silent, identical failure —
-        // which is precisely what happened on 2026-08-13, minus the permanence.
+        // An API outage is a property of the moment, not of the inputs; memoising it
+        // would make one bad afternoon a permanent, silent, identical failure.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let (m, t, r) = fixtures();
@@ -890,7 +807,6 @@ mod tests {
         assert!(out.is_none());
         assert_eq!(store.stats().unwrap().0, 0, "nothing may be stored for a failure");
 
-        // And the next attempt must actually re-run rather than replay the failure.
         let mut ran = false;
         store
             .obtain(&inputs, || {
@@ -959,9 +875,8 @@ mod tests {
 
     #[test]
     fn a_stored_entry_is_read_only_on_disk() {
-        // The layer that binds what the types cannot see: a shell-out, a stray
-        // `cargo build --manifest-path`, a future refactor. Without it, "nothing runs
-        // in the cache" holds only for code that went through these types.
+        // Binds what the types cannot see: a shell-out, a stray `cargo build
+        // --manifest-path`, a future refactor.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let (m, t, r) = fixtures();
@@ -1014,8 +929,7 @@ mod tests {
         let key = inputs.key();
         store.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}")))).unwrap();
 
-        // Someone edits a stored crate — having first defeated the read-only bit,
-        // which is exactly the scenario the digest check exists for.
+        // Defeat the read-only bit first: this is the scenario the digest check exists for.
         let dir = store.entry_dir(&inputs, &key);
         crate::artifact::set_read_only(&dir, false).unwrap();
         std::fs::write(dir.join("code/src/lib.rs"), "pub fn a() { /* smuggled */ }").unwrap();
@@ -1038,10 +952,8 @@ mod tests {
 
     #[test]
     fn the_store_sits_outside_every_tree_walker() {
-        // `test::discover_batteries` is handed `results/<dataset>/<agent>` and treats
-        // each child as a battery; `stage_phase_for_runtests` symlinks each
-        // grandchild for scoring. If the store lived under either, a cached crate
-        // could be staged and graded as if it were a case.
+        // `discover_batteries` treats each child of `results/<dataset>/<agent>` as a
+        // battery, so a store living under it could be graded as if it were a case.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let (m, t, r) = fixtures();
@@ -1079,10 +991,8 @@ mod tests {
 
     #[test]
     fn recipe_digest_covers_the_agent_runtime_env() {
-        // The defect being closed: these settings lived in a shell driver as bare
-        // `export` lines, so two sweeps with different retry policy shared a cache
-        // entry. Retry count changes how a throttled session ends, so it changes
-        // what the agent produces.
+        // Retry count changes how a throttled session ends, so it changes what the agent
+        // produces; these once lived in a shell driver where the key could not see them.
         let twenty = recipe_with_env(&[("CLAUDE_CODE_MAX_RETRIES", "20")]);
         let one = recipe_with_env(&[("CLAUDE_CODE_MAX_RETRIES", "1")]);
         assert_ne!(twenty, one, "retry policy must change the key");
@@ -1093,8 +1003,8 @@ mod tests {
 
     #[test]
     fn recipe_digest_is_insensitive_to_env_ordering() {
-        // Reordering the constant is not a different experiment; if it were, a
-        // cosmetic edit would silently invalidate every stored entry.
+        // If reordering the constant were a different key, a cosmetic edit would
+        // silently invalidate every stored entry.
         let a = recipe_with_env(&[("A", "1"), ("B", "2")]);
         let b = recipe_with_env(&[("B", "2"), ("A", "1")]);
         assert_eq!(a, b);
@@ -1102,8 +1012,8 @@ mod tests {
 
     #[test]
     fn harness_stamp_is_recorded_but_not_keyed() {
-        // Recorded so a result is traceable to code; NOT keyed, or every harness
-        // commit would empty the cache. Both halves matter, so both are asserted.
+        // Recorded so a result is traceable to code, but NOT keyed, or every harness
+        // commit would empty the cache.
         let (m, t, r) = fixtures();
         let p = PromptDigest("sha256:p".into());
         let i = TreeDigest::for_test("sha256:i");
@@ -1121,8 +1031,7 @@ mod tests {
 
     #[test]
     fn toolchain_detect_refuses_an_overriding_env() {
-        // The 676-vs-11 compiler split in the current results tree came from exactly
-        // this variable being set.
+        // The 676-vs-11 compiler split in the results tree came from this variable.
         let prev = std::env::var_os("RUSTUP_TOOLCHAIN");
         std::env::set_var("RUSTUP_TOOLCHAIN", "1.97.1");
         let got = ToolchainId::detect();

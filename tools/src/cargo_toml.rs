@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use toml_edit::{Array, DocumentMut, Item, Table};
 
-/// Read, modify, and write a Cargo.toml file.
 pub struct CargoToml {
     doc: DocumentMut,
     path: std::path::PathBuf,
@@ -26,7 +25,6 @@ impl CargoToml {
             .with_context(|| format!("writing {}", self.path.display()))
     }
 
-    /// Set [lib] name and ensure crate-type = ["cdylib"].
     pub fn set_lib(&mut self, name: &str) {
         let lib = self.doc.entry("lib").or_insert_with(|| {
             Item::Table(Table::new())
@@ -39,7 +37,6 @@ impl CargoToml {
         }
     }
 
-    /// Set [[bin]] name = "driver", path = "src/main.rs".
     pub fn set_bin_driver(&mut self) {
         if let Some(bins) = self.doc.get_mut("bin").and_then(|b| b.as_array_of_tables_mut()) {
             if let Some(bin) = bins.iter_mut().next() {
@@ -47,7 +44,6 @@ impl CargoToml {
                 return;
             }
         }
-        // No [[bin]] exists — append one
         let mut bin = Table::new();
         bin.insert("name", toml_edit::value("driver"));
         bin.insert("path", toml_edit::value("src/main.rs"));
@@ -56,19 +52,16 @@ impl CargoToml {
         self.doc.insert("bin", Item::ArrayOfTables(arr));
     }
 
-    /// Remove all [[bin]] sections.
     pub fn remove_bin(&mut self) {
         self.doc.remove("bin");
     }
 
-    /// Add [workspace] if not present.
     pub fn add_workspace(&mut self) {
         if self.doc.get("workspace").is_none() {
             self.doc.insert("workspace", Item::Table(Table::new()));
         }
     }
 
-    /// Set default = [...] under [features].
     pub fn set_default_features(&mut self, features: &[String]) {
         let feat = self.doc.entry("features").or_insert_with(|| {
             Item::Table(Table::new())
@@ -82,7 +75,6 @@ impl CargoToml {
         }
     }
 
-    /// Get all defined feature names (excluding "default").
     pub fn defined_features(&self) -> Vec<String> {
         self.doc
             .get("features")
@@ -97,7 +89,6 @@ impl CargoToml {
     }
 }
 
-/// Remove main.rs and tests/ directory for lib cases.
 pub fn strip_for_lib(translated_rust_dir: &Path) -> Result<()> {
     let main_rs = translated_rust_dir.join("src/main.rs");
     if main_rs.exists() {
