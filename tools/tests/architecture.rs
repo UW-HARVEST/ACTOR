@@ -14,6 +14,10 @@ fn src(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name)
 }
 
+fn file_name(path: &Path) -> String {
+    path.file_name().unwrap_or_default().to_string_lossy().into_owned()
+}
+
 fn parse(path: &Path) -> syn::File {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     syn::parse_file(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
@@ -330,5 +334,57 @@ fn nothing_new_runs_inside_the_results_tree() {
          Build in a scratch copy instead — measuring an artifact must not mutate it.",
         v.hits.len(),
         v.hits
+    );
+}
+
+// ── A6 ─────────────────────────────────────────────────────────────────────
+
+/// "Did this phase produce a crate?" has exactly one spelling: `battery::has_crate`.
+///
+/// It had two — `crate_dir`'s `is_dir()` and its callers' `verified/Cargo.toml` — and
+/// pcre2 satisfied one and not the other, so it left the harvest-bench denominator
+/// instead of counting as a failure. Nothing else would catch a third spelling.
+#[test]
+fn only_battery_defines_the_has_crate_predicate() {
+    struct V {
+        file: String,
+        hits: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
+            if matches!(c.method.to_string().as_str(), "exists" | "is_file") {
+                if let syn::Expr::MethodCall(inner) = &*c.receiver {
+                    let joins_manifest = inner.method == "join"
+                        && inner.args.iter().any(|a| matches!(a,
+                            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. })
+                                if s.value() == "Cargo.toml"));
+                    if joins_manifest {
+                        self.hits.push(format!("{}: .join(\"Cargo.toml\").{}()", self.file, c.method));
+                    }
+                }
+            }
+            syn::visit::visit_expr_method_call(self, c);
+        }
+    }
+
+    let mut hits: Vec<String> = Vec::new();
+    for path in rust_sources() {
+        if file_name(&path) == "battery.rs" {
+            continue;
+        }
+        let mut v = V { file: file_name(&path), hits: Vec::new() };
+        v.visit_file(&parse(&path));
+        hits.extend(v.hits);
+    }
+    assert!(
+        hits.is_empty(),
+        "the phase predicate is spelled out again outside battery.rs: {hits:#?}\n\
+         Call `battery::has_crate(dir)`. Two spellings of \"this phase produced a crate\"\n\
+         is how a project vanished from a published denominator."
+    );
+    let battery = std::fs::read_to_string(src("battery.rs")).expect("battery.rs");
+    assert!(
+        battery.contains(r#"phase_dir.join("Cargo.toml").is_file()"#),
+        "battery::has_crate must still BE the predicate this rule redirects callers to"
     );
 }

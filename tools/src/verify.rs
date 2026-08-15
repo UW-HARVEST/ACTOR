@@ -61,7 +61,7 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
             let handle = s.spawn(|| {
                 let _permit = sem.acquire();
                 let case_dir = output_dir.join(&c.name);
-                if !crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
+                if !crate::battery::has_crate(&crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED)) {
                     return (c.name.clone(), None);
                 }
                 if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
@@ -104,7 +104,7 @@ fn run_with_semaphore(paths: &Paths, battery_name: &str, filter: Option<&str>, f
         current += 1;
         let real_dir = output_dir.join(&group.real_case);
 
-        if !crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
+        if !crate::battery::has_crate(&crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED)) {
             continue;
         }
 
@@ -170,7 +170,7 @@ pub fn run_harvest_bench(paths: &Paths, projects: &[battery::HarvestBenchProject
                 move || {
                     let _permit = sem.acquire();
                     let case_dir = paths.output_dir(&name);
-                    if !crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml").exists() {
+                    if !crate::battery::has_crate(&crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED)) {
                         return (name, None);
                     }
                     if !force && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED).join("logs/verify.log").exists() {
