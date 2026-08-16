@@ -132,6 +132,7 @@ Three non-negotiables:
 | 7 | **translate ported onto it — the translate cache** | behaviour | — | differential run |
 | 8 | `cache/` + `dataset/` split; `cache_mode` off `Paths` | move + 1 cut | `battery ↔ cache`, `cache ↔ cli` | DAG baseline drops 2 |
 | 9 | `oracle/` + `analyse/` | move | — | token-diff |
+| 11 | **an entry records the inputs its key came from**: `input/` verbatim + the digest preimages | additions only | — | the key recomputed from the entry alone |
 | 10 | renames: `Scrubbed`→`ScrubbedTree`, `Sealed`→`SealedTree`, `CDir`→`OracleDir` | mechanical | — | 9 `.stderr` re-records, one at a time |
 
 ### What each PR actually does
@@ -208,6 +209,17 @@ patching:
 | 2× homes for `translation.log` | one, a function of `P` |
 | 2× 17-arm dispatch matches | one, parameterised by `PromptKind` |
 | `IsolatedWorkDir` (Verify hardcoded) | generic over `P` |
+
+**11 — the key's inputs.** An entry stores its output tree and re-derives it on every load,
+but of the eight key components the three that are digests keep no preimage: the normalised
+prompt text, the recipe shape and the input tree are all discarded once hashed. So a change
+to `normalise`, to `Recipe::digest`'s framing or to `hash_tree` empties the store instead of
+re-keying it, and each of those three has a change already in the plan — the
+`$HARVEST_WORKDIR`/`$WORK` token unification, and file mode entering the tree digest once the
+C-dataset projects bring executables. Storing `input/` verbatim alongside `code/` plus one
+small `key-preimage.json` makes every entry able to recompute the key it is filed under,
+which is the acceptance test. Size is not a constraint here: full recoverability is the
+point.
 
 **10 — renames.** Last, because the nine `.stderr` files are column- and
 toolchain-exact.
