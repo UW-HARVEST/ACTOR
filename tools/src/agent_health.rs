@@ -12,7 +12,7 @@
 //!
 //! The process exit code is not a discriminator either, though it is 1:1 with
 //! `terminal_reason` today: the agent runs under `ulimit -f`/`-d` (see
-//! [`crate::workdir`]), so a test binary killed by `SIGXFSZ` fails commands inside
+//! [`crate::io::workdir`]), so a test binary killed by `SIGXFSZ` fails commands inside
 //! a session that is itself fine — that is a *result*. Exit codes are therefore
 //! reported as corroborating detail only.
 
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn a_credential_expiry_is_infra_despite_subtype_success() {
         // subtype says "success"; the run is dead.
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let log = write(tmp.path(), "verify.log", DEAD);
         match classify_log(&log) {
             Health::Infra { reason, detail } => {
@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn subtype_success_alone_never_makes_a_run_healthy() {
         // Guard against a future refactor keying on `subtype`.
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let log = write(tmp.path(), "v.log", DEAD);
         assert!(classify_log(&log).is_infra());
         assert!(
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn a_completed_run_is_completed() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let log = write(tmp.path(), "v.log", CLEAN);
         assert_eq!(classify_log(&log), Health::Completed);
     }
@@ -441,7 +441,7 @@ mod tests {
             "Verified. c_src/ was not modified.",
             "Phase B found a divergence; the Rust port returns 0 where C returns -1.",
         );
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let log = write(tmp.path(), "v.log", &body);
         assert_eq!(classify_log(&log), Health::Completed);
     }
@@ -450,7 +450,7 @@ mod tests {
     fn a_truncated_log_is_infra_not_silently_ok() {
         // A killed run leaves a fresh mtime and no terminal record; skipping on
         // existence alone corrupted 4 cases of a real sweep.
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let log = write(
             tmp.path(),
             "v.log",
@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn a_kiro_log_is_unknown_not_a_failure() {
         // kiro-cli is not stream-json. Absence of evidence must not block scoring.
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let log = write(tmp.path(), "v.log", "Credits: 1.25\nTime: 3m 4s\n");
         assert!(matches!(classify_log(&log), Health::Unknown { .. }));
     }
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn stderr_interleaved_into_the_stream_does_not_break_parsing() {
         let body = format!("warning: something on stderr\n{CLEAN}\n");
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let log = write(tmp.path(), "v.log", &body);
         assert_eq!(classify_log(&log), Health::Completed);
     }
@@ -482,7 +482,7 @@ mod tests {
     fn the_last_terminal_record_wins() {
         // Retries can leave earlier records in the stream.
         let body = format!("{DEAD}\n{CLEAN}\n");
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let log = write(tmp.path(), "v.log", &body);
         assert_eq!(
             classify_log(&log),
@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn audit_prefers_the_verify_log_over_the_translate_log() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let case = tmp.path().join("B01/case_x");
         write(&case, "translated/logs/translation.log", CLEAN);
         write(&case, "verified/logs/verify.log", DEAD);
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn audit_reads_exit_code_as_corroboration_only() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let case = tmp.path().join("hb/jansson");
         write(&case, "verified/logs/verify.log", DEAD);
         std::fs::write(
@@ -529,7 +529,7 @@ mod tests {
         // `completed()` returns None. `Scrubbed::seal` demands a Completed, so 9 of 16
         // translate backends could never publish, and kiro's verify phase never could
         // either.
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let log = write(
             tmp.path(),
             "t.log",
@@ -551,7 +551,7 @@ mod tests {
 
     #[test]
     fn an_opaque_log_is_never_sealed_on_a_failure_or_without_an_observation() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let log = write(tmp.path(), "t.log", "error: could not compile\n");
         for exit in [
             Exit::Failure { code: Some(1) },
@@ -573,7 +573,7 @@ mod tests {
         // A tool that ran and could not translate is a RESULT and must be scored;
         // calling it infra is how a project silently leaves the denominator and
         // inflates the published rate. A timeout genuinely has no measurement.
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let log = write(tmp.path(), "t.log", "c2rust: unsupported construct\n");
         assert!(
             !classify(&log, LogFormat::Opaque, Exit::Failure { code: Some(1) }).is_infra(),
@@ -587,7 +587,7 @@ mod tests {
         // The agent runs under `ulimit -f`/`-d`, so a test binary killed by SIGXFSZ
         // fails commands inside a session that is itself fine — a result, not an infra
         // failure. And an api_error run must stay infra however cleanly the shell exited.
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let clean = write(tmp.path(), "c.log", CLEAN);
         let dead = write(tmp.path(), "d.log", DEAD);
         for exit in [
@@ -638,7 +638,7 @@ mod tests {
 
     #[test]
     fn describe_is_none_when_everything_completed() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         write(&tmp.path().join("b/c1"), "verified/logs/verify.log", CLEAN);
         let a = audit(tmp.path()).unwrap();
         assert!(describe_infra_failures(&a).is_none());
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn describe_names_the_cases_and_the_counts() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         write(
             &tmp.path().join("b/good"),
             "verified/logs/verify.log",

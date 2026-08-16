@@ -175,7 +175,7 @@ impl CliVersion {
     }
 
     /// The override is a parameter, not a read: mutating process env in a test races
-    /// across test threads (see `crate::workdir::resolve_from`).
+    /// across test threads (see `crate::io::workdir::resolve_from`).
     fn resolve(program: &str, stated: Option<String>) -> Result<Self> {
         if let Some(v) = stated {
             let v = v.trim();
@@ -255,7 +255,7 @@ pub fn normalise(text: &str, work_root: &Path, repo_root: &Path) -> String {
         (work_root.to_path_buf(), "$WORK"),
         (repo_root.to_path_buf(), "$REPO"),
     ];
-    if let Ok(base) = crate::workdir::base() {
+    if let Ok(base) = crate::io::workdir::base() {
         roots.push((base, "$WORKBASE"));
     }
     if let Some(home) = std::env::var_os("HOME") {
@@ -921,7 +921,7 @@ mod tests {
 
     #[test]
     fn a_cli_version_must_be_observed_rather_than_assumed() {
-        let d = crate::workdir::test_tempdir().unwrap();
+        let d = crate::io::workdir::test_tempdir().unwrap();
         let ok = fake_program(
             d.path(),
             "ok",
@@ -1169,7 +1169,7 @@ mod tests {
     /// A results tree with one case, laid out as `Store::open` and `assemble_into`
     /// expect to find it.
     fn fixture() -> Fixture {
-        let repo = crate::workdir::test_tempdir().unwrap();
+        let repo = crate::io::workdir::test_tempdir().unwrap();
         let case = repo.path().join("results/Test-Corpus/claude/P00_case");
         for (rel, body) in [
             ("Cargo.toml", "[package]\nname=\"x\""),

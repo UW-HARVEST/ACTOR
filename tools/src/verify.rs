@@ -423,7 +423,7 @@ impl Backend {
             // `--trust-all-tools` and no policy file: there is nothing to record.
             Backend::Kiro => None,
             Backend::Claude => Some(tokenise(
-                crate::sandbox::settings_json(crate::sandbox::Policy {
+                crate::io::sandbox::settings_json(crate::io::sandbox::Policy {
                     repo_root: &paths.repo_root,
                     work_root,
                     enforcement: paths.enforcement,
@@ -568,7 +568,7 @@ fn run_verify_agent(
         Backend::Claude => {
             // Denies the repo root (the graded oracle, plus results/) and the shared
             // scratch base holding sibling work dirs, then re-grants this run's own root.
-            let settings_path = crate::sandbox::write_settings(crate::sandbox::Policy {
+            let settings_path = crate::io::sandbox::write_settings(crate::io::sandbox::Policy {
                 repo_root: &paths.repo_root,
                 work_root: work.root(),
                 enforcement: paths.enforcement,
@@ -580,7 +580,7 @@ fn run_verify_agent(
                     prompt,
                     log: log_path,
                     settings: &settings_path,
-                    agent_tmp: &crate::workdir::agent_tmp(work.root())?,
+                    agent_tmp: &crate::io::workdir::agent_tmp(work.root())?,
                     model: &inv.model,
                 })
                 .status()
@@ -633,7 +633,7 @@ fn run_verify_agent(
     // `verified/` would hold: `cargo check` writes `target/`, so checking in place would
     // mutate the artifact being measured, and gating before publication removes the
     // publish-then-roll-back path.
-    let gate = crate::workdir::tempdir("harvest-verify-gate-")?;
+    let gate = crate::io::workdir::tempdir("harvest-verify-gate-")?;
     sealed.assemble_into(case_dir, gate.path())?;
     let check = Command::new("timeout")
         .args(["120", "cargo", "check"])
@@ -738,7 +738,7 @@ mod tests {
             cache::Mode::Bypass,
             // AllowUnsandboxed so the test asserts policy content rather than whether
             // this machine happens to have bwrap installed.
-            crate::sandbox::Enforcement::AllowUnsandboxed,
+            crate::io::sandbox::Enforcement::AllowUnsandboxed,
         )
         .unwrap();
         assert!(verify_invocation(&paths).unwrap().is_none());
@@ -748,7 +748,7 @@ mod tests {
     fn each_backend_records_the_policy_it_actually_applies() {
         // Every backend's recipe used to carry claude's sandbox settings, including the
         // two that never read that file.
-        let repo = crate::workdir::test_tempdir().unwrap();
+        let repo = crate::io::workdir::test_tempdir().unwrap();
         let paths = Paths::new(
             repo.path(),
             Agent::Claude,
@@ -757,7 +757,7 @@ mod tests {
             cache::Mode::Bypass,
             // AllowUnsandboxed so the test asserts policy content rather than whether
             // this machine happens to have bwrap installed.
-            crate::sandbox::Enforcement::AllowUnsandboxed,
+            crate::io::sandbox::Enforcement::AllowUnsandboxed,
         )
         .unwrap();
         let work = repo.path().join("work");

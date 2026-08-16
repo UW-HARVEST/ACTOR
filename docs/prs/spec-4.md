@@ -23,7 +23,7 @@ its module doc: this is the only layer that may name `std::fs`, `std::process`,
 |---|---|---|
 | all of `workdir.rs` | `io/workdir.rs` | scratch base, ulimits, tmpfs refusal |
 | all of `sandbox.rs` | `io/sandbox.rs` | writes `settings.json`, probes PATH |
-| the git plumbing in `provenance.rs` (`git`, `head_sha`, `dirty_file_count`, `count_dirty_in`, `repo_root`) | `io/git.rs` | shells out to git |
+| ~~the git plumbing in `provenance.rs`~~ | — | **not moved**: see below |
 
 ### Corrected after the first attempt: the tree walking does NOT move
 
@@ -52,11 +52,9 @@ moves to `domain/`. Do not move it here.
 
 ## What does NOT move, and why
 
-**`TreeDigest` stays with the hashing.** PR 3a established this: the newtype is unforgeable
-because its tuple field is private and only its own module can construct one. Since
-`hash_tree` moves to `io/tree.rs`, `TreeDigest` moves *with it* — they must stay in the same
-module. If that forces a visibility change anywhere else, stop and report rather than
-widening.
+**`TreeDigest` stays with the hashing, and the hashing stays in `artifact.rs`** — see the
+correction above. PR 3a established the principle: the newtype is unforgeable because its
+tuple field is private and only its own module can construct one.
 
 **The typestate family stays in `artifact.rs`.** `Scratch`, `WorkTree`, `Scrubbed`, `Sealed`,
 `Corpus`, `CDir` and their transitions are one state machine and one concept. They will
@@ -76,9 +74,8 @@ widen for that to compile, report it — do not widen.
 
 ## Rules you will have to update in the same commit
 
-- **`the_digest_path_is_lossless`** guards `hash_tree`, `digest_tree`, `scrub` and
-  `classify` by module path. Three of those move. Repoint it; it must still be able to fail
-  loudly if a guarded function disappears.
+- **`the_digest_path_is_lossless`** needs NO repointing: with the hashing staying in
+  `artifact.rs`, none of the modules it guards moved. Confirm that rather than assuming it.
 - **`the_shape_rules_cannot_pass_while_inspecting_nothing`** has `MIN_FILES` set to the
   measured file count minus 2. You are adding files. Raise it and keep the 2-file margin,
   and update its comment with the new measured count.
@@ -123,3 +120,16 @@ this is the direct check on it.
 What moved; that the moves are byte-identical apart from `use` lines; why `TreeDigest`
 travelled with `hash_tree`; what you decided about extending the two artifact-module rules
 to `io/` and why; and that 40 golden digests are unchanged.
+
+## Outcome: `io/` is smaller than this spec first said
+
+`io/` contains `workdir.rs` and `sandbox.rs`. The git plumbing stayed in `provenance.rs`,
+because extracting any nonempty subset of `{git, repo_root, head_sha, count_dirty_in,
+dirty_file_count}` requires at least three widenings — `head_sha` and `dirty_file_count`
+have callers that stay, and `BEHAVIOUR_PATHS` is read by `impl Display for Unreproducible`
+as well as by `count_dirty_in`.
+
+That was allowed to stand rather than widened. `provenance.rs` is one cohesive concept —
+which code produced this result, and refuse to measure if we cannot say — and splitting it
+three ways to satisfy a layer diagram is the sprawl this plan exists to remove. `io/` is for
+items whose only job is touching the outside world, not for every call that happens to.

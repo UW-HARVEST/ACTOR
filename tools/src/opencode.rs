@@ -210,7 +210,7 @@ fn project_config(tmp_root: &Path, m: &Model) -> String {
     )
 }
 
-/// The filesystem policy alone — OpenCode's equivalent of `sandbox::settings_json`, and
+/// The filesystem policy alone — OpenCode's equivalent of `io::sandbox::settings_json`, and
 /// what the cache key records for this backend.
 ///
 /// Deliberately excludes the provider block: it carries `AWS_PROFILE`, a machine-local
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn materialize_config_writes_plugin_only_for_verify() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let root = tmp.path();
         let m = bedrock_sonnet();
 

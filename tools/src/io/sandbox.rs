@@ -66,7 +66,7 @@ fn which(bin: &str) -> Option<PathBuf> {
 /// stale sibling results tree was readable — and one audited log did exactly that,
 /// reading a third run's translated output.
 pub fn denied_read_roots(repo_root: &Path) -> Result<Vec<PathBuf>> {
-    let mut roots = vec![repo_root.to_path_buf(), crate::workdir::base()?];
+    let mut roots = vec![repo_root.to_path_buf(), crate::io::workdir::base()?];
     if let Some(parent) = repo_root.parent() {
         roots.push(parent.to_path_buf());
     }
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn write_settings_creates_the_file_where_settings_flag_looks_for_it() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let parent = tmp.path().join("root");
         std::fs::create_dir_all(&parent).unwrap();
         // The real function, not `policy`: base() needs HOME, which tests have.
@@ -268,7 +268,7 @@ mod tests {
         // nothing applied it, because bwrap was absent and the CLI fails open. Whether
         // this machine can enforce is environmental, so assert the two directions
         // against the same predicate rather than hardcoding an expectation.
-        let parent = crate::workdir::test_tempdir().unwrap();
+        let parent = crate::io::workdir::test_tempdir().unwrap();
         let refused = write_settings(Policy {
             repo_root: Path::new("/repo"),
             work_root: parent.path(),

@@ -58,7 +58,7 @@ fn main() -> Result<()> {
                 dataset,
                 model,
                 cache.into(),
-                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(
+                harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),
             )?;
@@ -98,7 +98,7 @@ fn main() -> Result<()> {
                 dataset,
                 model,
                 cache.into(),
-                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(
+                harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),
             )?;
@@ -123,7 +123,7 @@ fn main() -> Result<()> {
                 dataset,
                 model,
                 cache.into(),
-                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(
+                harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),
             )?;
@@ -171,7 +171,7 @@ fn main() -> Result<()> {
                 dataset,
                 model,
                 cache.into(),
-                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(
+                harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),
             )?;
@@ -201,7 +201,7 @@ fn main() -> Result<()> {
                 dataset,
                 model,
                 cache.into(),
-                harvest_tools::sandbox::Enforcement::from_allow_unsandboxed_flag(
+                harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),
             )?;

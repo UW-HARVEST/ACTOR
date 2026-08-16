@@ -220,7 +220,7 @@ mod tests {
     /// Guards the `merge_into` / `check_enrichment` inverse invariant.
     #[test]
     fn merge_into_then_check_has_no_diffs() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let src = tmp.path().join("src");
         fs::create_dir_all(&src).unwrap();
         fs::write(
@@ -285,7 +285,7 @@ mod tests {
     /// Proves the check above is not vacuously empty.
     #[test]
     fn check_detects_tampered_unsafe_count() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let src = tmp.path().join("src");
         fs::create_dir_all(&src).unwrap();
         fs::write(
