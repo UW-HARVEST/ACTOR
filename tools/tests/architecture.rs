@@ -155,10 +155,10 @@ fn is_public(vis: &syn::Visibility) -> bool {
 /// all of them, `sealed_implements_only_debug` included, and each would still report green.
 #[test]
 fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
-    // Measured 30 today: 28 module files plus lib.rs and main.rs. The floor is that count
+    // Measured 34 today: 32 module files plus lib.rs and main.rs. The floor is that count
     // minus 2, so a merge landing a file needs no edit here while deleting three fails
     // instead of quietly narrowing what every rule below inspects. Add files, raise it.
-    const MIN_FILES: usize = 28;
+    const MIN_FILES: usize = 32;
     const REQUIRED: &[&str] = &["Sealed", "WorkTree", "Scrubbed", "Corpus", "TreeDigest"];
 
     let found = rust_sources();
@@ -208,9 +208,9 @@ fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
         (found.len(), nested),
         count_rust_files(&dir, 1),
         "rust_sources() and an independent walk of src/ disagree on (total, nested). \
-         domain/, analyse/, io/ and oracle/ make the nested half live: 16 of 30 today, so \
-         a traversal that stopped at the top level of src/ would fail here instead of \
-         reporting green."
+         agents/, analyse/, domain/, io/ and oracle/ make the nested half live: 22 of 34 \
+         today, so a traversal that stopped at the top level of src/ would fail here \
+         instead of reporting green."
     );
 }
 
@@ -990,23 +990,18 @@ fn typestates_have_private_fields_and_consuming_transitions() {
     );
 }
 
-/// Measured: `src/` is one strongly connected component of these nine modules. Shrink-only —
+/// Measured: `src/` is one strongly connected component of these five modules. Shrink-only —
 /// a cut makes the rule fail as stale, and the list is then edited DOWN to what it reports.
 ///
 /// `agent_health` left it in PR 3b: `classify` takes the transcript text instead of opening
 /// the file, so the vocabulary it decides over moved to `domain::health` and neither
 /// `artifact` nor `cli` names this module any more.
-const CYCLE_BASELINE: &[&str] = &[
-    "analyse",
-    "artifact",
-    "battery",
-    "cache",
-    "cli",
-    "opencode",
-    "session",
-    "translate",
-    "verify",
-];
+///
+/// PR 5 moved the shared agent machinery into `agents/`, which took `translate`, `verify`
+/// and `analyse` out of the component; `session` and `opencode` are members of `agents` now
+/// rather than nodes of their own. The one edge holding `agents` in is `cache`, which names
+/// `Session` to hash a recipe and `opencode` to slug a model directory.
+const CYCLE_BASELINE: &[&str] = &["agents", "artifact", "battery", "cache", "cli"];
 
 fn top_level_module(root: &Path, file: &Path) -> Option<String> {
     let rel = file.strip_prefix(root).ok()?;
@@ -1264,7 +1259,7 @@ fn a_module_cycle_may_only_shrink() {
         cycles(&graph.edges)
     );
 
-    // A ring of ten is the one violation no plantable src/ tree reaches cheaply.
+    // A ring of six is the one violation no plantable src/ tree reaches cheaply.
     let ring: Vec<&str> = CYCLE_BASELINE.iter().copied().chain(["scoring"]).collect();
     let planted: BTreeMap<String, BTreeSet<String>> = ring
         .iter()
@@ -1280,8 +1275,8 @@ fn a_module_cycle_may_only_shrink() {
     assert!(
         caught
             .iter()
-            .any(|v| v == "the largest cycle has 10 modules; the baseline records 9"),
-        "a planted ten-module ring did not read as bigger than the nine the baseline\n\
+            .any(|v| v == "the largest cycle has 6 modules; the baseline records 5"),
+        "a planted six-module ring did not read as bigger than the five the baseline\n\
          records: {caught:#?}"
     );
 

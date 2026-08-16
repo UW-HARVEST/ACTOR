@@ -375,14 +375,14 @@ fn extract_limits(output: &str, provider: &str, model_id: &str) -> Option<ModelL
 /// [`prompt_suffix`] — callers append it so the text recorded to
 /// `logs/prompt.md` is exactly what the agent received.
 pub fn invoke(
-    session: &crate::session::Session,
+    session: &crate::agents::session::Session,
     prompt: &str,
     log_path: &Path,
     work_dir: &Path,
     tmp_root: &Path,
     m: &Model,
 ) -> Result<()> {
-    let mut cmd = session.opencode_command(crate::session::OpencodeRun {
+    let mut cmd = session.opencode_command(crate::agents::session::OpencodeRun {
         cwd: work_dir,
         prompt,
         log: log_path,
@@ -407,7 +407,7 @@ pub fn invoke(
     }
 
     let status = cmd.status().context("invoking opencode")?;
-    crate::translate::record_agent_exit(status);
+    crate::agents::exit::record_agent_exit(status);
     Ok(())
 }
 

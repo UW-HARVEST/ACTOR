@@ -5,7 +5,7 @@
 //! the recipe recorded beside a cached artifact cannot describe a command that did not
 //! run. It used to: the recipe named claude's 10800s / 1000-turn / bypassPermissions
 //! invocation for every backend, including kiro runs that really ran `timeout 2700`
-//! with no turn limit and none of [`crate::translate::AGENT_ENV`].
+//! with no turn limit and none of [`AGENT_ENV`].
 //!
 //! Every session runs under `bash -c`, never `bash -lc`. A login shell re-resolves
 //! PATH from the profile, while the key names what *harvest-tools itself* resolved —
@@ -18,6 +18,26 @@ use crate::cache::ModelId;
 use anyhow::Result;
 use std::path::Path;
 use std::process::Command;
+
+/// Deliberately matches kiro_plain.json (built-in tools only, no skills/plugins/
+/// MCP, no extra system prompt) so the two agents are compared on equal footing.
+pub const CLAUDE_PLAIN_AGENT_JSON: &str = r#"{"claude_plain":{"description":"Bare-bones agent matching kiro_plain","prompt":"You are a coding assistant. Use the available tools to complete the user's task.","tools":["Bash","Edit","Read","Write","Task"]}}"#;
+
+/// Agent-runtime settings that materially change how a session behaves.
+///
+/// They belong here, not in the shell driver as bare `export`s, so
+/// [`crate::cache::Recipe`] hashes them by construction: otherwise two sweeps with
+/// different retry policy would share a cache entry.
+pub const AGENT_ENV: &[(&str, &str)] = &[
+    // A single request may legitimately run this long on a large project; the
+    // per-session wall clock is bounded separately by `timeout`.
+    ("API_TIMEOUT_MS", "1200000"),
+    ("API_FORCE_IDLE_TIMEOUT", "0"),
+    // Bedrock throttles under concurrency; without generous retries a throttle
+    // becomes a dead case, which #67 then correctly refuses to score.
+    ("CLAUDE_CODE_MAX_RETRIES", "20"),
+    ("CLAUDE_CODE_RETRY_WATCHDOG", "1"),
+];
 
 const CLAUDE_MAX_TURNS: u32 = 1000;
 const CLAUDE_PERMISSION_MODE: &str = "bypassPermissions";
@@ -57,8 +77,8 @@ impl Session {
                 fsize_blocks: crate::io::workdir::AGENT_FSIZE_BLOCKS,
                 data_kb: crate::io::workdir::AGENT_DATA_KB,
             }),
-            agents_json: crate::translate::CLAUDE_PLAIN_AGENT_JSON,
-            agent_env: crate::translate::AGENT_ENV,
+            agents_json: CLAUDE_PLAIN_AGENT_JSON,
+            agent_env: AGENT_ENV,
             script: String::new(),
         };
         let script = format!(
@@ -95,8 +115,8 @@ impl Session {
     }
 
     /// No `--pure`: it clears external plugins, disabling the compaction plugin
-    /// [`crate::opencode::materialize_config`] writes.
-    pub fn opencode(phase: crate::opencode::Phase, timeout_secs: u64) -> Self {
+    /// [`crate::agents::opencode::materialize_config`] writes.
+    pub fn opencode(phase: crate::agents::opencode::Phase, timeout_secs: u64) -> Self {
         let s = Self {
             program: "opencode",
             timeout_secs,
@@ -284,7 +304,7 @@ mod tests {
         vec![
             Session::claude(10_800),
             Session::kiro(2_700),
-            Session::opencode(crate::opencode::Phase::Verify, 10_800),
+            Session::opencode(crate::agents::opencode::Phase::Verify, 10_800),
         ]
     }
 
@@ -314,7 +334,7 @@ mod tests {
         assert!(claude.shape().contains("permission_mode=bypassPermissions"));
         for s in [
             Session::kiro(2_700),
-            Session::opencode(crate::opencode::Phase::Verify, 10_800),
+            Session::opencode(crate::agents::opencode::Phase::Verify, 10_800),
         ] {
             let shape = s.shape();
             assert!(!shape.contains("max_turns"), "{}: {shape}", s.program);
@@ -378,8 +398,42 @@ mod tests {
             shape.contains(&crate::io::workdir::AGENT_DATA_KB.to_string()),
             "{shape}"
         );
-        for (k, v) in crate::translate::AGENT_ENV {
+        for (k, v) in AGENT_ENV {
             assert!(shape.contains(&format!("env:{k}={v}")), "{shape}");
+        }
+    }
+
+    /// A shell `export` of one of these is invisible to [`crate::cache::Recipe`], so a
+    /// driver that kept its own copy could change agent behaviour without changing the
+    /// cache key — and `.envs()` means the copy never took effect in the first place.
+    #[test]
+    fn no_shell_script_names_an_agent_env_key() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("tools/ has a parent");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["ls-files", "-z", "--", "*.sh"])
+            .output()
+            .expect("git ls-files");
+        assert!(out.status.success(), "git ls-files: {}", out.status);
+        let listing = String::from_utf8(out.stdout).expect("paths are utf-8");
+        let scripts: Vec<&str> = listing.split('\0').filter(|s| !s.is_empty()).collect();
+        assert!(
+            !scripts.is_empty(),
+            "no committed *.sh found, so this rule would pass vacuously"
+        );
+        for rel in scripts {
+            let text = std::fs::read_to_string(root.join(rel)).expect(rel);
+            for (key, value) in AGENT_ENV {
+                assert!(
+                    !text.contains(key),
+                    "{rel} names {key}; AGENT_ENV owns it (={value}) and applies it via \
+                     .envs(), so a copy in the driver is at best dead and at worst a \
+                     divergent value the cache key cannot see"
+                );
+            }
         }
     }
 
@@ -387,9 +441,11 @@ mod tests {
     fn the_timeout_reaches_the_script_rather_than_a_literal() {
         assert!(Session::claude(42).script.contains("timeout 42 claude"));
         assert!(Session::kiro(43).script.contains("timeout 43 kiro-cli"));
-        assert!(Session::opencode(crate::opencode::Phase::Translate, 44)
-            .script
-            .contains("timeout 44 opencode"));
+        assert!(
+            Session::opencode(crate::agents::opencode::Phase::Translate, 44)
+                .script
+                .contains("timeout 44 opencode")
+        );
     }
 
     #[test]

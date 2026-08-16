@@ -18,10 +18,10 @@
 //! `OPENSSL_DIR` is deliberately excluded: it can only influence `build_ok`, which is
 //! decided in the test phase, and the test phase is not cached.
 
+use crate::agents::session::Session;
 use crate::artifact::{Access, Phase, Sealed, TreeDigest};
 use crate::cli::Agent;
 use crate::io::workdir::Roots;
-use crate::session::Session;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -109,7 +109,7 @@ impl AgentKey {
                 let raw = model.context(
                     "--agent opencode needs --model <provider>/<model-id>: it names the results dir",
                 )?;
-                crate::opencode::results_slug(&crate::opencode::parse_model(raw)?)
+                crate::agents::opencode::results_slug(&crate::agents::opencode::parse_model(raw)?)
             }
             Agent::Oneshot => model
                 .map(|m| m.rsplit_once('/').map_or(m, |(_, last)| last).to_string())
@@ -166,7 +166,7 @@ pub struct CliVersion(String);
 
 /// States the build when the CLI is not installed — replaying a stored cache without
 /// one. The build must still be NAMED, so the key stays as specific as before, and
-/// [`crate::translate::assert_pins_honoured`] still checks it against what the
+/// [`crate::agents::invocation::assert_pins_honoured`] still checks it against what the
 /// transcript reports.
 pub const ENV_CLI_VERSION: &str = "HARVEST_CLI_VERSION";
 
@@ -1125,7 +1125,7 @@ mod tests {
         let claude = recipe(&Session::claude(10_800), Some("deny=$REPO allow=$WORK"));
         let kiro = recipe(&Session::kiro(2_700), None);
         let oc = recipe(
-            &Session::opencode(crate::opencode::Phase::Verify, 10_800),
+            &Session::opencode(crate::agents::opencode::Phase::Verify, 10_800),
             Some("allow=$WORK"),
         );
         assert_ne!(claude, kiro);

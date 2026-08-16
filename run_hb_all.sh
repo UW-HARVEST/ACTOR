@@ -36,7 +36,7 @@ require_version cmake 3.24 "$(cmake --version | head -1 | grep -oE '[0-9]+(\.[0-
 require_version python 3.10 "$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
 command -v claude >/dev/null || { echo "claude not on PATH" >&2; exit 1; }
 
-# The agent-runtime settings are deliberately NOT exported here: translate::AGENT_ENV
+# The agent-runtime settings are deliberately NOT exported here: agents::session::AGENT_ENV
 # applies them, and the cache key can only hash them from there. See its doc comment.
 
 BIN=./tools/target/release/harvest-tools

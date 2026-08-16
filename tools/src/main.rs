@@ -1,8 +1,9 @@
 use anyhow::Result;
 // Never re-declare these with `mod` here; see the note in lib.rs.
+use harvest_tools::agents::opencode;
 use harvest_tools::analyse::report;
 use harvest_tools::cli::{Cli, Command, Dataset};
-use harvest_tools::{agent_health, battery, benchmark, cache, cli, opencode, oracle, provenance};
+use harvest_tools::{agent_health, battery, benchmark, cache, cli, oracle, provenance};
 
 fn main() -> Result<()> {
     let cli = Cli::parse_args();

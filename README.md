@@ -148,8 +148,8 @@ directory and carries workarounds for three upstream OpenCode issues — a
 sub-agent permission deadlock, the 32k per-response output cap
 ([opencode#29363](https://github.com/sst/opencode/issues/29363)), and
 post-compaction loss of the verify prompt's `SYMBOLS.md`/`ERRORS.md`/
-`CONFIGS.md` tables. See `tools/src/opencode.rs` for details; remove them when
-the upstream fixes ship.
+`CONFIGS.md` tables. See `tools/src/agents/opencode.rs` for details; remove
+them when the upstream fixes ship.
 
 ## Datasets
 

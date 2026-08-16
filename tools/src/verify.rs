@@ -1,9 +1,11 @@
+use crate::agents::exit::{clear_agent_exit, observed_exit, record_agent_exit};
+use crate::agents::session::{ClaudeRun, Session};
+use crate::agents::work::IsolatedWorkDir;
+use crate::agents::Semaphore;
 use crate::battery::{self, Case, Paths};
 use crate::cache::{self, CliVersion, ModelId};
 use crate::cli::Agent;
 use crate::io::workdir::Roots;
-use crate::session::{ClaudeRun, Session};
-use crate::translate::{IsolatedWorkDir, Semaphore};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -339,7 +341,7 @@ pub fn run_harvest_bench(
 enum Backend {
     Kiro,
     Claude,
-    OpenCode(crate::opencode::Model),
+    OpenCode(crate::agents::opencode::Model),
 }
 
 /// Everything about the run the key must name, resolved per backend and BEFORE the agent
@@ -357,18 +359,13 @@ struct Invocation {
 /// one, which is what the claude default used to do here.
 const KIRO_UNPINNED_MODEL: &str = "unpinned:kiro-cli-default";
 
-/// The only place a per-agent verify phase is decided; `None` means no verify phase.
-/// Consulted before the store so a verify-less agent never materialises a work tree to
-/// discard.
-/// Whether this agent has a verify phase at all.
+/// Resolves the backend a verify phase will use; `None` means no verify phase. Consulted
+/// before the store so a verify-less agent never materialises a work tree to discard.
 ///
-/// The same match as `verify_invocation`, minus the parts that need `Paths` — kept next
-/// to it so the two cannot disagree about which arms verify. `translate.rs` asserts they
-/// agree.
-pub fn has_verify_phase(agent: Agent) -> bool {
-    matches!(agent, Agent::Kiro | Agent::Claude | Agent::OpenCode)
-}
-
+/// `agents::invocation::has_verify_phase` answers the same question without a `Paths`, so
+/// the two are one decision split across two files.
+/// `a_verify_backend_resolves_exactly_where_a_verify_phase_is_declared` is what holds them
+/// together; adjacency used to be all there was, and it was never a guard.
 fn verify_invocation(paths: &Paths) -> Result<Option<Invocation>> {
     let inv = match paths.agent {
         Agent::Kiro => Invocation {
@@ -379,17 +376,21 @@ fn verify_invocation(paths: &Paths) -> Result<Option<Invocation>> {
         },
         Agent::Claude => Invocation {
             backend: Backend::Claude,
-            model: crate::translate::claude_model()?,
+            model: crate::agents::invocation::claude_model()?,
             cli: CliVersion::probe("claude")?,
             session: Session::claude(VERIFY_TIMEOUT_SECS),
         },
         Agent::OpenCode => {
-            let model = crate::opencode::parse_model(paths.model.as_deref().unwrap_or_default())?;
+            let model =
+                crate::agents::opencode::parse_model(paths.model.as_deref().unwrap_or_default())?;
             Invocation {
                 model: ModelId::new(model.as_arg())?,
                 backend: Backend::OpenCode(model),
                 cli: CliVersion::probe("opencode")?,
-                session: Session::opencode(crate::opencode::Phase::Verify, VERIFY_TIMEOUT_SECS),
+                session: Session::opencode(
+                    crate::agents::opencode::Phase::Verify,
+                    VERIFY_TIMEOUT_SECS,
+                ),
             }
         }
         // ClaudeCombined verifies inside translate; ClaudeMinimal and the
@@ -432,7 +433,9 @@ impl Backend {
                 })?
                 .to_string(),
             )),
-            Backend::OpenCode(_) => Some(tokenise(crate::opencode::permission_shape(work_root))),
+            Backend::OpenCode(_) => Some(tokenise(crate::agents::opencode::permission_shape(
+                work_root,
+            ))),
         })
     }
 }
@@ -473,7 +476,7 @@ fn verify_case(
         .replace("ALL_CONFIGURATIONS", configs_text);
 
     if matches!(inv.backend, Backend::OpenCode(_)) {
-        prompt.push_str(&crate::opencode::prompt_suffix(work.root()));
+        prompt.push_str(&crate::agents::opencode::prompt_suffix(work.root()));
     }
 
     let _ = std::fs::write(verified_logs.join("prompt.md"), &prompt);
@@ -559,7 +562,7 @@ fn run_verify_agent(
 
     // Cleared so a skipped or absent CLI run records no spend, and so a replay
     // (which never reaches this function) reports none either.
-    crate::translate::clear_agent_exit();
+    clear_agent_exit();
 
     match &inv.backend {
         Backend::Kiro => {
@@ -568,7 +571,7 @@ fn run_verify_agent(
                 .kiro_command(work.root(), prompt, log_path)
                 .status()
                 .context("invoking kiro-cli for verification")?;
-            crate::translate::record_agent_exit(status);
+            record_agent_exit(status);
         }
         Backend::Claude => {
             // Denies the repo root (the graded oracle, plus results/) and the shared
@@ -590,18 +593,18 @@ fn run_verify_agent(
                 })
                 .status()
                 .context("invoking claude for verification")?;
-            crate::translate::record_agent_exit(status);
-            crate::translate::assert_pins_honoured(log_path, &inv.model, &inv.cli)?;
+            record_agent_exit(status);
+            crate::agents::invocation::assert_pins_honoured(log_path, &inv.model, &inv.cli)?;
         }
         Backend::OpenCode(oc_model) => {
             // The compaction plugin restores SYMBOLS/ERRORS/CONFIGS.md, which
             // verify.md's Phases B/C are gated on.
-            crate::opencode::materialize_config(
+            crate::agents::opencode::materialize_config(
                 work.root(),
-                crate::opencode::Phase::Verify,
+                crate::agents::opencode::Phase::Verify,
                 oc_model,
             )?;
-            crate::opencode::invoke(
+            crate::agents::opencode::invoke(
                 &inv.session,
                 prompt,
                 log_path,
@@ -619,11 +622,9 @@ fn run_verify_agent(
     // classifying its log as stream-json made `completed()` return None every time and
     // this function could never publish a kiro verification at all.
     let health = match crate::agent_health::read_tail(log_path) {
-        Ok(tail) => crate::domain::health::classify(
-            &tail,
-            paths.agent.log_format(),
-            crate::translate::observed_exit(),
-        ),
+        Ok(tail) => {
+            crate::domain::health::classify(&tail, paths.agent.log_format(), observed_exit())
+        }
         // The transcript is the evidence, so an unreadable one is no evidence: `Unknown`
         // mints no proof, and a case with nothing to show for itself must not be sealed.
         Err(e) => crate::domain::health::Health::Unknown {
@@ -660,7 +661,7 @@ fn run_verify_agent(
     Ok(Some(cache::Produced::new(
         sealed,
         log_path.to_path_buf(),
-        crate::translate::agent_provenance(&paths.agent_key, start.elapsed().as_secs()),
+        crate::agents::exit::agent_provenance(&paths.agent_key, start.elapsed().as_secs()),
     )))
 }
 
@@ -737,6 +738,60 @@ fn get_cmake_flags(paths: &Paths, battery: &str, case_name: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The one decision written twice, and since `has_verify_phase` moved to `agents/`,
+    /// written in two files. Nothing else connects them: `translate.rs` pins
+    /// `has_verify_phase` against the verify-prompt table, not against this match, and the
+    /// only other test to call `verify_invocation` calls it for one agent with no phase.
+    #[test]
+    fn a_verify_backend_resolves_exactly_where_a_verify_phase_is_declared() {
+        use crate::agents::invocation::has_verify_phase;
+        use clap::ValueEnum;
+
+        let (mut with_backend, mut without) = (0usize, 0usize);
+        // clap's derived list, the same one translate.rs walks; `verify_invocation`'s match
+        // is exhaustive over `Agent`, so a new variant is a compile error in this file
+        // before it can be a case this loop silently never sees.
+        for agent in Agent::value_variants() {
+            // A model for every agent because opencode and oneshot make it part of their
+            // identity and refuse without one; the rest ignore it. An unbuildable `Paths`
+            // fails the test rather than dropping the variant from it.
+            let paths = Paths::new(
+                Path::new("/nonexistent"),
+                *agent,
+                crate::cli::Dataset::TestCorpus,
+                Some("amazon-bedrock/us.anthropic.claude-sonnet-5"),
+                cache::Mode::Bypass,
+                crate::io::sandbox::Enforcement::AllowUnsandboxed,
+            )
+            .unwrap_or_else(|e| panic!("{agent:?}: no Paths, so it went unchecked: {e:#}"));
+            // `Ok(None)` is the only way this function says "no verify phase": every
+            // verify-less arm returns it before touching the environment, so an `Err` is a
+            // backend that resolved and then failed to probe a CLI this machine lacks —
+            // a phase, not the absence of one.
+            let resolves = match verify_invocation(&paths) {
+                Ok(inv) => inv.is_some(),
+                Err(_) => true,
+            };
+            assert_eq!(
+                has_verify_phase(*agent),
+                resolves,
+                "{agent:?}: has_verify_phase and verify_invocation disagree, so either a \
+                 verify phase runs and resolves to nothing, or a backend exists that \
+                 Benchmark::verifies never reaches"
+            );
+            if resolves {
+                with_backend += 1;
+            } else {
+                without += 1;
+            }
+        }
+        assert!(
+            with_backend > 0 && without > 0,
+            "{with_backend} agents with a backend, {without} without: the assertion above \
+             discriminates only if both sides actually occur"
+        );
+    }
+
     #[test]
     fn a_verify_less_agent_resolves_before_any_cli_is_probed() {
         // The order matters: resolving the backend is what stops a verify-less agent
@@ -789,7 +844,7 @@ mod tests {
 
         assert_eq!(Backend::Kiro.policy_shape(&paths, &roots).unwrap(), None);
 
-        let oc = Backend::OpenCode(crate::opencode::parse_model("p/m").unwrap())
+        let oc = Backend::OpenCode(crate::agents::opencode::parse_model("p/m").unwrap())
             .policy_shape(&paths, &roots)
             .unwrap();
         assert!(
