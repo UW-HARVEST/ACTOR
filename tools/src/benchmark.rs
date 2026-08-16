@@ -3,6 +3,7 @@
 //! Each `impl` must stay thin, delegating to `translate` / `verify` / `oracle` rather than
 //! reimplementing them.
 
+use crate::agents::invocation::has_verify_phase;
 use crate::battery::{self, Paths};
 use crate::cli::{Agent, Dataset};
 use crate::oracle::{self, TestMode, TestOutcome};
@@ -95,7 +96,7 @@ impl Benchmark for TestCorpus {
     }
 
     fn verifies(&self, agent: Agent) -> bool {
-        verify::has_verify_phase(agent)
+        has_verify_phase(agent)
     }
 
     fn translate(
@@ -215,7 +216,7 @@ impl Benchmark for HarvestBench {
     }
 
     fn verifies(&self, agent: Agent) -> bool {
-        verify::has_verify_phase(agent)
+        has_verify_phase(agent)
     }
 
     fn translate(

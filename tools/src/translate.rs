@@ -1,149 +1,27 @@
+use crate::agents::exit::{clear_agent_exit, merge_agent_exit, record_agent_exit};
+use crate::agents::invocation::{assert_pins_honoured, claude_model};
+use crate::agents::Semaphore;
 use crate::analyse::cargo_toml::{self, CargoToml};
 use crate::battery::{self, Case, Paths};
 use crate::cli::Agent;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Condvar, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-// ── claude_plain agent (mirrors kiro_plain) ────────────────────────────
-// Deliberately matches kiro_plain.json (built-in tools only, no skills/plugins/
-// MCP, no extra system prompt) so the two agents are compared on equal footing.
-pub const CLAUDE_PLAIN_AGENT_JSON: &str = r#"{"claude_plain":{"description":"Bare-bones agent matching kiro_plain","prompt":"You are a coding assistant. Use the available tools to complete the user's task.","tools":["Bash","Edit","Read","Write","Task"]}}"#;
-
-/// Agent-runtime settings that materially change how a session behaves.
-///
-/// They belong here, not in the shell driver as bare `export`s, so
-/// [`crate::cache::Recipe`] hashes them by construction: otherwise two sweeps with
-/// different retry policy would share a cache entry.
-pub const AGENT_ENV: &[(&str, &str)] = &[
-    // A single request may legitimately run this long on a large project; the
-    // per-session wall clock is bounded separately by `timeout`.
-    ("API_TIMEOUT_MS", "1200000"),
-    ("API_FORCE_IDLE_TIMEOUT", "0"),
-    // Bedrock throttles under concurrency; without generous retries a throttle
-    // becomes a dead case, which #67 then correctly refuses to score.
-    ("CLAUDE_CODE_MAX_RETRIES", "20"),
-    ("CLAUDE_CODE_RETRY_WATCHDOG", "1"),
-];
-
-/// The model every `--agent claude` invocation is pinned to.
-///
-/// Must be pinned explicitly: the CLI auto-updates, so an unpinned run is attributed
-/// to whatever model it defaulted to that day. The cache key also has to name the
-/// model *before* the run, and the resolved model only appears in the transcript's
-/// `init` record — after the money is spent.
-///
-/// A Bedrock inference-profile id because `CLAUDE_CODE_USE_BEDROCK` is set;
-/// `HARVEST_CLAUDE_MODEL` overrides it for an environment routed differently.
-pub const CLAUDE_MODEL_DEFAULT: &str = "global.anthropic.claude-opus-5[1m]";
-
-pub fn claude_model() -> Result<crate::cache::ModelId> {
-    let raw =
-        std::env::var("HARVEST_CLAUDE_MODEL").unwrap_or_else(|_| CLAUDE_MODEL_DEFAULT.to_string());
-    crate::cache::ModelId::new(raw)
-}
-
-/// Fail loudly if the CLI did not honour the model pin, or is not the build the key
-/// was computed for.
-///
-/// `--model` is a request, not a guarantee: an unrecognised id can be silently
-/// substituted, and the sweep would then be cached under a key naming a model that
-/// never ran. The CLI build has the same problem from the other end — it auto-updates
-/// through a shim, so the binary can change between the probe and the run. The
-/// transcript's `init` record is the CLI's own report of both.
-pub fn assert_pins_honoured(
-    log_path: &Path,
-    want: &crate::cache::ModelId,
-    cli: &crate::cache::CliVersion,
-) -> Result<()> {
-    let text = match std::fs::read_to_string(log_path) {
-        Ok(t) => t,
-        // The health classifier already treats a missing log as a non-completion.
-        Err(_) => return Ok(()),
-    };
-    let Some(init) = text
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .find(|r| r["type"] == "system" && r["subtype"] == "init")
-    else {
-        // Older transcripts predate the init record; nothing to compare against.
-        return Ok(());
-    };
-    // A typed refusal, not an ensure!: the sweep collects these and fails the command,
-    // where an anyhow error would have been folded into an ordinary red X.
-    if let Some(got) = init["model"].as_str() {
-        if got != want.as_str() {
-            return Err(crate::refusal::Refusal::ModelSubstituted {
-                asked: want.as_str().to_string(),
-                got: got.to_string(),
-            }
-            .into());
-        }
-    }
-    if let Some(got) = init["claude_code_version"].as_str() {
-        anyhow::ensure!(
-            cli.covers(got),
-            "the CLI upgraded under the run: the key names {}, the session reports {got}. \
-             Refusing to store this artifact under a key naming another build.",
-            cli.as_str()
-        );
-    }
-    Ok(())
-}
-
 /// Wall-clock cap on one agentic session. Reaches the command through
-/// [`crate::session::Session`], which is also what the cache key records.
+/// [`crate::agents::session::Session`], which is also what the cache key records.
 const TRANSLATE_TIMEOUT_SECS: u64 = 10800;
 
 const KIRO_TRANSLATE_TIMEOUT_SECS: u64 = 5400;
 
-fn opencode_model(paths: &Paths) -> Result<crate::opencode::Model> {
+fn opencode_model(paths: &Paths) -> Result<crate::agents::opencode::Model> {
     let raw = paths.model.as_deref().context(
         "--agent opencode requires --model <provider>/<model-id> (should have been \
          rejected at startup)",
     )?;
-    crate::opencode::parse_model(raw)
-}
-
-// ── Semaphore ──────────────────────────────────────────────────────────
-
-pub struct Semaphore {
-    state: Mutex<usize>,
-    cvar: Condvar,
-    max: usize,
-}
-
-impl Semaphore {
-    pub fn new(max: usize) -> Self {
-        Self {
-            state: Mutex::new(0),
-            cvar: Condvar::new(),
-            max,
-        }
-    }
-    /// Poison is recovered, not propagated: a `usize` is never half-updated and the
-    /// panicking worker's guard still ran, so the count is sound — while propagating
-    /// would panic every sibling worker that next acquires.
-    pub fn acquire(&self) -> SemaphoreGuard<'_> {
-        let mut count = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        while *count >= self.max {
-            count = self.cvar.wait(count).unwrap_or_else(|e| e.into_inner());
-        }
-        *count += 1;
-        SemaphoreGuard(self)
-    }
-}
-
-pub struct SemaphoreGuard<'a>(&'a Semaphore);
-
-impl Drop for SemaphoreGuard<'_> {
-    fn drop(&mut self) {
-        // Runs while unwinding, where a second panic aborts the process; see `acquire`.
-        *self.0.state.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
-        self.0.cvar.notify_one();
-    }
+    crate::agents::opencode::parse_model(raw)
 }
 
 // ── Result type ────────────────────────────────────────────────────────
@@ -517,10 +395,10 @@ impl PromptKind {
 ///
 /// `None` means this agent reads no prompt of that kind at all: c2rust and the
 /// docker-driven translators are given none, and the ablations plus the one-shot LLM
-/// arms have no verify phase (`verify::has_verify_phase` must agree — a test asserts
-/// it). Returning the *name* rather than the text is what lets a test check the choice
-/// against the files on disk, so a renamed prompt fails in CI instead of reaching a
-/// paid agent run as an empty one.
+/// arms have no verify phase (`agents::invocation::has_verify_phase` must agree — a test
+/// asserts it). Returning the *name* rather than the text is what lets a test check the
+/// choice against the files on disk, so a renamed prompt fails in CI instead of reaching
+/// a paid agent run as an empty one.
 pub fn prompt_file_for(agent: Agent, kind: PromptKind) -> Option<&'static str> {
     use PromptKind::{Executable, Library, Shared, Verify};
     match agent {
@@ -936,9 +814,9 @@ pub fn translate_case_at(
 
             if matches!(paths.agent, Agent::OpenCode) {
                 // OpenCode's equivalent of the .claude/settings.json sandbox above.
-                crate::opencode::materialize_config(
+                crate::agents::opencode::materialize_config(
                     tmp.path(),
-                    crate::opencode::Phase::Translate,
+                    crate::agents::opencode::Phase::Translate,
                     &opencode_model(paths)?,
                 )?;
             }
@@ -950,7 +828,10 @@ pub fn translate_case_at(
     // OpenCode's appended filesystem-boundary contract names the temp dir, so the
     // final prompt is only known once the workspace exists.
     let prompt: &str = &match paths.agent {
-        Agent::OpenCode => format!("{prompt}{}", crate::opencode::prompt_suffix(&work_root)),
+        Agent::OpenCode => format!(
+            "{prompt}{}",
+            crate::agents::opencode::prompt_suffix(&work_root)
+        ),
         _ => prompt.to_string(),
     };
 
@@ -963,7 +844,7 @@ pub fn translate_case_at(
 
     match paths.agent {
         Agent::Kiro => {
-            let status = crate::session::Session::kiro(KIRO_TRANSLATE_TIMEOUT_SECS)
+            let status = crate::agents::session::Session::kiro(KIRO_TRANSLATE_TIMEOUT_SECS)
                 .kiro_command(&work_dir, prompt, &log_path)
                 .status()
                 .context("invoking kiro-cli")?;
@@ -980,8 +861,8 @@ pub fn translate_case_at(
             // different flags for the same CLI.
             let model = claude_model()?;
             let cli = crate::cache::CliVersion::probe("claude")?;
-            let status = crate::session::Session::claude(TRANSLATE_TIMEOUT_SECS)
-                .claude_command(&crate::session::ClaudeRun {
+            let status = crate::agents::session::Session::claude(TRANSLATE_TIMEOUT_SECS)
+                .claude_command(&crate::agents::session::ClaudeRun {
                     cwd: &work_dir,
                     prompt,
                     log: &log_path,
@@ -1024,8 +905,8 @@ pub fn translate_case_at(
                     work_dir: &work_dir,
                     context_label: "translate",
                 },
-                &crate::session::Session::opencode(
-                    crate::opencode::Phase::Translate,
+                &crate::agents::session::Session::opencode(
+                    crate::agents::opencode::Phase::Translate,
                     TRANSLATE_TIMEOUT_SECS,
                 ),
                 &work_root,
@@ -1160,78 +1041,6 @@ pub fn propagate_config(
 
 // ── Metrics ────────────────────────────────────────────────────────────
 
-// ── Agent process exit capture ─────────────────────────────────────────
-//
-// The exit status is captured deep inside translate_case_at but written out by
-// run_and_record, so it is stashed in a thread-local instead of being threaded back
-// through dispatch_translate's ~12 match arms. Sound only because each case runs on
-// its own thread: "last agent exit on this thread" is unambiguously this case's.
-//
-// `exit_code` is the shell pipeline's status (`set -o pipefail` makes it the agent's
-// own code). Absent for agents with no single agent process (kimi/oneshot, c2rust).
-#[derive(Clone, Copy, Default)]
-pub struct AgentExit {
-    pub exit_code: Option<i32>,
-    pub timed_out: bool,
-    pub recorded: bool,
-}
-
-thread_local! {
-    static LAST_AGENT_EXIT: std::cell::Cell<AgentExit> =
-        const { std::cell::Cell::new(AgentExit { exit_code: None, timed_out: false, recorded: false }) };
-}
-
-pub fn record_agent_exit(status: std::process::ExitStatus) {
-    let code = status.code();
-    LAST_AGENT_EXIT.with(|c| {
-        c.set(AgentExit {
-            exit_code: code,
-            timed_out: code == Some(124), // `timeout` exits 124 when it kills the child
-            recorded: true,
-        })
-    });
-}
-
-/// Call at the start of a case: a non-CLI agent on a re-used thread must not inherit
-/// the previous case's exit code.
-pub fn clear_agent_exit() {
-    LAST_AGENT_EXIT.with(|c| c.set(AgentExit::default()));
-}
-
-fn take_agent_exit() -> AgentExit {
-    LAST_AGENT_EXIT.with(|c| c.replace(AgentExit::default()))
-}
-
-/// The observed exit, WITHOUT consuming it.
-///
-/// `merge_agent_exit` must be called exactly once per invocation because it takes the
-/// thread-local, and it runs later, when the metrics are written. The classifier needs
-/// the same observation first, so this peeks. `Copy` on [`AgentExit`] is what makes that
-/// a read rather than a second claim on it.
-pub fn observed_exit() -> crate::domain::health::Exit {
-    use crate::domain::health::Exit;
-    let e = LAST_AGENT_EXIT.with(|c| c.get());
-    if !e.recorded {
-        return Exit::Unobserved;
-    }
-    if e.timed_out {
-        return Exit::Timeout;
-    }
-    match e.exit_code {
-        Some(0) => Exit::Success,
-        code => Exit::Failure { code },
-    }
-}
-
-/// Shared by translate and verify so both report agent process health identically.
-fn merge_agent_exit(metrics: &mut serde_json::Value) {
-    let e = take_agent_exit();
-    if e.recorded {
-        metrics["exit_code"] = serde_json::json!(e.exit_code);
-        metrics["timed_out"] = serde_json::json!(e.timed_out);
-    }
-}
-
 /// Inside the `translated/` PHASE dir, beside the log it describes. The case ROOT is
 /// where this used to land, while `agent_health::collect` and `battery.rs` both read the
 /// phase dir — so `exit_code`/`timed_out` were written and then read by nothing, and
@@ -1261,26 +1070,6 @@ fn write_translation_metrics(
         path,
         serde_json::to_string_pretty(&metrics).unwrap_or_default() + "\n",
     );
-}
-
-/// What one agent invocation cost and how it exited.
-///
-/// Must be built exactly once per invocation: `merge_agent_exit` consumes the
-/// recorded exit. The one value then feeds both `verification.json` and the cache
-/// entry, so the two cannot disagree about the same run.
-pub fn agent_provenance(agent: &crate::cache::AgentKey, duration_secs: u64) -> serde_json::Value {
-    let mut p = serde_json::json!({
-        "agent": agent.as_str(),
-        "duration_secs": duration_secs,
-        "success": true,
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        // Which harness code produced this; results are otherwise unattributable
-        // after the fact.
-        "harness": crate::provenance::harness_id(),
-        "sandboxed": crate::io::sandbox::is_enforceable(),
-    });
-    merge_agent_exit(&mut p);
-    p
 }
 
 /// Verify-side sibling of `write_translation_metrics`.
@@ -1380,72 +1169,6 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
         // impcheck creates .pipe FIFOs — and std::fs::copy blocks forever on them.
     }
     Ok(())
-}
-
-/// The verify phase's working copy, expressed in terms of [`crate::artifact`].
-///
-/// Materialises `translated/` into disk-backed scratch, hands the agent a
-/// [`crate::artifact::WorkTree`] (the only artifact type that yields a path, hence
-/// the only one anything can execute in), and on `finish` requires proof that the
-/// agent completed before the result may reach `verified/`.
-pub struct IsolatedWorkDir {
-    work: crate::artifact::WorkTree<crate::artifact::Verify>,
-    /// Digest of the `translated/` artifact this was materialised from.
-    input: crate::artifact::TreeDigest,
-    /// Digest of the C oracle as handed to the agent, compared on `finish`: the C
-    /// side is the reference being graded against, so a run that modified it has not
-    /// been verified against the original program. `verify.md` contains no rule
-    /// forbidding that, so this check is the only thing catching it.
-    c_before: crate::artifact::TreeDigest,
-}
-
-impl IsolatedWorkDir {
-    pub fn new(case_dir: &Path) -> Result<Self> {
-        let translated = crate::artifact::Sealed::<crate::artifact::Translate>::adopt(case_dir)
-            .context("adopting translated/ as a sealed artifact")?;
-        let scratch = crate::artifact::Scratch::new("harvest-work-")?;
-        let input = translated.digest().clone();
-        let work = translated.materialise_into::<crate::artifact::Verify>(scratch)?;
-        let c_before = work.c().digest()?;
-        Ok(Self {
-            work,
-            input,
-            c_before,
-        })
-    }
-
-    pub fn translated_rust(&self) -> PathBuf {
-        self.work.crate_dir()
-    }
-
-    /// Scratch root: current_dir, the sandbox policy and the agent's TMPDIR.
-    pub fn root(&self) -> &Path {
-        self.work.path()
-    }
-
-    /// The cache key's input component. Taken here rather than recomputed later
-    /// because it must describe what the agent was actually given.
-    pub fn input_digest(&self) -> &crate::artifact::TreeDigest {
-        &self.input
-    }
-
-    /// Seal the agent's output.
-    ///
-    /// Requires `&Completed` so an infra-failed run cannot be sealed. Returns the
-    /// artifact rather than publishing it: publication happens once on the far side
-    /// of the cache, so replayed and fresh results travel the same path.
-    pub fn finish(
-        self,
-        proof: &crate::domain::health::Completed,
-    ) -> Result<crate::artifact::Sealed<crate::artifact::Verify>> {
-        let scrubbed = self.work.scrub()?;
-        // Reported rather than silent: a file that embedded the scratch path is a
-        // file whose content varied per run (3 files across 345 cases).
-        for rel in scrubbed.rewritten() {
-            eprintln!("  scrubbed per-run path from {}", rel.as_path().display());
-        }
-        scrubbed.seal(proof, &self.c_before)
-    }
 }
 
 // ── c2rust ─────────────────────────────────────────────────────────────
@@ -2572,9 +2295,9 @@ fn scan_opencode_log_for_transient_error(log_path: &Path) -> Option<String> {
 /// 0 with nothing written, indistinguishable from a genuine translation failure.
 fn invoke_opencode_with_retry(
     retry: RetrySession<'_>,
-    session: &crate::session::Session,
+    session: &crate::agents::session::Session,
     tmp_root: &Path,
-    model: &crate::opencode::Model,
+    model: &crate::agents::opencode::Model,
 ) -> Result<()> {
     let RetrySession {
         prompt,
@@ -2586,7 +2309,7 @@ fn invoke_opencode_with_retry(
     const RETRY_BACKOFF_SECS: u64 = 30;
 
     for attempt in 1..=MAX_RETRIES {
-        crate::opencode::invoke(session, prompt, log_path, work_dir, tmp_root, model)
+        crate::agents::opencode::invoke(session, prompt, log_path, work_dir, tmp_root, model)
             .with_context(|| format!("invoking opencode ({context_label})"))?;
 
         match scan_opencode_log_for_transient_error(log_path) {
@@ -2640,39 +2363,6 @@ mod tests {
         assert_eq!(truncated(&s, 3), "é");
         assert_eq!(truncated("ok", 500), "ok");
         assert_eq!(truncated(&s, 4), "éé");
-    }
-
-    #[test]
-    fn merge_agent_exit_records_code_when_captured() {
-        clear_agent_exit();
-        record_agent_exit(exit_status(0));
-        let mut m = serde_json::json!({"success": true});
-        merge_agent_exit(&mut m);
-        assert_eq!(m["exit_code"], serde_json::json!(0));
-        assert_eq!(m["timed_out"], serde_json::json!(false));
-    }
-
-    #[test]
-    fn merge_agent_exit_flags_timeout_124() {
-        clear_agent_exit();
-        record_agent_exit(exit_status(124)); // `timeout` uses 124
-        let mut m = serde_json::json!({});
-        merge_agent_exit(&mut m);
-        assert_eq!(m["exit_code"], serde_json::json!(124));
-        assert_eq!(m["timed_out"], serde_json::json!(true));
-    }
-
-    #[test]
-    fn merge_agent_exit_absent_for_non_cli_agent() {
-        // No record_agent_exit call, as on the kimi/oneshot API path.
-        clear_agent_exit();
-        let mut m = serde_json::json!({"success": true});
-        merge_agent_exit(&mut m);
-        assert!(
-            m.get("exit_code").is_none(),
-            "exit_code must be absent when no CLI agent ran"
-        );
-        assert!(m.get("timed_out").is_none());
     }
 
     /// The writer must land where `agent_health::collect` and `battery.rs` look, or the
@@ -2752,17 +2442,6 @@ mod tests {
             "another case's exit must not be attributed here"
         );
         assert!(m.get("timed_out").is_none());
-    }
-
-    #[test]
-    fn take_agent_exit_clears_so_next_case_starts_fresh() {
-        record_agent_exit(exit_status(1));
-        let _ = take_agent_exit(); // consume
-        let second = take_agent_exit(); // must be empty now
-        assert!(
-            !second.recorded,
-            "exit must not leak into the next case on a reused thread"
-        );
     }
 
     fn write_log(body: &str) -> tempfile::NamedTempFile {
@@ -2859,47 +2538,13 @@ mod tests {
         }
     }
 
-    /// A shell `export` of one of these is invisible to [`crate::cache::Recipe`], so a
-    /// driver that kept its own copy could change agent behaviour without changing the
-    /// cache key — and `.envs()` means the copy never took effect in the first place.
-    #[test]
-    fn no_shell_script_names_an_agent_env_key() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("tools/ has a parent");
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["ls-files", "-z", "--", "*.sh"])
-            .output()
-            .expect("git ls-files");
-        assert!(out.status.success(), "git ls-files: {}", out.status);
-        let listing = String::from_utf8(out.stdout).expect("paths are utf-8");
-        let scripts: Vec<&str> = listing.split('\0').filter(|s| !s.is_empty()).collect();
-        assert!(
-            !scripts.is_empty(),
-            "no committed *.sh found, so this rule would pass vacuously"
-        );
-        for rel in scripts {
-            let text = std::fs::read_to_string(root.join(rel)).expect(rel);
-            for (key, value) in AGENT_ENV {
-                assert!(
-                    !text.contains(key),
-                    "{rel} names {key}; AGENT_ENV owns it (={value}) and applies it via \
-                     .envs(), so a copy in the driver is at best dead and at worst a \
-                     divergent value the cache key cannot see"
-                );
-            }
-        }
-    }
-
     #[test]
     fn a_verify_prompt_exists_exactly_where_a_verify_phase_does() {
         use clap::ValueEnum;
         for agent in Agent::value_variants() {
             assert_eq!(
                 prompt_file_for(*agent, PromptKind::Verify).is_some(),
-                crate::verify::has_verify_phase(*agent),
+                crate::agents::invocation::has_verify_phase(*agent),
                 "{agent:?}: the verify prompt and the verify backend disagree, so either a \
                  phase would run with no prompt or a prompt is named for a phase that never runs"
             );

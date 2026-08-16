@@ -4,6 +4,7 @@
 //! one instance per compilation.
 
 pub mod agent_health;
+pub mod agents;
 pub mod analyse;
 pub mod artifact;
 pub mod battery;
@@ -12,10 +13,8 @@ pub mod cache;
 pub mod cli;
 pub mod domain;
 pub mod io;
-pub mod opencode;
 pub mod oracle;
 pub mod provenance;
 pub mod refusal;
-pub mod session;
 pub mod translate;
 pub mod verify;
