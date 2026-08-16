@@ -31,9 +31,26 @@ crate, enforced by `the_store_is_obtained_from_exactly_one_place`. Verify runs t
 | # | PR | spec | state |
 |---|---|---|---|
 | 7b | translate on `run_cached` — **the translate cache** | `docs/prs/spec-7b.md` | in flight |
-| 7c | shared-source groups: one key, N publishes | not yet written | |
-| 8 | `cache/` + `dataset/` split; `cache_mode` off `Paths` | not yet written | breaks `battery ↔ cache`, `cache ↔ cli` |
-| 10 | renames: `Scrubbed`→`ScrubbedTree`, `Sealed`→`SealedTree`, `CDir`→`OracleDir` | not yet written | last; touches 10 column-exact `.stderr` files |
+| T | stop the suite writing to `/tmp`, and stop it leaking | `docs/prs/spec-tmp.md` | **written, never landed — see below** |
+| 7c | shared-source groups: one key, N publishes | `docs/prs/spec-7c.md` | ready |
+| 8 | `cache/` + `dataset/` split; `cache_mode` off `Paths` | `docs/prs/spec-8.md` | ready; breaks `battery ↔ cache`, `cache ↔ cli` |
+| 10 | renames: `Scrubbed`→`ScrubbedTree`, `Sealed`→`SealedTree`, `CDir`→`OracleDir` | `docs/prs/spec-10.md` | ready; last, touches 10 column-exact `.stderr` files |
+
+**PR T is the unlanded root cause of the outage below, and it should go early rather than
+last.** Verified on `main` at 27581dc: `tools/.cargo/config.toml` does not exist, and
+**76 `tempdir().unwrap()` call sites across 16 files** still resolve through
+`tempfile`'s default, i.e. `env::temp_dir()`, i.e. the `/tmp` tmpfs — the heaviest being
+`artifact.rs` (19), `battery.rs` (17) and `analyse/cargo_toml.rs` (7). Production code
+refuses a tmpfs base *deliberately* (`io/workdir.rs` opens by explaining why, and
+`Tmpfs::Refuse` is the default), so the suite is the one part of the crate that ignores the
+rule the crate wrote down. Combined with cache entries being chmod'd read-only —
+`TempDir::drop` does a plain recursive delete, cannot report an error, and so fails
+**silently** — every cache test leaks its tempdir permanently.
+
+`/tmp` currently holds 99 MB and zero `.tmp*` dirs, but only because the reboot cleared it:
+the machine had accumulated 24,707 leaked dirs and hit the **inode** cap with ~2 GB of bytes
+still free. Nothing has changed that will stop it happening again. Every PR in this sequence
+runs the suite many times.
 
 `docs/prs/spec-7.md` is superseded by 7a/7b/7c — it bundled nine changes and stalled an agent
 after 198 tool calls with nothing produced. **Keep PRs to one concern.**
