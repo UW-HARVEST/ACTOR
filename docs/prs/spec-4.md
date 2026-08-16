@@ -21,10 +21,31 @@ its module doc: this is the only layer that may name `std::fs`, `std::process`,
 
 | from | to | what it is |
 |---|---|---|
-| `visit`, `hash_tree`, `digest_tree`, `feed`, `copy_carrying`, `Access`, `set_read_only`, `is_cmake_build_dir` from `artifact.rs` | `io/tree.rs` | walking, hashing and copying real trees |
 | all of `workdir.rs` | `io/workdir.rs` | scratch base, ulimits, tmpfs refusal |
 | all of `sandbox.rs` | `io/sandbox.rs` | writes `settings.json`, probes PATH |
 | the git plumbing in `provenance.rs` (`git`, `head_sha`, `dirty_file_count`, `count_dirty_in`, `repo_root`) | `io/git.rs` | shells out to git |
+
+### Corrected after the first attempt: the tree walking does NOT move
+
+The first attempt also moved `visit`, `hash_tree`, `digest_tree`, `feed`, `copy_carrying`,
+`Access` and `set_read_only` to `io/tree.rs`. Doing so required widening `digest_tree`,
+`visit` and `copy_carrying` from private to `pub(crate)`, and the implementer then rewrote
+`artifact.rs`'s module doc from "Three invariants are enforced by the compiler" to "Two",
+conceding that "any module can now hash a raw path".
+
+That third invariant is **a tree cannot be hashed before it is scrubbed**. Agent output
+embeds the random scratch directory name, so a digest of unscrubbed output differs every
+run — a cache keyed on one looks enabled and never hits, silently re-paying the agent cost.
+`digest_tree` being private in `artifact.rs` is what enforced it: the only routes to a
+`TreeDigest` of a work tree ran through `Scrubbed::seal` / `Sealed::adopt` /
+`Sealed::from_cache`, all in that one file.
+
+So these stay in `artifact.rs`, for the same reason `TreeDigest` does and for the same
+reason the typestate family lives in one file: **the privacy IS the enforcement
+mechanism**. An item whose private visibility carries an invariant cannot be moved to a
+lower layer, because the move is what breaks it. `io/` gets the genuinely external things —
+scratch bases, sandbox policy files, git subprocesses — not the implementation of the
+artifact pipeline's own transitions.
 
 `provenance::assess` is already pure and stays put for now — PR 3b decides whether it
 moves to `domain/`. Do not move it here.
