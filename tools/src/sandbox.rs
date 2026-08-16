@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn write_settings_creates_the_file_where_settings_flag_looks_for_it() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let parent = tmp.path().join("root");
         std::fs::create_dir_all(&parent).unwrap();
         // The real function, not `policy`: base() needs HOME, which tests have.
@@ -268,7 +268,7 @@ mod tests {
         // nothing applied it, because bwrap was absent and the CLI fails open. Whether
         // this machine can enforce is environmental, so assert the two directions
         // against the same predicate rather than hardcoding an expectation.
-        let parent = tempfile::tempdir().unwrap();
+        let parent = crate::workdir::test_tempdir().unwrap();
         let refused = write_settings(Policy {
             repo_root: Path::new("/repo"),
             work_root: parent.path(),

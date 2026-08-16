@@ -785,6 +785,32 @@ impl Store {
     }
 }
 
+/// A stand-in for a program a test execs: an agent CLI here, the harvest-bench runner in
+/// [`crate::test`].
+///
+/// `cp` writes it rather than `fs::write` because the caller execs it. `fs::write` closes
+/// its own fd, but every `Command::spawn` in this binary `fork()`s, and a child forked
+/// inside that window holds the inherited write fd until its own exec closes it — execve
+/// on a file any process has open for writing fails with ETXTBSY, which failed 15 of 600
+/// contended runs of the lib suite, and 0 of 600 with this. The fd `cp` opens lives in
+/// `cp`, which has exited before this returns, so this process never holds one for a fork
+/// to inherit; `chmod` needs no fd, so it cannot reopen the window. Neither caller can
+/// retry around the exec instead: both take the program as a path and spawn it themselves.
+#[cfg(test)]
+pub(crate) fn fake_program(dir: &Path, name: &str, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let source = dir.join(format!("{name}.sh"));
+    std::fs::write(&source, format!("#!/bin/sh\n{body}\n")).unwrap();
+    let program = dir.join(name);
+    let cp = std::process::Command::new("cp")
+        .args([&source, &program])
+        .status()
+        .expect("spawning cp");
+    assert!(cp.success(), "cp {} failed: {cp}", source.display());
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    program.to_string_lossy().into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,19 +919,10 @@ mod tests {
         assert!(AgentKey::new(Agent::OpenCode, None).is_err());
     }
 
-    /// A stand-in for an agent CLI, so the probe is exercised without running one.
-    fn fake_cli(dir: &Path, name: &str, body: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
-        let p = dir.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        p.to_string_lossy().into_owned()
-    }
-
     #[test]
     fn a_cli_version_must_be_observed_rather_than_assumed() {
-        let d = tempfile::tempdir().unwrap();
-        let ok = fake_cli(
+        let d = crate::workdir::test_tempdir().unwrap();
+        let ok = fake_program(
             d.path(),
             "ok",
             "echo '2.1.232.657 (Claude Code)'; echo 'trailing note'",
@@ -920,12 +937,12 @@ mod tests {
             CliVersion::probe("harvest-no-such-program").is_err(),
             "a missing CLI must refuse"
         );
-        let broken = fake_cli(d.path(), "broken", "echo 1.0; exit 3");
+        let broken = fake_program(d.path(), "broken", "echo 1.0; exit 3");
         assert!(
             CliVersion::probe(&broken).is_err(),
             "a failing probe must refuse"
         );
-        let mute = fake_cli(d.path(), "mute", "exit 0");
+        let mute = fake_program(d.path(), "mute", "exit 0");
         assert!(
             CliVersion::probe(&mute).is_err(),
             "an unreportable version must refuse"
@@ -1127,16 +1144,32 @@ mod tests {
 
     use crate::artifact::{Scratch, Sealed, Translate, Verify, WorkTree};
 
+    /// Every test that lets a [`Store`] write goes through [`fixture`], so the unlock below
+    /// is what a new one cannot forget.
     struct Fixture {
-        _repo: tempfile::TempDir,
+        tree: Option<tempfile::TempDir>,
         repo: PathBuf,
         case: PathBuf,
+    }
+
+    /// `TempDir`'s own `Drop` is a plain recursive delete, which cannot remove the `0o444`
+    /// files inside the `0o555` directories `store` deliberately leaves behind — and `Drop`
+    /// cannot report that, so it failed silently until 24,707 undeletable trees had
+    /// exhausted the inode table of `/tmp`. Unlocking first is what makes the delete
+    /// possible; `close` rather than the implicit drop is what makes a failure visible.
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let tree = self.tree.take().expect("dropped once");
+            crate::artifact::set_read_only(tree.path(), Access::Writable)
+                .expect("unlocking the fixture tree so it can be deleted");
+            tree.close().expect("deleting the fixture tree");
+        }
     }
 
     /// A results tree with one case, laid out as `Store::open` and `assemble_into`
     /// expect to find it.
     fn fixture() -> Fixture {
-        let repo = tempfile::tempdir().unwrap();
+        let repo = crate::workdir::test_tempdir().unwrap();
         let case = repo.path().join("results/Test-Corpus/claude/P00_case");
         for (rel, body) in [
             ("Cargo.toml", "[package]\nname=\"x\""),
@@ -1150,7 +1183,7 @@ mod tests {
         }
         let path = repo.path().to_path_buf();
         Fixture {
-            _repo: repo,
+            tree: Some(repo),
             repo: path,
             case,
         }

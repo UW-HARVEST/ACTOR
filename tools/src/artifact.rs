@@ -604,7 +604,7 @@ mod tests {
     /// cache does not misbehave subtly: no entry can validate, so it silently never hits.
     #[test]
     fn from_artifact_keeps_everything_the_digest_covers() {
-        let src = tempfile::tempdir().unwrap();
+        let src = crate::workdir::test_tempdir().unwrap();
         tree(
             src.path(),
             &[
@@ -618,7 +618,7 @@ mod tests {
                 ("target/debug/junk", "build output"), // BuildOutput: must not survive
             ],
         );
-        let dest = tempfile::tempdir().unwrap();
+        let dest = crate::workdir::test_tempdir().unwrap();
         let out = dest.path().join("code");
         copy_carrying(src.path(), &out, Carry::FromArtifact).unwrap();
 
@@ -656,7 +656,7 @@ mod tests {
     /// longer exists, and being nested, only the content sniff catches it.
     #[test]
     fn a_stale_cmake_cache_does_not_reach_the_agent() {
-        let src = tempfile::tempdir().unwrap();
+        let src = crate::workdir::test_tempdir().unwrap();
         tree(
             src.path(),
             &[
@@ -670,7 +670,7 @@ mod tests {
                 ("logs/translate.log", "transcript"),
             ],
         );
-        let dest = tempfile::tempdir().unwrap();
+        let dest = crate::workdir::test_tempdir().unwrap();
         let out = dest.path().join("work");
         copy_carrying(src.path(), &out, Carry::IntoWorkTree).unwrap();
 
@@ -704,7 +704,7 @@ mod tests {
     /// in `results/` must survive; this measures that rather than assuming it.
     #[test]
     fn lossless_path_encoding_does_not_change_an_existing_digest() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let r = tmp.path();
         std::fs::create_dir_all(r.join("src")).unwrap();
         std::fs::write(r.join("Cargo.toml"), b"[package]\nname=\"x\"\n").unwrap();
@@ -723,7 +723,7 @@ mod tests {
     fn paths_differing_only_outside_utf8_digest_differently() {
         use std::os::unix::ffi::OsStrExt;
         let digest_of = |name: &[u8]| {
-            let tmp = tempfile::tempdir().unwrap();
+            let tmp = crate::workdir::test_tempdir().unwrap();
             let f = tmp.path().join(std::ffi::OsStr::from_bytes(name));
             std::fs::write(&f, b"same content").unwrap();
             digest_tree(tmp.path()).unwrap().as_str().to_owned()
@@ -736,7 +736,7 @@ mod tests {
     /// the guard is blind to exactly what the artifact digest records.
     #[test]
     fn the_oracle_guard_sees_a_bak_file_change() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let c = tmp.path().join("c_src");
         tree(
             &c,
@@ -764,7 +764,7 @@ mod tests {
     #[test]
     fn an_absent_corpus_is_refused_rather_than_keyed_as_absent() {
         // Otherwise `sha256:absent` becomes a key every missing corpus shares.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let err = Corpus::adopt(&tmp.path().join("nope"))
             .err()
             .expect("must refuse an absent corpus");
@@ -774,7 +774,7 @@ mod tests {
     #[test]
     fn two_corpora_differing_only_in_an_ignored_file_get_different_digests() {
         // THE FALSE-HIT HAZARD — see `Corpus::digest`.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let a = tmp.path().join("a");
         let b = tmp.path().join("b");
         tree(
@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn a_corpus_seeds_the_oracle_and_a_sealed_artifact_seeds_the_crate_root() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let src = tmp.path().join("corpus");
         tree(&src, &[("src/lib.c", "int f(void){return 1;}")]);
 
@@ -842,12 +842,12 @@ mod tests {
 
     #[test]
     fn digest_ignores_build_output_and_logs() {
-        let a = tempfile::tempdir().unwrap();
+        let a = crate::workdir::test_tempdir().unwrap();
         tree(
             a.path(),
             &[("src/lib.rs", "fn a() {}"), ("logs/verify.log", "noise")],
         );
-        let b = tempfile::tempdir().unwrap();
+        let b = crate::workdir::test_tempdir().unwrap();
         tree(
             b.path(),
             &[
@@ -866,9 +866,9 @@ mod tests {
 
     #[test]
     fn digest_changes_when_a_source_byte_changes() {
-        let a = tempfile::tempdir().unwrap();
+        let a = crate::workdir::test_tempdir().unwrap();
         tree(a.path(), &[("src/lib.rs", "fn a() {}")]);
-        let b = tempfile::tempdir().unwrap();
+        let b = crate::workdir::test_tempdir().unwrap();
         tree(b.path(), &[("src/lib.rs", "fn b() {}")]);
         assert_ne!(
             digest_tree(a.path()).unwrap(),
@@ -879,8 +879,8 @@ mod tests {
     #[test]
     fn digest_is_path_independent() {
         // Path independence is what lets one phase's output key the next phase's lookup.
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
+        let a = crate::workdir::test_tempdir().unwrap();
+        let b = crate::workdir::test_tempdir().unwrap();
         for r in [a.path(), b.path()] {
             tree(
                 r,
@@ -897,7 +897,7 @@ mod tests {
     /// between the phases is covered nowhere else.
     #[test]
     fn lifecycle_round_trips_from_translated_to_verified() {
-        let case = tempfile::tempdir().unwrap();
+        let case = crate::workdir::test_tempdir().unwrap();
         let translated = case.path().join(crate::battery::TRANSLATED);
         tree(
             &translated,
@@ -984,7 +984,7 @@ mod tests {
     /// prerequisite for scoring a battery outside the tree it scores.
     #[test]
     fn one_scratch_root_holds_many_cases_and_outlives_each_of_them() {
-        let case = tempfile::tempdir().unwrap();
+        let case = crate::workdir::test_tempdir().unwrap();
         tree(
             &case.path().join(crate::battery::TRANSLATED),
             &[("Cargo.toml", "[package]"), ("src/lib.rs", "pub fn a() {}")],
@@ -1032,7 +1032,7 @@ mod tests {
 
     #[test]
     fn seal_refuses_when_the_agent_modified_the_c_oracle() {
-        let case = tempfile::tempdir().unwrap();
+        let case = crate::workdir::test_tempdir().unwrap();
         tree(
             &case.path().join(crate::battery::TRANSLATED),
             &[

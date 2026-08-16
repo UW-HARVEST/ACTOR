@@ -1289,7 +1289,7 @@ fn a_module_cycle_may_only_shrink() {
 
     // Driven through the real extraction, not a synthetic edge map: the hole this rule
     // shipped with was in `crate_refs`, a layer a synthetic map never reaches.
-    let tree = tempfile::tempdir().expect("tempdir");
+    let tree = harvest_tools::workdir::test_tempdir().unwrap();
     let src = tree.path().join("src");
     let write = |name: &str, text: &str| {
         let path = src.join(name);
@@ -1416,7 +1416,7 @@ fn nothing_in_the_pure_layer_names_the_filesystem_a_process_or_the_environment()
 
     // Through the real extraction over a planted tree, not a synthetic name list: the hole
     // the DAG rule shipped with was in its extraction, which no synthetic list reaches.
-    let tree = tempfile::tempdir().expect("tempdir");
+    let tree = harvest_tools::workdir::test_tempdir().unwrap();
     let planted = tree.path().join(PURE_LAYER);
     std::fs::create_dir_all(&planted).expect("mkdir");
     std::fs::write(

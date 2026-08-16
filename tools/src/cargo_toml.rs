@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn set_lib_name_and_cdylib() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let path = write_cargo_toml(
             tmp.path(),
             "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n",
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn set_bin_driver() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let path = write_cargo_toml(tmp.path(), "[package]\nname = \"mybin\"\n");
         let mut cargo = CargoToml::open(&path).unwrap();
         cargo.set_bin_driver();
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn remove_bin_section() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let path = write_cargo_toml(
             tmp.path(),
             "[package]\nname = \"mylib\"\n\n[[bin]]\nname = \"driver\"\npath = \"src/main.rs\"\n",
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn add_workspace_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let path = write_cargo_toml(tmp.path(), "[package]\nname = \"test\"\n\n[workspace]\n");
         let mut cargo = CargoToml::open(&path).unwrap();
         cargo.add_workspace();
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn set_default_features() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let path = write_cargo_toml(
             tmp.path(),
             "[package]\nname = \"test\"\n\n[features]\nblake = []\nsha2 = []\n\"128f\" = []\n",
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn strip_for_lib_removes_main_and_tests() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let dir = tmp.path().join(crate::battery::TRANSLATED_RUST);
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::create_dir_all(dir.join("tests")).unwrap();
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn strip_for_lib_noop_when_missing() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let dir = tmp.path().join(crate::battery::TRANSLATED_RUST);
         fs::create_dir_all(dir.join("src")).unwrap();
         strip_for_lib(&dir).unwrap();
