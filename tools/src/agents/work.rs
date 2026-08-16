@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// hands the agent: a key naming another tree is unrepresentable rather than avoided.
 pub struct IsolatedWorkDir<P: crate::artifact::Phase> {
     work: crate::artifact::WorkTree<P>,
-    /// Digest of the artifact this was materialised from.
+    /// Digest of the artifact or corpus this was materialised from.
     input: crate::artifact::TreeDigest,
     /// Digest of the C oracle as handed to the agent, compared on `finish`: the C
     /// side is the reference being graded against, so a run that modified it has not
@@ -24,8 +24,27 @@ pub struct IsolatedWorkDir<P: crate::artifact::Phase> {
     c_before: crate::artifact::TreeDigest,
 }
 
-/// Seeding a verification from a sealed translation is the one transition this type
-/// materialises today; [`crate::artifact::SeededBy`] is what stops any other pair compiling.
+/// Translate is the first phase, so it is seeded from the C corpus — an INPUT, and the only
+/// per-case component of its key. Through [`crate::artifact::Corpus`], whose digest is rooted at
+/// the corpus: the root-anchored rules would otherwise drop every `*.bak`, `*.log` and `*.sha256`
+/// that IS hashed once seeded under `c_src/`, so two corpora could replay each other's work.
+impl IsolatedWorkDir<crate::artifact::Translate> {
+    pub fn from_corpus(corpus_dir: &Path) -> Result<Self> {
+        let corpus = crate::artifact::Corpus::adopt(corpus_dir)?;
+        let scratch = crate::artifact::Scratch::new("harvest-translate-")?;
+        let input = corpus.digest()?;
+        let work = corpus.materialise_into::<crate::artifact::Translate>(scratch)?;
+        let c_before = work.c().digest()?;
+        Ok(Self {
+            work,
+            input,
+            c_before,
+        })
+    }
+}
+
+/// Seeding a verification from a sealed translation is the other transition this type
+/// materialises; [`crate::artifact::SeededBy`] is what stops any other pair compiling.
 impl IsolatedWorkDir<crate::artifact::Verify> {
     pub fn new(case_dir: &Path) -> Result<Self> {
         let translated = crate::artifact::Sealed::<crate::artifact::Translate>::adopt(case_dir)

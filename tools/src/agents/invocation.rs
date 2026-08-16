@@ -5,8 +5,11 @@
 //! before the money is spent — the model the CLI settled on otherwise appears for the first
 //! time in the transcript, after the run.
 
+use crate::agents::session::Session;
 use crate::cache::{CliVersion, ModelId};
 use crate::cli::Agent;
+use crate::io::sandbox::Enforcement;
+use crate::io::workdir::Roots;
 use anyhow::Result;
 use std::path::Path;
 
@@ -71,6 +74,59 @@ pub fn assert_pins_honoured(log_path: &Path, want: &ModelId, cli: &CliVersion) -
     Ok(())
 }
 
+/// kiro-cli takes no `--model` and reports none in its prose transcript, so no honest
+/// model id exists to key. Named as unpinned rather than filled in with a plausible
+/// one, which is what the claude default used to do.
+pub(crate) const KIRO_UNPINNED_MODEL: &str = "unpinned:kiro-cli-default";
+
+/// Which CLI runs an agentic phase. An enum rather than a `bool` keeps each phase's
+/// invocation `match` exhaustive over the backends that exist, with no second list of agent
+/// names to keep in step. OpenCode carries its own parsed model, so its arm cannot reach
+/// for another backend's — which is how claude's model came to be keyed for all three.
+pub(crate) enum Backend {
+    Kiro,
+    Claude,
+    OpenCode(crate::agents::opencode::Model),
+}
+
+impl Backend {
+    /// The filesystem policy this backend actually applies, paths tokenised: the literal directory
+    /// names are machine-specific and must not enter the key. ONE rendering for both phases, from
+    /// the one resolved [`Roots`], so translate cannot key a policy verify does not apply.
+    pub(crate) fn policy_shape(
+        &self,
+        enforcement: Enforcement,
+        roots: &Roots,
+    ) -> Result<Option<String>> {
+        let tokenise = |s: String| crate::cache::normalise(&s, roots);
+        Ok(match self {
+            // `--trust-all-tools` and no policy file: there is nothing to record.
+            Backend::Kiro => None,
+            Backend::Claude => Some(tokenise(
+                crate::io::sandbox::settings_json(crate::io::sandbox::Policy {
+                    repo_root: &roots.repo,
+                    work_root: &roots.work,
+                    enforcement,
+                })?
+                .to_string(),
+            )),
+            Backend::OpenCode(_) => Some(tokenise(crate::agents::opencode::permission_shape(
+                &roots.work,
+            ))),
+        })
+    }
+}
+
+/// Everything about the run the key must name, resolved per backend and BEFORE the agent
+/// starts: the model that will actually be asked for, the CLI build that will ask for it,
+/// and the exact command.
+pub(crate) struct Invocation {
+    pub(crate) backend: Backend,
+    pub(crate) model: ModelId,
+    pub(crate) cli: CliVersion,
+    pub(crate) session: Session,
+}
+
 /// Whether this agent has a verify phase at all.
 ///
 /// The same partition of `Agent` as `verify::verify_invocation`, minus the parts that need
@@ -82,4 +138,47 @@ pub fn assert_pins_honoured(log_path: &Path, want: &ModelId, cli: &CliVersion) -
 /// prompt table.
 pub fn has_verify_phase(agent: Agent) -> bool {
     matches!(agent, Agent::Kiro | Agent::Claude | Agent::OpenCode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_backend_records_the_policy_it_actually_applies() {
+        // Every backend's recipe used to carry claude's sandbox settings, including the
+        // two that never read that file.
+        let repo = crate::io::workdir::test_tempdir().unwrap();
+        let roots = Roots::resolve(&repo.path().join("work"), repo.path());
+        // AllowUnsandboxed so the test asserts policy content rather than whether this
+        // machine happens to have bwrap installed.
+        let shape = |b: Backend| {
+            b.policy_shape(Enforcement::AllowUnsandboxed, &roots)
+                .unwrap()
+        };
+
+        let claude = shape(Backend::Claude);
+        assert!(
+            claude.as_deref().is_some_and(|p| p.contains("denyRead")),
+            "{claude:?}"
+        );
+        assert!(
+            claude
+                .as_deref()
+                .is_some_and(|p| !p.contains(&*repo.path().to_string_lossy())),
+            "the literal paths must be tokenised or no key is portable: {claude:?}"
+        );
+
+        assert_eq!(shape(Backend::Kiro), None);
+
+        let oc = shape(Backend::OpenCode(
+            crate::agents::opencode::parse_model("p/m").unwrap(),
+        ));
+        assert!(
+            oc.as_deref()
+                .is_some_and(|p| p.contains("external_directory")),
+            "{oc:?}"
+        );
+        assert_ne!(oc, claude);
+    }
 }

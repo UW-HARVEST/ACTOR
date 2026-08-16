@@ -1122,6 +1122,32 @@ mod tests {
         assert!(msg.contains("modified the C oracle"), "{msg}");
     }
 
+    /// Sealing refuses ADDITIONS to `c_src/`, not only edits, so a run that compiled the oracle in
+    /// place now fails where it used to publish. `CMakeCache.txt` AT the hash root is the worst:
+    /// it makes `is_cmake_build_dir` true for the oracle, so [`CDir::digest`] admits nothing below.
+    #[test]
+    fn a_translation_that_built_the_c_oracle_in_place_is_refused() {
+        for left_behind in ["driver", "CMakeCache.txt"] {
+            let tmp = crate::io::workdir::test_tempdir().unwrap();
+            let src = tmp.path().join("corpus");
+            tree(&src, &[("src/lib.c", "int a(void){return 0;}")]);
+            let work: WorkTree<Translate> = Corpus::adopt(&src)
+                .unwrap()
+                .materialise_into(Scratch::new("t-").unwrap())
+                .unwrap();
+            let c_before = work.c().digest().unwrap();
+            tree(&work.crate_dir(), &[("Cargo.toml", "[package]")]);
+            tree(&work.c().0, &[(left_behind, "\x7fELF")]);
+
+            let err = work
+                .scrub()
+                .unwrap()
+                .seal(&crate::domain::health::Completed::for_test(), &c_before)
+                .expect_err(left_behind);
+            assert!(format!("{err:#}").contains("C oracle"), "{err:#}");
+        }
+    }
+
     #[test]
     fn debug_on_sealed_reveals_the_digest_not_the_location() {
         // Formatting must not be a way to recover a path and run something there.

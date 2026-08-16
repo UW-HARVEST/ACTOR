@@ -6,7 +6,7 @@
 //! one.
 
 use crate::agents::work::IsolatedWorkDir;
-use crate::artifact::{Phase, Sealed, Verify};
+use crate::artifact::{Phase, Sealed, Translate, Verify};
 use crate::cache::{
     AgentKey, CliVersion, KeyInputs, ModelId, Produced, PromptDigest, RecipeDigest, Store,
     ToolchainId,
@@ -20,6 +20,7 @@ use std::path::Path;
 /// happens to compile.
 pub trait Cached: Phase {}
 
+impl Cached for Translate {}
 impl Cached for Verify {}
 
 /// Everything one cached phase needs, all of it resolved BEFORE the agent runs so the key
@@ -108,7 +109,8 @@ where
 
     if obtained.replayed {
         println!(
-            "  ♻️  replayed a stored verification ({:?})",
+            "  ♻️  replayed a stored {}/ ({:?})",
+            P::DIR,
             obtained.sealed.digest()
         );
         // A replay must leave behind the same log a fresh run tees, or the skip check
@@ -172,7 +174,7 @@ pub(crate) fn write_phase_metrics<P: Phase>(
 mod tests {
     use super::*;
     use crate::agents::session::Session;
-    use crate::artifact::{phase_metrics, Translate};
+    use crate::artifact::{phase_metrics, TreeDigest};
     use crate::battery::{phase_dir, TRANSLATED, VERIFIED};
     use crate::cache::tests::fixture;
     use crate::cache::{fake_program, prompt_digest, Mode, Recipe};
@@ -218,14 +220,28 @@ mod tests {
                     .digest(),
             }
         }
+
+        /// The key the driver computes for `P`, varying nothing but the phase and the tree.
+        fn inputs<'a, P: Cached>(&'a self, input_tree: &'a TreeDigest) -> KeyInputs<'a> {
+            KeyInputs {
+                phase: P::DIR,
+                agent: &self.agent,
+                model: &self.model,
+                cli: &self.cli,
+                toolchain: &self.toolchain,
+                prompt: &self.prompt,
+                recipe: &self.recipe,
+                input_tree,
+            }
+        }
     }
 
-    fn phase_run<'a>(
+    fn phase_run<'a, P: Cached>(
         case: &'a Path,
         log: &'a Path,
         keys: &'a Keys,
-        work: IsolatedWorkDir<Verify>,
-    ) -> PhaseRun<'a, Verify> {
+        work: IsolatedWorkDir<P>,
+    ) -> PhaseRun<'a, P> {
         PhaseRun {
             work,
             case_dir: case,
@@ -239,10 +255,23 @@ mod tests {
         }
     }
 
+    /// `doc/footer.html.bak` is real in 26 stored cases, and is what the root rules drop.
+    fn corpus(at: &Path, bak: &str) -> PathBuf {
+        for (rel, body) in [
+            ("src/lib.c", "int a(void){return 0;}"),
+            ("doc/footer.html.bak", bak),
+        ] {
+            let p = at.join(rel);
+            std::fs::create_dir_all(p.parent().expect("a parent")).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        at.to_path_buf()
+    }
+
     /// A replay carries the ORIGINAL invocation's cost, so recording one as a fresh run
-    /// reports that spend as this run's. The whole-path test below reaches the verify half
-    /// only: translate does not run through this driver yet, so nothing else covers what one
-    /// writer for both phases now writes for `Translate`.
+    /// reports that spend as this run's. Where the whole-path tests below exercise one phase
+    /// each, this is what asserts the two records land beside their own artifact rather than
+    /// one overwriting the other.
     #[test]
     fn a_replay_is_recorded_as_a_replay_whichever_phase_it_belongs_to() {
         fn record<P: Phase>(case: &Path, recorded: Recorded<'_>) -> serde_json::Value {
@@ -330,7 +359,7 @@ mod tests {
             "a killed run has nothing to publish"
         );
 
-        let m = metrics_of(&case);
+        let m = metrics_of::<Verify>(&case);
         assert_eq!(
             m["exit_code"],
             serde_json::json!(124),
@@ -344,8 +373,8 @@ mod tests {
         );
     }
 
-    fn metrics_of(case: &Path) -> serde_json::Value {
-        let path = phase_metrics::<Verify>(case);
+    fn metrics_of<P: Phase>(case: &Path) -> serde_json::Value {
+        let path = phase_metrics::<P>(case);
         serde_json::from_str(
             &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
         )
@@ -385,7 +414,10 @@ mod tests {
         };
         let published = phase_dir(&case, VERIFIED).join("src/lib.rs");
         assert_eq!(std::fs::read_to_string(&published).unwrap(), FIXED);
-        assert_eq!(metrics_of(&case)["replayed"], serde_json::json!(false));
+        assert_eq!(
+            metrics_of::<Verify>(&case)["replayed"],
+            serde_json::json!(false)
+        );
 
         // The evidence for the restore: a fresh run tees this file, a replay never runs the
         // agent, so its reappearance can only be the store putting it back.
@@ -428,7 +460,7 @@ mod tests {
              fresh run nor a replay may publish it"
         );
 
-        let m = metrics_of(&case);
+        let m = metrics_of::<Verify>(&case);
         assert_eq!(
             m["replayed"],
             serde_json::json!(true),
@@ -437,6 +469,174 @@ mod tests {
         assert!(
             m["cache_key"].as_str().is_some_and(|k| !k.is_empty()),
             "the entry replayed must be named: {m}"
+        );
+        assert_eq!(
+            m["duration_secs"], 42,
+            "a replay reports the ORIGINAL invocation's cost, not a blank"
+        );
+    }
+
+    /// THE false-hit hazard: nothing substitutes a case into a translate prompt, so `input_tree`
+    /// is the only per-case component of its key — and digested as a phase dir, the root-anchored
+    /// rules drop every `*.bak`, `*.log` and `*.sha256`. Every case of a battery would then
+    /// collide on one key and be served another's translation, with nothing downstream to notice.
+    #[test]
+    fn two_corpora_differing_only_in_an_ignored_file_do_not_share_a_translate_key() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let keys = Keys::new(tmp.path());
+        let (a, b) = (
+            corpus(&tmp.path().join("a"), "one"),
+            corpus(&tmp.path().join("b"), "two"),
+        );
+        let digest_of = |c: &Path| {
+            IsolatedWorkDir::<Translate>::from_corpus(c)
+                .unwrap()
+                .input_digest()
+                .clone()
+        };
+        let (da, db) = (digest_of(&a), digest_of(&b));
+        assert_ne!(
+            keys.inputs::<Translate>(&da).key(),
+            keys.inputs::<Translate>(&db).key(),
+            "an ignored-at-root file still changes what the agent is given to translate"
+        );
+
+        // ...and the naive spelling really would have collided, so this cannot pass
+        // vacuously: `from_cache` is `digest_tree` over a path, reached from here.
+        assert_eq!(
+            Sealed::<Translate>::from_cache(&a).unwrap().digest(),
+            Sealed::<Translate>::from_cache(&b).unwrap().digest(),
+            "fixture assumption: digest_tree is the hashing that drops the .bak"
+        );
+    }
+
+    /// `phase` comes from `P::DIR` and not a `&str` the caller passes, so no otherwise identical
+    /// request crosses phases: a verify sweep replaying its own translations would publish the
+    /// pre-verify crate as `verified/` and score it as verified.
+    #[test]
+    fn a_translate_entry_cannot_serve_a_verify_request() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let keys = Keys::new(tmp.path());
+        let input = TreeDigest::for_test("sha256:the-same-tree");
+        assert_ne!(
+            keys.inputs::<Translate>(&input).key(),
+            keys.inputs::<Verify>(&input).key(),
+            "the phase must separate two requests that agree on everything else"
+        );
+        assert_eq!(
+            keys.inputs::<Verify>(&input).key(),
+            keys.inputs::<Verify>(&input).key(),
+            "the builder varies nothing but the phase, so the inequality above IS the phase"
+        );
+    }
+
+    /// The whole path a translation takes, twice: corpus → agent → seal → store → publish →
+    /// metrics, then the same inputs again. This is the $795.59 a harvest-bench sweep re-paid per
+    /// pass; a replay leaving no `translation.log` behind makes the next sweep pay it again, and
+    /// one omitting `replayed`/`cache_key` reports the original's cost as this run's.
+    #[test]
+    fn a_replayed_translation_publishes_and_restores_the_transcript_a_fresh_run_would_have_teed() {
+        let f = fixture();
+        let case = f.case.clone();
+        let keys = Keys::new(&f.repo);
+        let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        let corpus = corpus(&f.repo.join("corpus"), "upstream");
+        let log = phase_dir(&case, TRANSLATED).join("logs/translation.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "the transcript the invocation teed\n").unwrap();
+
+        const FIXED: &str = "pub fn a() { /* translated */ }";
+        let translate = |work: IsolatedWorkDir<Translate>| -> Result<Option<Produced<Translate>>> {
+            let crate_dir = work.translated_rust();
+            std::fs::create_dir_all(crate_dir.join("src"))?;
+            std::fs::write(crate_dir.join("Cargo.toml"), "[package]\nname=\"x\"")?;
+            std::fs::write(crate_dir.join("src/lib.rs"), FIXED)?;
+            // Where a real `cargo build` leaves it: the tree that gets sealed. Planted in
+            // `translated/` it proves nothing — `publish` clears that dir before it copies.
+            std::fs::create_dir_all(crate_dir.join("target/debug"))?;
+            std::fs::write(crate_dir.join("target/debug/junk"), "build output")?;
+            Ok(Some(Produced::new(
+                work.finish(&Completed::for_test())?,
+                log.clone(),
+                serde_json::json!({"agent": "claude", "duration_secs": 42}),
+            )))
+        };
+        let fresh = run_cached(
+            phase_run(
+                &case,
+                &log,
+                &keys,
+                IsolatedWorkDir::<Translate>::from_corpus(&corpus).unwrap(),
+            ),
+            &store,
+            translate,
+        )
+        .unwrap();
+        let Outcome::Published(fresh) = fresh else {
+            panic!("a completed run must publish");
+        };
+        let published = phase_dir(&case, TRANSLATED).join("src/lib.rs");
+        assert_eq!(std::fs::read_to_string(&published).unwrap(), FIXED);
+        assert!(
+            phase_dir(&case, TRANSLATED)
+                .join("c_src/doc/footer.html.bak")
+                .is_file(),
+            "the corpus travels into the translation: it is the oracle the scorer builds"
+        );
+        assert!(
+            !phase_dir(&case, TRANSLATED).join("target").exists(),
+            "build output is regenerable and bakes in a dead scratch path, so neither a \
+             fresh run nor a replay may publish it"
+        );
+        let first = metrics_of::<Translate>(&case);
+        assert_eq!(first["replayed"], serde_json::json!(false));
+
+        std::fs::remove_file(&log).unwrap();
+        assert!(
+            !log.exists(),
+            "the fixture must remove what the replay restores"
+        );
+
+        let replayed = run_cached(
+            phase_run(
+                &case,
+                &log,
+                &keys,
+                IsolatedWorkDir::<Translate>::from_corpus(&corpus).unwrap(),
+            ),
+            &store,
+            |_| panic!("the agent must NOT run on a hit — that is the entire point"),
+        )
+        .unwrap();
+        let Outcome::Published(replayed) = replayed else {
+            panic!("a hit must publish the stored artifact");
+        };
+        assert_eq!(
+            replayed.digest(),
+            fresh.digest(),
+            "a replay must publish the artifact that was stored"
+        );
+        assert_eq!(std::fs::read_to_string(&published).unwrap(), FIXED);
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap_or_default(),
+            "the transcript the invocation teed\n",
+            "without the restored transcript the skip check misses this case and the next \
+             sweep pays for it again"
+        );
+
+        let m = metrics_of::<Translate>(&case);
+        assert_eq!(
+            m["replayed"],
+            serde_json::json!(true),
+            "a replay recorded as a fresh run reports the original's spend as this run's: {m}"
+        );
+        assert_eq!(
+            m["cache_key"], first["cache_key"],
+            "a replay must name the entry the original wrote: {m}"
+        );
+        assert!(
+            m["cache_key"].as_str().is_some_and(|k| !k.is_empty()),
+            "and that entry must actually be named: {m}"
         );
         assert_eq!(
             m["duration_secs"], 42,
