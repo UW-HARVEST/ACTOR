@@ -49,6 +49,17 @@ COMMENT BUDGET TRAP: comment_budget.py reads git ls-files, so it does NOT see un
 files. Run 'git add -A' before measuring, or a new file's comments are invisible locally
 and fail in CI.
 
+DO NOT WRITE TO /tmp. It is a 16 GB tmpfs with a 1,048,576 inode cap, and it has already
+been exhausted once — by ~24,700 leaked test tempdirs plus ~10 GB of agent scratch (tree
+copies and cargo target dirs). When it fills, EVERY process on the box fails to create a
+file, including the tooling needed to clean up, and all work stops.
+
+Use /local/home/scheschb/scratch/<something-you-own> for any scratch tree, proof copy or
+build target you need outside your worktree, and delete it when you are done. If you copy
+the repo to prove something, put the copy there and its CARGO_TARGET_DIR there too.
+Cache-store entries are chmod'd read-only on purpose, so 'rm -rf' fails on them: run
+'chmod -R u+w <dir>' first or your cleanup silently leaves the tree behind.
+
 NEVER, under any circumstances:
   * widen, disable, skip or delete a gate to make your change pass
   * add #[allow], #[expect], #![allow] or #[ignore]

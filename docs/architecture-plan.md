@@ -115,6 +115,7 @@ Three non-negotiables:
 | 0 | **Delete four shape rules** and their allowlists — **landed** | net removal | the lockstep tax on 3–9 | 10 rules still green |
 | 1 | `CorpusDir` + `SeedAt` + `SeededBy` | types | — | 3 new tests + 1 compile-fail case |
 | 2 | **Guards**: recursive `rust_sources()` + anti-vacuity, DAG rule w/ baseline, golden fingerprint | additions only | — | rule fails on a planted cycle |
+| T | **Stop the suite writing to /tmp, and stop it leaking** — `TMPDIR` on disk, read-only-safe cleanup, ETXTBSY flake | reliability | — | 0 new `/tmp/.tmp*`; 200 contended runs |
 | 3a | `domain/` + layer-purity rule; move only what is already pure | move | — | purity rule; token-diff |
 | 3b | the boundary cuts: `classify(text, …)`, `normalise(text, roots)` | 2 cuts | `agent_health ↔ artifact` | purity rule |
 | 4 | `io/` moves | move | — | token-diff |
