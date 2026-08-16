@@ -35,8 +35,9 @@ pub enum LogFormat {
 /// The harness's LIVE observation of how the agent process ended.
 ///
 /// [`Exit::Unobserved`] is deliberately distinct from [`Exit::Failure`]: it means
-/// nobody watched, not that anything went wrong. An after-the-fact audit of a
-/// results tree has no observation, and must not manufacture one.
+/// nobody watched, not that anything went wrong. An after-the-fact audit recovers
+/// what the run recorded ([`crate::agent_health::recorded_exit`]) and lands here only
+/// when there is no record — it must never manufacture an observation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Exit {
     Success,
@@ -93,8 +94,8 @@ impl Health {
 /// Takes the text, never the path: the caller knows which backend it launched, how the
 /// process ended, and where the transcript is, so all three are its business and the
 /// decision here needs no fixture on disk. [`crate::agent_health::classify_log`] is the
-/// after-the-fact counterpart for auditing a results tree, where no observation is
-/// available.
+/// after-the-fact counterpart for auditing a results tree, where the observation is read
+/// back from what the run recorded rather than made live.
 ///
 /// For [`LogFormat::StreamJson`] the terminal record is authoritative and `exit` is
 /// deliberately ignored — see the module docs on `SIGXFSZ`: the agent runs under

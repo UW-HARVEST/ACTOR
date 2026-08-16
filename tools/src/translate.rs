@@ -1,11 +1,13 @@
 use crate::agents::exit::{clear_agent_exit, merge_agent_exit, record_agent_exit};
 use crate::agents::invocation::{assert_pins_honoured, claude_model};
+use crate::agents::run::{write_phase_metrics, Recorded};
 use crate::agents::Semaphore;
 use crate::analyse::cargo_toml::{self, CargoToml};
+use crate::artifact::Translate;
 use crate::battery::{self, Case, Paths};
 use crate::cli::Agent;
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -58,7 +60,7 @@ impl CaseResult {
         // that thread last ran, and a panic after `run_and_record` returned must not
         // overwrite the real record with a zero-duration failure.
         clear_agent_exit();
-        if !translation_metrics_path(case_dir).is_file() {
+        if !crate::artifact::phase_metrics::<Translate>(case_dir).is_file() {
             write_translation_metrics(case_dir, agent, 0, false);
         }
         CaseResult {
@@ -546,6 +548,13 @@ pub fn run_harvest_bench(
     projects: &[battery::HarvestBenchProject],
     parallel: usize,
 ) -> Result<()> {
+    // Ahead of `preflight_check`, so an agent with no translate phase here refuses once
+    // before a CLI it will never run is probed, rather than panicking once per project.
+    anyhow::ensure!(
+        in_tool_translate(paths.agent).is_some(),
+        "{}",
+        no_in_tool_translate(&paths.agent_key)
+    );
     preflight_check(paths.agent)?;
 
     // A harvest-bench test_case/ is always a C library the suite links by ABI, so the
@@ -736,6 +745,65 @@ fn preflight_check(agent: Agent) -> Result<()> {
 
 // ── Core translation ───────────────────────────────────────────────────
 
+/// Which CLI [`translate_case_at`] drives, resolved from `--agent` before anything runs.
+/// Codex's model and region travel with the arm that chose it, where a second
+/// `match paths.agent` picked them behind a `_ => unreachable!()` that was sound only because
+/// of the first — a reachability argument spread over two matches.
+#[derive(Copy, Clone)]
+enum InTool {
+    Kiro,
+    Claude,
+    Codex {
+        model: &'static str,
+        region: &'static str,
+    },
+    OpenCode,
+    C2rust,
+}
+
+/// `None` is "this agent has no in-tool translate phase", the counterpart of
+/// `verify::verify_invocation`'s `Ok(None)`. The five it answers `None` for were
+/// `unreachable!()` arms of the invocation match, and they are reachable: harvest-bench calls
+/// `translate_case_at` for whatever `--agent` was passed, so `--agent laertes translate
+/// HB/<project>` panicked there and `CaseResult::panicked` reported an ordinary ❌.
+fn in_tool_translate(agent: Agent) -> Option<InTool> {
+    Some(match agent {
+        Agent::Kiro => InTool::Kiro,
+        Agent::Claude
+        | Agent::ClaudeCombined
+        | Agent::ClaudeMinimal
+        | Agent::ClaudeNoIter
+        | Agent::ClaudeNoFeatures
+        | Agent::ClaudeNoSubtask
+        | Agent::ClaudeCrossPrompt => InTool::Claude,
+        Agent::CodexGpt55 => InTool::Codex {
+            model: "openai.gpt-5.5",
+            region: "us-east-2",
+        },
+        Agent::CodexGpt54 => InTool::Codex {
+            model: "openai.gpt-5.4",
+            region: "us-west-2",
+        },
+        Agent::OpenCode => InTool::OpenCode,
+        Agent::C2rust => InTool::C2rust,
+        // Each is driven by its own docker pipeline or single API call, reached from
+        // `dispatch_translate` and never from here.
+        Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust | Agent::Kimi | Agent::Oneshot => {
+            return None
+        }
+    })
+}
+
+fn no_in_tool_translate(agent: &crate::cache::AgentKey) -> String {
+    format!(
+        "--agent {} has no in-tool translate phase: its translation comes from an external \
+         docker pipeline or a single API call (see docs), which `dispatch_translate` reaches \
+         on Test-Corpus only. There is nothing to run here — but harvest-tools can still \
+         verify, test and score results that pipeline produced.",
+        agent.as_str()
+    )
+}
+
 fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Result<()> {
     let input_test_case = paths.input_dir(battery).join(name).join("test_case");
     let case_dir = paths.case_dir(battery, name);
@@ -753,41 +821,27 @@ pub fn translate_case_at(
     prompt: &str,
 ) -> Result<()> {
     let case_dir = out_case_dir;
+    let backend =
+        in_tool_translate(paths.agent).with_context(|| no_in_tool_translate(&paths.agent_key))?;
 
-    if case_dir.exists() {
-        std::fs::remove_dir_all(case_dir)?;
-    }
-
-    // Created before the agent runs so `tee` can write its log there live; the
-    // crate copy-back below merges into this dir rather than replacing it.
+    // Created before the agent runs so `tee` can write its log there live; `clear_phase`
+    // below keeps `logs/` for exactly that reason.
     let translated_dir = crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED);
-    let logs_dir = translated_dir.join("logs");
+    let logs_dir = crate::artifact::phase_logs::<Translate>(case_dir);
     std::fs::create_dir_all(&logs_dir)?;
 
-    let log_path = logs_dir.join("translation.log");
+    let log_path = crate::artifact::phase_log::<Translate>(case_dir);
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
     // The sandbox, settings path and OpenCode contract are all rooted at the temp dir, so
     // it leaves the match directly: recovering it as `work_dir.parent()` turned a known
     // root into an `Option` that three call sites below then had to guess at.
-    let (work_root, work_dir, _tmp_guard) = match paths.agent {
-        Agent::Kiro
-        | Agent::Claude
-        | Agent::ClaudeCombined
-        | Agent::ClaudeMinimal
-        | Agent::ClaudeNoIter
-        | Agent::ClaudeNoFeatures
-        | Agent::ClaudeNoSubtask
-        | Agent::ClaudeCrossPrompt
-        | Agent::CodexGpt55
-        | Agent::CodexGpt54
-        | Agent::OpenCode
-        | Agent::C2rust
-        | Agent::Laertes
-        | Agent::C2SaferRust
-        | Agent::SmartC2Rust
-        | Agent::Kimi
-        | Agent::Oneshot => {
+    let (work_root, work_dir, _tmp_guard) = match backend {
+        InTool::Kiro
+        | InTool::Claude
+        | InTool::Codex { .. }
+        | InTool::OpenCode
+        | InTool::C2rust => {
             let tmp = crate::io::workdir::tempdir("harvest-translate-")
                 .context("creating isolated temp dir")?;
             let work = tmp.path().join(crate::battery::TRANSLATED_RUST);
@@ -795,16 +849,7 @@ pub fn translate_case_at(
             std::fs::create_dir_all(&c_src)?;
             copy_dir_all(input_test_case, &c_src)?;
 
-            if matches!(
-                paths.agent,
-                Agent::Claude
-                    | Agent::ClaudeCombined
-                    | Agent::ClaudeMinimal
-                    | Agent::ClaudeNoIter
-                    | Agent::ClaudeNoFeatures
-                    | Agent::ClaudeNoSubtask
-                    | Agent::ClaudeCrossPrompt
-            ) {
+            if matches!(backend, InTool::Claude) {
                 crate::io::sandbox::write_settings(crate::io::sandbox::Policy {
                     repo_root: &paths.repo_root,
                     work_root: tmp.path(),
@@ -812,7 +857,7 @@ pub fn translate_case_at(
                 })?;
             }
 
-            if matches!(paths.agent, Agent::OpenCode) {
+            if matches!(backend, InTool::OpenCode) {
                 // OpenCode's equivalent of the .claude/settings.json sandbox above.
                 crate::agents::opencode::materialize_config(
                     tmp.path(),
@@ -827,8 +872,8 @@ pub fn translate_case_at(
 
     // OpenCode's appended filesystem-boundary contract names the temp dir, so the
     // final prompt is only known once the workspace exists.
-    let prompt: &str = &match paths.agent {
-        Agent::OpenCode => format!(
+    let prompt: &str = &match backend {
+        InTool::OpenCode => format!(
             "{prompt}{}",
             crate::agents::opencode::prompt_suffix(&work_root)
         ),
@@ -842,21 +887,15 @@ pub fn translate_case_at(
         let _ = std::fs::write(logs_dir.join("prompt.md"), prompt);
     }
 
-    match paths.agent {
-        Agent::Kiro => {
+    match backend {
+        InTool::Kiro => {
             let status = crate::agents::session::Session::kiro(KIRO_TRANSLATE_TIMEOUT_SECS)
                 .kiro_command(&work_dir, prompt, &log_path)
                 .status()
                 .context("invoking kiro-cli")?;
             record_agent_exit(status);
         }
-        Agent::Claude
-        | Agent::ClaudeCombined
-        | Agent::ClaudeMinimal
-        | Agent::ClaudeNoIter
-        | Agent::ClaudeNoFeatures
-        | Agent::ClaudeNoSubtask
-        | Agent::ClaudeCrossPrompt => {
+        InTool::Claude => {
             // The same builder verify uses, so the two phases cannot drift into
             // different flags for the same CLI.
             let model = claude_model()?;
@@ -877,14 +916,9 @@ pub fn translate_case_at(
             // artifact — and `verified/` is built on top of it.
             assert_pins_honoured(&log_path, &model, &cli)?;
         }
-        Agent::CodexGpt55 | Agent::CodexGpt54 => {
-            // Model and region are passed as `-c` overrides so the run does not
-            // depend on a global ~/.codex/config.toml.
-            let (model, region) = match paths.agent {
-                Agent::CodexGpt55 => ("openai.gpt-5.5", "us-east-2"),
-                Agent::CodexGpt54 => ("openai.gpt-5.4", "us-west-2"),
-                _ => unreachable!(),
-            };
+        // Model and region are passed as `-c` overrides so the run does not depend on a
+        // global ~/.codex/config.toml.
+        InTool::Codex { model, region } => {
             invoke_codex_with_retry(
                 RetrySession {
                     prompt,
@@ -897,7 +931,7 @@ pub fn translate_case_at(
                 &openssl_dir,
             )?;
         }
-        Agent::OpenCode => {
+        InTool::OpenCode => {
             invoke_opencode_with_retry(
                 RetrySession {
                     prompt,
@@ -913,21 +947,19 @@ pub fn translate_case_at(
                 &opencode_model(paths)?,
             )?;
         }
-        Agent::C2rust => {
+        InTool::C2rust => {
             c2rust_translate(&work_dir, &log_path)?;
         }
-        Agent::Laertes => unreachable!("laertes uses laertes_translate_case"),
-        Agent::C2SaferRust => unreachable!("c2saferrust uses c2saferrust_translate_case"),
-        Agent::SmartC2Rust => unreachable!("smartc2rust is not translated in-tool"),
-        Agent::Kimi => unreachable!("kimi uses kimi_translate_case"),
-        Agent::Oneshot => unreachable!("oneshot uses oneshot_translate_case"),
     };
 
     if !crate::battery::has_crate(&work_dir) {
         anyhow::bail!("no Cargo.toml produced");
     }
 
-    // copy_dir_all merges, so the logs/ already written into `translated/` survive.
+    // Publication, and not a line earlier: everything above can fail, and until here the
+    // previous translation is still what is on disk. copy_dir_all merges, so the `logs/`
+    // that `clear_phase` kept survive.
+    crate::artifact::clear_phase::<Translate>(case_dir)?;
     copy_dir_all(&work_dir, &translated_dir)?;
 
     Ok(())
@@ -1041,35 +1073,21 @@ pub fn propagate_config(
 
 // ── Metrics ────────────────────────────────────────────────────────────
 
-/// Inside the `translated/` PHASE dir, beside the log it describes. The case ROOT is
-/// where this used to land, while `agent_health::collect` and `battery.rs` both read the
-/// phase dir — so `exit_code`/`timed_out` were written and then read by nothing, and
-/// that is the 124-on-timeout signal for a project killed at the wall clock.
-fn translation_metrics_path(case_dir: &Path) -> PathBuf {
-    crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED).join("translation.json")
-}
-
+/// Nothing here reaches the store yet, so the record is always of a fresh run.
 fn write_translation_metrics(
     case_dir: &Path,
     agent: &crate::cache::AgentKey,
     duration_secs: u64,
     success: bool,
 ) {
-    let mut metrics = serde_json::json!({
+    let mut provenance = serde_json::json!({
         "agent": agent.as_str(),
         "duration_secs": duration_secs,
         "success": success,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
-    merge_agent_exit(&mut metrics);
-    let path = translation_metrics_path(case_dir);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(
-        path,
-        serde_json::to_string_pretty(&metrics).unwrap_or_default() + "\n",
-    );
+    merge_agent_exit(&mut provenance);
+    write_phase_metrics::<Translate>(case_dir, &provenance, Recorded::Fresh { entry: None });
 }
 
 fn count_cases(battery: &battery::Battery) -> usize {
@@ -1310,23 +1328,11 @@ fn oneshot_llm_translate(
     invoke_llm: impl FnOnce(Conversation<'_>, &Path) -> Result<LlmResponse>,
 ) -> Result<()> {
     let case_dir = paths.case_dir(battery, name);
-    if case_dir.exists() {
-        std::fs::remove_dir_all(&case_dir)?;
-    }
-
-    let logs_dir = case_dir.join("logs");
+    let logs_dir = crate::artifact::phase_logs::<Translate>(&case_dir);
     std::fs::create_dir_all(&logs_dir)?;
-    let log_path = logs_dir.join("translation.log");
+    let log_path = crate::artifact::phase_log::<Translate>(&case_dir);
 
     let input_test_case = paths.input_dir(battery).join(name).join("test_case");
-    let translated = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
-    std::fs::create_dir_all(&translated)?;
-
-    // The test harness expects the C sources beside the crate.
-    let c_src = translated.join("c_src");
-    std::fs::create_dir_all(&c_src)?;
-    copy_dir_all(&input_test_case, &c_src)?;
-
     let files_json = collect_c_files_json(&input_test_case)?;
     let is_lib = detect_is_library(&input_test_case).unwrap_or(is_lib_hint);
     let system_prompt = require_prompt(paths, PromptKind::independent(is_lib))?;
@@ -1358,11 +1364,22 @@ fn oneshot_llm_translate(
         serde_json::to_string_pretty(&usage).unwrap_or_default() + "\n",
     );
 
-    write_llm_files(&resp.content, &translated)?;
-
-    if !crate::battery::has_crate(&translated) {
+    // Assembled in scratch first, as on the CLI-agent path: a response that parses to no
+    // crate must not be what replaces the previous translation. `c_src` because the test
+    // harness expects the C sources beside the crate.
+    let staged = crate::io::workdir::tempdir("harvest-oneshot-")
+        .context("creating a staging dir for the LLM response")?;
+    copy_dir_all(&input_test_case, &staged.path().join("c_src"))?;
+    write_llm_files(&resp.content, staged.path())?;
+    if !crate::battery::has_crate(staged.path()) {
         anyhow::bail!("no Cargo.toml in LLM response");
     }
+
+    crate::artifact::clear_phase::<Translate>(&case_dir)?;
+    copy_dir_all(
+        staged.path(),
+        &crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED),
+    )?;
     Ok(())
 }
 
@@ -1688,12 +1705,8 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     );
 
     let case_dir = paths.case_dir(battery, name);
-    if case_dir.exists() {
-        std::fs::remove_dir_all(&case_dir)?;
-    }
-    let logs_dir = case_dir.join("logs");
-    std::fs::create_dir_all(&logs_dir)?;
-    let log_path = logs_dir.join("translation.log");
+    std::fs::create_dir_all(crate::artifact::phase_logs::<Translate>(&case_dir))?;
+    let log_path = crate::artifact::phase_log::<Translate>(&case_dir);
     let translated = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
 
     // Staged in scratch like its c2saferrust neighbour: the container gets this mounted
@@ -1760,6 +1773,7 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
         }
     )?;
 
+    crate::artifact::clear_phase::<Translate>(&case_dir)?;
     copy_dir_filtered(&work, &translated, &["target"])?;
     Ok(())
 }
@@ -1893,12 +1907,9 @@ fn c2saferrust_translate_case(
     let token = bedrock_token(&region)?;
 
     let case_dir = paths.case_dir(battery, name);
-    if case_dir.exists() {
-        std::fs::remove_dir_all(&case_dir)?;
-    }
-    let logs_dir = case_dir.join("logs");
+    let logs_dir = crate::artifact::phase_logs::<Translate>(&case_dir);
     std::fs::create_dir_all(&logs_dir)?;
-    let log_path = logs_dir.join("translation.log");
+    let log_path = crate::artifact::phase_log::<Translate>(&case_dir);
     let translated = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
 
     // Bind-mounted into the container: the tool reshapes <work>/rust in place and
@@ -1964,6 +1975,7 @@ fn c2saferrust_translate_case(
         )?;
         work_rust.clone()
     };
+    crate::artifact::clear_phase::<Translate>(&case_dir)?;
     copy_dir_filtered(&source_dir, &translated, &["target"])?;
     for junk in [
         "callgraph.dot",
@@ -2342,6 +2354,108 @@ mod tests {
         assert_eq!(truncated(&s, 4), "éé");
     }
 
+    /// THE ORDERING BUG: all four translate paths wiped the case dir before invoking the
+    /// agent, so an outage, a timeout or a crash left the case holding nothing where a
+    /// complete result had been. Driven through the oneshot path because its LLM call is the
+    /// one injectable failure of the four; the wipe was identical at every site.
+    #[test]
+    fn a_translation_that_fails_leaves_the_previous_result_standing() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let root = tmp.path();
+        // `require_prompt` refuses an absent one, failing ahead of the code under test.
+        let prompts = root.join("prompts/oneshot");
+        std::fs::create_dir_all(&prompts).unwrap();
+        for f in ["translate-library.md", "translate-executable.md"] {
+            std::fs::write(
+                prompts.join(f),
+                "translate this C project into Rust.".repeat(8),
+            )
+            .unwrap();
+        }
+        let paths = Paths::new(
+            root,
+            Agent::Oneshot,
+            crate::cli::Dataset::TestCorpus,
+            Some("openai/gpt-5.4"),
+            crate::cache::Mode::Bypass,
+            crate::io::sandbox::Enforcement::AllowUnsandboxed,
+        )
+        .expect("Paths");
+        let (battery, name) = ("B01_organic", "strcmp");
+        let test_case = paths.input_dir(battery).join(name).join("test_case");
+        std::fs::create_dir_all(&test_case).unwrap();
+        std::fs::write(test_case.join("main.c"), "int main(void){return 0;}").unwrap();
+
+        // What the last sweep left: a translation, the verification built on it, and the
+        // test artifacts staged beside both.
+        let case = paths.case_dir(battery, name);
+        let translated = crate::battery::phase_dir(&case, crate::battery::TRANSLATED);
+        let verified = crate::battery::phase_dir(&case, crate::battery::VERIFIED);
+        for dir in [&translated, &verified] {
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
+            std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}").unwrap();
+        }
+        std::fs::create_dir_all(case.join("test_vectors")).unwrap();
+        std::fs::write(case.join("test_vectors/in.txt"), "1 2").unwrap();
+
+        let err = oneshot_llm_translate(&paths, battery, name, false, None, |_, log| {
+            // The transcript is teed live, as the real backends do, and then the call dies.
+            std::fs::write(log, "=== OPENROUTER REQUEST ===\n").unwrap();
+            anyhow::bail!("api_error 403: the security token included in the request is expired")
+        })
+        .expect_err("the injected outage must fail the translation");
+        assert!(format!("{err:#}").contains("403"), "{err:#}");
+
+        for f in [
+            translated.join("src/lib.rs"),
+            verified.join("Cargo.toml"),
+            case.join("test_vectors/in.txt"),
+        ] {
+            assert!(
+                f.is_file(),
+                "{} was destroyed by a run that produced no translation to replace it",
+                f.display()
+            );
+        }
+
+        // Non-vacuity: publishing DOES clear the first two, so the assertions above hold
+        // because the wipe moved to publish time, not because nothing ever clears.
+        crate::artifact::clear_phase::<Translate>(&case).unwrap();
+        assert!(
+            !translated.join("src/lib.rs").exists(),
+            "a publish must replace the old crate"
+        );
+        assert!(
+            !verified.exists(),
+            "and must invalidate the verification built on it"
+        );
+        assert!(
+            crate::artifact::phase_log::<Translate>(&case).is_file(),
+            "while the transcript teed into the phase dir survives"
+        );
+        assert!(
+            case.join("test_vectors/in.txt").is_file(),
+            "and what translate does not own is never its to delete"
+        );
+    }
+
+    /// `--agent laertes translate HB/<project>` reached `translate_case_at`, hit an
+    /// `unreachable!()` and was caught by `CaseResult::panicked`, so every project read as an
+    /// ordinary ❌ — indistinguishable from a translation that genuinely failed.
+    #[test]
+    fn an_agent_with_no_in_tool_translate_phase_refuses_instead_of_panicking() {
+        let paths = paths_for(Agent::Laertes, crate::cli::Dataset::HarvestBench);
+        let err = run_harvest_bench(&paths, &[], 1).expect_err("must refuse, not panic");
+        assert!(
+            format!("{err:#}").contains("no in-tool translate phase"),
+            "{err:#}"
+        );
+        // ...and the refusal discriminates: the agents that have one are not refused.
+        assert!(in_tool_translate(Agent::Claude).is_some());
+        assert!(in_tool_translate(Agent::Laertes).is_none());
+    }
+
     /// The writer must land where `agent_health::collect` and `battery.rs` look, or the
     /// timeout signal (`timeout` exits 124) is written and read by nobody.
     #[test]
@@ -2381,7 +2495,8 @@ mod tests {
         clear_agent_exit();
         record_agent_exit(exit_status(124));
         write_translation_metrics(&case, &test_agent_key(), 10_800, false);
-        let before = std::fs::read_to_string(translation_metrics_path(&case)).unwrap();
+        let before =
+            std::fs::read_to_string(crate::artifact::phase_metrics::<Translate>(&case)).unwrap();
 
         // The joining thread carries some OTHER case's exit; it must not be borrowed.
         record_agent_exit(exit_status(0));
@@ -2389,7 +2504,7 @@ mod tests {
 
         assert!(!r.success);
         assert_eq!(
-            std::fs::read_to_string(translation_metrics_path(&case)).unwrap(),
+            std::fs::read_to_string(crate::artifact::phase_metrics::<Translate>(&case)).unwrap(),
             before,
             "the real 3h/124 record must survive the panic report",
         );
@@ -2406,7 +2521,7 @@ mod tests {
         CaseResult::panicked("jansson".into(), &case, &test_agent_key(), Box::new("boom"));
 
         let m: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(translation_metrics_path(&case)).unwrap(),
+            &std::fs::read_to_string(crate::artifact::phase_metrics::<Translate>(&case)).unwrap(),
         )
         .unwrap();
         assert_eq!(

@@ -228,7 +228,7 @@ fn run_test(
 ) -> Result<()> {
     // Must precede scoring: `bench.test` writes result.json and `report::generate`
     // rewrites all of tables/, so a warning afterwards comes too late to help.
-    let audit = agent_health::audit(&paths.results_dir)?;
+    let audit = agent_health::audit(&paths.results_dir, paths.agent.log_format())?;
     if let Some(report) = agent_health::describe_infra_failures(&audit) {
         agent_health::record_infra_failures(&paths.results_dir, &audit)?;
         if !allow_infra_failures {

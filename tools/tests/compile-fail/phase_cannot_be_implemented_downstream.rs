@@ -3,5 +3,8 @@
 struct Sideways;
 impl harvest_tools::artifact::Phase for Sideways {
     const DIR: &'static str = "sideways";
+    const LOG: &'static str = "sideways.log";
+    const METRICS: &'static str = "sideways.json";
+    const INVALIDATES: &'static [&'static str] = &[];
 }
 fn main() {}

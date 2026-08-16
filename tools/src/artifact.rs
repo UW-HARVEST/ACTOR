@@ -31,6 +31,20 @@ mod sealed_trait {
 /// Sealed, so that every phase-dependent constant lives here and cannot drift apart.
 pub trait Phase: sealed_trait::Sealed + Copy + 'static {
     const DIR: &'static str;
+    /// The transcript this phase tees, under `<DIR>/logs/`.
+    const LOG: &'static str;
+    /// What this phase records beside its artifact, in the phase dir with the log. Every
+    /// reader resolves both from the phase dir — `agent_health::audit`, the `oracle/`
+    /// enrichers, `battery::extract_agent_meta` — and three of translate's four paths wrote
+    /// the case ROOT, so an infra failure on those backends was scored as a result and
+    /// `exit_code`/`timed_out` (the 124 a wall-clock kill leaves) were read by nothing.
+    const METRICS: &'static str;
+    /// Phase dirs a fresh result of this phase makes stale, which `clear_phase` removes
+    /// whole. A translation invalidates `verified/`: [`crate::battery::crate_dir`] prefers
+    /// `verified/` when it holds a crate, so it would score the last sweep's verification
+    /// against this one's translation — and the "already verified" skip keys on
+    /// `verified/logs/verify.log`, so keeping just its logs makes verify skip the case.
+    const INVALIDATES: &'static [&'static str];
 }
 
 #[derive(Copy, Clone)]
@@ -43,9 +57,70 @@ impl sealed_trait::Sealed for Verify {}
 
 impl Phase for Translate {
     const DIR: &'static str = crate::battery::TRANSLATED;
+    const LOG: &'static str = "translation.log";
+    const METRICS: &'static str = "translation.json";
+    const INVALIDATES: &'static [&'static str] = &[crate::battery::VERIFIED];
 }
 impl Phase for Verify {
     const DIR: &'static str = crate::battery::VERIFIED;
+    const LOG: &'static str = "verify.log";
+    const METRICS: &'static str = "verification.json";
+    const INVALIDATES: &'static [&'static str] = &[];
+}
+
+/// Inside the phase's own dir, which is what lets [`clear_phase`] keep the transcript while
+/// replacing the artifact around it.
+pub(crate) fn phase_logs<P: Phase>(case_dir: &Path) -> PathBuf {
+    crate::battery::phase_dir(case_dir, P::DIR).join("logs")
+}
+
+/// THE log path of a phase: a function of the phase, so it cannot have four homes again.
+pub(crate) fn phase_log<P: Phase>(case_dir: &Path) -> PathBuf {
+    phase_logs::<P>(case_dir).join(P::LOG)
+}
+
+pub(crate) fn phase_metrics<P: Phase>(case_dir: &Path) -> PathBuf {
+    crate::battery::phase_dir(case_dir, P::DIR).join(P::METRICS)
+}
+
+/// Make room for a fresh result of this phase. THE definition of "clear a phase dir";
+/// [`Sealed::publish`] is its other caller.
+///
+/// Call it immediately before the new output is written, never before the agent starts: the
+/// four translate paths used to `remove_dir_all` the whole case up front, so a crash, an API
+/// outage or a timeout left the case holding *nothing* where a complete result had been, and
+/// took `verified/` plus the staged `test_vectors/` and `runner/`, which translate does not
+/// own. `logs/` survives, because the transcript is teed there while the agent runs.
+///
+/// `pub(crate)`, not `pub`: a recursive delete parameterised by a caller-supplied `case_dir`
+/// is not crate-external API, and `no_public_path_escapes_the_artifact_modules` reads only
+/// impls and structs, so nothing would have caught it escaping.
+pub(crate) fn clear_phase<P: Phase>(case_dir: &Path) -> Result<()> {
+    for stale in P::INVALIDATES {
+        let dir = crate::battery::phase_dir(case_dir, stale);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("removing the stale {}", dir.display()))?;
+        }
+    }
+    let dst = crate::battery::phase_dir(case_dir, P::DIR);
+    if !dst.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&dst)? {
+        let entry = entry?;
+        if entry.file_name() == "logs" {
+            continue;
+        }
+        let p = entry.path();
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        }
+        .with_context(|| format!("clearing {}", p.display()))?;
+    }
+    Ok(())
 }
 
 /// Where a seed's contents land inside a work tree. Swapping these is silent: a corpus
@@ -563,22 +638,8 @@ impl<P: Phase> Sealed<P> {
     }
 
     pub fn publish(&self, case_dir: &Path) -> Result<()> {
-        let dst = crate::battery::phase_dir(case_dir, P::DIR);
-        if dst.exists() {
-            for entry in std::fs::read_dir(&dst)? {
-                let entry = entry?;
-                if entry.file_name() == "logs" {
-                    continue; // verify.log is written here live
-                }
-                let p = entry.path();
-                if entry.file_type()?.is_dir() {
-                    std::fs::remove_dir_all(&p)?;
-                } else {
-                    std::fs::remove_file(&p)?;
-                }
-            }
-        }
-        self.assemble_into(case_dir, &dst)
+        clear_phase::<P>(case_dir)?;
+        self.assemble_into(case_dir, &crate::battery::phase_dir(case_dir, P::DIR))
     }
 
     /// Factored out of [`Self::publish`] so that "what this phase's tree contains" —
