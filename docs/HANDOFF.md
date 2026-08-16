@@ -110,6 +110,20 @@ python3 tools/comment_budget.py --max 14     # from repo root, AFTER `git add -A
 python3 tools/check_paths.py                 # from repo root
 ```
 
+**A tenth gate exists in CI and is missing from that list: `cargo build --release --locked`.**
+It is the `build` job of `validate-translations`, i.e. the *first* thing CI does and the job
+the seven agent matrix arms depend on — so a PR can pass all nine gates locally and still fail
+CI before a single test runs. Release differs from the debug builds above in real ways
+(`debug_assertions` off, no overflow checks, different dead-code reachability). Run it too:
+
+```
+cargo build --release --locked --manifest-path tools/Cargo.toml   # from repo root
+```
+
+The nine above are the `type safety` workflow; `validate-translations` is the expensive one.
+Neither CI workflow runs `--test integration`, which is why the golden fingerprint has to be
+run by hand and why it silently prints `NO SIGNAL` without `HARVEST_GOLDEN_RESULTS`.
+
 Plus, for any PR that touches the artifact pipeline:
 
 ```
