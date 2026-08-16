@@ -7,7 +7,7 @@ not in any of those and that a fresh context would otherwise rediscover expensiv
 
 ## Where the work stands
 
-Sixteen PRs merged (#89–#104). The layered architecture is most of the way in:
+Eighteen PRs merged (#89–#106). The layered architecture is most of the way in:
 
 ```
 tools/src/
@@ -30,12 +30,23 @@ crate, enforced by `the_store_is_obtained_from_exactly_one_place`. Verify runs t
 
 | # | PR | spec | state |
 |---|---|---|---|
-| 7b | translate on `run_cached` — **the translate cache** | `docs/prs/spec-7b.md` | in flight |
-| 12 | **the skip check consults the store**, not the presence of a `Cargo.toml` | `docs/prs/spec-12.md` | ready; this is what makes 7b pay |
+| 14 | **the oracle check must judge the oracle**, not the directory it sits in | `docs/prs/spec-14.md` | in flight; **blocks the next sweep** |
+| 12 | **the skip check consults the store**, not the presence of a `Cargo.toml` | `docs/prs/spec-12.md` | in flight; this is what makes 7b pay |
 | 11 | **an entry records the inputs its key came from** — store `input/` and the digest preimages | `docs/prs/spec-11.md` | ready; land before the next sweep |
 | 7c | shared-source groups: one key, N publishes | `docs/prs/spec-7c.md` | ready |
 | 8 | `cache/` + `dataset/` split; `cache_mode` off `Paths` | `docs/prs/spec-8.md` | ready; breaks `battery ↔ cache`, `cache ↔ cli` |
+| 15 | five seams the 7b review exposed, led by a store failure losing a paid artifact | `docs/prs/spec-15.md` | ready; item 1 is a money bug |
 | 10 | renames: `Scrubbed`→`ScrubbedTree`, `Sealed`→`SealedTree`, `CDir`→`OracleDir` | `docs/prs/spec-10.md` | ready; last, touches 10 column-exact `.stderr` files |
+
+**Landed since this table was written:** 7b as #105 (translate is memoised; shared-source
+groups deliberately left at `Mode::Bypass` for 7c) and 13 as #106 (the comment budget).
+
+**NO SWEEP UNTIL 14 LANDS.** 7b routes translate through `Scrubbed::seal`, which refuses any
+run that changed `c_src/` — including one that merely *added* a build artefact, while the
+translate prompt tells the agent to build the C library and run `nm -D` on the resulting `.so`.
+71 of 6,312 stored `translated/*/c_src` trees already hold a `.o`/`.a`/`.so` at a non-build
+path, so a sweep run before 14 lands would report a lower translation success rate for a reason
+that is not the agent's fault.
 
 **PR T (the `/tmp` fix) landed as #98 — and looking for it in the obvious place says
 otherwise.** Worth spelling out, because this handoff briefly claimed it was unlanded on
@@ -65,11 +76,16 @@ git add docs/prs/spec-N.md && git commit && git push origin main
 # 2. worktree off main
 git worktree add -b prN-slug /local/home/scheschb/pr-auto-N main
 
-# 3. run the pipeline
-Workflow({scriptPath: ".claude/workflows/pr-pipeline.js",
+# 3. run the pipeline -- v2, and PASS THE BASE SHA
+Workflow({scriptPath: ".claude/workflows/pr-pipeline2.js",
           args: {pr:"N", worktree:"/local/home/scheschb/pr-auto-N",
                  branch:"prN-slug", spec:"docs/prs/spec-N.md",
-                 repo:"/local/home/scheschb/research/ACTOR", rounds:2}})
+                 repo:"/local/home/scheschb/research/ACTOR",
+                 base:"<the sha the worktree was cut from>", rounds:2}})
+# `base` matters: origin/main moves while a run is in flight, and then every agent reads
+# unrelated commits as this branch's deletions. One run lost real time to exactly that.
+# v2 also screens each blocking finding with a skeptic before a resolver acts on it, and
+# ends with an audit stage asking what every earlier stage did not check.
 
 # 4. when it returns: REBASE, then RE-VERIFY EVERY GATE YOURSELF, then merge
 cd /local/home/scheschb/pr-auto-N
