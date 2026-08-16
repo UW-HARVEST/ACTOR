@@ -34,7 +34,6 @@ crate, enforced by `the_store_is_obtained_from_exactly_one_place`. Verify runs t
 | 12 | **the skip check consults the store**, not the presence of a `Cargo.toml` | `docs/prs/spec-12.md` | ready; this is what makes 7b pay |
 | 11 | **an entry records the inputs its key came from** — store `input/` and the digest preimages | `docs/prs/spec-11.md` | ready; land before the next sweep |
 | 7c | shared-source groups: one key, N publishes | `docs/prs/spec-7c.md` | ready |
-| 13 | **the comment budget is green on a false measurement** | `docs/prs/spec-13.md` | ready; needs an operator decision on the metric |
 | 8 | `cache/` + `dataset/` split; `cache_mode` off `Paths` | `docs/prs/spec-8.md` | ready; breaks `battery ↔ cache`, `cache ↔ cli` |
 | 10 | renames: `Scrubbed`→`ScrubbedTree`, `Sealed`→`SealedTree`, `CDir`→`OracleDir` | `docs/prs/spec-10.md` | ready; last, touches 10 column-exact `.stderr` files |
 
@@ -85,7 +84,7 @@ git worktree remove /local/home/scheschb/pr-auto-N --force
 ```
 
 **Always rebase and re-verify before merging.** Gates measured against a tree that no longer
-exists prove nothing, and the comment budget is a whole-tree ratio so two PRs can each pass
+exists prove nothing, and the comment budget is measured whole-tree, so two PRs can each pass
 and jointly fail.
 
 **Write the commit message from `git diff`, never from the agent's report.** Two reports in
@@ -94,7 +93,7 @@ been widened when they had not moved at all; one stated in prose that a change w
 deliberately NOT made while the diff made it, omitting two changed files. The pipeline now
 instructs against this, but verify anyway.
 
-## The nine gates
+## The ten gates
 
 Run from `tools/`, with `export PATH="$HOME/.cargo/bin:$PATH" && unset RUSTUP_TOOLCHAIN`
 first — `RUSTUP_TOOLCHAIN=1.97.1` is exported in the login shell and **silently overrides**
@@ -109,13 +108,14 @@ cargo test  --locked --test compile_fail
 cargo clippy --locked --all-targets
 cargo clippy --locked --lib --bins -- -D clippy::panic
 cargo doc   --locked --no-deps
-python3 tools/comment_budget.py --max 14     # from repo root, AFTER `git add -A`
+python3 tools/test_comment_budget.py                  # the same CI step runs this first
+python3 tools/comment_budget.py --max-comments 2560 --max-ratio 20   # root, AFTER `git add -A`
 python3 tools/check_paths.py                 # from repo root
 ```
 
-**A tenth gate exists in CI and is missing from that list: `cargo build --release --locked`.**
+**An eleventh gate exists in CI and is missing from that list: `cargo build --release --locked`.**
 It is the `build` job of `validate-translations`, i.e. the *first* thing CI does and the job
-the seven agent matrix arms depend on — so a PR can pass all nine gates locally and still fail
+the seven agent matrix arms depend on — so a PR can pass all ten gates locally and still fail
 CI before a single test runs. Release differs from the debug builds above in real ways
 (`debug_assertions` off, no overflow checks, different dead-code reachability). Run it too:
 
@@ -123,9 +123,26 @@ CI before a single test runs. Release differs from the debug builds above in rea
 cargo build --release --locked --manifest-path tools/Cargo.toml   # from repo root
 ```
 
-The nine above are the `type safety` workflow; `validate-translations` is the expensive one.
-Neither CI workflow runs `--test integration`, which is why the golden fingerprint has to be
-run by hand and why it silently prints `NO SIGNAL` without `HARVEST_GOLDEN_RESULTS`.
+Those ten are the `type safety` workflow, which runs one more failing command they do not
+cover: the `Install the pinned toolchain` step, which exits 1 if `rustc --version` disagrees
+with `rust-toolchain.toml` or `rust-src` is missing. The `export PATH` / `unset
+RUSTUP_TOOLCHAIN` preamble above is how you satisfy it locally, which is why it is a preamble
+here and a step there. `validate-translations` is the expensive one. Neither CI workflow runs
+`--test integration`, which is why the golden fingerprint has to be run by hand and why it
+silently prints `NO SIGNAL` without `HARVEST_GOLDEN_RESULTS`.
+
+The count is per *command*, not per CI step or per flag — the `Lint` step is one step running
+two `clippy` commands, and the `Comment budget` step became two commands when PR 13 added
+`tools/test_comment_budget.py`, which is what moved the list from nine to ten. `--max-ratio`
+is a second *limit* on the same command, so it did not move the count again. The specs in
+`docs/prs/` each froze whatever count was in force when they were written ("the nine gates",
+"the ten gates"); they all defer to this list, and this list is the count that is in force.
+
+**PR 13 also changed the flags**, so the invocation in force is the one above,
+`--max-comments 2560 --max-ratio 20`; `--max` retired with the whole-tree ratio. Nine older
+specs still print `--max 14` (3a, 3b, 4, 5, 6, 9, tmp) or `--max 13` (0, 2) — frozen records of
+already-merged PRs, deliberately not rewritten. Copying one exits 2 loudly ("the following
+arguments are required: --max-comments, --max-ratio") rather than mismeasuring.
 
 Plus, for any PR that touches the artifact pipeline:
 
@@ -181,10 +198,16 @@ until a human answers. Cache-store entries are chmod'd read-only, so a delete ne
   reached by path surgery into a sibling agent's results tree with no digest, so the key
   cannot name *which* c2rust output was consumed. A wrong key is worse than no cache.
   C2SaferRust's `BEDROCK_API_KEY` must never reach a digest or `meta.json`.
-- **The comment budget is a whole-tree ratio at `--max 14`**, currently ~13.99%. A ratio can
-  be tripped by a *deletion* (removing comment-sparse code raises it), which is wrong for a
-  refactor made of deletions. Replacing it with an absolute ceiling is unlanded work; a PR 0
-  reviewer recommended it and it was deferred.
+- **The comment budget is an absolute comment-line ceiling, `--max-comments 2560`, with
+  `--max-ratio 20` as a loose backstop** — PR 13 replaced the whole-tree ratio as the primary
+  metric, so this is no longer deferred; the ratio survives only to catch the class a count
+  cannot see (code deleted, comments kept). It also fixed the masker that made the ratio green
+  on a false measurement (`r(#*)"` matched any `r` before a quote: 95 of 149 matches were
+  ordinary words, hiding 92 comment and 320 counted lines; the corrected detector still
+  accepts exactly one, `"/r"` in `cache.rs`, at a measured cost of 0 lines). The tree measures
+  2,413 comment lines at 14.42%; the duty on a PR is to stay under both ceilings or lower
+  them, never raise them. `tools/test_comment_budget.py` pins six failures, including that
+  each limit really does exit non-zero.
 - **`provenance.rs`'s git plumbing did not move to `io/`.** Extracting any subset needs ≥3
   widenings. It is one cohesive concept — *which code produced this result, and refuse to
   measure if we cannot say* — and splitting it to satisfy a diagram is the sprawl this plan

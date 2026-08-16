@@ -52,7 +52,9 @@ THE GATES (all must pass; run from ${WT}/tools unless noted):
   cargo clippy --locked --lib --bins -- -D clippy::panic
   cargo doc   --locked --no-deps
   cargo build --release --locked            (CI runs this FIRST; debug passing proves little)
-  python3 tools/comment_budget.py --max 14  (from ${WT}; must match type-safety.yaml)
+  python3 tools/test_comment_budget.py                 (from ${WT}; same CI step)
+  python3 tools/comment_budget.py --max-comments 2560 --max-ratio 20
+                                            (from ${WT}; must match type-safety.yaml)
   python3 tools/check_paths.py              (from ${WT})
 
 And if your diff touches the artifact pipeline, the golden fingerprint, which needs the env
@@ -65,7 +67,8 @@ identical on the base tree. Run the fingerprint by name, not the whole file.
 
 COMMENT BUDGET TRAP: comment_budget.py reads git ls-files, so it does NOT see untracked
 files. Run 'git add -A' before measuring, or a new file's comments are invisible locally
-and fail in CI. It currently passes with about two comment lines of headroom.
+and fail in CI. It measures 2468 comment lines against the 2560 ceiling (92 lines of
+headroom) and 14.42% against the 20% ratio backstop. Either may be lowered, never raised.
 
 DO NOT WRITE TO /tmp. It is a 16 GB tmpfs whose inode table has been exhausted once, taking
 the whole machine down: every process then fails to create a file, including the tooling

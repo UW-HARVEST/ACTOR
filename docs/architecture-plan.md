@@ -263,8 +263,15 @@ sweep currently re-pays about $800 that a cache would return.
   separately; PR 0 instead raised the flag 13 → 14 in the same commit, with the reasoning
   recorded beside it in `.github/workflows/type-safety.yaml`. That was a deliberate call
   by the operator, not the implementing agent — the agent correctly refused to touch the
-  gate and escalated. The reviewer's preference remains the better shape: replacing the
-  ratio with an absolute ceiling is still unlanded work.
+  gate and escalated. **PR 13 then landed the reviewer's preference**: the primary limit is
+  now an absolute ceiling, `--max-comments 2560`, with a deliberately loose `--max-ratio 20`
+  kept only for the class a count cannot see (code deleted, comments kept). It also fixed the
+  raw-string masker the ratio was measured with — `r(#*)"` matched any `r` before a quote, so
+  95 of its 149 matches over `tools/src/**.rs` were ordinary words like `"a valid parser")`
+  and everything to the next quote was blanked, hiding 92 comment and 320 counted lines from
+  the gate: 2,291 / 16,378 (13.99%, green) was really 2,383 / 16,698 (14.27%, red at
+  `--max 14`). The correction is 95 false matches → 1, not → 0: `"/r"` in `cache.rs` still
+  opens a phantom raw string at a measured cost of 0 lines, and a test pins that.
 
 * **Three surviving rules key on the literal filename `"artifact.rs"`** —
   `no_public_path_escapes_the_artifact_modules` and `digests_cannot_be_fabricated` iterate

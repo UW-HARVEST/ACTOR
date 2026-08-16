@@ -94,13 +94,48 @@ jobs:
         # and could never fire -- the bloat is in `//!` module headers. tools/
         # comment_budget.py lexes string literals and counts doc comments.
         #
-        # Raised 13 -> 14 deliberately, not to admit a change that tripped it. Deleting
-        # 351 lines of comment-sparse test code took comments DOWN (1942 -> 1916) and the
-        # ratio UP (12.999% -> 13.157%), because the denominator shrank faster. A ratio
-        # cannot tell "comments were added" from "code was removed", so it penalises
-        # exactly the deletions this refactor consists of. 14% is the headroom for the
-        # rest of the sequence; the absolute count is the thing to watch.
-        run: python3 tools/comment_budget.py --max 14
+        # TWO ceilings, because each is blind to exactly what the other catches.
+        #
+        # --max-comments 2560 is primary: an absolute comment-line ceiling since PR 13,
+        # not the `--max 14` whole-tree ratio before it. The ratio was green on a false
+        # measurement -- the raw-string masker matched any `r` before a quote, so 95 of
+        # its 149 matches over tools/src/**.rs were ordinary words like `"a valid
+        # parser")`, and everything to the next quote was blanked: 38 lines of
+        # oracle/mod.rs at one match, the `r"` inside `"/usr"` on line 18, whose span ran
+        # to the next quote 42 lines later. Correcting it moved the base tree from 2291
+        # comment / 16378 counted lines (13.99%, exit 0) to 2383 / 16698 (14.27%, exit 1
+        # at --max 14): 92 comment and 320 counted lines were hidden from the gate, which
+        # was passing by 0.012 points. 15 files carry all of that; the largest is
+        # translate.rs at +15 comment and +41 code lines. The correction is 95 false
+        # matches -> ONE, not -> zero: `roots("/w", "/r")` in cache.rs still opens a
+        # phantom raw string, measured cost 0 counted lines, pinned by
+        # test_comment_budget.py. And a ratio cannot tell "comments were added" from
+        # "code was removed", so it RISES on a deletion -- PR 0 took comments DOWN 1942
+        # -> 1916 and the ratio UP 12.999% -> 13.157%, which is the whole reason 13 -> 14
+        # was needed. An absolute count cannot be tripped by deleting code.
+        #
+        # --max-ratio 20 is the backstop for the one class the count cannot see. Measured
+        # on a copy of this tree with 5,000 code lines deleted and every comment kept: the
+        # comment count did not move at all, the ratio went 14.37% -> 20.44%, exit 1.
+        # Measured now: 2468 comment / 17107 counted = 14.43%, so it fires only once the
+        # counted tree shrinks by 4,767 lines (28%) with not one comment removed --
+        # deliberately loose, unlike the 0.01-point margin `--max 14` was passing by. It
+        # cannot pre-empt the count either: growing comments to 2560 puts the ratio at
+        # 14.88%, so an addition always hits --max-comments first.
+        #
+        # 2560 is the tree as PR 13 leaves it -- 2468 comment lines -- plus 92 (3.7%) of
+        # headroom for the WHY documentation the remaining PRs add. Lower it when a PR
+        # lands well under it; never raise it. It reads 2560 rather than the 2500 this
+        # PR was written against because #105 landed between the two, taking the tree
+        # 2413 -> 2468 and the intended 3.6% of headroom down to 1.3%; the number is the
+        # stated derivation applied to the tree actually being merged, measured at merge.
+        #
+        # .py is in neither HASH nor SLASH, so the budget does not count itself: this
+        # script's own docstring and all 250 lines of tools/test_comment_budget.py cost
+        # ZERO against both ceilings. Deriving 2560 from the tree needs that fact.
+        run: |
+          python3 tools/test_comment_budget.py
+          python3 tools/comment_budget.py --max-comments 2560 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is
