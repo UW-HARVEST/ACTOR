@@ -51,7 +51,19 @@ There is precedent for how this is handled here: PR 0 raised the flag 13 → 14 
 reasoning recorded next to it in `type-safety.yaml`, and that was an operator call, not the
 implementing agent's.
 
-## The recommended shape: an absolute ceiling
+## The operator decision, already made — do not escalate this one
+
+**Replace the ratio with an absolute comment-line ceiling.** This is the choice; implement it.
+It was recommended by a PR 0 reviewer, is recorded twice in `docs/architecture-plan.md` as
+unlanded work, and the alternative — leaving a required gate mismeasuring by 320 lines — is
+worse than any threshold argument.
+
+Set the ceiling from the **corrected** measurement with stated headroom, and record beside the
+flag in `type-safety.yaml`: the old metric, the old and new measured totals, and why an
+absolute ceiling is the right shape. Do not adjust comments anywhere in the tree to make a
+number work.
+
+## Why an absolute ceiling
 
 `docs/architecture-plan.md` already carries a reviewer's recommendation that has never landed,
 and the same reasoning applies with more force now:
