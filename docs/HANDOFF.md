@@ -31,8 +31,10 @@ crate, enforced by `the_store_is_obtained_from_exactly_one_place`. Verify runs t
 | # | PR | spec | state |
 |---|---|---|---|
 | 7b | translate on `run_cached` — **the translate cache** | `docs/prs/spec-7b.md` | in flight |
+| 12 | **the skip check consults the store**, not the presence of a `Cargo.toml` | `docs/prs/spec-12.md` | ready; this is what makes 7b pay |
 | 11 | **an entry records the inputs its key came from** — store `input/` and the digest preimages | `docs/prs/spec-11.md` | ready; land before the next sweep |
 | 7c | shared-source groups: one key, N publishes | `docs/prs/spec-7c.md` | ready |
+| 13 | **the comment budget is green on a false measurement** | `docs/prs/spec-13.md` | ready; needs an operator decision on the metric |
 | 8 | `cache/` + `dataset/` split; `cache_mode` off `Paths` | `docs/prs/spec-8.md` | ready; breaks `battery ↔ cache`, `cache ↔ cli` |
 | 10 | renames: `Scrubbed`→`ScrubbedTree`, `Sealed`→`SealedTree`, `CDir`→`OracleDir` | `docs/prs/spec-10.md` | ready; last, touches 10 column-exact `.stderr` files |
 
