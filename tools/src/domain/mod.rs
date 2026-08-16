@@ -5,5 +5,6 @@
 //! `tests/architecture.rs` is what keeps that true rather than intended.
 
 pub mod contents;
+pub mod health;
 pub mod outcome;
 pub mod relpath;

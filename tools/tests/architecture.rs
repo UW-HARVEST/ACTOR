@@ -155,10 +155,10 @@ fn is_public(vis: &syn::Visibility) -> bool {
 /// all of them, `sealed_implements_only_debug` included, and each would still report green.
 #[test]
 fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
-    // Measured 29 today: 27 module files plus lib.rs and main.rs. The floor is that count
+    // Measured 30 today: 28 module files plus lib.rs and main.rs. The floor is that count
     // minus 2, so a merge landing a file needs no edit here while deleting three fails
     // instead of quietly narrowing what every rule below inspects. Add files, raise it.
-    const MIN_FILES: usize = 27;
+    const MIN_FILES: usize = 28;
     const REQUIRED: &[&str] = &["Sealed", "WorkTree", "Scrubbed", "Corpus", "TreeDigest"];
 
     let found = rust_sources();
@@ -208,7 +208,7 @@ fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
         (found.len(), nested),
         count_rust_files(&dir, 1),
         "rust_sources() and an independent walk of src/ disagree on (total, nested). \
-         domain/, analyse/, io/ and oracle/ make the nested half live: 15 of 29 today, so \
+         domain/, analyse/, io/ and oracle/ make the nested half live: 16 of 30 today, so \
          a traversal that stopped at the top level of src/ would fail here instead of \
          reporting green."
     );
@@ -990,10 +990,13 @@ fn typestates_have_private_fields_and_consuming_transitions() {
     );
 }
 
-/// Measured: `src/` is one strongly connected component of these ten modules. Shrink-only —
+/// Measured: `src/` is one strongly connected component of these nine modules. Shrink-only —
 /// a cut makes the rule fail as stale, and the list is then edited DOWN to what it reports.
+///
+/// `agent_health` left it in PR 3b: `classify` takes the transcript text instead of opening
+/// the file, so the vocabulary it decides over moved to `domain::health` and neither
+/// `artifact` nor `cli` names this module any more.
 const CYCLE_BASELINE: &[&str] = &[
-    "agent_health",
     "analyse",
     "artifact",
     "battery",
@@ -1261,7 +1264,7 @@ fn a_module_cycle_may_only_shrink() {
         cycles(&graph.edges)
     );
 
-    // A ring of eleven is the one violation no plantable src/ tree reaches cheaply.
+    // A ring of ten is the one violation no plantable src/ tree reaches cheaply.
     let ring: Vec<&str> = CYCLE_BASELINE.iter().copied().chain(["scoring"]).collect();
     let planted: BTreeMap<String, BTreeSet<String>> = ring
         .iter()
@@ -1277,8 +1280,8 @@ fn a_module_cycle_may_only_shrink() {
     assert!(
         caught
             .iter()
-            .any(|v| v == "the largest cycle has 11 modules; the baseline records 10"),
-        "a planted eleven-module ring did not read as bigger than the ten the baseline\n\
+            .any(|v| v == "the largest cycle has 10 modules; the baseline records 9"),
+        "a planted ten-module ring did not read as bigger than the nine the baseline\n\
          records: {caught:#?}"
     );
 

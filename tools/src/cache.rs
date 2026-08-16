@@ -9,7 +9,7 @@
 //! led a 3h20m sweep to be launched expecting translation to populate the store.
 //!
 //! [`Produced`] is constructible only from a [`Sealed`], which requires
-//! [`crate::agent_health::Completed`], so "never cache an infra failure" is
+//! [`crate::domain::health::Completed`], so "never cache an infra failure" is
 //! unrepresentable rather than checked.
 //!
 //! Keys are machine-independent: paths are rewritten to `$WORK` / `$REPO` tokens
@@ -20,6 +20,7 @@
 
 use crate::artifact::{Access, Phase, Sealed, TreeDigest};
 use crate::cli::Agent;
+use crate::io::workdir::Roots;
 use crate::session::Session;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -244,31 +245,31 @@ fn parse_rustc_vv(text: &str) -> Result<String> {
 
 /// Rewrite machine-specific paths to stable tokens. Applied to everything that enters
 /// a digest, so the same work yields the same key on another machine.
-pub fn normalise(text: &str, work_root: &Path, repo_root: &Path) -> String {
+///
+/// Takes the roots rather than resolving them: they decide the key, and a function that
+/// read `$HOME` itself could not be read as a function of its inputs at all.
+pub fn normalise(text: &str, roots: &Roots) -> String {
     let mut out = text.to_string();
     // `to_str`, never `to_string_lossy`: lossy mapping sends every invalid byte to
     // U+FFFD, so two different roots can produce the same substitution string and two
     // different prompts the same digest — a false cache *hit*, the one failure mode
     // this key exists to prevent. Skipping a non-UTF-8 root instead leaves the literal
     // path in the normalised text, which can only cost a miss.
-    let mut roots: Vec<(PathBuf, &str)> = vec![
-        (work_root.to_path_buf(), "$WORK"),
-        (repo_root.to_path_buf(), "$REPO"),
-    ];
-    if let Ok(base) = crate::io::workdir::base() {
-        roots.push((base, "$WORKBASE"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.push((PathBuf::from(home), "$HOME"));
-    }
-    let mut subs: Vec<(String, &str)> = roots
-        .iter()
-        .filter_map(|(p, token)| p.to_str().map(|s| (s.to_owned(), *token)))
-        .collect();
+    let mut subs: Vec<(&str, &str)> = [
+        (Some(roots.work.as_path()), "$WORK"),
+        (Some(roots.repo.as_path()), "$REPO"),
+        (roots.work_base.as_deref(), "$WORKBASE"),
+        (roots.home.as_deref(), "$HOME"),
+    ]
+    .into_iter()
+    .filter_map(|(p, token)| p?.to_str().map(|s| (s, token)))
+    .collect();
+    // Longest first: a work root nested under the scratch base would otherwise be
+    // rewritten as `$WORKBASE/harvest-work-AbCdEf`, putting the per-run name in the key.
     subs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
     for (from, to) in subs {
         if !from.is_empty() {
-            out = out.replace(&from, to);
+            out = out.replace(from, to);
         }
     }
     out
@@ -279,10 +280,10 @@ fn feed(h: &mut Sha256, bytes: &[u8]) {
     h.update(bytes);
 }
 
-pub fn prompt_digest(prompt: &str, work_root: &Path, repo_root: &Path) -> PromptDigest {
+pub fn prompt_digest(prompt: &str, roots: &Roots) -> PromptDigest {
     let mut h = Sha256::new();
     feed(&mut h, b"prompt-v1");
-    feed(&mut h, normalise(prompt, work_root, repo_root).as_bytes());
+    feed(&mut h, normalise(prompt, roots).as_bytes());
     PromptDigest(format!("sha256:{:x}", h.finalize()))
 }
 
@@ -995,12 +996,23 @@ mod tests {
         assert!(err.contains("release:"), "{err}");
     }
 
+    /// The roots as VALUES: no environment is consulted, so the substitution set is
+    /// exactly what a test writes here.
+    fn roots(work: &str, repo: &str) -> Roots {
+        Roots {
+            work: PathBuf::from(work),
+            repo: PathBuf::from(repo),
+            work_base: None,
+            home: None,
+        }
+    }
+
     #[test]
     fn normalise_removes_every_machine_specific_path() {
-        let work = Path::new("/home/alice/.harvest/work/harvest-work-AbCdEf");
-        let repo = Path::new("/home/alice/src/ACTOR");
-        let text = format!("cd {} && ls {}/prompts", work.display(), repo.display());
-        let n = normalise(&text, work, repo);
+        let work = "/home/alice/.harvest/work/harvest-work-AbCdEf";
+        let repo = "/home/alice/src/ACTOR";
+        let text = format!("cd {work} && ls {repo}/prompts");
+        let n = normalise(&text, &roots(work, repo));
         assert!(!n.contains("alice"), "no username may survive: {n}");
         assert!(
             !n.contains("harvest-work-AbCdEf"),
@@ -1014,13 +1026,14 @@ mod tests {
         // A leak here means a colleague's cache silently never hits.
         let a = prompt_digest(
             "work in /home/alice/.harvest/work/w-1 on /home/alice/src/ACTOR",
-            Path::new("/home/alice/.harvest/work/w-1"),
-            Path::new("/home/alice/src/ACTOR"),
+            &roots("/home/alice/.harvest/work/w-1", "/home/alice/src/ACTOR"),
         );
         let b = prompt_digest(
             "work in /local/home/bob/.harvest/work/w-2 on /local/home/bob/repo/ACTOR",
-            Path::new("/local/home/bob/.harvest/work/w-2"),
-            Path::new("/local/home/bob/repo/ACTOR"),
+            &roots(
+                "/local/home/bob/.harvest/work/w-2",
+                "/local/home/bob/repo/ACTOR",
+            ),
         );
         assert_eq!(
             a, b,
@@ -1030,12 +1043,8 @@ mod tests {
 
     #[test]
     fn prompt_digest_changes_when_the_prompt_changes() {
-        let w = Path::new("/w");
-        let r = Path::new("/r");
-        assert_ne!(
-            prompt_digest("verify X", w, r),
-            prompt_digest("verify Y", w, r)
-        );
+        let r = roots("/w", "/r");
+        assert_ne!(prompt_digest("verify X", &r), prompt_digest("verify Y", &r));
     }
 
     #[test]
@@ -1199,7 +1208,7 @@ mod tests {
         std::fs::write(work.crate_dir().join("src/lib.rs"), edit).unwrap();
         work.scrub()
             .unwrap()
-            .seal(&crate::agent_health::Completed::for_test(), &c_before)
+            .seal(&crate::domain::health::Completed::for_test(), &c_before)
             .unwrap()
     }
 

@@ -132,6 +132,34 @@ pub fn tempdir(prefix: &str) -> Result<tempfile::TempDir> {
         .with_context(|| format!("creating {prefix}* scratch dir in {}", base.display()))
 }
 
+/// Every machine-specific root [`crate::cache::normalise`] rewrites to a stable token.
+///
+/// One named struct rather than four paths in a row: they are all the same type, and a
+/// transposed root is a wrong cache key — silently, since the digest is still a digest.
+/// The two optional ones are `None` where the root does not exist to be substituted;
+/// leaving a literal path in the normalised text can only cost a cache miss.
+pub struct Roots {
+    pub work: PathBuf,
+    pub repo: PathBuf,
+    pub work_base: Option<PathBuf>,
+    pub home: Option<PathBuf>,
+}
+
+impl Roots {
+    /// The reads `normalise` used to do inside itself, in the layer that is allowed to do
+    /// them — and where `$HOME` and the scratch base are already this module's business.
+    /// A key-affecting function that consults the environment cannot be reasoned about
+    /// from its arguments, and could not be tested without setting one.
+    pub fn resolve(work: &Path, repo: &Path) -> Self {
+        Self {
+            work: work.to_path_buf(),
+            repo: repo.to_path_buf(),
+            work_base: base().ok(),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+        }
+    }
+}
+
 /// Scratch dir handed to the agent as `TMPDIR`: agent-generated test code calls
 /// `std::env::temp_dir()`, which is the `/tmp` tmpfs unless `TMPDIR` is set, and
 /// inside the work root that scratch is on disk and discarded with the case.

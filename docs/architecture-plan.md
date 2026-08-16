@@ -13,10 +13,18 @@ agent_health · artifact · battery · cache · cargo_toml
 cli · opencode · session · translate · verify
 ```
 
-Ten mutual pairs, including `translate ↔ verify`, `session ↔ translate`,
-`opencode ↔ translate`, `cache ↔ translate`, `battery ↔ cache`, `cache ↔ cli`,
-`agent_health ↔ artifact`. Only eight modules are cycle-free: `workdir`, `sandbox`,
-`provenance`, `refusal`, `scoring`, `test`, `report`, `benchmark`.
+Only eight modules are cycle-free: `workdir`, `sandbox`, `provenance`, `refusal`,
+`scoring`, `test`, `report`, `benchmark`.
+
+The "ten mutual pairs" this paragraph used to list were counted by a regex over raw text,
+which reads `crate::foo` inside a doc comment as a dependency. `a_module_cycle_may_only_shrink`
+token-lexes with `proc_macro2`, where a doc comment is a string literal and creates no edge,
+and by that measure there are **eight** as PR 3b begins — `agent_health ↔ cli`,
+`battery ↔ cache`, `cache ↔ cli`, `cache ↔ session`, `opencode ↔ session`,
+`opencode ↔ translate`, `session ↔ translate`, `translate ↔ verify` — of which PR 3b cuts
+the first, leaving seven. Two pairs named here before were never mutual: `translate → cache`
+has only a doc link back, and `agent_health` never named `artifact` at all; its real partner
+was `cli`, through `Agent::log_format`.
 
 So the file names suggest a design, and nothing enforces it. Two symptoms:
 
@@ -117,7 +125,7 @@ Three non-negotiables:
 | 2 | **Guards**: recursive `rust_sources()` + anti-vacuity, DAG rule w/ baseline, golden fingerprint | additions only | — | rule fails on a planted cycle |
 | T | **Stop the suite writing to /tmp, and stop it leaking** — `TMPDIR` on disk, read-only-safe cleanup, ETXTBSY flake | reliability | — | 0 new `/tmp/.tmp*`; 200 contended runs |
 | 3a | `domain/` + layer-purity rule; move only what is already pure | move | — | purity rule; token-diff |
-| 3b | the boundary cuts: `classify(text, …)`, `normalise(text, roots)` | 2 cuts | `agent_health ↔ artifact` | purity rule |
+| 3b | the boundary cuts: `classify(text, …)`, `normalise(text, roots)` | 2 cuts | `agent_health ↔ cli` | purity rule |
 | 4 | `io/` moves | move | — | token-diff |
 | 5 | `agents/`: session + opencode + `Invocation` out of verify | move + 1 cut | `translate ↔ verify`, `session ↔ translate`, `opencode ↔ translate` | DAG baseline drops 3 |
 | 6 | `run_cached<P>`; verify ported onto it | behaviour | — | golden digests identical |

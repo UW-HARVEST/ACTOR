@@ -1,7 +1,7 @@
 // seal() consumes the Scrubbed, so a second seal cannot re-digest a tree the first
 // seal's caller may already have published. `scrub`'s edge is pinned separately; without
 // this case the seal edge of the same chain is asserted by nothing.
-fn proof() -> &'static harvest_tools::agent_health::Completed {
+fn proof() -> &'static harvest_tools::domain::health::Completed {
     // Never runs: the file must fail to compile, and only the token's *type* is needed.
     unreachable!()
 }

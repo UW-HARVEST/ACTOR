@@ -1,6 +1,7 @@
 use crate::battery::{self, Case, Paths};
 use crate::cache::{self, CliVersion, ModelId};
 use crate::cli::Agent;
+use crate::io::workdir::Roots;
 use crate::session::{ClaudeRun, Session};
 use crate::translate::{IsolatedWorkDir, Semaphore};
 use anyhow::{Context, Result};
@@ -417,8 +418,9 @@ impl Backend {
     /// The filesystem policy this backend actually applies, paths tokenised. A
     /// hand-written summary would drift, and the literal directory names are
     /// machine-specific and must not enter the key.
-    fn policy_shape(&self, paths: &Paths, work_root: &Path) -> Result<Option<String>> {
-        let tokenise = |s: String| crate::cache::normalise(&s, work_root, &paths.repo_root);
+    fn policy_shape(&self, paths: &Paths, roots: &Roots) -> Result<Option<String>> {
+        let work_root = roots.work.as_path();
+        let tokenise = |s: String| crate::cache::normalise(&s, roots);
         Ok(match self {
             // `--trust-all-tools` and no policy file: there is nothing to record.
             Backend::Kiro => None,
@@ -478,8 +480,11 @@ fn verify_case(
 
     let input_tree = work.input_digest().clone();
     let toolchain = cache::ToolchainId::detect()?;
-    let prompt_digest = cache::prompt_digest(&prompt, work.root(), &paths.repo_root);
-    let policy = inv.backend.policy_shape(paths, work.root())?;
+    // Resolved once, here: every root that decides the key is then a value, and the two
+    // digests below cannot disagree about what machine they were taken on.
+    let roots = Roots::resolve(work.root(), &paths.repo_root);
+    let prompt_digest = cache::prompt_digest(&prompt, &roots);
+    let policy = inv.backend.policy_shape(paths, &roots)?;
     let recipe = cache::Recipe::new(&inv.session, policy)?.digest();
     let inputs = cache::KeyInputs {
         phase: crate::battery::VERIFIED,
@@ -613,11 +618,18 @@ fn run_verify_agent(
     // The backend's log format is an argument rather than a guess: kiro writes prose, so
     // classifying its log as stream-json made `completed()` return None every time and
     // this function could never publish a kiro verification at all.
-    let health = crate::agent_health::classify(
-        log_path,
-        paths.agent.log_format(),
-        crate::translate::observed_exit(),
-    );
+    let health = match crate::agent_health::read_tail(log_path) {
+        Ok(tail) => crate::domain::health::classify(
+            &tail,
+            paths.agent.log_format(),
+            crate::translate::observed_exit(),
+        ),
+        // The transcript is the evidence, so an unreadable one is no evidence: `Unknown`
+        // mints no proof, and a case with nothing to show for itself must not be sealed.
+        Err(e) => crate::domain::health::Health::Unknown {
+            why: format!("cannot read {}: {e}", log_path.display()),
+        },
+    };
     let Some(proof) = health.completed() else {
         eprintln!(
             "  {} — not publishing verified/: the agent did not complete ({:?})",
@@ -761,8 +773,9 @@ mod tests {
         )
         .unwrap();
         let work = repo.path().join("work");
+        let roots = Roots::resolve(&work, repo.path());
 
-        let claude = Backend::Claude.policy_shape(&paths, &work).unwrap();
+        let claude = Backend::Claude.policy_shape(&paths, &roots).unwrap();
         assert!(
             claude.as_deref().is_some_and(|p| p.contains("denyRead")),
             "{claude:?}"
@@ -774,10 +787,10 @@ mod tests {
             "the literal paths must be tokenised or no key is portable: {claude:?}"
         );
 
-        assert_eq!(Backend::Kiro.policy_shape(&paths, &work).unwrap(), None);
+        assert_eq!(Backend::Kiro.policy_shape(&paths, &roots).unwrap(), None);
 
         let oc = Backend::OpenCode(crate::opencode::parse_model("p/m").unwrap())
-            .policy_shape(&paths, &work)
+            .policy_shape(&paths, &roots)
             .unwrap();
         assert!(
             oc.as_deref()
