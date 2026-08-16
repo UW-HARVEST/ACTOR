@@ -13,22 +13,37 @@ for m in re.finditer(r'r(#*)"', text):
 
 `r(#*)"` matches **any `r` immediately followed by a quote** — including the final `r` of an
 ordinary word at the end of an ordinary string. Measured over `tools/src/**.rs`: **149
-matches, of which 95 are not raw strings at all.** Examples: `"…a valid parser")` in `cli.rs`,
+matches, of which 95 are not raw strings at all.** Examples: `"/usr"` in `oracle/mod.rs`,
 `"…it names the results dir",` in `cache.rs`, `"model must matter");` in `cache.rs`.
 
 For each false match, `text.find('"', m.end())` then finds some *later, unrelated* quote, and
-everything between is blanked. One false match in `cli.rs` blanks **51 lines** of real code.
-Blanked lines count as neither comment nor code, so they leave the denominator entirely.
+everything between is blanked. The worst one in the *counted* tree is `oracle/mod.rs:18`, the
+`r"` inside `"/usr"`, whose span runs to the next quote 42 lines later and blanks **38 counted
+lines** (17 comment, 21 code). Blanked lines count as neither comment nor code, so they leave
+the denominator entirely. (An earlier draft of this spec cited "51 lines of `cli.rs` at one
+match": `cli.rs` is in `SKIP_FILES`, so nothing it hides ever reaches the budget.)
+
+**As landed, the reduction is 95 false matches → 1, not → 0.** The lookbehind excludes only
+`[0-9A-Za-z_\\]`, so a string whose last character is `r` preceded by anything else still
+opens a phantom raw string: `let r = roots("/w", "/r");` at `cache.rs:1053` is the one such
+site in the tree today. Its span dies inside the following line, so its measured cost is 0
+comment and 0 counted lines — no number above moves — and
+`a_string_ending_in_slash_r_is_the_one_false_match_left` pins that rather than leaving it a
+surprise. Eliminating the class needs real Rust string lexing, which is not worth it for one
+harmless match. The fix also has to accept the optional `b` of a byte raw string, with the
+lookbehind applied before it: `b` is inside the excluded class, so `br"…"` and `br#"…"#` went
+from masked to never masked, the mirror image of the bug. Measured `br(#*)"` sites in the
+counted tree: **0**, so no number moves for that either.
 
 What that does to the gate:
 
 | masker | comment | counted | ratio | `--max 14` |
 |---|---|---|---|---|
-| **as shipped** | 2291 | 16378 | **13.9931 %** | exit 0 |
+| **as shipped** | 2291 | 16378 | **13.9883 %** | exit 0 |
 | detector requires a non-identifier char before `r` | 2383 | 16698 | **14.2711 %** | **exit 1** |
 
 **The gate passes only because it is mismeasuring.** 320 counted lines and 92 comment lines
-are being hidden from it by accident. It passes by 0.007 percentage points, which is about two
+are being hidden from it by accident. It passes by 0.012 percentage points, which is about two
 comment lines of headroom, so any change to code that happens to contain a word ending in `r`
 before a quote moves the total and can flip the gate for reasons unrelated to comments. That
 flakiness is already observed: shortening one `ensure!` message by a line moved the measured
@@ -62,6 +77,15 @@ Set the ceiling from the **corrected** measurement with stated headroom, and rec
 flag in `type-safety.yaml`: the old metric, the old and new measured totals, and why an
 absolute ceiling is the right shape. Do not adjust comments anywhere in the tree to make a
 number work.
+
+**As landed, the absolute ceiling is primary and a loose ratio is kept as a backstop**
+(`--max-comments 2560 --max-ratio 20`). Deleting the ratio outright leaves one class ungated,
+and it is the class only the ratio can see: delete thousands of lines of comment-sparse code,
+keep every comment, and the absolute count does not move — exit 0 — while density climbs. At
+20% the backstop carries 5.6 points of headroom over the measured 14.42%: it fires only once
+the counted tree shrinks by 4,665 lines (28%) with not one comment removed, so it cannot
+recreate the 0.01-point fragility `--max 14` had. What each flag catches that the other cannot
+is recorded beside both in `type-safety.yaml`.
 
 ## Why an absolute ceiling
 
@@ -100,6 +124,23 @@ The script has no tests, which is why a detector this wrong survived in a requir
    trade one error for the other.
 3. **`the_reported_total_does_not_move_when_an_unrelated_line_shifts`** — the observed flake,
    pinned: insert a blank line in one file and assert the totals are identical.
+
+Three more, added because all of the above call `classify_text` only — nothing reached the
+comparisons and the exit code, which are the part that actually gates:
+
+4. **`a_tree_over_the_comment_ceiling_fails_the_build_and_one_at_it_does_not`** — runs the
+   script as a subprocess against the real tree at the measured total (exit 0) and one below
+   it (exit 1, naming the count). Inverting, `>=`-ing or removing the comparison, or dropping
+   the `return 1`, all turn it red.
+5. **`code_deleted_with_the_comments_kept_fails_the_ratio_the_count_cannot_see`** — one test
+   per limit: the class the absolute count is blind to, then the ratio's own exit code at the
+   measured ratio and 0.01 below it, with `--max-comments` wide open so only the ratio can
+   fire.
+6. **`a_string_ending_in_slash_r_is_the_one_false_match_left`** — the known residual recorded
+   as behaviour, asserting its cost is 0 comment and 0 counted lines.
+
+`a_real_raw_string_is_still_masked` also carries `br#"…"#` and an inner `r"` inside the raw
+string, so dropping the `b?` or the `m.start() < i` re-entry guard turns it red.
 
 Named after the failure, per `CLAUDE.md`.
 
