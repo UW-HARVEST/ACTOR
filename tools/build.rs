@@ -25,5 +25,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_instructions(&rustc)?
         .add_instructions(&cargo)?
         .emit()?;
+
+    // `.cargo/config.toml` points TMPDIR off the /tmp tmpfs at this directory, and cargo
+    // sets the variable without creating it, so every child of a `cargo run` would be
+    // handed a TMPDIR it cannot use. Derived from CARGO_MANIFEST_DIR rather than read back
+    // from TMPDIR: a build script may only write inside its own package, and the ambient
+    // value can name anywhere — with `TMPDIR=/nonexistent` exported, creating it aborted
+    // the build with a bare EACCES that named neither the variable nor this script.
+    let tmp = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR")?).join("target/tmp");
+    std::fs::create_dir_all(&tmp).map_err(|e| {
+        format!(
+            "creating {} for the TMPDIR in .cargo/config.toml: {e}",
+            tmp.display()
+        )
+    })?;
     Ok(())
 }

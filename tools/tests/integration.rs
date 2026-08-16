@@ -140,7 +140,7 @@ mod cargo_toml_manipulation {
         }
 
         // Read, modify, write to temp, verify
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = harvest_tools::workdir::test_tempdir().unwrap();
         let tmp_cargo = tmp.path().join("Cargo.toml");
         std::fs::copy(&cargo_path, &tmp_cargo).unwrap();
 
@@ -183,7 +183,7 @@ mod cargo_toml_manipulation {
             }
 
             // Copy to temp and strip
-            let tmp = tempfile::tempdir().unwrap();
+            let tmp = harvest_tools::workdir::test_tempdir().unwrap();
             let dst = tmp.path().join("translated");
             harvest_tools::translate::copy_dir_all(&original, &dst).unwrap();
 

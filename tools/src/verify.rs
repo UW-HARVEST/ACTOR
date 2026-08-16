@@ -748,7 +748,7 @@ mod tests {
     fn each_backend_records_the_policy_it_actually_applies() {
         // Every backend's recipe used to carry claude's sandbox settings, including the
         // two that never read that file.
-        let repo = tempfile::tempdir().unwrap();
+        let repo = crate::workdir::test_tempdir().unwrap();
         let paths = Paths::new(
             repo.path(),
             Agent::Claude,

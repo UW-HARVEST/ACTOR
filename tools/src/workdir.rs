@@ -75,16 +75,19 @@ fn resolve_from(
             .with_context(|| format!("HOME is unset; set {ENV_BASE} to choose a scratch base"))?
             .join(".harvest/work"),
     };
-    std::fs::create_dir_all(&base)
-        .with_context(|| format!("creating scratch base {}", base.display()))?;
-    // Canonicalise before the fstype check: $HOME is a symlink into /local here,
-    // and prefix-matching an uncanonicalised path against /proc/mounts misfires.
-    let base = base
-        .canonicalize()
-        .with_context(|| format!("resolving scratch base {}", base.display()))?;
-
     if tmpfs == Tmpfs::Refuse {
-        if let Some(fstype) = fstype_for(mounts, &base) {
+        // Decide before creating, or the refusal has already written to the location it
+        // refuses. The base itself need not exist yet for that: a mount point does, so its
+        // nearest existing ancestor is on the same filesystem. Canonicalised, because $HOME
+        // is a symlink into /local here and prefix-matching an uncanonicalised path against
+        // /proc/mounts misfires.
+        let probe = base
+            .ancestors()
+            .find(|a| a.exists())
+            .unwrap_or(Path::new("."))
+            .canonicalize()
+            .with_context(|| format!("resolving scratch base {}", base.display()))?;
+        if let Some(fstype) = fstype_for(mounts, &probe) {
             if fstype == "tmpfs" || fstype == "ramfs" {
                 bail!(
                     "scratch base {} is on {fstype} (RAM). Per-case build trees there are charged \
@@ -95,7 +98,10 @@ fn resolve_from(
             }
         }
     }
-    Ok(base)
+    std::fs::create_dir_all(&base)
+        .with_context(|| format!("creating scratch base {}", base.display()))?;
+    base.canonicalize()
+        .with_context(|| format!("resolving scratch base {}", base.display()))
 }
 
 /// Filesystem type of the mount containing `path`, by longest-prefix match over
@@ -161,6 +167,30 @@ pub const AGENT_FSIZE_BLOCKS: u64 = 4 * 1024 * 1024;
 /// allocation may be a translation-fidelity signal, not a harness bug.
 pub const AGENT_DATA_KB: u64 = 6 * 1024 * 1024;
 
+/// The one scratch tree for tests, in `tools/target/tmp`: gitignored, cleared by `cargo
+/// clean`, and on disk rather than in the `/tmp` tmpfs where 24,707 leaked trees exhausted
+/// the inode table and every process on the box then failed to create a file.
+///
+/// Derived from `CARGO_MANIFEST_DIR`, not from the `TMPDIR` `.cargo/config.toml` sets to
+/// the same directory for child processes: cargo reads that config by walking up from the
+/// invocation directory, so any run started elsewhere would leave the variable unset and
+/// put the suite back on the tmpfs with nothing going red.
+///
+/// Creating the directory is part of the job: cargo sets the variable without creating it,
+/// and `rm -rf target/tmp` — the documented cleanup for the read-only trees a killed run
+/// leaves behind — then failed 90 of 180 tests with `NotFound`.
+///
+/// `pub` and not `#[cfg(test)]` so the `--test` targets reach this one definition; a copy
+/// for them drifts, and half the suite quietly returning to /tmp is the incident itself.
+pub fn test_tempdir() -> Result<tempfile::TempDir> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating the suite scratch root {}", dir.display()))?;
+    tempfile::Builder::new()
+        .tempdir_in(&dir)
+        .with_context(|| format!("creating a scratch tree in {}", dir.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,7 +242,7 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
 
     #[test]
     fn explicit_base_wins_over_home_and_is_created_recursively() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_tempdir().unwrap();
         let want = tmp.path().join("deep/nested/base");
         let home = tmp.path().join("home");
         let got = resolve_from(Some(want.clone()), Some(home.clone()), Tmpfs::Allow, MOUNTS)
@@ -227,7 +257,7 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
 
     #[test]
     fn default_base_derives_from_home_and_is_not_tmp_or_cache() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_tempdir().unwrap();
         let home = tmp.path().join("home");
         let got = resolve_from(None, Some(home.clone()), Tmpfs::Allow, MOUNTS)
             .expect("resolves from HOME");
@@ -243,11 +273,25 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
         );
     }
 
+    /// A mount table that declares `dir` RAM-backed. `resolve_from` takes the table, so
+    /// the tests below control what counts as tmpfs; they used to rely on
+    /// `tempfile::tempdir()` landing under the `/tmp` MOUNTS calls tmpfs, which stopped
+    /// being true once the suite's scratch moved onto disk (`test_tempdir`).
+    fn mounts_calling_it_tmpfs(dir: &Path) -> String {
+        format!(
+            "{MOUNTS}tmpfs {} tmpfs rw,nosuid,nodev 0 0\n",
+            dir.display()
+        )
+    }
+
     #[test]
     fn tmpfs_base_is_refused_with_an_actionable_message() {
-        // tempfile::tempdir() lands in /tmp, which MOUNTS marks as tmpfs.
-        let tmp = tempfile::tempdir().unwrap();
-        let err = resolve_from(Some(tmp.path().to_path_buf()), None, Tmpfs::Refuse, MOUNTS)
+        let tmp = test_tempdir().unwrap();
+        // Canonical, because `resolve_from` matches the mount table against the
+        // canonicalised base.
+        let base = tmp.path().canonicalize().unwrap();
+        let mounts = mounts_calling_it_tmpfs(&base);
+        let err = resolve_from(Some(base), None, Tmpfs::Refuse, &mounts)
             .expect_err("a tmpfs base must be refused");
         let err = format!("{err:#}");
         assert!(
@@ -266,9 +310,26 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
 
     #[test]
     fn tmpfs_base_is_accepted_when_explicitly_allowed() {
-        let tmp = tempfile::tempdir().unwrap();
-        resolve_from(Some(tmp.path().to_path_buf()), None, Tmpfs::Allow, MOUNTS)
+        let tmp = test_tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let mounts = mounts_calling_it_tmpfs(&base);
+        resolve_from(Some(base), None, Tmpfs::Allow, &mounts)
             .expect("override should permit a tmpfs base");
+    }
+
+    #[test]
+    fn a_refused_base_is_not_created_before_the_refusal() {
+        let tmp = test_tempdir().unwrap();
+        let parent = tmp.path().canonicalize().unwrap();
+        let base = parent.join("work");
+        let mounts = mounts_calling_it_tmpfs(&parent);
+        resolve_from(Some(base.clone()), None, Tmpfs::Refuse, &mounts)
+            .expect_err("a tmpfs base must be refused");
+        assert!(
+            !base.exists(),
+            "the refusal wrote {} anyway, so it had already used what it declined",
+            base.display()
+        );
     }
 
     #[test]
@@ -284,7 +345,7 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
 
     #[test]
     fn unusable_base_errors_and_names_the_path() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_tempdir().unwrap();
         let file = tmp.path().join("i-am-a-file");
         std::fs::write(&file, b"x").unwrap();
         let bad = file.join("cannot/nest/under/a/file");
@@ -299,7 +360,7 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
 
     #[test]
     fn agent_tmp_is_inside_the_work_root() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_tempdir().unwrap();
         let dir = agent_tmp(tmp.path()).unwrap();
         assert!(dir.starts_with(tmp.path()));
         assert!(dir.is_dir());

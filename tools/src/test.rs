@@ -1299,7 +1299,7 @@ mod tests {
     /// Three passes reported for a rerun that produced none.
     #[test]
     fn a_failed_rerun_never_scores_the_previous_runs_report() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let report = tmp.path().join("harvest_bench_report.json");
         fs::write(&report, STALE).unwrap();
 
@@ -1331,26 +1331,23 @@ mod tests {
     /// afterwards did not come from a completed scoring run.
     #[test]
     fn a_runner_that_errors_is_not_scored_from_the_file_it_left() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let report = tmp.path().join("harvest_bench_report.json");
-        let fake = tmp.path().join("fake-runner");
-        fs::write(
-            &fake,
-            format!(
-                "#!/bin/sh\n\
-             while [ $# -gt 0 ]; do\n\
+        let fake = crate::cache::fake_program(
+            tmp.path(),
+            "fake-runner",
+            &format!(
+                "while [ $# -gt 0 ]; do\n\
              \x20 case \"$1\" in --json) shift; printf '%s' '{STALE}' > \"$1\";; esac\n\
              \x20 shift\n\
              done\n\
-             exit 2\n"
+             exit 2"
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        );
 
         let scored =
-            score_harvest_bench_suite(&fake, tmp.path(), Path::new("libx.so"), &report).unwrap();
+            score_harvest_bench_suite(Path::new(&fake), tmp.path(), Path::new("libx.so"), &report)
+                .unwrap();
 
         assert!(
             report.is_file(),
@@ -1371,7 +1368,7 @@ mod tests {
     /// Guards the `merge_into` / `check_enrichment` inverse invariant.
     #[test]
     fn merge_into_then_check_has_no_diffs() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let src = tmp.path().join("src");
         fs::create_dir_all(&src).unwrap();
         fs::write(
@@ -1436,7 +1433,7 @@ mod tests {
     /// Proves the check above is not vacuously empty.
     #[test]
     fn check_detects_tampered_unsafe_count() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let src = tmp.path().join("src");
         fs::create_dir_all(&src).unwrap();
         fs::write(

@@ -1,2 +1,18 @@
 [alias]
 harvest = "run --manifest-path tools/Cargo.toml"
+
+# `tempfile` and every child process take their scratch from TMPDIR, and unset that is the
+# /tmp tmpfs where 24,707 leaked test trees exhausted the inode table and every process on
+# the box then failed to create a file. Here rather than under `tools/` because cargo finds
+# this file by walking up from the INVOCATION directory: CI runs `cargo test --manifest-path
+# tools/Cargo.toml` from the repo root, which reads no config below it. `relative = true`
+# resolves against this file's parent, so nothing machine-specific is committed; `force =
+# true` because `[env]` otherwise loses to an exported TMPDIR, which macOS and many
+# container images always set.
+#
+# `tools/build.rs` creates the directory, since cargo sets the variable without creating it.
+# A run killed before `Fixture::drop` leaves the 0o555/0o444 trees the cache store
+# publishes, and `rm -rf` and `cargo clean` BOTH refuse those (measured): `chmod -R u+w
+# tools/target/tmp` first, or the clean stops on the first one and leaves the tree.
+[env]
+TMPDIR = { value = "tools/target/tmp", relative = true, force = true }

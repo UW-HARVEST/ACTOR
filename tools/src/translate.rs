@@ -2679,7 +2679,7 @@ mod tests {
     /// timeout signal (`timeout` exits 124) is written and read by nobody.
     #[test]
     fn translation_metrics_land_where_the_readers_look() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let case = tmp.path().join("mujs");
         clear_agent_exit();
         record_agent_exit(exit_status(124));
@@ -2709,7 +2709,7 @@ mod tests {
 
     #[test]
     fn a_panic_after_the_metrics_were_written_does_not_overwrite_them() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let case = tmp.path().join("libpng");
         clear_agent_exit();
         record_agent_exit(exit_status(124));
@@ -2730,7 +2730,7 @@ mod tests {
 
     #[test]
     fn a_panic_with_no_record_yet_writes_one_without_borrowing_an_exit_code() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let case = tmp.path().join("jansson");
         clear_agent_exit();
         // Belongs to whatever case this thread ran before, NOT to jansson.

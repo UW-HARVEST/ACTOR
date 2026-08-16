@@ -859,7 +859,7 @@ mod tests {
     /// non-real case in a mixed battery (B02_synthetic) from verify.
     #[test]
     fn mixed_battery_separates_independent_and_shared() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let battery = tmp.path().join("Public-Tests/mixed");
 
         for name in ["arity_lib", "strcmp", "cleanup_lib"] {
@@ -903,7 +903,7 @@ mod tests {
     /// Regression, pcre2: a `verified/` holding only logs used to shadow the crate.
     #[test]
     fn a_verified_dir_holding_only_logs_resolves_to_translated() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let case = tmp.path().join("pcre2");
         fs::create_dir_all(case.join("verified/logs")).unwrap();
         fs::write(case.join("verified/logs/verify.log"), "transcript").unwrap();
@@ -929,7 +929,7 @@ mod tests {
 
     #[test]
     fn a_verified_crate_still_wins() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let case = tmp.path().join("zstd");
         for phase in [TRANSLATED, VERIFIED] {
             fs::create_dir_all(case.join(phase)).unwrap();
@@ -940,7 +940,7 @@ mod tests {
 
     #[test]
     fn no_symlinks_all_independent() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let battery = tmp.path().join("Public-Tests/simple");
 
         for name in ["case_a", "case_b_lib", "case_c"] {
@@ -958,7 +958,7 @@ mod tests {
 
     #[test]
     fn lib_detection_from_name() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let battery = tmp.path().join("Public-Tests/libtest");
 
         for name in ["foo_lib", "bar", "baz_lib"] {
@@ -982,7 +982,7 @@ mod tests {
 
     #[test]
     fn extract_lib_name_from_runner() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let runner = tmp.path().join("mycase/runner/src");
         fs::create_dir_all(&runner).unwrap();
         fs::write(
@@ -997,13 +997,13 @@ mod tests {
 
     #[test]
     fn extract_lib_name_missing_runner() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         assert_eq!(extract_lib_name(tmp.path(), "nonexistent"), None);
     }
 
     #[test]
     fn filter_regex_selects_matching_cases() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let battery = tmp.path().join("Public-Tests/filtered");
 
         for name in ["alpha", "beta_lib", "gamma"] {
@@ -1040,7 +1040,7 @@ mod provenance_tests {
 
     #[test]
     fn records_the_model_and_cli_version_from_the_init_record() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let p = log(tmp.path(), &format!("{INIT}\n{DONE}\n"));
         let m = extract_agent_meta(&p).expect("stream-json is recognised");
         assert_eq!(
@@ -1052,7 +1052,7 @@ mod provenance_tests {
 
     #[test]
     fn records_cost_turns_and_tokens_from_the_terminal_record() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let p = log(tmp.path(), &format!("{INIT}\n{DONE}\n"));
         let m = extract_agent_meta(&p).unwrap();
         assert_eq!(m.num_turns, Some(56));
@@ -1066,7 +1066,7 @@ mod provenance_tests {
 
     #[test]
     fn models_billed_comes_from_model_usage_not_the_requested_model() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let two = DONE.replace(
             r#""modelUsage":{"global.anthropic.claude-opus-5[1m]":{"inputTokens":669}}"#,
             r#""modelUsage":{"global.anthropic.claude-opus-5[1m]":{"inputTokens":1},"claude-haiku-4-5":{"inputTokens":2}}"#,
@@ -1086,7 +1086,7 @@ mod provenance_tests {
 
     #[test]
     fn absent_is_absent_never_zero() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         // Credits and time MUST stay on one line: the regex `.` does not cross a
         // newline, so a two-line fixture silently fails to match.
         let p = log(tmp.path(), "▸ Credits: 1.25 • Time: 3m 4s\n");
@@ -1113,7 +1113,7 @@ mod provenance_tests {
 
     #[test]
     fn api_error_status_null_on_success_is_none_not_zero() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let p = log(tmp.path(), &format!("{INIT}\n{DONE}\n"));
         let m = extract_agent_meta(&p).unwrap();
         assert!(
@@ -1127,7 +1127,7 @@ mod provenance_tests {
     fn a_dead_run_records_its_cost_and_its_reason() {
         // jansson really burned $90 over 193 turns and then died on a 403: the
         // cost was real, the result was not.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let p = log(tmp.path(), &format!("{INIT}\n{DEAD}\n"));
         let m = extract_agent_meta(&p).unwrap();
         assert_eq!(m.terminal_reason.as_deref(), Some("api_error"));
@@ -1138,7 +1138,7 @@ mod provenance_tests {
 
     #[test]
     fn exit_code_is_read_from_the_sibling_metrics_file() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let p = log(tmp.path(), &format!("{INIT}\n{DEAD}\n"));
         std::fs::write(
             tmp.path().join("verified/verification.json"),
@@ -1155,7 +1155,7 @@ mod provenance_tests {
 
     #[test]
     fn interleaved_stderr_does_not_defeat_extraction() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let body = format!("warning: bwrap not installed\n{INIT}\nnote: noise\n{DONE}\n");
         let p = log(tmp.path(), &body);
         let m = extract_agent_meta(&p).unwrap();
@@ -1168,7 +1168,7 @@ mod provenance_tests {
 
     #[test]
     fn a_log_in_neither_format_yields_none() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let p = log(tmp.path(), "just some prose, no credits, no json\n");
         assert!(
             extract_agent_meta(&p).is_none(),

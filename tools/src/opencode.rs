@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn materialize_config_writes_plugin_only_for_verify() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::workdir::test_tempdir().unwrap();
         let root = tmp.path();
         let m = bedrock_sonnet();
 
