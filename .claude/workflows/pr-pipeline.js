@@ -107,7 +107,7 @@ been widened when they had not moved at all; one stated in prose that a change w
 deliberately NOT made while the diff made it, and omitted two changed files from its table.
 Both would have put a false structural record in permanent history.
 
-So: run `git diff --numstat origin/main` and `git diff origin/main` at the END, list EVERY
+So: run 'git diff --numstat origin/main' and 'git diff origin/main' at the END, list EVERY
 file, and derive each claim from what you see there. If you reasoned your way to a decision
 mid-task and then did something else, the diff is what is true. Every number you state must
 come from a command you ran.
