@@ -1,0 +1,104 @@
+# PR 4 — Create `io/`, the only layer allowed to touch the outside world
+
+## Goal
+
+Second layer of `docs/architecture-plan.md`. Everything that touches the filesystem, a
+process, the environment or git moves into `io/`. Pure moves only; no behaviour change.
+
+## Why
+
+`domain/` (PR 3a) is enforced pure by a rule. The complement is not enforced at all:
+filesystem and process access is scattered across `artifact.rs`, `workdir.rs`,
+`sandbox.rs` and `provenance.rs`, so "conversion at the edges" is a description of
+intent rather than a property. Naming the layer is what lets a later rule say *only* `io/`
+may do these things.
+
+## What moves
+
+Create `tools/src/io/` as a directory module. `io/mod.rs` re-exports and states the rule in
+its module doc: this is the only layer that may name `std::fs`, `std::process`,
+`std::env`, or shell out to git.
+
+| from | to | what it is |
+|---|---|---|
+| `visit`, `hash_tree`, `digest_tree`, `feed`, `copy_carrying`, `Access`, `set_read_only`, `is_cmake_build_dir` from `artifact.rs` | `io/tree.rs` | walking, hashing and copying real trees |
+| all of `workdir.rs` | `io/workdir.rs` | scratch base, ulimits, tmpfs refusal |
+| all of `sandbox.rs` | `io/sandbox.rs` | writes `settings.json`, probes PATH |
+| the git plumbing in `provenance.rs` (`git`, `head_sha`, `dirty_file_count`, `count_dirty_in`, `repo_root`) | `io/git.rs` | shells out to git |
+
+`provenance::assess` is already pure and stays put for now — PR 3b decides whether it
+moves to `domain/`. Do not move it here.
+
+## What does NOT move, and why
+
+**`TreeDigest` stays with the hashing.** PR 3a established this: the newtype is unforgeable
+because its tuple field is private and only its own module can construct one. Since
+`hash_tree` moves to `io/tree.rs`, `TreeDigest` moves *with it* — they must stay in the same
+module. If that forces a visibility change anywhere else, stop and report rather than
+widening.
+
+**The typestate family stays in `artifact.rs`.** `Scratch`, `WorkTree`, `Scrubbed`, `Sealed`,
+`Corpus`, `CDir` and their transitions are one state machine and one concept. They will
+*call* `io/tree.rs`; they do not move into it. If a transition's private field would have to
+widen for that to compile, report it — do not widen.
+
+## Constraints
+
+- Every move is a **pure move**: byte-identical apart from `use` lines and the module it
+  lives in. Report anything you changed beyond that and why.
+- No visibility may widen to make a move work. If a move requires it, that item is in the
+  wrong layer — leave it and say so.
+- Do not add `#[allow]`/`#[expect]`/`#[ignore]`, weaken any rule, grow any ALLOWED list, or
+  re-record any `.stderr`.
+- Tests move with the code they test.
+- Do not write to `/tmp` (see the pipeline's standing instruction).
+
+## Rules you will have to update in the same commit
+
+- **`the_digest_path_is_lossless`** guards `hash_tree`, `digest_tree`, `scrub` and
+  `classify` by module path. Three of those move. Repoint it; it must still be able to fail
+  loudly if a guarded function disappears.
+- **`the_shape_rules_cannot_pass_while_inspecting_nothing`** has `MIN_FILES` set to the
+  measured file count minus 2. You are adding files. Raise it and keep the 2-file margin,
+  and update its comment with the new measured count.
+- **`no_public_path_escapes_the_artifact_modules`** and **`digests_cannot_be_fabricated`**
+  address the artifact and cache modules by module path. `io/tree.rs` now holds
+  `TreeDigest` and path-returning helpers — decide deliberately whether each rule should
+  cover `io/` too, and say why in the commit message. Getting this wrong silently drops
+  coverage.
+- **`a_module_cycle_may_only_shrink`** — report the cycle membership it prints if it
+  changes. Either outcome is information; do not edit the baseline to make it quiet unless
+  the cycle genuinely shrank, and say so if it did.
+
+## Acceptance criteria
+
+Pinned toolchain, `RUSTUP_TOOLCHAIN` unset:
+
+```
+cargo fmt --check                                        clean
+cargo test  --locked --lib --bin harvest-tools           all pass, count unchanged
+cargo test  --locked --test architecture                 all pass
+cargo test  --locked --test compile_fail                 10 cases
+cargo clippy --locked --all-targets                      0 warnings
+cargo clippy --locked --lib --bins -- -D clippy::panic   0
+cargo doc   --locked --no-deps                           clean
+python3 tools/comment_budget.py --max 14                 exit 0  (after `git add -A`)
+python3 tools/check_paths.py                             exit 0
+```
+
+And the one that matters most for a move PR:
+
+```
+HARVEST_GOLDEN_RESULTS=/local/home/scheschb/research/ACTOR/results \
+  cargo test --locked --test integration artifact_fingerprint
+```
+
+must pass **and must not skip** — 40 artifact digests identical. A pure move that changes a
+digest is the failure this plan risks; the hashing code itself is what you are moving, so
+this is the direct check on it.
+
+## Commit message
+
+What moved; that the moves are byte-identical apart from `use` lines; why `TreeDigest`
+travelled with `hash_tree`; what you decided about extending the two artifact-module rules
+to `io/` and why; and that 40 golden digests are unchanged.
