@@ -1,11 +1,19 @@
-use crate::agents::exit::{clear_agent_exit, merge_agent_exit, record_agent_exit};
-use crate::agents::invocation::{assert_pins_honoured, claude_model};
-use crate::agents::run::{write_phase_metrics, Recorded};
+use crate::agents::exit::{
+    agent_provenance, clear_agent_exit, merge_agent_exit, observed_exit, record_agent_exit,
+};
+use crate::agents::invocation::{
+    assert_pins_honoured, claude_model, Backend, Invocation, KIRO_UNPINNED_MODEL,
+};
+use crate::agents::run::{run_cached, write_phase_metrics, Outcome, PhaseRun, Recorded};
+use crate::agents::session::{ClaudeRun, Session};
+use crate::agents::work::IsolatedWorkDir;
 use crate::agents::Semaphore;
 use crate::analyse::cargo_toml::{self, CargoToml};
 use crate::artifact::Translate;
 use crate::battery::{self, Case, Paths};
+use crate::cache::{self, CliVersion, ModelId, Produced, Store};
 use crate::cli::Agent;
+use crate::io::workdir::Roots;
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -108,6 +116,7 @@ pub fn run_test_corpus(
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
     std::fs::create_dir_all(&output_dir)?;
+    let store = cache::Store::open(&paths.repo_root, paths.cache_mode)?;
 
     let total = count_cases(&battery);
     ensure_cases_found(total, paths, battery_name)?;
@@ -132,7 +141,7 @@ pub fn run_test_corpus(
                     c.name.clone(),
                     s.spawn(|| {
                         let _permit = sem.acquire();
-                        translate_one_independent(paths, &output_dir, battery_name, c)
+                        translate_one_independent(paths, &output_dir, battery_name, c, &store)
                     }),
                 )
             })
@@ -223,6 +232,7 @@ fn translate_one_independent(
     output_dir: &Path,
     battery_name: &str,
     case: &battery::IndependentCase,
+    store: &Store,
 ) -> CaseResult {
     if crate::battery::has_crate(&crate::battery::phase_dir(
         &output_dir.join(&case.name),
@@ -241,7 +251,7 @@ fn translate_one_independent(
         &case.name,
         &output_dir.join(&case.name),
         &paths.agent_key,
-        || dispatch_translate(paths, battery_name, &case.name, case.is_lib),
+        || dispatch_translate(paths, battery_name, &case.name, case.is_lib, store),
         || {
             if paths.agent == Agent::ClaudeCrossPrompt {
                 // E4: the agent's lib-vs-bin choice IS the experiment, so it must not
@@ -327,11 +337,18 @@ fn translate_one_shared(
 
 // ── DRY dispatch helpers ───────────────────────────────────────────────
 
+/// Who wrote `translation.json`: [`run_cached`] does for the phase it drives, carrying the entry
+/// a replay served and the exit code the infra audit reads — a second write would blank both.
+enum RecordedBy {
+    Driver,
+    Caller,
+}
+
 fn run_and_record(
     name: &str,
     case_dir: &Path,
     agent: &crate::cache::AgentKey,
-    translate_fn: impl FnOnce() -> Result<()>,
+    translate_fn: impl FnOnce() -> Result<RecordedBy>,
     post_process_fn: impl FnOnce() -> Result<()>,
 ) -> CaseResult {
     // A thread may be re-used across cases; without this, a non-CLI agent would
@@ -339,9 +356,11 @@ fn run_and_record(
     clear_agent_exit();
     let start = Instant::now();
     match translate_fn() {
-        Ok(()) => {
+        Ok(recorded) => {
             let elapsed = start.elapsed().as_secs();
-            write_translation_metrics(case_dir, agent, elapsed, true);
+            if matches!(recorded, RecordedBy::Caller) {
+                write_translation_metrics(case_dir, agent, elapsed, true);
+            }
             let _ = post_process_fn();
             CaseResult {
                 name: name.to_owned(),
@@ -501,39 +520,53 @@ pub fn require_prompt(paths: &Paths, kind: PromptKind) -> Result<String> {
     })
 }
 
-fn dispatch_translate(paths: &Paths, battery: &str, name: &str, is_lib: bool) -> Result<()> {
+fn uncached(r: Result<()>) -> Result<RecordedBy> {
+    r.map(|()| RecordedBy::Caller)
+}
+
+fn dispatch_translate(
+    paths: &Paths,
+    battery: &str,
+    name: &str,
+    is_lib: bool,
+    store: &Store,
+) -> Result<RecordedBy> {
     match paths.agent {
-        Agent::Laertes => laertes_translate_case(paths, battery, name),
-        Agent::C2SaferRust => c2saferrust_translate_case(paths, battery, name, is_lib),
+        Agent::Laertes => uncached(laertes_translate_case(paths, battery, name)),
+        Agent::C2SaferRust => uncached(c2saferrust_translate_case(paths, battery, name, is_lib)),
         Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
-        Agent::Kimi => kimi_translate_case(paths, battery, name, is_lib),
-        Agent::Oneshot => oneshot_translate_case(paths, battery, name, is_lib),
-        Agent::C2rust => translate_case(paths, battery, name, ""),
+        Agent::Kimi => uncached(kimi_translate_case(paths, battery, name, is_lib)),
+        Agent::Oneshot => uncached(oneshot_translate_case(paths, battery, name, is_lib)),
+        Agent::C2rust => translate_case(paths, battery, name, "", store),
         // Every remaining agent differs only in which prompt file it reads.
         Agent::Kiro | Agent::Claude | Agent::OpenCode | Agent::ClaudeCombined
         | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures
         | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
         | Agent::CodexGpt55 | Agent::CodexGpt54 => {
             let prompt = require_prompt(paths, PromptKind::independent(is_lib))?;
-            translate_case(paths, battery, name, &prompt)
+            translate_case(paths, battery, name, &prompt, store)
         }
     }
 }
 
-fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result<()> {
+/// Bypassed, with the store opened here so no caller can hand this path a keyed one: one
+/// invocation serves N configs that `propagate_config` DERIVES from the published real case, and
+/// whether a replay derives identical followers is what spec-7c exists to demonstrate.
+fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result<RecordedBy> {
+    let store = Store::open(&paths.repo_root, cache::Mode::Bypass)?;
     match paths.agent {
-        Agent::Laertes => laertes_translate_case(paths, battery, name),
-        Agent::C2SaferRust => c2saferrust_translate_case(paths, battery, name, true),
+        Agent::Laertes => uncached(laertes_translate_case(paths, battery, name)),
+        Agent::C2SaferRust => uncached(c2saferrust_translate_case(paths, battery, name, true)),
         Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
-        Agent::Kimi => kimi_translate_case(paths, battery, name, true),
-        Agent::Oneshot => oneshot_translate_case(paths, battery, name, true),
-        Agent::C2rust => translate_case(paths, battery, name, ""),
+        Agent::Kimi => uncached(kimi_translate_case(paths, battery, name, true)),
+        Agent::Oneshot => uncached(oneshot_translate_case(paths, battery, name, true)),
+        Agent::C2rust => translate_case(paths, battery, name, "", &store),
         Agent::Kiro | Agent::Claude | Agent::OpenCode | Agent::ClaudeCombined
         | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures
         | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
         | Agent::CodexGpt55 | Agent::CodexGpt54 => {
             let prompt = require_prompt(paths, PromptKind::Shared)?;
-            translate_case(paths, battery, name, &prompt)
+            translate_case(paths, battery, name, &prompt, &store)
         }
     }
 }
@@ -570,6 +603,7 @@ pub fn run_harvest_bench(
     );
     let total = projects.len();
     let sem = Semaphore::new(parallel);
+    let store = cache::Store::open(&paths.repo_root, paths.cache_mode)?;
 
     let results: Vec<CaseResult> = std::thread::scope(|s| {
         let handles: Vec<(String, _)> = projects
@@ -577,12 +611,13 @@ pub fn run_harvest_bench(
             .map(|p| {
                 let prompt = &prompt;
                 let sem = &sem;
+                let store = &store;
                 let name = p.name().to_owned(); // see run_test_corpus
                 (
                     name,
                     s.spawn(move || {
                         let _permit = sem.acquire();
-                        translate_one_harvest_bench(paths, p, prompt)
+                        translate_one_harvest_bench(paths, p, prompt, store)
                     }),
                 )
             })
@@ -622,6 +657,7 @@ fn translate_one_harvest_bench(
     paths: &Paths,
     project: &battery::HarvestBenchProject,
     prompt: &str,
+    store: &Store,
 ) -> CaseResult {
     let name = project.name();
     let case_dir = paths.output_dir(name);
@@ -643,7 +679,7 @@ fn translate_one_harvest_bench(
         name,
         &case_dir,
         &paths.agent_key,
-        || translate_case_at(paths, project.test_case(), &case_dir, prompt),
+        || translate_case_at(paths, project.test_case(), &case_dir, prompt, store),
         || {
             // The lib name must be the project name: the suite links `lib<name>.so`
             // by ABI, not by crate name.
@@ -804,78 +840,105 @@ fn no_in_tool_translate(agent: &crate::cache::AgentKey) -> String {
     )
 }
 
-fn translate_case(paths: &Paths, battery: &str, name: &str, prompt: &str) -> Result<()> {
+fn translate_case(
+    paths: &Paths,
+    battery: &str,
+    name: &str,
+    prompt: &str,
+    store: &Store,
+) -> Result<RecordedBy> {
     let input_test_case = paths.input_dir(battery).join(name).join("test_case");
     let case_dir = paths.case_dir(battery, name);
-    translate_case_at(paths, &input_test_case, &case_dir, prompt)
+    translate_case_at(paths, &input_test_case, &case_dir, prompt, store)
 }
 
-/// The agentic-translation core: copies the C source into an isolated temp
-/// workspace, invokes the agent there, and on success copies the produced crate to
-/// `<out_case_dir>/translated_rust`. Paths are explicit so it serves any dataset
-/// layout.
-pub fn translate_case_at(
+/// How the agent will be launched, resolved from `--agent` before anything runs. Only
+/// [`Launch::Keyed`] reaches the store, and the other three each say why they cannot: a wrong
+/// key is worse than no cache.
+enum Launch {
+    Keyed(Invocation),
+    /// `opencode run --format json` is not claude's `--output-format stream-json`, whose
+    /// terminal records are all [`crate::domain::health::classify`] reads, so nothing mints the
+    /// `Completed` the driver seals with and keying it would refuse every healthy run. Teaching
+    /// the classifier this format changes what verify publishes too — its own change.
+    OpenCode {
+        model: crate::agents::opencode::Model,
+        session: Session,
+    },
+    /// Model and region are `-c` overrides so the run does not depend on a global
+    /// ~/.codex/config.toml. No [`Session`] renders this invocation — it is a literal argv — and
+    /// `cache::Recipe` hashes a `Session` precisely because argv carries the scratch path.
+    Codex {
+        model: &'static str,
+        region: &'static str,
+    },
+    /// No model to name, and no agent exit recorded, so an opaque log is `Unknown` and mints no
+    /// `Completed` either. Also the one backend whose spend a cache would not save.
+    C2rust,
+}
+
+/// The CLI build is probed and the model pinned HERE, before the agent runs: both are key
+/// components, and neither is honest after the fact — the CLIs auto-update through a shim, and
+/// the resolved model appears only in the transcript.
+fn resolve_launch(paths: &Paths, backend: InTool) -> Result<Launch> {
+    Ok(match backend {
+        InTool::Kiro => Launch::Keyed(Invocation {
+            backend: Backend::Kiro,
+            model: ModelId::new(KIRO_UNPINNED_MODEL)?,
+            cli: CliVersion::probe("kiro-cli")?,
+            session: Session::kiro(KIRO_TRANSLATE_TIMEOUT_SECS),
+        }),
+        InTool::Claude => Launch::Keyed(Invocation {
+            backend: Backend::Claude,
+            model: claude_model()?,
+            cli: CliVersion::probe("claude")?,
+            // The same builder verify uses, so the phases cannot drift on flags for one CLI.
+            session: Session::claude(TRANSLATE_TIMEOUT_SECS),
+        }),
+        InTool::OpenCode => Launch::OpenCode {
+            model: opencode_model(paths)?,
+            session: Session::opencode(
+                crate::agents::opencode::Phase::Translate,
+                TRANSLATE_TIMEOUT_SECS,
+            ),
+        },
+        InTool::Codex { model, region } => Launch::Codex { model, region },
+        InTool::C2rust => Launch::C2rust,
+    })
+}
+
+/// The agentic-translation core: materialises the C corpus into an isolated work tree, invokes
+/// the agent there, and publishes the sealed crate to `<case_dir>/translated`. Paths are
+/// explicit so it serves any dataset layout, and it is memoised through [`run_cached`] wherever
+/// [`resolve_launch`] yields a [`Launch::Keyed`]. Nothing substitutes a case into a translate
+/// prompt, so `input_tree` is the ONLY per-case component of that key — hence
+/// [`IsolatedWorkDir::from_corpus`], never a phase dir.
+fn translate_case_at(
     paths: &Paths,
     input_test_case: &Path,
-    out_case_dir: &Path,
+    case_dir: &Path,
     prompt: &str,
-) -> Result<()> {
-    let case_dir = out_case_dir;
+    store: &Store,
+) -> Result<RecordedBy> {
     let backend =
         in_tool_translate(paths.agent).with_context(|| no_in_tool_translate(&paths.agent_key))?;
 
     // Created before the agent runs so `tee` can write its log there live; `clear_phase`
-    // below keeps `logs/` for exactly that reason.
-    let translated_dir = crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED);
+    // keeps `logs/` for exactly that reason.
     let logs_dir = crate::artifact::phase_logs::<Translate>(case_dir);
     std::fs::create_dir_all(&logs_dir)?;
-
     let log_path = crate::artifact::phase_log::<Translate>(case_dir);
-    let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
 
-    // The sandbox, settings path and OpenCode contract are all rooted at the temp dir, so
-    // it leaves the match directly: recovering it as `work_dir.parent()` turned a known
-    // root into an `Option` that three call sites below then had to guess at.
-    let (work_root, work_dir, _tmp_guard) = match backend {
-        InTool::Kiro
-        | InTool::Claude
-        | InTool::Codex { .. }
-        | InTool::OpenCode
-        | InTool::C2rust => {
-            let tmp = crate::io::workdir::tempdir("harvest-translate-")
-                .context("creating isolated temp dir")?;
-            let work = tmp.path().join(crate::battery::TRANSLATED_RUST);
-            let c_src = work.join("c_src");
-            std::fs::create_dir_all(&c_src)?;
-            copy_dir_all(input_test_case, &c_src)?;
+    // Before the store is consulted: the OpenCode contract below embeds this root and the prompt
+    // is keyed, so on a hit the copy is wasted but the prompt hashed is the prompt shown.
+    let work = IsolatedWorkDir::<Translate>::from_corpus(input_test_case)?;
 
-            if matches!(backend, InTool::Claude) {
-                crate::io::sandbox::write_settings(crate::io::sandbox::Policy {
-                    repo_root: &paths.repo_root,
-                    work_root: tmp.path(),
-                    enforcement: paths.enforcement,
-                })?;
-            }
-
-            if matches!(backend, InTool::OpenCode) {
-                // OpenCode's equivalent of the .claude/settings.json sandbox above.
-                crate::agents::opencode::materialize_config(
-                    tmp.path(),
-                    crate::agents::opencode::Phase::Translate,
-                    &opencode_model(paths)?,
-                )?;
-            }
-
-            (tmp.path().to_path_buf(), work, Some(tmp))
-        }
-    };
-
-    // OpenCode's appended filesystem-boundary contract names the temp dir, so the
-    // final prompt is only known once the workspace exists.
-    let prompt: &str = &match backend {
+    // OpenCode's appended filesystem-boundary contract names the work root, so the final
+    // prompt is only known once the tree exists.
+    let prompt = match backend {
         InTool::OpenCode => format!(
             "{prompt}{}",
-            crate::agents::opencode::prompt_suffix(&work_root)
+            crate::agents::opencode::prompt_suffix(work.root())
         ),
         _ => prompt.to_string(),
     };
@@ -884,84 +947,161 @@ pub fn translate_case_at(
     // store the rendered text, after any per-agent suffix. Empty for non-prompt
     // agents such as c2rust.
     if !prompt.is_empty() {
-        let _ = std::fs::write(logs_dir.join("prompt.md"), prompt);
+        let _ = std::fs::write(logs_dir.join("prompt.md"), &prompt);
     }
 
-    match backend {
-        InTool::Kiro => {
-            let status = crate::agents::session::Session::kiro(KIRO_TRANSLATE_TIMEOUT_SECS)
-                .kiro_command(&work_dir, prompt, &log_path)
-                .status()
-                .context("invoking kiro-cli")?;
-            record_agent_exit(status);
-        }
-        InTool::Claude => {
-            // The same builder verify uses, so the two phases cannot drift into
-            // different flags for the same CLI.
-            let model = claude_model()?;
-            let cli = crate::cache::CliVersion::probe("claude")?;
-            let status = crate::agents::session::Session::claude(TRANSLATE_TIMEOUT_SECS)
-                .claude_command(&crate::agents::session::ClaudeRun {
-                    cwd: &work_dir,
-                    prompt,
-                    log: &log_path,
-                    settings: &work_root.join(".claude/settings.json"),
-                    agent_tmp: &crate::io::workdir::agent_tmp(&work_root)?,
-                    model: &model,
-                })
-                .status()
-                .context("invoking claude")?;
-            record_agent_exit(status);
-            // Translate is not cached, but an unhonoured pin still misattributes the
-            // artifact — and `verified/` is built on top of it.
-            assert_pins_honoured(&log_path, &model, &cli)?;
-        }
-        // Model and region are passed as `-c` overrides so the run does not depend on a
-        // global ~/.codex/config.toml.
-        InTool::Codex { model, region } => {
-            invoke_codex_with_retry(
-                RetrySession {
-                    prompt,
-                    log_path: &log_path,
-                    work_dir: &work_dir,
-                    context_label: "translate",
-                },
+    let launch = resolve_launch(paths, backend)?;
+    let Launch::Keyed(inv) = &launch else {
+        // Published as before this PR — copied, not sealed. Sealing demands a `Completed` none of
+        // these three transcripts can mint (see [`Launch`]), so routing them through the driver
+        // would refuse every healthy run rather than cache one.
+        run_translate_agent(paths, &launch, &work, &prompt, &log_path)?;
+        crate::artifact::clear_phase::<Translate>(case_dir)?;
+        copy_dir_all(
+            &work.translated_rust(),
+            &crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED),
+        )?;
+        return Ok(RecordedBy::Caller);
+    };
+
+    // Resolved once, so the digests below cannot disagree about what machine they were taken on.
+    let roots = Roots::resolve(work.root(), &paths.repo_root);
+    let prompt_digest = cache::prompt_digest(&prompt, &roots);
+    let policy = inv.backend.policy_shape(paths.enforcement, &roots)?;
+    let recipe = cache::Recipe::new(&inv.session, policy)?.digest();
+    let toolchain = cache::ToolchainId::detect()?;
+
+    let outcome = run_cached(
+        PhaseRun {
+            work,
+            case_dir,
+            log_path: &log_path,
+            agent: &paths.agent_key,
+            model: &inv.model,
+            cli: &inv.cli,
+            toolchain: &toolchain,
+            prompt: &prompt_digest,
+            recipe: &recipe,
+        },
+        store,
+        |work| {
+            let start = Instant::now();
+            run_translate_agent(paths, &launch, &work, &prompt, &log_path)?;
+            let sealed = work.finish(&completion_proof(paths, &log_path)?)?;
+            // Once per invocation and inside `compute`: `agent_provenance` CONSUMES the observed
+            // exit, so in the caller a replay would report the previous case's exit as this one's.
+            Ok(Some(Produced::new(
+                sealed,
+                log_path.clone(),
+                agent_provenance(&paths.agent_key, start.elapsed().as_secs()),
+            )))
+        },
+    )?;
+    anyhow::ensure!(
+        matches!(outcome, Outcome::Published(_)),
+        "no translation was published, so the case has no result and must not be reported as \
+         one — the driver has already recorded why beside it"
+    );
+    Ok(RecordedBy::Driver)
+}
+
+/// The proof [`IsolatedWorkDir::finish`] demands, from the same discriminator the scoring gate
+/// uses: an infra failure is no measurement, so it must become neither `translated/` nor a cache
+/// entry — a transient outage memoised is a permanent, silent one.
+fn completion_proof(paths: &Paths, log_path: &Path) -> Result<crate::domain::health::Completed> {
+    let health =
+        crate::agent_health::classify_log(log_path, paths.agent.log_format(), observed_exit());
+    health
+        .completed()
+        .with_context(|| format!("the agent did not complete ({health:?})"))
+}
+
+/// Borrows the work tree rather than sealing it: the bypassed caller must leave the observed exit
+/// for [`write_translation_metrics`], the only thing putting `exit_code` in front of the audit.
+fn run_translate_agent(
+    paths: &Paths,
+    launch: &Launch,
+    work: &IsolatedWorkDir<Translate>,
+    prompt: &str,
+    log_path: &Path,
+) -> Result<()> {
+    // Cleared so an absent CLI run records no spend; a replay never reaches this function.
+    clear_agent_exit();
+    let cwd = work.translated_rust();
+
+    match launch {
+        Launch::Keyed(inv) => match &inv.backend {
+            Backend::Kiro => {
+                let status = inv
+                    .session
+                    .kiro_command(&cwd, prompt, log_path)
+                    .status()
+                    .context("invoking kiro-cli")?;
+                record_agent_exit(status);
+            }
+            Backend::Claude => {
+                let settings = crate::io::sandbox::write_settings(crate::io::sandbox::Policy {
+                    repo_root: &paths.repo_root,
+                    work_root: work.root(),
+                    enforcement: paths.enforcement,
+                })?;
+                let status = inv
+                    .session
+                    .claude_command(&ClaudeRun {
+                        cwd: &cwd,
+                        prompt,
+                        log: log_path,
+                        settings: &settings,
+                        agent_tmp: &crate::io::workdir::agent_tmp(work.root())?,
+                        model: &inv.model,
+                    })
+                    .status()
+                    .context("invoking claude")?;
+                record_agent_exit(status);
+                // An unhonoured pin misattributes the artifact, `verified/` is built on top of
+                // it, and it would now be stored under a key naming a model that never ran.
+                assert_pins_honoured(log_path, &inv.model, &inv.cli)?;
+            }
+            // `resolve_launch` resolves no opencode `Invocation`; refused here rather than at the
+            // seal two functions away, which is where an opencode transcript would fail instead.
+            Backend::OpenCode(_) => anyhow::bail!(
+                "translate keys no opencode invocation: its transcript mints no `Completed` \
+                 for the driver to seal with (see `Launch::OpenCode`)"
+            ),
+        },
+        Launch::OpenCode { model, session } => {
+            crate::agents::opencode::materialize_config(
+                work.root(),
+                crate::agents::opencode::Phase::Translate,
                 model,
-                region,
-                &openssl_dir,
             )?;
-        }
-        InTool::OpenCode => {
             invoke_opencode_with_retry(
                 RetrySession {
                     prompt,
-                    log_path: &log_path,
-                    work_dir: &work_dir,
+                    log_path,
+                    work_dir: &cwd,
                     context_label: "translate",
                 },
-                &crate::agents::session::Session::opencode(
-                    crate::agents::opencode::Phase::Translate,
-                    TRANSLATE_TIMEOUT_SECS,
-                ),
-                &work_root,
-                &opencode_model(paths)?,
+                session,
+                work.root(),
+                model,
             )?;
         }
-        InTool::C2rust => {
-            c2rust_translate(&work_dir, &log_path)?;
-        }
-    };
-
-    if !crate::battery::has_crate(&work_dir) {
-        anyhow::bail!("no Cargo.toml produced");
+        Launch::Codex { model, region } => invoke_codex_with_retry(
+            RetrySession {
+                prompt,
+                log_path,
+                work_dir: &cwd,
+                context_label: "translate",
+            },
+            model,
+            region,
+            &std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into()),
+        )?,
+        Launch::C2rust => c2rust_translate(&cwd, log_path)?,
     }
 
-    // Publication, and not a line earlier: everything above can fail, and until here the
-    // previous translation is still what is on disk. copy_dir_all merges, so the `logs/`
-    // that `clear_phase` kept survive.
-    crate::artifact::clear_phase::<Translate>(case_dir)?;
-    copy_dir_all(&work_dir, &translated_dir)?;
-
+    anyhow::ensure!(crate::battery::has_crate(&cwd), "no Cargo.toml produced");
     Ok(())
 }
 
@@ -1073,7 +1213,7 @@ pub fn propagate_config(
 
 // ── Metrics ────────────────────────────────────────────────────────────
 
-/// Nothing here reaches the store yet, so the record is always of a fresh run.
+/// For the paths that do NOT reach the store (see [`RecordedBy`]), so it is always fresh.
 fn write_translation_metrics(
     case_dir: &Path,
     agent: &crate::cache::AgentKey,
