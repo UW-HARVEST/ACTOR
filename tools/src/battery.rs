@@ -558,7 +558,7 @@ fn extract_stream_json_meta(log_path: &Path) -> Option<AgentRunMeta> {
         }
     }
 
-    // Written beside the log by write_verification_metrics /
+    // Written beside the log by agents::run::write_metrics /
     // write_translation_metrics.
     m.exit_code = log_path
         .parent()

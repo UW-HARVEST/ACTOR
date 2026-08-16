@@ -155,10 +155,10 @@ fn is_public(vis: &syn::Visibility) -> bool {
 /// all of them, `sealed_implements_only_debug` included, and each would still report green.
 #[test]
 fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
-    // Measured 34 today: 32 module files plus lib.rs and main.rs. The floor is that count
+    // Measured 35 today: 33 module files plus lib.rs and main.rs. The floor is that count
     // minus 2, so a merge landing a file needs no edit here while deleting three fails
     // instead of quietly narrowing what every rule below inspects. Add files, raise it.
-    const MIN_FILES: usize = 32;
+    const MIN_FILES: usize = 33;
     const REQUIRED: &[&str] = &["Sealed", "WorkTree", "Scrubbed", "Corpus", "TreeDigest"];
 
     let found = rust_sources();
@@ -208,7 +208,7 @@ fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
         (found.len(), nested),
         count_rust_files(&dir, 1),
         "rust_sources() and an independent walk of src/ disagree on (total, nested). \
-         agents/, analyse/, domain/, io/ and oracle/ make the nested half live: 22 of 34 \
+         agents/, analyse/, domain/, io/ and oracle/ make the nested half live: 23 of 35 \
          today, so a traversal that stopped at the top level of src/ would fail here \
          instead of reporting green."
     );
@@ -728,6 +728,191 @@ fn the_key_deriving_functions_keep_their_exhaustive_patterns() {
         "a key-deriving function can now skip a field silently: {bad:#?}\n\
          Keep the pattern exhaustive and feed every binding, so a new field is a compile\n\
          error rather than two invocations quietly sharing a cache entry."
+    );
+}
+
+/// Modules whose NON-TEST code calls `obtain`, in EITHER spelling, one entry per call site,
+/// sorted. Takes `(module, source)` pairs so planted calls can test the extraction itself.
+///
+/// An item whose `cfg` list is EXACTLY `test` is skipped, because `cache.rs`'s own unit tests
+/// drive `obtain` directly — which is how the store is tested at all, and what makes the
+/// assertion below non-vacuous: were the skip broken, those 25 sites would be reported.
+/// Compared exactly and not by substring: as a substring the skip also swallowed
+/// `#[cfg(not(test))]`, which is code that compiles into the production lib and NOTHING
+/// else, plus `any(test, ..)` and `feature = "test-util"`. Over-exclusion here is a silent
+/// second cached path; over-inclusion is a loud failure a reader can see, so the exact
+/// comparison is the safe direction to be wrong in.
+///
+/// A macro invocation's arguments reach `syn` as unparsed tokens, so the walk cannot see a
+/// call inside one — `matches!(s.obtain(..), Ok(_))` read as no call at all. Those tokens are
+/// scanned for `obtain` in call position as well. The scan is hung off `visit_macro` rather
+/// than run over the whole file so that the `cfg` skip still governs what it reaches.
+fn obtain_call_sites(sources: &[(String, String)]) -> Vec<String> {
+    /// `obtain(..)` and `obtain::<Verify>(..)` anywhere in a token stream, counted. Between
+    /// the name and its argument list only a turbofish may stand, so idents and the puncts
+    /// it is spelled with are stepped over and anything else ends the match.
+    fn calls_in_tokens(stream: TokenStream) -> usize {
+        let turbofish = |t: Option<&TokenTree>| match t {
+            Some(TokenTree::Ident(_)) => true,
+            Some(TokenTree::Punct(p)) => ":<>".contains(p.as_char()),
+            _ => false,
+        };
+        let tokens: Vec<TokenTree> = stream.into_iter().collect();
+        let mut found = 0;
+        for (i, token) in tokens.iter().enumerate() {
+            if let TokenTree::Group(g) = token {
+                found += calls_in_tokens(g.stream());
+            }
+            if !matches!(token, TokenTree::Ident(id) if id == "obtain") {
+                continue;
+            }
+            let mut j = i + 1;
+            while turbofish(tokens.get(j)) {
+                j += 1;
+            }
+            if matches!(tokens.get(j), Some(TokenTree::Group(g))
+                if g.delimiter() == Delimiter::Parenthesis)
+            {
+                found += 1;
+            }
+        }
+        found
+    }
+
+    struct V {
+        module: String,
+        hits: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            let attrs: &[syn::Attribute] = match item {
+                syn::Item::Mod(m) => &m.attrs,
+                syn::Item::Fn(f) => &f.attrs,
+                syn::Item::Impl(i) => &i.attrs,
+                _ => &[],
+            };
+            let test_only = attrs.iter().any(|a| {
+                a.path().is_ident("cfg")
+                    && a.meta
+                        .require_list()
+                        .is_ok_and(|l| l.tokens.to_string() == "test")
+            });
+            if !test_only {
+                syn::visit::visit_item(self, item);
+            }
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            for _ in 0..calls_in_tokens(m.tokens.clone()) {
+                self.hits.push(self.module.clone());
+            }
+            syn::visit::visit_macro(self, m);
+        }
+        fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
+            if c.method == "obtain" {
+                self.hits.push(self.module.clone());
+            }
+            syn::visit::visit_expr_method_call(self, c);
+        }
+        /// `Store::obtain(store, ..)` is an `ExprCall` over a path, not an `ExprMethodCall`,
+        /// so a receiver-only visitor reports a second cached path as no path at all.
+        fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(p) = &*c.func {
+                if p.path.segments.last().is_some_and(|s| s.ident == "obtain") {
+                    self.hits.push(self.module.clone());
+                }
+            }
+            syn::visit::visit_expr_call(self, c);
+        }
+    }
+    let mut out = Vec::new();
+    for (module, text) in sources {
+        let mut v = V {
+            module: module.clone(),
+            hits: Vec::new(),
+        };
+        v.visit_file(&syn::parse_file(text).expect("source parses"));
+        out.extend(v.hits);
+    }
+    out.sort();
+    out
+}
+
+/// One cached execution path, hence exactly one `Store::obtain` call site.
+///
+/// Everything `agents::run::run_cached` claims — one key, one publish, one metrics write, no
+/// replay branch a caller can get wrong — holds only while it is the sole way to reach the
+/// store. A second `obtain` restores the fork silently: both sites would cache, both would
+/// look right, and nothing would go red while the two drifted apart.
+#[test]
+fn the_store_is_obtained_from_exactly_one_place() {
+    let sources: Vec<(String, String)> = rust_sources()
+        .into_iter()
+        .map(|p| (module_path(&p), read(&p)))
+        .collect();
+    assert_eq!(
+        obtain_call_sites(&sources),
+        ["agents::run"],
+        "Store::obtain must be called by the one driver and nowhere else. Route the phase \
+         through `agents::run::run_cached` instead of consulting the store again.\n\
+         What this rule still cannot see, stated so nobody reads a green as more than it is: \
+         a call whose name is never lexed as the ident `obtain` — assembled by token pasting, \
+         emitted by a proc-macro or a build script — or one reached through a binding rather \
+         than named at the call site (`let f = Store::obtain; f(..)`). `#[cfg(test)]` items \
+         are skipped by design."
+    );
+
+    // One planted source per spelling that was, or would have been, a green bypass: only the
+    // receiver form was seen at first; the qualified form, a `cfg` that merely CONTAINS
+    // `test`, and a call inside macro tokens each got a second cached path past the rule
+    // while architecture.rs stayed untouched. Labels rather than real module names, so a
+    // failure here names the hole that reopened.
+    let planted = [
+        (
+            "cfg_any",
+            "#[cfg(any(test, feature = \"x\"))]\n\
+             fn a(s: &Store, i: &KeyInputs) { let _ = s.obtain(i, || Ok(None)); }",
+        ),
+        (
+            "cfg_not_test",
+            "#[cfg(not(test))]\n\
+             pub fn shipped(s: &Store, i: &KeyInputs) { let _ = s.obtain(i, || Ok(None)); }",
+        ),
+        (
+            "in_macro",
+            "fn m(s: &Store, i: &KeyInputs) { let _ = matches!(s.obtain(i, || Ok(None)), Ok(_)); }",
+        ),
+        (
+            "qualified",
+            "fn third(s: &Store, i: &KeyInputs) { let _ = cache::Store::obtain::<Verify>(s, i, \
+             || Ok(None)); }",
+        ),
+        (
+            "receiver",
+            "fn second(s: &Store, i: &KeyInputs) { let _ = s.obtain(i, || Ok(None)); }",
+        ),
+        (
+            "test_only",
+            "#[cfg(test)]\nmod tests { fn t(s: &Store, i: &KeyInputs) {\n    \
+             let _ = s.obtain(i, || Ok(None));\n    \
+             let _ = matches!(s.obtain(i, || Ok(None)), Ok(_));\n} }",
+        ),
+    ]
+    .map(|(module, source)| (module.to_owned(), source.to_owned()));
+    assert_eq!(
+        obtain_call_sites(&planted),
+        [
+            "cfg_any",
+            "cfg_not_test",
+            "in_macro",
+            "qualified",
+            "receiver"
+        ],
+        "a planted second call site was not reported, so this rule cannot fail. \
+         `cfg_not_test` and `cfg_any` are the over-EXCLUSIVE direction: both compile into the \
+         production lib, and a `cfg` list matched by substring skipped them. `in_macro` is a \
+         call syn hands over as tokens. `test_only` is the other direction, and must stay \
+         absent in BOTH extractions — the skip is what lets cache.rs's own 25 sites drive \
+         the store."
     );
 }
 

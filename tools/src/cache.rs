@@ -229,6 +229,13 @@ impl ToolchainId {
         anyhow::ensure!(out.status.success(), "`rustc -vV` failed");
         Ok(Self(parse_rustc_vv(&String::from_utf8_lossy(&out.stdout))?))
     }
+
+    /// `detect` reads `RUSTUP_TOOLCHAIN`, and one test sets it — so a second test calling
+    /// `detect` concurrently would refuse for that test's reason, ~1 run in a few thousand.
+    #[cfg(test)]
+    pub(crate) fn for_test(s: &str) -> Self {
+        Self(s.to_string())
+    }
 }
 
 /// Refuses output it cannot parse rather than substituting a placeholder, which would key
@@ -813,7 +820,7 @@ pub(crate) fn fake_program(dir: &Path, name: &str, body: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn recipe(session: &Session, policy: Option<&str>) -> RecipeDigest {
@@ -1153,12 +1160,12 @@ mod tests {
 
     use crate::artifact::{Scratch, Sealed, Translate, Verify, WorkTree};
 
-    /// Every test that lets a [`Store`] write goes through [`fixture`], so the unlock below
-    /// is what a new one cannot forget.
-    struct Fixture {
+    /// Every test in the crate that lets a [`Store`] write goes through [`fixture`] — hence
+    /// `pub(crate)` — so the unlock below is what a new one cannot forget.
+    pub(crate) struct Fixture {
         tree: Option<tempfile::TempDir>,
-        repo: PathBuf,
-        case: PathBuf,
+        pub(crate) repo: PathBuf,
+        pub(crate) case: PathBuf,
     }
 
     /// `TempDir`'s own `Drop` is a plain recursive delete, which cannot remove the `0o444`
@@ -1177,7 +1184,7 @@ mod tests {
 
     /// A results tree with one case, laid out as `Store::open` and `assemble_into`
     /// expect to find it.
-    fn fixture() -> Fixture {
+    pub(crate) fn fixture() -> Fixture {
         let repo = crate::io::workdir::test_tempdir().unwrap();
         let case = repo.path().join("results/Test-Corpus/claude/P00_case");
         for (rel, body) in [

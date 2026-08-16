@@ -3,15 +3,19 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// The verify phase's working copy, expressed in terms of [`crate::artifact`].
+/// One phase's working copy, expressed in terms of [`crate::artifact`].
 ///
-/// Materialises `translated/` into disk-backed scratch, hands the agent a
-/// [`crate::artifact::WorkTree`] (the only artifact type that yields a path, hence
-/// the only one anything can execute in), and on `finish` requires proof that the
-/// agent completed before the result may reach `verified/`.
-pub struct IsolatedWorkDir {
-    work: crate::artifact::WorkTree<crate::artifact::Verify>,
-    /// Digest of the `translated/` artifact this was materialised from.
+/// Materialises the previous phase's artifact into disk-backed scratch, hands the agent a
+/// [`crate::artifact::WorkTree`] (the only artifact type that yields a path, hence the only
+/// one anything can execute in), and on `finish` requires proof that the agent completed
+/// before the result may reach the phase dir.
+///
+/// The two digests travel WITH the tree rather than beside it, so
+/// [`crate::agents::run::run_cached`] reads the key's input component off the very tree it
+/// hands the agent: a key naming another tree is unrepresentable rather than avoided.
+pub struct IsolatedWorkDir<P: crate::artifact::Phase> {
+    work: crate::artifact::WorkTree<P>,
+    /// Digest of the artifact this was materialised from.
     input: crate::artifact::TreeDigest,
     /// Digest of the C oracle as handed to the agent, compared on `finish`: the C
     /// side is the reference being graded against, so a run that modified it has not
@@ -20,7 +24,9 @@ pub struct IsolatedWorkDir {
     c_before: crate::artifact::TreeDigest,
 }
 
-impl IsolatedWorkDir {
+/// Seeding a verification from a sealed translation is the one transition this type
+/// materialises today; [`crate::artifact::SeededBy`] is what stops any other pair compiling.
+impl IsolatedWorkDir<crate::artifact::Verify> {
     pub fn new(case_dir: &Path) -> Result<Self> {
         let translated = crate::artifact::Sealed::<crate::artifact::Translate>::adopt(case_dir)
             .context("adopting translated/ as a sealed artifact")?;
@@ -34,7 +40,9 @@ impl IsolatedWorkDir {
             c_before,
         })
     }
+}
 
+impl<P: crate::artifact::Phase> IsolatedWorkDir<P> {
     pub fn translated_rust(&self) -> PathBuf {
         self.work.crate_dir()
     }
@@ -58,7 +66,7 @@ impl IsolatedWorkDir {
     pub fn finish(
         self,
         proof: &crate::domain::health::Completed,
-    ) -> Result<crate::artifact::Sealed<crate::artifact::Verify>> {
+    ) -> Result<crate::artifact::Sealed<P>> {
         let scrubbed = self.work.scrub()?;
         // Reported rather than silent: a file that embedded the scratch path is a
         // file whose content varied per run (3 files across 345 cases).
