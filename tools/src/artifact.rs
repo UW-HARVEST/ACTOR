@@ -3,7 +3,7 @@
 //! Three invariants are enforced by the compiler, not by convention:
 //! * Nothing runs in a published artifact: `Command::current_dir` and `--target-dir`
 //!   both take `impl AsRef<Path>`, so "can obtain a path" *is* "can execute here", and
-//!   [`Sealed`] yields no path in any form. (`test.rs` still builds inside the tree it
+//!   [`Sealed`] yields no path in any form. (`oracle/` still builds inside the tree it
 //!   scores. No layout *inside* `results/` fixes that: MIT `runtests` resolves each
 //!   crate at `<case>/translated_rust` and pins its build output to
 //!   `<that>/target` with an explicit `--target-dir`, and its `cando2` runner bakes

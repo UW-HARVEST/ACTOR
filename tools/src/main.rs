@@ -1,9 +1,8 @@
 use anyhow::Result;
 // Never re-declare these with `mod` here; see the note in lib.rs.
+use harvest_tools::analyse::report;
 use harvest_tools::cli::{Cli, Command, Dataset};
-use harvest_tools::{
-    agent_health, battery, benchmark, cache, cli, opencode, provenance, report, test,
-};
+use harvest_tools::{agent_health, battery, benchmark, cache, cli, opencode, oracle, provenance};
 
 fn main() -> Result<()> {
     let cli = Cli::parse_args();
@@ -83,7 +82,7 @@ fn main() -> Result<()> {
                 bench.as_ref(),
                 &paths,
                 inner,
-                test::TestMode::Update,
+                oracle::TestMode::Update,
                 false,
             )?;
         }
@@ -178,11 +177,11 @@ fn main() -> Result<()> {
             )?;
             let inner = Dataset::strip_prefix(target);
             let mode = if update {
-                test::TestMode::Update
+                oracle::TestMode::Update
             } else if check {
-                test::TestMode::Check
+                oracle::TestMode::Check
             } else {
-                test::TestMode::Run
+                oracle::TestMode::Run
             };
 
             run_test(
@@ -223,7 +222,7 @@ fn run_test(
     bench: &dyn benchmark::Benchmark,
     paths: &battery::Paths,
     target: &str,
-    mode: test::TestMode,
+    mode: oracle::TestMode,
     allow_infra_failures: bool,
 ) -> Result<()> {
     // Must precede scoring: `bench.test` writes result.json and `report::generate`
@@ -248,7 +247,7 @@ fn run_test(
     }
 
     let outcome = bench.test(paths, target, mode)?;
-    if matches!(mode, test::TestMode::Update) {
+    if matches!(mode, oracle::TestMode::Update) {
         // Best-effort: the tables are a whole-corpus roll-up, so `report::generate`
         // legitimately fails on a partial tree and must not fail the score run.
         match report::generate(repo_root) {
@@ -263,8 +262,8 @@ fn run_test(
     Ok(())
 }
 
-fn report_test_outcome(outcome: test::TestOutcome) {
-    if let test::TestOutcome::Failed(ref mismatches) = outcome {
+fn report_test_outcome(outcome: oracle::TestOutcome) {
+    if let oracle::TestOutcome::Failed(ref mismatches) = outcome {
         eprintln!("\n❌ {} battery(ies) mismatched:", mismatches.len());
         for m in mismatches {
             eprintln!("  {}: {}", m.battery, m.diffs.join("; "));
