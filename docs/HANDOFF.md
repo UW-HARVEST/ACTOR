@@ -31,26 +31,25 @@ crate, enforced by `the_store_is_obtained_from_exactly_one_place`. Verify runs t
 | # | PR | spec | state |
 |---|---|---|---|
 | 7b | translate on `run_cached` — **the translate cache** | `docs/prs/spec-7b.md` | in flight |
-| T | stop the suite writing to `/tmp`, and stop it leaking | `docs/prs/spec-tmp.md` | **written, never landed — see below** |
 | 7c | shared-source groups: one key, N publishes | `docs/prs/spec-7c.md` | ready |
 | 8 | `cache/` + `dataset/` split; `cache_mode` off `Paths` | `docs/prs/spec-8.md` | ready; breaks `battery ↔ cache`, `cache ↔ cli` |
 | 10 | renames: `Scrubbed`→`ScrubbedTree`, `Sealed`→`SealedTree`, `CDir`→`OracleDir` | `docs/prs/spec-10.md` | ready; last, touches 10 column-exact `.stderr` files |
 
-**PR T is the unlanded root cause of the outage below, and it should go early rather than
-last.** Verified on `main` at 27581dc: `tools/.cargo/config.toml` does not exist, and
-**76 `tempdir().unwrap()` call sites across 16 files** still resolve through
-`tempfile`'s default, i.e. `env::temp_dir()`, i.e. the `/tmp` tmpfs — the heaviest being
-`artifact.rs` (19), `battery.rs` (17) and `analyse/cargo_toml.rs` (7). Production code
-refuses a tmpfs base *deliberately* (`io/workdir.rs` opens by explaining why, and
-`Tmpfs::Refuse` is the default), so the suite is the one part of the crate that ignores the
-rule the crate wrote down. Combined with cache entries being chmod'd read-only —
-`TempDir::drop` does a plain recursive delete, cannot report an error, and so fails
-**silently** — every cache test leaks its tempdir permanently.
+**PR T (the `/tmp` fix) landed as #98 — and looking for it in the obvious place says
+otherwise.** Worth spelling out, because this handoff briefly claimed it was unlanded on
+exactly that evidence:
 
-`/tmp` currently holds 99 MB and zero `.tmp*` dirs, but only because the reboot cleared it:
-the machine had accumulated 24,707 leaked dirs and hit the **inode** cap with ~2 GB of bytes
-still free. Nothing has changed that will stop it happening again. Every PR in this sequence
-runs the suite many times.
+- The `[env] TMPDIR` block is in the **repo-root** `.cargo/config.toml`, *not*
+  `tools/.cargo/config.toml`, and deliberately so: cargo discovers config by walking up
+  from the **invocation** directory, and CI runs `cargo test --manifest-path
+  tools/Cargo.toml` from the root, which reads nothing below it. So `ls tools/.cargo/`
+  returns "No such file or directory" for a fix that is present and working.
+- `tempdir().unwrap()` greps to ~76 sites, but they are
+  `io::workdir::test_tempdir()` — anchored at `CARGO_MANIFEST_DIR/target/tmp`, so it does
+  not even depend on `TMPDIR`. Exactly one `tempfile::tempdir()` remains in the tree and it
+  is inside a doc comment. Match on the qualified path, not the suffix.
+- Evidence it is holding: `tools/target/tmp` is empty and `/tmp` contains **zero** `.tmp*`
+  directories.
 
 `docs/prs/spec-7.md` is superseded by 7a/7b/7c — it bundled nine changes and stalled an agent
 after 198 tool calls with nothing produced. **Keep PRs to one concern.**
