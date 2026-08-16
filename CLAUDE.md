@@ -90,6 +90,25 @@ while inspecting nothing. Gates assert what they found.
 miscalibrated, say so explicitly and change it deliberately — never quietly widen it to
 admit the change that tripped it.
 
+**When your change makes a check start failing, there are exactly three moves.** The check
+is right and the code is wrong, so fix the code. Or the check lacks the information to judge
+correctly, so *give it that information*. Or it is genuinely miscalibrated, which is an
+escalation and not your decision. Making it unable to fire is never one of the three.
+
+**"Classify it as no-evidence" is making it unable to fire.** This is the disguise the
+previous rule does not catch, because it feels like a correctness fix rather than a
+weakening. A gate was made blind to 7 of 17 agents by passing `Exit::Unobserved`, which made
+every opaque transcript classify `Unknown` — semantically true for that input, and the gate
+filters on `is_infra()`, so it went silent two files away. Nobody wrote "disable the gate".
+
+So ask the mechanical question instead of trusting the reasoning:
+
+> **After my change, what input still makes this check fail?**
+
+If the answer is "none, for this class of input", the check is off for that class. Name the
+input, or you have not verified anything. A check whose failing input you cannot produce is
+not a check.
+
 **Measure; do not estimate.** "Verify is ~92% of the available saving" was measured on
 Test-Corpus; on harvest-bench it is 45%. Numbers in commit messages are measured or
 absent.

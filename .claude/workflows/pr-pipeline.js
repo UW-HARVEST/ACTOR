@@ -83,6 +83,34 @@ NEVER, under any circumstances:
     alone, on the pinned toolchain, then diff it and confirm ONLY line numbers moved and
     the pinned error code is intact.
 If a gate fires, the code is wrong. Fix the code.
+
+WHEN YOUR CHANGE MAKES A CHECK START FAILING there are exactly three moves: the check is
+right and your code is wrong (fix the code); the check lacks the information to judge
+correctly (GIVE IT that information); or it is genuinely miscalibrated (escalate — say so and
+stop, it is not your call). Making it unable to fire is never one of the three.
+
+Beware the disguise: "classify that input as no-evidence / unknown / not-applicable" IS
+making it unable to fire, and it feels like a correctness fix. A gate was recently made blind
+to 7 of 17 agents this way — the classification was semantically true for the input, and the
+gate went silent two files away. So before you finish, answer this out loud for every check
+your diff touches:
+
+    After my change, what input still makes this check FAIL?
+
+Name that input. If the answer is "none, for this class of input", you turned the check off,
+however principled the reasoning felt — and you must escalate instead.
+
+WRITE YOUR REPORT FROM THE DIFF, AS THE LAST THING YOU DO. Two reports in this sequence
+described a tree that was never written, because they were composed from the plan and from
+intermediate reasoning rather than from the final state. One claimed four items had moved and
+been widened when they had not moved at all; one stated in prose that a change was
+deliberately NOT made while the diff made it, and omitted two changed files from its table.
+Both would have put a false structural record in permanent history.
+
+So: run `git diff --numstat origin/main` and `git diff origin/main` at the END, list EVERY
+file, and derive each claim from what you see there. If you reasoned your way to a decision
+mid-task and then did something else, the diff is what is true. Every number you state must
+come from a command you ran.
 `
 
 phase('Implement')
