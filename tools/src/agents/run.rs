@@ -14,17 +14,13 @@ use crate::cache::{
 use anyhow::Result;
 use std::path::Path;
 
-/// What a phase leaves in its phase dir besides the artifact. On the phase MARKER rather
-/// than in [`PhaseRun`]: a caller cannot pass another phase's file name, and a phase ported
-/// onto this driver cannot forget to say what its metrics are called, because the missing
-/// impl is what stops `run_cached::<P>` compiling at all.
-pub trait Cached: Phase {
-    const METRICS: &'static str;
-}
+/// The phases this driver runs. Carries nothing of its own — a phase's metrics file name is
+/// a [`Phase`] constant, since the uncached translate paths write one too — but the bound is
+/// still what makes porting a phase onto this driver deliberate rather than a call that
+/// happens to compile.
+pub trait Cached: Phase {}
 
-impl Cached for Verify {
-    const METRICS: &'static str = "verification.json";
-}
+impl Cached for Verify {}
 
 /// Everything one cached phase needs, all of it resolved BEFORE the agent runs so the key
 /// can name it.
@@ -91,23 +87,22 @@ where
     };
 
     let obtained = store.obtain(&inputs, || compute(work))?;
-    let metrics = crate::battery::phase_dir(case_dir, P::DIR).join(P::METRICS);
 
     let Some(obtained) = obtained else {
         // Nothing published or stored, but the transcript is on disk (the invocation tees it
         // live), so the post-mortem survives and the "already done" skip check still sees
         // this case.
-        write_metrics(
-            &metrics,
-            &serde_json::json!({
-                "agent": agent.as_str(),
-                "duration_secs": start.elapsed().as_secs(),
-                "success": false,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }),
-            false,
-            None,
-        );
+        let mut provenance = serde_json::json!({
+            "agent": agent.as_str(),
+            "duration_secs": start.elapsed().as_secs(),
+            "success": false,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        // `agent_provenance` carries the observed exit where the phase publishes; this is the
+        // only place it survives where it does not — and an opaque transcript cannot tell a
+        // finished run from one killed at the wall clock, so dropped here the audit sees nothing.
+        crate::agents::exit::merge_agent_exit(&mut provenance);
+        write_phase_metrics::<P>(case_dir, &provenance, Recorded::Fresh { entry: None });
         return Ok(Outcome::Nothing);
     };
 
@@ -124,29 +119,46 @@ where
     obtained.sealed.publish(case_dir)?;
 
     // After the publish, which clears everything in the phase dir but `logs`.
-    write_metrics(
-        &metrics,
+    let entry = obtained.key.as_str();
+    write_phase_metrics::<P>(
+        case_dir,
         &obtained.provenance,
-        obtained.replayed,
-        Some(obtained.key.as_str()),
+        if obtained.replayed {
+            Recorded::Replayed { entry }
+        } else {
+            Recorded::Fresh { entry: Some(entry) }
+        },
     );
     Ok(Outcome::Published(obtained.sealed))
 }
 
-/// `provenance` describes the invocation that produced the artifact, which on a replay is
-/// the ORIGINAL one — so `replayed` and `cache_key` are what stop its cost and timestamp
-/// being read as this run's spend.
-fn write_metrics(
-    path: &Path,
+/// Whose invocation the `provenance` beside it describes: on a replay, the ORIGINAL one, so
+/// a replay recorded as fresh reports that cost and timestamp as this run's spend. A named
+/// enum rather than a `replayed: bool`, because `success` is already a bool in the same
+/// object — and a `Replayed` naming no entry is then unrepresentable rather than unwritten.
+pub(crate) enum Recorded<'a> {
+    Fresh { entry: Option<&'a str> },
+    Replayed { entry: &'a str },
+}
+
+/// THE writer of what a phase records beside its artifact, for both phases: a translate
+/// record that omitted `replayed` would report a replayed translation's stored cost as this
+/// run's spend the moment the translate cache lands.
+pub(crate) fn write_phase_metrics<P: Phase>(
+    case_dir: &Path,
     provenance: &serde_json::Value,
-    replayed: bool,
-    cache_key: Option<&str>,
+    recorded: Recorded<'_>,
 ) {
+    let (replayed, entry) = match recorded {
+        Recorded::Fresh { entry } => (false, entry),
+        Recorded::Replayed { entry } => (true, Some(entry)),
+    };
     let mut metrics = provenance.clone();
     metrics["replayed"] = serde_json::json!(replayed);
-    if let Some(k) = cache_key {
+    if let Some(k) = entry {
         metrics["cache_key"] = serde_json::json!(k);
     }
+    let path = crate::artifact::phase_metrics::<P>(case_dir);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -160,6 +172,7 @@ fn write_metrics(
 mod tests {
     use super::*;
     use crate::agents::session::Session;
+    use crate::artifact::{phase_metrics, Translate};
     use crate::battery::{phase_dir, TRANSLATED, VERIFIED};
     use crate::cache::tests::fixture;
     use crate::cache::{fake_program, prompt_digest, Mode, Recipe};
@@ -226,8 +239,113 @@ mod tests {
         }
     }
 
+    /// A replay carries the ORIGINAL invocation's cost, so recording one as a fresh run
+    /// reports that spend as this run's. The whole-path test below reaches the verify half
+    /// only: translate does not run through this driver yet, so nothing else covers what one
+    /// writer for both phases now writes for `Translate`.
+    #[test]
+    fn a_replay_is_recorded_as_a_replay_whichever_phase_it_belongs_to() {
+        fn record<P: Phase>(case: &Path, recorded: Recorded<'_>) -> serde_json::Value {
+            write_phase_metrics::<P>(
+                case,
+                &serde_json::json!({"agent": "claude", "duration_secs": 42, "success": true}),
+                recorded,
+            );
+            let path = phase_metrics::<P>(case);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            serde_json::from_str(&text).expect("metrics parse")
+        }
+
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let case = tmp.path().join("mujs");
+
+        let fresh = record::<Translate>(&case, Recorded::Fresh { entry: None });
+        assert_eq!(fresh["replayed"], serde_json::json!(false));
+        assert!(
+            fresh.get("cache_key").is_none(),
+            "an uncached run stored no entry to name: {fresh}"
+        );
+
+        let replayed = record::<Verify>(
+            &case,
+            Recorded::Replayed {
+                entry: "verify/abc123",
+            },
+        );
+        assert_eq!(
+            replayed["replayed"],
+            serde_json::json!(true),
+            "a replay recorded as fresh bills the original's spend to this run: {replayed}"
+        );
+        assert_eq!(replayed["cache_key"], serde_json::json!("verify/abc123"));
+        assert_eq!(
+            replayed["duration_secs"], 42,
+            "and it still reports the ORIGINAL invocation's cost, not a blank"
+        );
+
+        // Each record lands beside its own artifact, so neither overwrote the other.
+        assert!(phase_metrics::<Translate>(&case).is_file());
+        assert_ne!(
+            std::fs::read_to_string(phase_metrics::<Translate>(&case)).unwrap(),
+            std::fs::read_to_string(phase_metrics::<Verify>(&case)).unwrap(),
+        );
+    }
+
+    /// The writing half of the wall-clock kill: a phase that publishes nothing is where the
+    /// observation matters, because an opaque transcript cannot tell a finished run from a killed
+    /// one. Dropped here, `agent_health::recorded_exit` had nothing to read and the killed run
+    /// audited as `Unknown` — the record shape asserted below is the one
+    /// `agent_health::tests::a_wall_clock_killed_opaque_run_is_an_infra_failure` reads back.
+    #[test]
+    fn a_phase_that_published_nothing_still_records_how_the_agent_exited() {
+        let f = fixture();
+        let case = f.case.clone();
+        let keys = Keys::new(&f.repo);
+        let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        let log = phase_dir(&case, VERIFIED).join("logs/verify.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "> reading c_src/parson.c\n").unwrap();
+
+        crate::agents::exit::clear_agent_exit();
+        let outcome = run_cached(
+            phase_run(&case, &log, &keys, IsolatedWorkDir::new(&case).unwrap()),
+            &store,
+            |_| {
+                // What `timeout` leaves behind when it kills the child, reported as the
+                // pipeline's status by the session's `set -o pipefail`.
+                crate::agents::exit::record_agent_exit(
+                    std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg("exit 124")
+                        .status()
+                        .unwrap(),
+                );
+                Ok(None)
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, Outcome::Nothing),
+            "a killed run has nothing to publish"
+        );
+
+        let m = metrics_of(&case);
+        assert_eq!(
+            m["exit_code"],
+            serde_json::json!(124),
+            "the audit's only evidence for an opaque backend: {m}"
+        );
+        assert_eq!(m["timed_out"], serde_json::json!(true), "{m}");
+        assert_eq!(
+            m["success"],
+            serde_json::json!(false),
+            "and it is still not a result: {m}"
+        );
+    }
+
     fn metrics_of(case: &Path) -> serde_json::Value {
-        let path = phase_dir(case, VERIFIED).join(Verify::METRICS);
+        let path = phase_metrics::<Verify>(case);
         serde_json::from_str(
             &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
         )

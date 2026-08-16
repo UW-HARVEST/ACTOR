@@ -3,6 +3,7 @@ use crate::agents::run::{run_cached, Outcome, PhaseRun};
 use crate::agents::session::{ClaudeRun, Session};
 use crate::agents::work::IsolatedWorkDir;
 use crate::agents::Semaphore;
+use crate::artifact::Verify;
 use crate::battery::{self, Case, Paths};
 use crate::cache::{self, CliVersion, ModelId};
 use crate::cli::Agent;
@@ -93,11 +94,7 @@ fn run_with_semaphore(
                     )) {
                         return (c.name.clone(), None);
                     }
-                    if !force
-                        && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED)
-                            .join("logs/verify.log")
-                            .exists()
-                    {
+                    if !force && crate::artifact::phase_log::<Verify>(&case_dir).exists() {
                         return (c.name.clone(), None);
                     }
                     let cmake_flags = get_cmake_flags(paths, battery_name, &c.name);
@@ -160,11 +157,7 @@ fn run_with_semaphore(
             continue;
         }
 
-        if !force
-            && crate::battery::phase_dir(&real_dir, crate::battery::VERIFIED)
-                .join("logs/verify.log")
-                .exists()
-        {
+        if !force && crate::artifact::phase_log::<Verify>(&real_dir).exists() {
             println!(
                 "[{current}/{total}] ⏭️  {} (already verified)",
                 group.real_case
@@ -270,11 +263,7 @@ pub fn run_harvest_bench(
                         )) {
                             return (name, None);
                         }
-                        if !force
-                            && crate::battery::phase_dir(&case_dir, crate::battery::VERIFIED)
-                                .join("logs/verify.log")
-                                .exists()
-                        {
+                        if !force && crate::artifact::phase_log::<Verify>(&case_dir).exists() {
                             return (name, None);
                         }
                         let ok = crate::refusal::record(
@@ -456,9 +445,9 @@ fn verify_case(
     };
 
     // Verify never mutates `translated/`, so no snapshot/restore is needed.
-    let verified_logs = crate::battery::phase_dir(case_dir, crate::battery::VERIFIED).join("logs");
+    let verified_logs = crate::artifact::phase_logs::<Verify>(case_dir);
     std::fs::create_dir_all(&verified_logs)?;
-    let log_path = verified_logs.join("verify.log");
+    let log_path = crate::artifact::phase_log::<Verify>(case_dir);
 
     // Isolated temp dir: the agent sees no config-specific path names and no
     // test_vectors/runner, only the crate's own c_src. Materialised before the store is
