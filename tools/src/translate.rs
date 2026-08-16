@@ -1072,29 +1072,6 @@ fn write_translation_metrics(
     );
 }
 
-/// Verify-side sibling of `write_translation_metrics`.
-///
-/// `provenance` describes the invocation that produced the artifact, which on a
-/// replay is the ORIGINAL one — so `replayed` and `cache_key` are what stop its cost
-/// and timestamp being read as this run's spend.
-pub fn write_verification_metrics(
-    case_dir: &Path,
-    provenance: &serde_json::Value,
-    replayed: bool,
-    cache_key: Option<&str>,
-) {
-    let mut metrics = provenance.clone();
-    metrics["replayed"] = serde_json::json!(replayed);
-    if let Some(k) = cache_key {
-        metrics["cache_key"] = serde_json::json!(k);
-    }
-    let _ = std::fs::create_dir_all(case_dir);
-    let _ = std::fs::write(
-        case_dir.join("verification.json"),
-        serde_json::to_string_pretty(&metrics).unwrap_or_default() + "\n",
-    );
-}
-
 fn count_cases(battery: &battery::Battery) -> usize {
     battery
         .cases

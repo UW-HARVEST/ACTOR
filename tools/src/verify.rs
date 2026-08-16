@@ -1,4 +1,5 @@
 use crate::agents::exit::{clear_agent_exit, observed_exit, record_agent_exit};
+use crate::agents::run::{run_cached, Outcome, PhaseRun};
 use crate::agents::session::{ClaudeRun, Session};
 use crate::agents::work::IsolatedWorkDir;
 use crate::agents::Semaphore;
@@ -440,10 +441,8 @@ impl Backend {
     }
 }
 
-/// The agent invocation goes through [`cache::Store::obtain`] rather than being called
-/// directly, so a replay and a fresh run leave by the same path — one assembly, one
-/// publish, one metrics write, and no "cached" branch to keep in step with an uncached
-/// one.
+/// Resolve what will run, then hand it to [`run_cached`] — the one execution path for an
+/// agent phase, where the store, the publish and the metrics live for both phases.
 fn verify_case(
     case_dir: &Path,
     prompt_template: &str,
@@ -468,8 +467,6 @@ fn verify_case(
     // agent are provably the same string.
     let work = IsolatedWorkDir::new(case_dir)?;
 
-    let start = std::time::Instant::now();
-
     let mut prompt = prompt_template
         .replace("CASE_DIR_PLACEHOLDER", &work.root().to_string_lossy())
         .replace("CMAKE_BUILD_FLAGS", cmake_flags)
@@ -481,7 +478,6 @@ fn verify_case(
 
     let _ = std::fs::write(verified_logs.join("prompt.md"), &prompt);
 
-    let input_tree = work.input_digest().clone();
     let toolchain = cache::ToolchainId::detect()?;
     // Resolved once, here: every root that decides the key is then a value, and the two
     // digests below cannot disagree about what machine they were taken on.
@@ -489,62 +485,25 @@ fn verify_case(
     let prompt_digest = cache::prompt_digest(&prompt, &roots);
     let policy = inv.backend.policy_shape(paths, &roots)?;
     let recipe = cache::Recipe::new(&inv.session, policy)?.digest();
-    let inputs = cache::KeyInputs {
-        phase: crate::battery::VERIFIED,
-        agent: &paths.agent_key,
-        model: &inv.model,
-        cli: &inv.cli,
-        toolchain: &toolchain,
-        prompt: &prompt_digest,
-        recipe: &recipe,
-        input_tree: &input_tree,
-    };
 
-    let obtained = store.obtain(&inputs, || {
-        run_verify_agent(case_dir, &inv, work, &prompt, &log_path, paths)
-    })?;
-
-    let verified_dir = crate::battery::phase_dir(case_dir, crate::battery::VERIFIED);
-
-    let Some(obtained) = obtained else {
-        // Nothing published or stored, but `verified/logs/verify.log` is on disk (the
-        // invocation tees it live), so the post-mortem survives and the "already
-        // verified" skip check still sees this case.
-        crate::translate::write_verification_metrics(
-            &verified_dir,
-            &serde_json::json!({
-                "agent": paths.agent_key.as_str(),
-                "duration_secs": start.elapsed().as_secs(),
-                "success": false,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }),
-            false,
-            None,
-        );
-        return Ok(false);
-    };
-
-    if obtained.replayed {
-        println!(
-            "  ♻️  replayed a stored verification ({:?})",
-            obtained.sealed.digest()
-        );
-        // A replay must leave behind the same verify.log a fresh run tees, or the skip
-        // check misses this case and the next sweep pays for it again.
-        store.restore_log(&inputs, &obtained.key, &log_path)?;
-    }
-
-    obtained.sealed.publish(case_dir)?;
-
+    let outcome = run_cached(
+        PhaseRun {
+            work,
+            case_dir,
+            log_path: &log_path,
+            agent: &paths.agent_key,
+            model: &inv.model,
+            cli: &inv.cli,
+            toolchain: &toolchain,
+            prompt: &prompt_digest,
+            recipe: &recipe,
+        },
+        store,
+        |work| run_verify_agent(case_dir, &inv, work, &prompt, &log_path, paths),
+    )?;
     // An artifact exists only if it compiled (see `run_verify_agent`), so a replay does
     // not re-prove it.
-    crate::translate::write_verification_metrics(
-        &verified_dir,
-        &obtained.provenance,
-        obtained.replayed,
-        Some(obtained.key.as_str()),
-    );
-    Ok(true)
+    Ok(matches!(outcome, Outcome::Published(_)))
 }
 
 /// `Ok(None)` means "nothing worth keeping" — API error, abort, or a crate that does
@@ -553,7 +512,7 @@ fn verify_case(
 fn run_verify_agent(
     case_dir: &Path,
     inv: &Invocation,
-    work: IsolatedWorkDir,
+    work: IsolatedWorkDir<crate::artifact::Verify>,
     prompt: &str,
     log_path: &Path,
     paths: &Paths,
