@@ -55,10 +55,25 @@ copies and cargo target dirs). When it fills, EVERY process on the box fails to 
 file, including the tooling needed to clean up, and all work stops.
 
 Use /local/home/scheschb/scratch/<something-you-own> for any scratch tree, proof copy or
-build target you need outside your worktree, and delete it when you are done. If you copy
-the repo to prove something, put the copy there and its CARGO_TARGET_DIR there too.
-Cache-store entries are chmod'd read-only on purpose, so 'rm -rf' fails on them: run
-'chmod -R u+w <dir>' first or your cleanup silently leaves the tree behind.
+build target you need outside your worktree. If you copy the repo to prove something, put
+the copy there and its CARGO_TARGET_DIR there too.
+
+CLEANUP RULES — a denied command BLOCKS this whole workflow until a human answers, so a
+sloppy cleanup command costs more than the disk it frees:
+  * NEVER use a wildcard or glob in a destructive command. 'rm -f -- *', 'rm -rf foo/*'
+    and 'rm -rf /tmp/prefix-*' are all statically unresolvable, so the permission system
+    flags them against the worst-case target it can imagine — which has read as
+    "/local/home/scheschb/research/ACTOR/*", the repo itself.
+  * NEVER rely on 'cd' to make a relative destructive command safe. The checker does not
+    know your cwd.
+  * Delete ONE absolute path, spelled in full, as the whole target:
+        rm -rf /local/home/scheschb/scratch/pr5-review
+    That form is resolvable and is allowed.
+  * Cache-store entries are chmod'd read-only on purpose, so a delete fails on them. Run
+    'chmod -R u+w /full/absolute/path' first, or your cleanup silently leaves the tree.
+  * If a cleanup is denied anyway, do NOT retry variants and do NOT stall: say in your
+    report which absolute path you left behind and continue. Leaving 2 GB of scratch is a
+    footnote; blocking the pipeline is not.
 
 NEVER, under any circumstances:
   * widen, disable, skip or delete a gate to make your change pass
