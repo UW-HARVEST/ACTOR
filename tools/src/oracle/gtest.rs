@@ -360,7 +360,7 @@ mod tests {
     /// Three passes reported for a rerun that produced none.
     #[test]
     fn a_failed_rerun_never_scores_the_previous_runs_report() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let report = tmp.path().join("harvest_bench_report.json");
         fs::write(&report, STALE).unwrap();
 
@@ -392,7 +392,7 @@ mod tests {
     /// afterwards did not come from a completed scoring run.
     #[test]
     fn a_runner_that_errors_is_not_scored_from_the_file_it_left() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let report = tmp.path().join("harvest_bench_report.json");
         let fake = crate::cache::fake_program(
             tmp.path(),

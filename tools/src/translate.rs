@@ -910,7 +910,7 @@ pub fn translate_case_at(
         | Agent::SmartC2Rust
         | Agent::Kimi
         | Agent::Oneshot => {
-            let tmp = crate::workdir::tempdir("harvest-translate-")
+            let tmp = crate::io::workdir::tempdir("harvest-translate-")
                 .context("creating isolated temp dir")?;
             let work = tmp.path().join(crate::battery::TRANSLATED_RUST);
             let c_src = work.join("c_src");
@@ -927,7 +927,7 @@ pub fn translate_case_at(
                     | Agent::ClaudeNoSubtask
                     | Agent::ClaudeCrossPrompt
             ) {
-                crate::sandbox::write_settings(crate::sandbox::Policy {
+                crate::io::sandbox::write_settings(crate::io::sandbox::Policy {
                     repo_root: &paths.repo_root,
                     work_root: tmp.path(),
                     enforcement: paths.enforcement,
@@ -986,7 +986,7 @@ pub fn translate_case_at(
                     prompt,
                     log: &log_path,
                     settings: &work_root.join(".claude/settings.json"),
-                    agent_tmp: &crate::workdir::agent_tmp(&work_root)?,
+                    agent_tmp: &crate::io::workdir::agent_tmp(&work_root)?,
                     model: &model,
                 })
                 .status()
@@ -1277,7 +1277,7 @@ pub fn agent_provenance(agent: &crate::cache::AgentKey, duration_secs: u64) -> s
         // Which harness code produced this; results are otherwise unattributable
         // after the fact.
         "harness": crate::provenance::harness_id(),
-        "sandboxed": crate::sandbox::is_enforceable(),
+        "sandboxed": crate::io::sandbox::is_enforceable(),
     });
     merge_agent_exit(&mut p);
     p
@@ -1999,8 +1999,8 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     // Staged in scratch like its c2saferrust neighbour: the container gets this mounted
     // read-write, and the compile check writes `target/` plus a `Cargo.lock` that is part
     // of the hashed artifact — so in `translated/` the arm mutated its own result.
-    let tmp =
-        crate::workdir::tempdir("harvest-laertes-").context("creating laertes temp workspace")?;
+    let tmp = crate::io::workdir::tempdir("harvest-laertes-")
+        .context("creating laertes temp workspace")?;
     let work = tmp.path().join("project");
     copy_dir_filtered(&c2rust_original, &work, &["target"])?;
 
@@ -2203,8 +2203,8 @@ fn c2saferrust_translate_case(
 
     // Bind-mounted into the container: the tool reshapes <work>/rust in place and
     // writes <work>/rust_WIP.
-    let tmp =
-        crate::workdir::tempdir("harvest-c2sr-").context("creating c2saferrust temp workspace")?;
+    let tmp = crate::io::workdir::tempdir("harvest-c2sr-")
+        .context("creating c2saferrust temp workspace")?;
     let work_rust = tmp.path().join("rust");
     copy_dir_filtered(&c2rust_original, &work_rust, &["target", "c_src"])?;
     let _ = std::fs::remove_file(work_rust.join("Cargo.lock"));
@@ -2679,7 +2679,7 @@ mod tests {
     /// timeout signal (`timeout` exits 124) is written and read by nobody.
     #[test]
     fn translation_metrics_land_where_the_readers_look() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let case = tmp.path().join("mujs");
         clear_agent_exit();
         record_agent_exit(exit_status(124));
@@ -2709,7 +2709,7 @@ mod tests {
 
     #[test]
     fn a_panic_after_the_metrics_were_written_does_not_overwrite_them() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let case = tmp.path().join("libpng");
         clear_agent_exit();
         record_agent_exit(exit_status(124));
@@ -2730,7 +2730,7 @@ mod tests {
 
     #[test]
     fn a_panic_with_no_record_yet_writes_one_without_borrowing_an_exit_code() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let case = tmp.path().join("jansson");
         clear_agent_exit();
         // Belongs to whatever case this thread ran before, NOT to jansson.
@@ -2828,7 +2828,7 @@ mod tests {
             dataset,
             model,
             crate::cache::Mode::Bypass,
-            crate::sandbox::Enforcement::AllowUnsandboxed,
+            crate::io::sandbox::Enforcement::AllowUnsandboxed,
         )
         .expect("Paths")
     }

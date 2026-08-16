@@ -54,8 +54,8 @@ impl Session {
             max_turns: Some(CLAUDE_MAX_TURNS),
             permission_mode: Some(CLAUDE_PERMISSION_MODE),
             caps: Some(Caps {
-                fsize_blocks: crate::workdir::AGENT_FSIZE_BLOCKS,
-                data_kb: crate::workdir::AGENT_DATA_KB,
+                fsize_blocks: crate::io::workdir::AGENT_FSIZE_BLOCKS,
+                data_kb: crate::io::workdir::AGENT_DATA_KB,
             }),
             agents_json: crate::translate::CLAUDE_PLAIN_AGENT_JSON,
             agent_env: crate::translate::AGENT_ENV,
@@ -271,7 +271,7 @@ pub struct ClaudeRun<'a> {
     pub log: &'a Path,
     pub settings: &'a Path,
     /// Agent scratch, on disk inside the work root rather than the /tmp tmpfs — see
-    /// [`crate::workdir`].
+    /// [`crate::io::workdir`].
     pub agent_tmp: &'a Path,
     pub model: &'a ModelId,
 }
@@ -371,11 +371,11 @@ mod tests {
         // constant must change the key.
         let shape = Session::claude(10_800).shape();
         assert!(
-            shape.contains(&crate::workdir::AGENT_FSIZE_BLOCKS.to_string()),
+            shape.contains(&crate::io::workdir::AGENT_FSIZE_BLOCKS.to_string()),
             "{shape}"
         );
         assert!(
-            shape.contains(&crate::workdir::AGENT_DATA_KB.to_string()),
+            shape.contains(&crate::io::workdir::AGENT_DATA_KB.to_string()),
             "{shape}"
         );
         for (k, v) in crate::translate::AGENT_ENV {

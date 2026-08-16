@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn the_scope_catches_code_and_ignores_harness_output() {
-        let tmp = crate::workdir::test_tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let root = tmp.path();
         let run = |args: &[&str]| {
             let out = std::process::Command::new("git")

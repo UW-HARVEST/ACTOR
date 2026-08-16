@@ -155,10 +155,10 @@ fn is_public(vis: &syn::Visibility) -> bool {
 /// all of them, `sealed_implements_only_debug` included, and each would still report green.
 #[test]
 fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
-    // Measured 28 today: 26 module files plus lib.rs and main.rs. The floor is that count
+    // Measured 29 today: 27 module files plus lib.rs and main.rs. The floor is that count
     // minus 2, so a merge landing a file needs no edit here while deleting three fails
     // instead of quietly narrowing what every rule below inspects. Add files, raise it.
-    const MIN_FILES: usize = 26;
+    const MIN_FILES: usize = 27;
     const REQUIRED: &[&str] = &["Sealed", "WorkTree", "Scrubbed", "Corpus", "TreeDigest"];
 
     let found = rust_sources();
@@ -208,8 +208,8 @@ fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
         (found.len(), nested),
         count_rust_files(&dir, 1),
         "rust_sources() and an independent walk of src/ disagree on (total, nested). \
-         domain/, analyse/ and oracle/ make the nested half live: 12 of 28 today, so a \
-         traversal that stopped at the top level of src/ would fail here instead of \
+         domain/, analyse/, io/ and oracle/ make the nested half live: 15 of 29 today, so \
+         a traversal that stopped at the top level of src/ would fail here instead of \
          reporting green."
     );
 }
@@ -1284,7 +1284,7 @@ fn a_module_cycle_may_only_shrink() {
 
     // Driven through the real extraction, not a synthetic edge map: the hole this rule
     // shipped with was in `crate_refs`, a layer a synthetic map never reaches.
-    let tree = harvest_tools::workdir::test_tempdir().unwrap();
+    let tree = harvest_tools::io::workdir::test_tempdir().unwrap();
     let src = tree.path().join("src");
     let write = |name: &str, text: &str| {
         let path = src.join(name);
@@ -1411,7 +1411,7 @@ fn nothing_in_the_pure_layer_names_the_filesystem_a_process_or_the_environment()
 
     // Through the real extraction over a planted tree, not a synthetic name list: the hole
     // the DAG rule shipped with was in its extraction, which no synthetic list reaches.
-    let tree = harvest_tools::workdir::test_tempdir().unwrap();
+    let tree = harvest_tools::io::workdir::test_tempdir().unwrap();
     let planted = tree.path().join(PURE_LAYER);
     std::fs::create_dir_all(&planted).expect("mkdir");
     std::fs::write(

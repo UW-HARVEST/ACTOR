@@ -162,7 +162,7 @@ impl Benchmark for TestCorpus {
     }
 
     // `_repo_root` is unused in every impl: the real repo root travels on `Paths` (see
-    // crate::sandbox), so the trait parameter could be dropped as a follow-up.
+    // crate::io::sandbox), so the trait parameter could be dropped as a follow-up.
     fn verify(
         &self,
         _repo_root: &Path,
