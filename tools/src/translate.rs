@@ -1,5 +1,5 @@
+use crate::analyse::cargo_toml::{self, CargoToml};
 use crate::battery::{self, Case, Paths};
-use crate::cargo_toml::{self, CargoToml};
 use crate::cli::Agent;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};

@@ -495,7 +495,7 @@ impl Store {
     /// Open the store at `<repo>/results/.cache/`.
     ///
     /// The level is load-bearing: every tree-walker is handed
-    /// `results/<dataset>/<agent>` or deeper (`test::discover_batteries` treats each
+    /// `results/<dataset>/<agent>` or deeper (`oracle::runtests::discover_batteries` treats each
     /// child as a battery, `stage_phase_for_runtests` symlinks each grandchild), so
     /// sitting two levels above them all is what stops a cached crate being staged,
     /// built, or graded as if it were a case.
@@ -786,7 +786,7 @@ impl Store {
 }
 
 /// A stand-in for a program a test execs: an agent CLI here, the harvest-bench runner in
-/// [`crate::test`].
+/// [`crate::oracle`].
 ///
 /// `cp` writes it rather than `fs::write` because the caller execs it. `fs::write` closes
 /// its own fd, but every `Command::spawn` in this binary `fork()`s, and a child forked

@@ -19,13 +19,6 @@ fn src(name: &str) -> PathBuf {
     src_dir().join(name)
 }
 
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned()
-}
-
 /// `src/artifact.rs` is `artifact`, `src/domain/contents.rs` is `domain::contents`, and
 /// `src/domain/mod.rs` is `domain`. Rules key on this rather than on the leaf filename,
 /// which stops naming the same code the moment a module becomes a directory.
@@ -162,10 +155,10 @@ fn is_public(vis: &syn::Visibility) -> bool {
 /// all of them, `sealed_implements_only_debug` included, and each would still report green.
 #[test]
 fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
-    // Measured 23 today: 21 module files plus lib.rs and main.rs. The floor is that count
+    // Measured 28 today: 26 module files plus lib.rs and main.rs. The floor is that count
     // minus 2, so a merge landing a file needs no edit here while deleting three fails
     // instead of quietly narrowing what every rule below inspects. Add files, raise it.
-    const MIN_FILES: usize = 21;
+    const MIN_FILES: usize = 26;
     const REQUIRED: &[&str] = &["Sealed", "WorkTree", "Scrubbed", "Corpus", "TreeDigest"];
 
     let found = rust_sources();
@@ -215,8 +208,9 @@ fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
         (found.len(), nested),
         count_rust_files(&dir, 1),
         "rust_sources() and an independent walk of src/ disagree on (total, nested). \
-         domain/ made the nested half live: 4 of 23 today, so a traversal that stopped at \
-         the top level of src/ would fail here instead of reporting green."
+         domain/, analyse/ and oracle/ make the nested half live: 12 of 28 today, so a \
+         traversal that stopped at the top level of src/ would fail here instead of \
+         reporting green."
     );
 }
 
@@ -446,8 +440,9 @@ fn compile_fail_cases_still_assert_what_they_were_written_for() {
 
 /// Nothing new may execute inside the results tree.
 ///
-/// A ratchet, not a gate. It matches two sites, and only `build_harvest_bench_lib`
-/// is really in `results/`; the other reaches scratch through `translated_rust()`.
+/// A ratchet, not a gate. It matches ONE site today, `build_harvest_bench_lib`, which is
+/// really in `results/`. The count is that measured number with no slack: at 2 a second
+/// build could be added inside the tree without this firing.
 /// It is also blind to the builds that matter most, which are spawned with a
 /// `--root` or `--target-dir` argument rather than a `current_dir` (MIT `runtests`,
 /// the gtest suite). A `Cwd` newtype only scratch can construct is the real fix.
@@ -455,7 +450,7 @@ fn compile_fail_cases_still_assert_what_they_were_written_for() {
 /// `artifact.rs`): `runtests` pins the build output inside the case either way.
 #[test]
 fn nothing_new_runs_inside_the_results_tree() {
-    const KNOWN: usize = 2;
+    const KNOWN: usize = 1;
 
     struct V {
         current_fn: String,
@@ -602,7 +597,7 @@ fn an_agents_identity_is_never_its_debug_output() {
 #[test]
 fn only_battery_defines_the_has_crate_predicate() {
     struct V {
-        file: String,
+        module: String,
         hits: Vec<String>,
     }
     impl<'ast> Visit<'ast> for V {
@@ -618,7 +613,7 @@ fn only_battery_defines_the_has_crate_predicate() {
                     if joins_manifest {
                         self.hits.push(format!(
                             "{}: .join(\"Cargo.toml\").{}()",
-                            self.file, c.method
+                            self.module, c.method
                         ));
                     }
                 }
@@ -629,11 +624,11 @@ fn only_battery_defines_the_has_crate_predicate() {
 
     let mut hits: Vec<String> = Vec::new();
     for path in rust_sources() {
-        if file_name(&path) == "battery.rs" {
+        if module_path(&path) == "battery" {
             continue;
         }
         let mut v = V {
-            file: file_name(&path),
+            module: module_path(&path),
             hits: Vec::new(),
         };
         v.visit_file(&parse(&path));
@@ -645,7 +640,7 @@ fn only_battery_defines_the_has_crate_predicate() {
          Call `battery::has_crate(dir)`. Two spellings of \"this phase produced a crate\"\n\
          is how a project vanished from a published denominator."
     );
-    let battery = std::fs::read_to_string(src("battery.rs")).expect("battery.rs");
+    let battery = read(&module_file("battery"));
     assert!(
         battery.contains(r#"phase_dir.join("Cargo.toml").is_file()"#),
         "battery::has_crate must still BE the predicate this rule redirects callers to"
@@ -999,10 +994,10 @@ fn typestates_have_private_fields_and_consuming_transitions() {
 /// a cut makes the rule fail as stale, and the list is then edited DOWN to what it reports.
 const CYCLE_BASELINE: &[&str] = &[
     "agent_health",
+    "analyse",
     "artifact",
     "battery",
     "cache",
-    "cargo_toml",
     "cli",
     "opencode",
     "session",

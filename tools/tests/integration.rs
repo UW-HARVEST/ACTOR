@@ -127,7 +127,7 @@ mod battery_discovery {
 
 mod cargo_toml_manipulation {
     use super::*;
-    use harvest_tools::cargo_toml::{strip_for_lib, CargoToml};
+    use harvest_tools::analyse::cargo_toml::{strip_for_lib, CargoToml};
 
     /// Test post-processing on a real P01 translation's Cargo.toml.
     #[test]

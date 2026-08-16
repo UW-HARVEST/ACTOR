@@ -1,11 +1,11 @@
 //! One lifecycle — translate → [verify?] → enrich → score(test) — written once in
 //! `main.rs` against this trait; datasets differ only in how each phase is carried out.
-//! Each `impl` must stay thin, delegating to `translate` / `verify` / `test` rather than
+//! Each `impl` must stay thin, delegating to `translate` / `verify` / `oracle` rather than
 //! reimplementing them.
 
 use crate::battery::{self, Paths};
 use crate::cli::{Agent, Dataset};
-use crate::test::{self, TestMode, TestOutcome};
+use crate::oracle::{self, TestMode, TestOutcome};
 use crate::{translate, verify};
 use anyhow::Result;
 use std::path::Path;
@@ -188,7 +188,7 @@ impl Benchmark for TestCorpus {
         let batteries = resolve_batteries(&paths.corpus_dir, target)?;
         let mut all_mismatches = Vec::new();
         for bat in &batteries {
-            if let TestOutcome::Failed(m) = test::run_test_corpus(paths, bat, mode)? {
+            if let TestOutcome::Failed(m) = oracle::run_test_corpus(paths, bat, mode)? {
                 all_mismatches.extend(m);
             }
         }
@@ -201,7 +201,7 @@ impl Benchmark for TestCorpus {
 
     fn enrich(&self, paths: &Paths, target: &str) -> Result<()> {
         for bat in resolve_batteries(&paths.corpus_dir, target)? {
-            test::enrich_test_corpus(paths, &bat)?;
+            oracle::enrich_test_corpus(paths, &bat)?;
         }
         Ok(())
     }
@@ -244,12 +244,12 @@ impl Benchmark for HarvestBench {
 
     fn test(&self, paths: &Paths, target: &str, mode: TestMode) -> Result<TestOutcome> {
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
-        test::run_harvest_bench_test(paths, &projects, mode)
+        oracle::run_harvest_bench_test(paths, &projects, mode)
     }
 
     fn enrich(&self, paths: &Paths, _target: &str) -> Result<()> {
         // HB results sit per-project directly under results/HarvestBench/<agent>/ with no
         // battery grouping, which is the shape enrich_test_corpus sees for an empty battery.
-        test::enrich_test_corpus(paths, "")
+        oracle::enrich_test_corpus(paths, "")
     }
 }
