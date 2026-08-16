@@ -1208,8 +1208,8 @@ fn take_agent_exit() -> AgentExit {
 /// thread-local, and it runs later, when the metrics are written. The classifier needs
 /// the same observation first, so this peeks. `Copy` on [`AgentExit`] is what makes that
 /// a read rather than a second claim on it.
-pub fn observed_exit() -> crate::agent_health::Exit {
-    use crate::agent_health::Exit;
+pub fn observed_exit() -> crate::domain::health::Exit {
+    use crate::domain::health::Exit;
     let e = LAST_AGENT_EXIT.with(|c| c.get());
     if !e.recorded {
         return Exit::Unobserved;
@@ -1436,7 +1436,7 @@ impl IsolatedWorkDir {
     /// of the cache, so replayed and fresh results travel the same path.
     pub fn finish(
         self,
-        proof: &crate::agent_health::Completed,
+        proof: &crate::domain::health::Completed,
     ) -> Result<crate::artifact::Sealed<crate::artifact::Verify>> {
         let scrubbed = self.work.scrub()?;
         // Reported rather than silent: a file that embedded the scratch path is a

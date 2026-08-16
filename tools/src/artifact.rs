@@ -10,12 +10,12 @@
 //!   `CARGO_MANIFEST_DIR`. The build has to leave the tree, which is what
 //!   [`Scratch::subdir`] + [`Sealed::materialise_at`] exist for.)
 //! * An infra-failed run cannot be sealed: [`Scrubbed::seal`] demands a
-//!   [`crate::agent_health::Completed`], mintable only from a completed run.
+//!   [`crate::domain::health::Completed`], mintable only from a completed run.
 //! * A tree cannot be hashed before it is scrubbed: agent output embeds the random
 //!   scratch directory name, so a digest of raw output changes every run.
 
-use crate::agent_health::Completed;
 use crate::domain::contents::{classify, Carry, Disposition, C_ORACLE_DIR};
+use crate::domain::health::Completed;
 use crate::domain::relpath::RelPath;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -955,7 +955,7 @@ mod tests {
         );
 
         let verified = scrubbed
-            .seal(&crate::agent_health::Completed::for_test(), &c_before)
+            .seal(&crate::domain::health::Completed::for_test(), &c_before)
             .expect("seal");
         verified.publish(case.path()).expect("publish");
 
@@ -1055,7 +1055,7 @@ mod tests {
         let err = work
             .scrub()
             .unwrap()
-            .seal(&crate::agent_health::Completed::for_test(), &c_before)
+            .seal(&crate::domain::health::Completed::for_test(), &c_before)
             .expect_err("modifying the oracle must be refused");
         let msg = format!("{err:#}");
         assert!(msg.contains("modified the C oracle"), "{msg}");

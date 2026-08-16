@@ -454,7 +454,7 @@ pub struct AgentRunMeta {
     pub models_billed: Vec<String>,
 
     // ── how it ended ────────────────────────────────────────────────────────
-    /// `completed` | `api_error`. See [`crate::agent_health`]: this is the
+    /// `completed` | `api_error`. See [`crate::domain::health`]: this is the
     /// discriminator, and `subtype` reads "success" even on a 403.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<String>,

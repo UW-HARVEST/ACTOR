@@ -97,12 +97,12 @@ impl Agent {
     ///
     /// The ONE table, matched exhaustively so a new variant is a compile error rather
     /// than a silent inheritance of the wrong classifier. Getting this wrong is not
-    /// cosmetic: `crate::agent_health::classify` mints the proof
+    /// cosmetic: `crate::domain::health::classify` mints the proof
     /// `crate::artifact::Scrubbed::seal` demands, so an agent wrongly marked
     /// `StreamJson` can never publish, and one wrongly marked `Opaque` would be
     /// sealed on the strength of an exit code its own log contradicts.
-    pub fn log_format(self) -> crate::agent_health::LogFormat {
-        use crate::agent_health::LogFormat::{Opaque, StreamJson};
+    pub fn log_format(self) -> crate::domain::health::LogFormat {
+        use crate::domain::health::LogFormat::{Opaque, StreamJson};
         match self {
             // Claude Code and the codex CLIs emit `--output-format stream-json`.
             Agent::Claude
@@ -349,6 +349,42 @@ impl Command {
             | Command::Report => true,
             // Read-only introspection.
             Command::Cache { .. } => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::health::LogFormat;
+
+    #[test]
+    fn every_agent_declares_a_log_format_and_the_prose_ones_are_opaque() {
+        // Guards the table against a new variant defaulting to the wrong classifier.
+        for a in [
+            Agent::Claude,
+            Agent::ClaudeCombined,
+            Agent::ClaudeMinimal,
+            Agent::ClaudeNoIter,
+            Agent::ClaudeNoFeatures,
+            Agent::ClaudeNoSubtask,
+            Agent::ClaudeCrossPrompt,
+            Agent::CodexGpt55,
+            Agent::CodexGpt54,
+            Agent::OpenCode,
+        ] {
+            assert_eq!(a.log_format(), LogFormat::StreamJson, "{a:?}");
+        }
+        for a in [
+            Agent::Kiro,
+            Agent::C2rust,
+            Agent::Laertes,
+            Agent::C2SaferRust,
+            Agent::SmartC2Rust,
+            Agent::Kimi,
+            Agent::Oneshot,
+        ] {
+            assert_eq!(a.log_format(), LogFormat::Opaque, "{a:?}");
         }
     }
 }
