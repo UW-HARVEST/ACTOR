@@ -993,7 +993,7 @@ pub(crate) mod tests {
     impl Inputs {
         fn new() -> Self {
             Self {
-                phase: crate::battery::VERIFIED,
+                phase: <Verify as Phase>::DIR,
                 agent: AgentKey::new(Agent::Claude, None).unwrap(),
                 model: ModelId::new("claude-opus-5[1m]").unwrap(),
                 cli: CliVersion("2.1.231.653 (Claude Code)".into()),
@@ -1424,7 +1424,7 @@ pub(crate) mod tests {
             ("c_src/src/lib.c", "int a(void){return 0;}"),
             ("target/debug/junk", "build output"),
         ] {
-            let p = case.join(crate::battery::TRANSLATED).join(rel);
+            let p = case.join(<Translate as Phase>::DIR).join(rel);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, body).unwrap();
         }
@@ -1805,7 +1805,9 @@ pub(crate) mod tests {
             })
             .unwrap();
 
-        let dest = crate::battery::phase_dir(&f.case, crate::battery::VERIFIED)
+        let dest = f
+            .case
+            .join(<Verify as Phase>::DIR)
             .join("logs")
             .join("verify.log");
         store.restore_log(&inputs, &key, &dest).unwrap();
@@ -2062,7 +2064,7 @@ pub(crate) mod tests {
         assert!(replay.replayed);
         replay.sealed.publish(&f.case).unwrap();
 
-        let published = crate::battery::phase_dir(&f.case, crate::battery::VERIFIED);
+        let published = f.case.join(<Verify as Phase>::DIR);
         std::fs::write(
             published.join("src/lib.rs"),
             "pub fn a() { /* editable */ }",

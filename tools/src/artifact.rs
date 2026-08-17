@@ -261,11 +261,11 @@ impl Seed {
 /// `Sealed<Corpus>` would inherit [`Sealed::publish`], and with `DIR = "test_case"` that
 /// deletes the experiment's own input.
 pub struct Corpus {
-    c: CDir,
+    c: OracleDir,
 }
 
 impl Corpus {
-    /// The only constructor. `is_dir` is what keeps [`CDir::digest`]'s fabricated
+    /// The only constructor. `is_dir` is what keeps [`OracleDir::digest`]'s fabricated
     /// `sha256:absent` unreachable from a cache key.
     pub fn adopt(dir: &Path) -> Result<Self> {
         anyhow::ensure!(
@@ -274,7 +274,7 @@ impl Corpus {
             dir.display()
         );
         Ok(Self {
-            c: CDir(dir.to_path_buf()),
+            c: OracleDir(dir.to_path_buf()),
         })
     }
 
@@ -283,7 +283,7 @@ impl Corpus {
         Seed::FromCorpus(self.c.0.clone())
     }
 
-    /// The corpus as the agent will see it. Through [`CDir`], never `digest_tree`: with
+    /// The corpus as the agent will see it. Through [`OracleDir`], never `digest_tree`: with
     /// the corpus as hash root, `is_ignored` drops `*.bak`/`*.log`/`*.sha256` that ARE
     /// hashed once seeded under `c_src/`. `doc/footer.html.bak` is real here, so two
     /// corpora could otherwise share a digest and replay each other's translation.
@@ -584,8 +584,8 @@ impl<P: Phase> WorkTree<P> {
         self.root.join(crate::battery::TRANSLATED_RUST)
     }
 
-    pub fn c(&self) -> CDir {
-        CDir(self.crate_dir().join(C_ORACLE_DIR))
+    pub fn c(&self) -> OracleDir {
+        OracleDir(self.crate_dir().join(C_ORACLE_DIR))
     }
 
     /// Rewrite per-run absolute paths to a stable token, then allow hashing. Consumes
@@ -638,9 +638,11 @@ impl<P: Phase> WorkTree<P> {
 /// Hands out no `&Path` and writes nothing, so nothing reached through it can alter the
 /// reference. The agent subprocess holds [`WorkTree::path`] and *can*, hence the compare in
 /// [`Scrubbed::seal`] — which then deletes only what that compare judged to be build output.
-pub struct CDir(PathBuf);
+/// The C reference we grade against, as a directory. Named for its JOB rather than its contents:
+/// `CDir` said "a directory of C", which is also true of a work tree's sources.
+pub struct OracleDir(PathBuf);
 
-/// The oracle's traversal predicate, spelled once for [`CDir::digest`], which keys the translate
+/// The oracle's traversal predicate, spelled once for [`OracleDir::digest`], which keys the translate
 /// cache, and for the seal guard. Wider than [`digest_tree`]'s: from `c_src` as its own root the
 /// root-anchored rules cannot see the prefix, so [`classify`] calls `.bak`/`.log`/`.sha256`
 /// `Ignore` although they are reference source — narrowing it loses 26 stored cases' files.
@@ -648,7 +650,7 @@ fn oracle_admits(d: Disposition) -> bool {
     d != Disposition::BuildOutput
 }
 
-impl CDir {
+impl OracleDir {
     /// Everything but build output — the files [`classify`] keeps under `c_src/` from the root.
     pub fn digest(&self) -> Result<TreeDigest> {
         if self.0.is_dir() {
@@ -741,7 +743,7 @@ fn refuse_symlink(abs: &Path, named: &Path) -> Result<()> {
 /// library and `nm -D` the resulting `.so`, so a difference is what compliance looks like — 532 of
 /// 6,312 stored `translated/*/c_src` trees hold 3,276 compiled artefacts at paths this walk
 /// covers. The invariant is "the reference we grade against is the one we shipped", not "nothing
-/// differs". Never empty, `NONE` aside: [`CDir::snapshot`] refuses rather than record nothing.
+/// differs". Never empty, `NONE` aside: [`OracleDir::snapshot`] refuses rather than record nothing.
 #[derive(Debug)]
 pub struct OracleFiles(std::collections::BTreeMap<RelPath, [u8; 32]>);
 
@@ -792,7 +794,7 @@ impl OracleFiles {
                 file: rel.as_path().display().to_string(),
             }))
         };
-        let now = CDir(artifact.join(C_ORACLE_DIR));
+        let now = OracleDir(artifact.join(C_ORACLE_DIR));
         let carried = oracle_paths_in_artifact(artifact)?;
         for (rel, before) in &self.0 {
             let abs = now.0.join(rel.as_path());
