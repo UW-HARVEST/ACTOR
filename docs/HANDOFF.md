@@ -32,8 +32,8 @@ crate, enforced by `the_store_is_obtained_from_exactly_one_place`. Verify runs t
 |---|---|---|---|
 | 12 | **the skip check consults the store**, not the presence of a `Cargo.toml` | `docs/prs/spec-12.md` | in flight; this is what makes 7b pay |
 | 11 | **an entry records the inputs its key came from** — store `input/` and the digest preimages | `docs/prs/spec-11.md` | ready; land before the next sweep |
-| 20 | **c2rust's scored results collapsed on 2026-08-03** — 60-97% of vectors gone | `docs/prs/spec-20.md` | ready; a real regression in published numbers, bisected to #48 |
-| 19 | **`validate-translations` red for six weeks, so CI proves nothing** | `docs/prs/spec-19.md` | ready; cheap, and it is why 20 went unseen |
+| ~~20~~ | c2rust scores | `docs/prs/spec-20.md` | **WITHDRAWN** — measured locally, harness correct, stored == actual; CI-runner-only |
+| ~~19~~ | `validate-translations` red for six weeks | `docs/prs/spec-19.md` | **DEFERRED** by operator decision; CI is out of scope |
 | ~~7c~~ | shared-source groups | `docs/prs/spec-7c.md` | **SHELVED** — value is Test-Corpus-only, introduces a wrong number, and the spec's premise was false |
 | 8 | `cache/` + `dataset/` split; `cache_mode` off `Paths` | `docs/prs/spec-8.md` | ready; breaks `battery ↔ cache`, `cache ↔ cli` |
 | 15 | five seams the 7b review exposed, led by a store failure losing a paid artifact | `docs/prs/spec-15.md` | ready; item 1 is a money bug |
@@ -147,10 +147,11 @@ sequence, merged on `type safety` alone. The cause is not a broken gate: every C
 `terminal_reason=max_turns` and the infra gate correctly refuses ("An infrastructure failure is not
 a result"). Agent invocations do not work on the runner, so nothing is scorable. The consequence is
 that a red matrix arm carries no information and a real translation regression would not be caught.
-**And it hid a real regression for six weeks:** c2rust is deterministic, its arm was green through
-2026-08-03 and has been red since `80b9475` (#48), with 60-97% of scored vectors gone across five
-batteries. #48's own message claimed "no behavior change to the existing datasets". See
-`docs/prs/spec-20.md`. **So do not read a green `tests` as "CI validated this."** `docs/prs/spec-19.md` moves the matrix to
+**It does NOT indicate a harness regression.** c2rust's arm went red at `80b9475` (#48), but
+`harvest-tools --agent c2rust test <battery> --check` reproduces every stored value exactly on this
+machine — B01_synthetic 85/85 (393v), B02_synthetic 38/42 (988v), P00_perlin_noise 1/1 (30v) — against
+CI's claimed 160/28/0. The harness is correct and the published numbers are unaffected; the failure
+is environmental to the runner. See `docs/prs/spec-20.md`, withdrawn. **So do not read a green `tests` as "CI validated this."** `docs/prs/spec-19.md` moves the matrix to
 a deliberate trigger so a red check means something again. Never make it green with
 `--allow-infra-failures`; that scores infrastructure failures as results.
 

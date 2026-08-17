@@ -1,4 +1,12 @@
-# PR 19 — `validate-translations` has been red on `main` for six weeks, so CI proves nothing
+# PR 19 — DEFERRED: `validate-translations` red for six weeks
+
+**Status: deferred by operator decision.** The reproducibility CI is known-buggy and will be
+addressed separately at a different time; it is explicitly out of scope for this sequence. The
+finding below is recorded because it is measured and will still be true when someone returns to it.
+
+Note the one operational consequence that matters in the meantime: **a green `tests` does not mean
+CI validated a translation.** See also `docs/prs/spec-20.md`, which was withdrawn after the harness
+turned out to be correct.
 
 ## The measurement
 
