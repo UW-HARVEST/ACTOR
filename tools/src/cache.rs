@@ -555,7 +555,10 @@ impl Store {
                     self.quarantine(&key, &dir)?;
                 }
             },
-            Mode::Refresh => self.quarantine(&key, &dir)?,
+            // Only the LOAD is skipped, so nothing is replayed; the entry stays servable until
+            // `store` moves it aside. Quarantined here, an aborted forced run left neither a live
+            // entry nor a published crate — both copies of a paid artifact, gone to one Ctrl-C.
+            Mode::Refresh => {}
             Mode::Bypass => {}
         }
 
@@ -727,6 +730,12 @@ impl Store {
 
         if let Some(parent) = dir.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        // `Refresh` replaces an entry the operator disputes, which makes that entry the evidence: it
+        // moves aside rather than being deleted, and only now — replacement staged, one rename away
+        // — so that an abort before this point leaves it servable.
+        if self.mode == Mode::Refresh {
+            self.quarantine(key, dir)?;
         }
         // A concurrent writer with the same key wrote identical content by construction,
         // so last-writer-wins is safe and a lock would only add a stale-lock failure mode
@@ -1394,6 +1403,49 @@ pub(crate) mod tests {
             after.sealed.digest(),
             new.sealed.digest(),
             "the replacement must be what is served afterwards"
+        );
+    }
+
+    /// A forced re-run that dies before producing anything — Ctrl-C, an outage, a wall-clock kill —
+    /// must not cost the operator the artifact it was going to replace: quarantined ahead of
+    /// `compute`, the live entry was already gone, and the phase dir's crate went with it.
+    #[test]
+    fn an_aborted_forced_run_leaves_the_entry_it_was_going_to_replace() {
+        let f = fixture();
+        let held = Inputs::new();
+        let inputs = held.key_inputs();
+
+        let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        let paid_for = rw
+            .obtain(&inputs, || {
+                Ok(Some(produced(&f.case, "pub fn a() { /* paid for */ }")))
+            })
+            .unwrap()
+            .unwrap();
+
+        let aborted = Store::open(&f.repo, Mode::Refresh)
+            .unwrap()
+            .obtain::<Verify>(&inputs, || Ok(None))
+            .unwrap();
+        assert!(aborted.is_none(), "the forced run produced nothing");
+
+        assert_eq!(
+            rw.stats().unwrap().0,
+            1,
+            "so the entry it was going to replace must still be there"
+        );
+        let served = rw
+            .obtain::<Verify>(&inputs, || panic!("the entry must still be servable"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            served.sealed.digest(),
+            paid_for.sealed.digest(),
+            "and a later run must be served the artifact that was paid for"
+        );
+        assert!(
+            !f.repo.join("results/.cache/quarantine").exists(),
+            "nothing was replaced, so nothing may have been moved aside"
         );
     }
 

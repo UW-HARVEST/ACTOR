@@ -1,6 +1,6 @@
 use crate::agents::exit::{clear_agent_exit, observed_exit, record_agent_exit};
 use crate::agents::invocation::{Backend, Invocation, KIRO_UNPINNED_MODEL};
-use crate::agents::run::{run_cached, Outcome, PhaseRun};
+use crate::agents::run::{run_cached, Outcome, PhaseRun, SkipCheck};
 use crate::agents::session::{ClaudeRun, Session};
 use crate::agents::work::IsolatedWorkDir;
 use crate::agents::Semaphore;
@@ -68,6 +68,7 @@ fn run_with_semaphore(
 ) -> Result<()> {
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
+    let skip = verify_skip_check(paths);
     let store = cache::Store::open(&paths.repo_root, paths.cache_mode)?;
     let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))?;
 
@@ -95,7 +96,11 @@ fn run_with_semaphore(
                     )) {
                         return (c.name.clone(), None);
                     }
-                    if !force && crate::artifact::phase_log::<Verify>(&case_dir).exists() {
+                    if !force
+                        && skip.already_done(|| {
+                            crate::artifact::phase_log::<Verify>(&case_dir).exists()
+                        })
+                    {
                         return (c.name.clone(), None);
                     }
                     let cmake_flags = get_cmake_flags(paths, battery_name, &c.name);
@@ -158,7 +163,8 @@ fn run_with_semaphore(
             continue;
         }
 
-        if !force && crate::artifact::phase_log::<Verify>(&real_dir).exists() {
+        if !force && skip.already_done(|| crate::artifact::phase_log::<Verify>(&real_dir).exists())
+        {
             println!(
                 "[{current}/{total}] ⏭️  {} (already verified)",
                 group.real_case
@@ -241,6 +247,7 @@ pub fn run_harvest_bench(
     let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))
         .context("reading verify.md")?;
 
+    let skip = verify_skip_check(paths);
     let store = cache::Store::open(&paths.repo_root, paths.cache_mode)?;
     let total = projects.len();
     println!("=== Verifying harvest-bench ({total} projects) ===");
@@ -264,7 +271,11 @@ pub fn run_harvest_bench(
                         )) {
                             return (name, None);
                         }
-                        if !force && crate::artifact::phase_log::<Verify>(&case_dir).exists() {
+                        if !force
+                            && skip.already_done(|| {
+                                crate::artifact::phase_log::<Verify>(&case_dir).exists()
+                            })
+                        {
                             return (name, None);
                         }
                         let ok = crate::refusal::record(
@@ -379,6 +390,34 @@ fn verify_invocation(paths: &Paths) -> Result<Option<Invocation>> {
         | Agent::CodexGpt54 => return Ok(None),
     };
     Ok(Some(inv))
+}
+
+/// "Already verified?", the same question `translate::translate_skip_check` answers, narrowed by the
+/// same store rule — two skip policies for one concept is how this drifted before. Keyed is NOT
+/// `has_verify_phase`: opencode HAS one, but `opencode run --format json` carries none of the
+/// terminal records [`crate::domain::health::classify`] reads, so nothing mints the `Completed` a
+/// seal needs and no entry can ever exist to hit — keyed, it misses and re-bills every case, every
+/// sweep, which the `verify.log` check used to make free. Exhaustive: a new backend decides here.
+fn verify_skip_check(paths: &Paths) -> SkipCheck {
+    match paths.agent {
+        Agent::Kiro | Agent::Claude => SkipCheck::Keyed,
+        Agent::OpenCode
+        | Agent::C2rust
+        | Agent::Laertes
+        | Agent::C2SaferRust
+        | Agent::SmartC2Rust
+        | Agent::Kimi
+        | Agent::Oneshot
+        | Agent::ClaudeCombined
+        | Agent::ClaudeMinimal
+        | Agent::ClaudeNoIter
+        | Agent::ClaudeNoFeatures
+        | Agent::ClaudeNoSubtask
+        | Agent::ClaudeCrossPrompt
+        | Agent::CodexGpt55
+        | Agent::CodexGpt54 => SkipCheck::WhateverIsPublished,
+    }
+    .through(paths.cache_mode)
 }
 
 /// Resolve what will run, then hand it to [`run_cached`] — the one execution path for an
@@ -552,6 +591,8 @@ fn run_verify_agent(
         .current_dir(gate.path())
         .output();
     if !check.is_ok_and(|o| o.status.success()) {
+        // The second clause holds because `run_cached` moves a stale `verified/` crate aside when
+        // it publishes nothing; left standing, `battery::crate_dir` keeps preferring the old one.
         eprintln!("  ⚠️  verify produced a non-compiling crate — not publishing; scorer will use translated/");
         return Ok(None);
     }
@@ -689,6 +730,54 @@ mod tests {
             "{with_backend} agents with a backend, {without} without: the assertion above \
              discriminates only if both sides actually occur"
         );
+    }
+
+    /// Verify gets translate's treatment on both halves: a backend that cannot produce an entry and
+    /// a store that cannot read one each leave `verify.log` as the only check there is.
+    #[test]
+    fn a_verify_sweep_whose_store_cannot_read_keeps_the_only_check_it_has() {
+        let paths = |agent, model, mode| {
+            Paths::new(
+                Path::new("/nonexistent"),
+                agent,
+                crate::cli::Dataset::TestCorpus,
+                model,
+                mode,
+                crate::io::sandbox::Enforcement::AllowUnsandboxed,
+            )
+            .unwrap()
+        };
+        for (mode, expected) in [
+            (cache::Mode::ReadWrite, SkipCheck::Keyed),
+            (cache::Mode::Refresh, SkipCheck::Keyed),
+            (cache::Mode::Bypass, SkipCheck::WhateverIsPublished),
+        ] {
+            assert_eq!(
+                verify_skip_check(&paths(Agent::Claude, None, mode)),
+                expected,
+                "--agent claude verifies and can seal, so the store decides: {mode:?}"
+            );
+            assert_eq!(
+                verify_skip_check(&paths(Agent::Kiro, None, mode)),
+                expected,
+                "and so does kiro, whose prose log mints a `Completed` from its exit: {mode:?}"
+            );
+            assert_eq!(
+                verify_skip_check(&paths(
+                    Agent::OpenCode,
+                    Some("amazon-bedrock/us.anthropic.claude-sonnet-5"),
+                    mode
+                )),
+                SkipCheck::WhateverIsPublished,
+                "opencode HAS a verify phase and still cannot seal one, so a key it can never \
+                 hit must not delete its only check: {mode:?}"
+            );
+            assert_eq!(
+                verify_skip_check(&paths(Agent::Oneshot, Some("openai/gpt-5.4"), mode)),
+                SkipCheck::WhateverIsPublished,
+                "and an agent with no verify phase has no key to ask about either way: {mode:?}"
+            );
+        }
     }
 
     #[test]

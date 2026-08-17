@@ -228,6 +228,41 @@ impl From<CacheMode> for crate::cache::Mode {
     }
 }
 
+/// Whether the operator will accept a previous result for this case. A named enum because
+/// `--force`, its only source, decides whether an agent is paid.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Reuse {
+    Permitted,
+    Refused,
+}
+
+impl Reuse {
+    /// The one bool→enum boundary, named for the flag that is its only source.
+    pub fn from_force_flag(flag: bool) -> Self {
+        if flag {
+            Reuse::Refused
+        } else {
+            Reuse::Permitted
+        }
+    }
+}
+
+impl CacheMode {
+    /// The store mode a sweep runs under, `--force` included.
+    ///
+    /// As a predicate on the skip check the flag decided nothing once a keyed phase asks the store
+    /// — `SkipCheck::Keyed` never answers "done" — so the operator who distrusted a result was
+    /// handed that very entry, replayed. `Refresh` is what "do not reuse" means to a store, and it
+    /// quarantines rather than deletes. `Off` is NOT upgraded: an operator who asked for no cache
+    /// must not get entries written, and there `--force` still overrides the published-log check.
+    pub fn honouring(self, reuse: Reuse) -> crate::cache::Mode {
+        match (crate::cache::Mode::from(self), reuse) {
+            (crate::cache::Mode::ReadWrite, Reuse::Refused) => crate::cache::Mode::Refresh,
+            (mode, _) => mode,
+        }
+    }
+}
+
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// Translate + verify + test (full pipeline)
@@ -257,7 +292,10 @@ pub enum Command {
         target: String,
         #[arg(long)]
         include_regex: Option<String>,
-        /// Re-verify already-verified cases
+        /// Do not reuse a previous verification of a case.
+        ///
+        /// Under `--cache on` this promotes the store to `refresh`: the stored entry is quarantined
+        /// and the agent runs again. Under `--cache off` it overrides the `verified/` log check.
         #[arg(long)]
         force: bool,
         #[arg(long, default_value_t = 1)]

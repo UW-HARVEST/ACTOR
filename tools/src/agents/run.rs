@@ -8,7 +8,7 @@
 use crate::agents::work::IsolatedWorkDir;
 use crate::artifact::{Phase, Sealed, Translate, Verify};
 use crate::cache::{
-    AgentKey, CliVersion, KeyInputs, ModelId, Produced, PromptDigest, RecipeDigest, Store,
+    AgentKey, CliVersion, KeyInputs, Mode, ModelId, Produced, PromptDigest, RecipeDigest, Store,
     ToolchainId,
 };
 use anyhow::Result;
@@ -22,6 +22,35 @@ pub trait Cached: Phase {}
 
 impl Cached for Translate {}
 impl Cached for Verify {}
+
+/// What may answer "has this phase already run for this case?", named rather than a `keyed: bool`:
+/// the store names the model, prompt, CLI and toolchain an artifact came from and a published crate
+/// names none — which reported all seven harvest-bench projects done, unrun, on 2026-08-15.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum SkipCheck {
+    Keyed,
+    /// All there is to ask wherever no key can be asked about — the honest limit of a bypass.
+    WhateverIsPublished,
+}
+
+impl SkipCheck {
+    /// Keyedness needs a keyed launch AND a store that reads one: [`Mode::Bypass`] neither loads
+    /// nor stores, so `Keyed` there deletes a path's only check. `Refresh` re-runs on purpose.
+    pub(crate) fn through(self, store: Mode) -> Self {
+        match store {
+            Mode::Bypass => SkipCheck::WhateverIsPublished,
+            Mode::ReadWrite | Mode::Refresh => self,
+        }
+    }
+
+    /// The keyed answer needs the key, which [`run_cached`] resolves; only `published` is local.
+    pub(crate) fn already_done(self, published: impl FnOnce() -> bool) -> bool {
+        match self {
+            SkipCheck::Keyed => false,
+            SkipCheck::WhateverIsPublished => published(),
+        }
+    }
+}
 
 /// Everything one cached phase needs, all of it resolved BEFORE the agent runs so the key
 /// can name it.
@@ -90,9 +119,19 @@ where
     let obtained = store.obtain(&inputs, || compute(work))?;
 
     let Some(obtained) = obtained else {
-        // Nothing published or stored, but the transcript is on disk (the invocation tees it
-        // live), so the post-mortem survives and the "already done" skip check still sees
-        // this case.
+        // Nothing published or stored, but the transcript stays in the phase dir (teed there live):
+        // it is the post-mortem, it is all the infra gate reads this case through, and the "already
+        // done" check still sees the case. It has also truncated the PREVIOUS run's, whose ARTIFACT
+        // is beside it — one phase dir describing two runs, and the enrichers stamp this log's model,
+        // CLI and cost onto that crate's `result.json`. So the artifact moves: after the run, never
+        // before, and moved, not deleted — a failure may not destroy the only copy of a paid crate.
+        if let Some(aside) = crate::artifact::displace_phase::<P>(case_dir)? {
+            eprintln!(
+                "  ⚠️  this run published nothing; the previous {}/ is at {}",
+                P::DIR,
+                aside.display()
+            );
+        }
         let mut provenance = serde_json::json!({
             "agent": agent.as_str(),
             "duration_secs": start.elapsed().as_secs(),
@@ -175,10 +214,10 @@ mod tests {
     use super::*;
     use crate::agents::session::Session;
     use crate::artifact::{phase_metrics, TreeDigest};
-    use crate::battery::{phase_dir, TRANSLATED, VERIFIED};
+    use crate::battery::{has_crate, phase_dir, TRANSLATED, VERIFIED};
     use crate::cache::tests::fixture;
     use crate::cache::{fake_program, prompt_digest, Mode, Recipe};
-    use crate::cli::Agent;
+    use crate::cli::{Agent, CacheMode, Reuse};
     use crate::domain::health::Completed;
     use crate::io::workdir::Roots;
     use std::path::PathBuf;
@@ -253,6 +292,174 @@ mod tests {
             prompt: &keys.prompt,
             recipe: &keys.recipe,
         }
+    }
+
+    /// The `bool` is whether the agent ran: outside, a replay and a re-run differ in nothing else.
+    fn translate_once(
+        case: &Path,
+        corpus: &Path,
+        log: &Path,
+        keys: &Keys,
+        store: &Store,
+        body: &str,
+    ) -> (Sealed<Translate>, bool) {
+        let ran = std::cell::Cell::new(false);
+        let outcome = run_cached(
+            phase_run(
+                case,
+                log,
+                keys,
+                IsolatedWorkDir::<Translate>::from_corpus(corpus).unwrap(),
+            ),
+            store,
+            |work| {
+                ran.set(true);
+                let crate_dir = work.translated_rust();
+                std::fs::create_dir_all(crate_dir.join("src"))?;
+                std::fs::write(crate_dir.join("Cargo.toml"), "[package]\nname=\"x\"")?;
+                std::fs::write(crate_dir.join("src/lib.rs"), body)?;
+                Ok(Some(Produced::new(
+                    work.finish(&Completed::for_test())?,
+                    log.to_path_buf(),
+                    serde_json::json!({"agent": "claude", "duration_secs": 42}),
+                )))
+            },
+        )
+        .unwrap();
+        let Outcome::Published(sealed) = outcome else {
+            panic!("a completed run must publish");
+        };
+        (sealed, ran.get())
+    }
+
+    /// The other half of the same defect: while `has_crate` answered "done" on a populated tree,
+    /// the store was never asked, so the cache was inert on the very sweep it exists for.
+    #[test]
+    fn a_populated_results_tree_still_replays_from_the_store_instead_of_re_running() {
+        let f = fixture();
+        let case = f.case.clone();
+        let mut keys = Keys::new(&f.repo);
+        let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        let corpus = corpus(&f.repo.join("corpus"), "upstream");
+        let log = phase_dir(&case, TRANSLATED).join("logs/translation.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "the transcript the invocation teed\n").unwrap();
+
+        const FIXED: &str = "pub fn a() { /* translated */ }";
+        let (first, ran) = translate_once(&case, &corpus, &log, &keys, &store, FIXED);
+        assert!(ran, "the first sweep has nothing stored, so the agent runs");
+
+        let published = phase_dir(&case, TRANSLATED);
+        assert!(
+            has_crate(&published),
+            "the tree must be populated, or this is not the case under test"
+        );
+
+        let replayed = run_cached(
+            phase_run(
+                &case,
+                &log,
+                &keys,
+                IsolatedWorkDir::<Translate>::from_corpus(&corpus).unwrap(),
+            ),
+            &store,
+            |_| panic!("the store holds this exact key, so no agent may be paid for it"),
+        )
+        .unwrap();
+        let Outcome::Published(replayed) = replayed else {
+            panic!("a hit must publish the stored artifact");
+        };
+        assert_eq!(
+            replayed.digest(),
+            first.digest(),
+            "a replay must publish the artifact that was stored"
+        );
+        assert_eq!(
+            std::fs::read_to_string(published.join("src/lib.rs")).unwrap(),
+            FIXED
+        );
+
+        // Non-vacuity: the entry served was the one THIS key names, not whatever was stored.
+        keys.model = ModelId::new("claude-sonnet-5").unwrap();
+        const OTHER: &str = "pub fn a() { /* another model translated this */ }";
+        let (second, ran) = translate_once(&case, &corpus, &log, &keys, &store, OTHER);
+        assert!(
+            ran,
+            "a translation by another model is not this model's result, so the agent must run"
+        );
+        assert_ne!(
+            first.digest(),
+            second.digest(),
+            "the two runs must differ, or 'it ran' proves nothing about what it published"
+        );
+        assert_eq!(
+            std::fs::read_to_string(published.join("src/lib.rs")).unwrap(),
+            OTHER,
+            "and what is published is the model that was asked for"
+        );
+    }
+
+    /// `--force` is "do not reuse a previous result", which a keyed skip check cannot honour — it
+    /// answers `false` anyway — so left there, the operator is handed that entry back, replayed.
+    #[test]
+    fn a_forced_run_pays_the_agent_again_rather_than_replaying_the_entry_it_distrusts() {
+        let f = fixture();
+        let case = f.case.clone();
+        let keys = Keys::new(&f.repo);
+        let log = phase_dir(&case, VERIFIED).join("logs/verify.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "the transcript the invocation teed\n").unwrap();
+
+        let verify_once = |store: &Store, body: &str| -> bool {
+            let ran = std::cell::Cell::new(false);
+            let outcome = run_cached(
+                phase_run(&case, &log, &keys, IsolatedWorkDir::new(&case).unwrap()),
+                store,
+                |work| {
+                    ran.set(true);
+                    std::fs::write(work.translated_rust().join("src/lib.rs"), body)?;
+                    Ok(Some(Produced::new(
+                        work.finish(&Completed::for_test())?,
+                        log.to_path_buf(),
+                        serde_json::json!({"agent": "claude", "duration_secs": 42}),
+                    )))
+                },
+            )
+            .unwrap();
+            assert!(
+                matches!(outcome, Outcome::Published(_)),
+                "a completed run must publish"
+            );
+            ran.get()
+        };
+
+        const DISPUTED: &str = "pub fn a() { /* the result the operator distrusts */ }";
+        let reusing = Store::open(&f.repo, CacheMode::On.honouring(Reuse::Permitted)).unwrap();
+        assert!(verify_once(&reusing, DISPUTED), "nothing is stored yet");
+        assert!(
+            !verify_once(&reusing, "pub fn a() { /* never reached */ }"),
+            "non-vacuity: this key IS a hit without the flag, so `Refused` below is the only \
+             thing that can change the answer"
+        );
+
+        const RERUN: &str = "pub fn a() { /* what a second look produced */ }";
+        let forced = Store::open(&f.repo, CacheMode::On.honouring(Reuse::Refused)).unwrap();
+        assert!(
+            verify_once(&forced, RERUN),
+            "--force must reach the store, or it changes nothing a keyed phase does"
+        );
+        assert_eq!(
+            std::fs::read_to_string(phase_dir(&case, VERIFIED).join("src/lib.rs")).unwrap(),
+            RERUN,
+            "and the published crate is this run's, not the entry that was replaced"
+        );
+
+        assert_eq!(
+            CacheMode::Off.honouring(Reuse::Refused),
+            Mode::Bypass,
+            "while an operator who asked for no cache must not be given one: there --force \
+             overrides the published-log check instead, which is all that path has"
+        );
     }
 
     /// `doc/footer.html.bak` is real in 26 stored cases, and is what the root rules drop.
@@ -370,6 +577,130 @@ mod tests {
             m["success"],
             serde_json::json!(false),
             "and it is still not a result: {m}"
+        );
+    }
+
+    const RUN_A: &str = "pub fn a() { /* run A's verification */ }";
+    const RUN_B_LOG: &str = "run B's transcript, teed over run A's\n";
+
+    /// Run A publishes a verified crate and is scored; run B publishes nothing. Both invariants.
+    fn a_run_that_published_nothing(f: &crate::cache::tests::Fixture) -> PathBuf {
+        let case = &f.case;
+        let verified = phase_dir(case, VERIFIED);
+        std::fs::create_dir_all(verified.join("src")).unwrap();
+        for (rel, body) in [
+            ("Cargo.toml", "[package]\nname=\"x\""),
+            ("src/lib.rs", RUN_A),
+            ("result.json", r#"{"tests_passed": 5}"#),
+        ] {
+            std::fs::write(verified.join(rel), body).unwrap();
+        }
+        assert_eq!(
+            crate::battery::crate_dir(case),
+            verified,
+            "the fixture must be a tree the scorer reads verified/ from, or there is no \
+             corruption to leave and nothing to lose"
+        );
+
+        let log = verified.join("logs/verify.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, RUN_B_LOG).unwrap();
+
+        crate::agents::exit::clear_agent_exit();
+        let keys = Keys::new(&f.repo);
+        let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        let outcome = run_cached(
+            phase_run(case, &log, &keys, IsolatedWorkDir::new(case).unwrap()),
+            &store,
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, Outcome::Nothing),
+            "a run that produced nothing has nothing to publish"
+        );
+        verified
+    }
+
+    /// INVARIANT 1. The failed run's transcript has replaced run A's, so run A's crate beside it
+    /// is scored as this run's result, with this run's model and cost stamped on by the enrichers.
+    #[test]
+    fn a_phase_that_published_nothing_leaves_no_earlier_crate_beside_its_transcript() {
+        let f = fixture();
+        let case = f.case.clone();
+        let verified = a_run_that_published_nothing(&f);
+
+        assert!(
+            !has_crate(&verified),
+            "run A's crate cannot stand beside run B's transcript: it would be scored as run \
+             B's result, with run B's model and cost"
+        );
+        assert!(
+            !verified.join("result.json").exists(),
+            "nor its score, which is what the enrichers rewrite in place"
+        );
+        assert_eq!(
+            crate::battery::crate_dir(&case),
+            phase_dir(&case, TRANSLATED),
+            "so the scorer falls back to translated/, which is what verify already claims it \
+             will when it declines to publish"
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::artifact::phase_log::<Verify>(&case)).unwrap(),
+            RUN_B_LOG,
+            "while the transcript itself survives — it is the entire post-mortem, and the \
+             infra gate reads this case through it"
+        );
+        assert_eq!(
+            metrics_of::<Verify>(&case)["success"],
+            serde_json::json!(false),
+            "and the record of the failed run is written after the artifact moves, not into it"
+        );
+    }
+
+    /// INVARIANT 2, at the same time: the crate run B could not replace was paid for and nothing
+    /// replays it — `--cache off` stores none — so deleting it makes one Ctrl-C a permanent loss.
+    #[test]
+    fn a_run_that_publishes_nothing_leaves_the_artifact_it_could_not_replace_on_disk() {
+        let f = fixture();
+        let case = f.case.clone();
+        a_run_that_published_nothing(&f);
+
+        let aside = case.join(format!("{VERIFIED}.displaced"));
+        assert!(
+            has_crate(&aside),
+            "run A's crate must still be on disk, whole: {}",
+            aside.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(aside.join("src/lib.rs")).unwrap(),
+            RUN_A,
+            "and it must be run A's crate rather than an empty shell of one"
+        );
+        assert!(
+            aside.join("result.json").is_file(),
+            "with the score it was measured at, since that score is run A's too"
+        );
+
+        // A second failure must not eat the first one's evidence.
+        let keys = Keys::new(&f.repo);
+        let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        let outcome = run_cached(
+            phase_run(
+                &case,
+                &crate::artifact::phase_log::<Verify>(&case),
+                &keys,
+                IsolatedWorkDir::new(&case).unwrap(),
+            ),
+            &store,
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Nothing));
+        assert_eq!(
+            std::fs::read_to_string(aside.join("src/lib.rs")).unwrap(),
+            RUN_A,
+            "a second failed run must not displace a metrics file over the crate"
         );
     }
 
