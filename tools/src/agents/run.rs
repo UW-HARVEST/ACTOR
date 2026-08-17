@@ -109,14 +109,16 @@ where
         phase: P::DIR,
         agent,
         model,
-        cli,
         toolchain,
         prompt,
         recipe,
         input_tree: &input_tree,
     };
 
-    let obtained = store.obtain(&inputs, || compute(work))?;
+    // `cli` travels beside the key inputs, not inside them: it is recorded in the entry for
+    // audit and deliberately not keyed, because the agent CLIs auto-update through a shim and
+    // keying them stranded every entry on each vendor release.
+    let obtained = store.obtain(&inputs, cli, || compute(work))?;
 
     let Some(obtained) = obtained else {
         // Nothing published or stored, but the transcript stays in the phase dir (teed there live):
@@ -266,7 +268,6 @@ mod tests {
                 phase: P::DIR,
                 agent: &self.agent,
                 model: &self.model,
-                cli: &self.cli,
                 toolchain: &self.toolchain,
                 prompt: &self.prompt,
                 recipe: &self.recipe,
