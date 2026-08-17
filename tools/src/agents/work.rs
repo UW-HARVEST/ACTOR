@@ -17,6 +17,10 @@ pub struct IsolatedWorkDir<P: crate::artifact::Phase> {
     work: crate::artifact::WorkTree<P>,
     /// Digest of the artifact or corpus this was materialised from.
     input: crate::artifact::TreeDigest,
+    /// WHERE that artifact or corpus is, kept so the store can record the tree the key was
+    /// computed from and not only its digest. Both constructors were handed this path and threw
+    /// it away, which is why an entry could never re-derive its own input.
+    seed: crate::artifact::Seed,
     /// The C oracle as handed to the agent, compared file by file on `finish`: the C
     /// side is the reference being graded against, so a run that modified it has not
     /// been verified against the original program. `verify.md` contains no rule
@@ -35,11 +39,13 @@ impl IsolatedWorkDir<crate::artifact::Translate> {
         let corpus = crate::artifact::Corpus::adopt(corpus_dir)?;
         let scratch = crate::artifact::Scratch::new("harvest-translate-")?;
         let input = corpus.digest()?;
+        let seed = corpus.as_seed();
         let work = corpus.materialise_into::<crate::artifact::Translate>(scratch)?;
         let c_before = work.c().snapshot()?;
         Ok(Self {
             work,
             input,
+            seed,
             c_before,
         })
     }
@@ -53,11 +59,13 @@ impl IsolatedWorkDir<crate::artifact::Verify> {
             .context("adopting translated/ as a sealed artifact")?;
         let scratch = crate::artifact::Scratch::new("harvest-work-")?;
         let input = translated.digest().clone();
+        let seed = translated.as_seed();
         let work = translated.materialise_into::<crate::artifact::Verify>(scratch)?;
         let c_before = work.c().snapshot()?;
         Ok(Self {
             work,
             input,
+            seed,
             c_before,
         })
     }
@@ -75,6 +83,11 @@ impl<P: crate::artifact::Phase> IsolatedWorkDir<P> {
 
     /// The cache key's input component. Taken here rather than recomputed later
     /// because it must describe what the agent was actually given.
+    /// The tree the key names, so [`crate::cache::Store`] can copy it into the entry.
+    pub fn seed(&self) -> &crate::artifact::Seed {
+        &self.seed
+    }
+
     pub fn input_digest(&self) -> &crate::artifact::TreeDigest {
         &self.input
     }

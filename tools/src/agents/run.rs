@@ -70,6 +70,14 @@ pub struct PhaseRun<'a, P: Cached> {
     pub toolchain: &'a ToolchainId,
     pub prompt: &'a PromptDigest,
     pub recipe: &'a RecipeDigest,
+    /// The bytes `prompt` was hashed from, and the recipe `recipe` was hashed from. Carried BESIDE
+    /// the digests, not instead of them: the digests are what the key names, these are only
+    /// recorded in the entry so a change to `normalise` or to `Recipe::digest`'s framing becomes a
+    /// re-key rather than a cache wipe.
+    pub prompt_text: &'a str,
+    /// Owned, from [`crate::cache::Recipe::shape_record`], because `Recipe` borrows the `Session`
+    /// beside it and a borrowed field here would make the type unconstructible in a test.
+    pub recipe_record: serde_json::Value,
 }
 
 /// What the phase left in the results tree.
@@ -100,9 +108,13 @@ where
         toolchain,
         prompt,
         recipe,
+        prompt_text,
+        recipe_record,
     } = run;
     let start = std::time::Instant::now();
     let input_tree = work.input_digest().clone();
+    // Taken before `work` moves into `compute`.
+    let seed = work.seed().clone();
     let inputs = KeyInputs {
         // From the phase itself, never a `&str` the caller passes: a literal that disagreed
         // with the `P` the store writes the entry under would key one phase as another.
@@ -118,7 +130,12 @@ where
     // `cli` travels beside the key inputs, not inside them: it is recorded in the entry for
     // audit and deliberately not keyed, because the agent CLIs auto-update through a shim and
     // keying them stranded every entry on each vendor release.
-    let obtained = store.obtain(&inputs, cli, || compute(work))?;
+    let record = crate::cache::Preimage {
+        seed,
+        prompt: prompt_text.to_string(),
+        recipe: recipe_record,
+    };
+    let obtained = store.obtain(&inputs, cli, &record, || compute(work))?;
 
     let Some(obtained) = obtained else {
         // Nothing published or stored, but the transcript stays in the phase dir (teed there live):
@@ -233,6 +250,9 @@ mod tests {
         toolchain: ToolchainId,
         prompt: PromptDigest,
         recipe: RecipeDigest,
+        /// Held so `PhaseRun` can carry the preimages beside the digests, as the driver does.
+        prompt_text: String,
+        recipe_record: serde_json::Value,
     }
 
     impl Keys {
@@ -260,6 +280,10 @@ mod tests {
                 recipe: Recipe::new(&Session::claude(10_800), Some("deny=$REPO".into()))
                     .unwrap()
                     .digest(),
+                prompt_text: crate::cache::normalise("verify the crate at $WORK", &roots),
+                recipe_record: Recipe::new(&Session::claude(10_800), Some("deny=$REPO".into()))
+                    .unwrap()
+                    .shape_record(),
             }
         }
 
@@ -293,6 +317,8 @@ mod tests {
             toolchain: &keys.toolchain,
             prompt: &keys.prompt,
             recipe: &keys.recipe,
+            prompt_text: &keys.prompt_text,
+            recipe_record: keys.recipe_record.clone(),
         }
     }
 

@@ -290,11 +290,32 @@ fn feed(h: &mut Sha256, bytes: &[u8]) {
     h.update(bytes);
 }
 
-pub fn prompt_digest(prompt: &str, roots: &Roots) -> PromptDigest {
+/// Named so the entry's record and the hasher cannot disagree about which algorithm ran.
+pub const KEY_ALGORITHM: &str = "key-v1";
+pub const PROMPT_ALGORITHM: &str = "prompt-v1";
+pub const RECIPE_ALGORITHM: &str = "recipe-v2";
+
+/// A prompt digest together with the bytes it was computed from. One constructor for both, so the
+/// recorded preimage cannot drift from the digest the key names -- which is the whole reason the
+/// record is worth having.
+pub struct Prompt {
+    pub digest: PromptDigest,
+    pub normalised: String,
+}
+
+pub fn prompt(text: &str, roots: &Roots) -> Prompt {
+    let normalised = normalise(text, roots);
     let mut h = Sha256::new();
-    feed(&mut h, b"prompt-v1");
-    feed(&mut h, normalise(prompt, roots).as_bytes());
-    PromptDigest(format!("sha256:{:x}", h.finalize()))
+    feed(&mut h, PROMPT_ALGORITHM.as_bytes());
+    feed(&mut h, normalised.as_bytes());
+    Prompt {
+        digest: PromptDigest(format!("sha256:{:x}", h.finalize())),
+        normalised,
+    }
+}
+
+pub fn prompt_digest(prompt: &str, roots: &Roots) -> PromptDigest {
+    self::prompt(prompt, roots).digest
 }
 
 /// How the agent was invoked, per backend.
@@ -326,13 +347,26 @@ impl<'a> Recipe<'a> {
     /// fails to compile here (E0027) instead of silently leaving the key unchanged, and
     /// binding one without feeding it is an `unused variable` error under
     /// `warnings = "deny"`. Do not reintroduce `..`.
+    /// The same two values `digest` feeds, as a record. Destructured exhaustively for the same
+    /// reason: a component added to `Recipe` and forgotten in either place is a compile error.
+    pub fn shape_record(&self) -> serde_json::Value {
+        let Self {
+            session,
+            policy_shape,
+        } = self;
+        serde_json::json!({
+            "session_shape": session.shape(),
+            "policy_shape": policy_shape,
+        })
+    }
+
     pub fn digest(&self) -> RecipeDigest {
         let Self {
             session,
             policy_shape,
         } = self;
         let mut h = Sha256::new();
-        feed(&mut h, b"recipe-v2");
+        feed(&mut h, RECIPE_ALGORITHM.as_bytes());
         feed(&mut h, session.shape().as_bytes());
         // Tagged, so "no policy" cannot hash the same as an empty one.
         match policy_shape {
@@ -343,6 +377,46 @@ impl<'a> Recipe<'a> {
             None => feed(&mut h, b"no-policy"),
         }
         RecipeDigest(format!("sha256:{:x}", h.finalize()))
+    }
+}
+
+/// What the three digest components of a key were computed FROM, so an entry can be re-keyed after
+/// an algorithm change instead of being thrown away. Recorded, never keyed: nothing here reaches
+/// the hash, and `the_key_deriving_functions_keep_their_exhaustive_patterns` is why it is a separate
+/// type rather than extra fields on [`KeyInputs`].
+///
+/// Everything here was ALREADY fed to a digest, so recording it exposes nothing new. That is the
+/// rule that keeps C2SaferRust's `BEDROCK_API_KEY` out: it lives in raw docker argv, which this
+/// module already refuses to hash.
+pub struct Preimage {
+    /// The tree the key names, exported verbatim into `input/`.
+    pub seed: crate::artifact::Seed,
+    /// The NORMALISED prompt, i.e. exactly the bytes `prompt_digest` hashed -- never the raw
+    /// prompt, which embeds host paths and would make the record machine-specific.
+    pub prompt: String,
+    /// What `Recipe::digest` hashed: the session shape, and the tokenised policy or its absence.
+    /// Owned, from [`Recipe::shape_record`], so this type borrows nothing and a test can build one.
+    pub recipe: serde_json::Value,
+}
+
+impl Preimage {
+    /// `algorithms` is not decoration: it is what tells a future re-keyer which version of each
+    /// digest it is converting from. The tags are named constants read by both the hasher and this
+    /// record, so the record cannot claim a version the hash did not use.
+    fn document(&self, key: &CacheKey, inputs: &KeyInputs<'_>) -> serde_json::Value {
+        serde_json::json!({
+            "schema": SCHEMA,
+            "key": key.as_str(),
+            "algorithms": {
+                "key": KEY_ALGORITHM,
+                "prompt": PROMPT_ALGORITHM,
+                "recipe": RECIPE_ALGORITHM,
+                "input_tree": self.seed.algorithm(),
+            },
+            "input_tree": inputs.input_tree.as_str(),
+            "prompt": self.prompt,
+            "recipe": self.recipe,
+        })
     }
 }
 
@@ -376,7 +450,7 @@ impl KeyInputs<'_> {
             input_tree,
         } = self;
         let mut h = Sha256::new();
-        feed(&mut h, b"key-v1");
+        feed(&mut h, KEY_ALGORITHM.as_bytes());
         feed(&mut h, &SCHEMA.to_le_bytes());
         for part in [
             *phase,
@@ -538,6 +612,7 @@ impl Store {
         &self,
         inputs: &KeyInputs<'_>,
         cli: &CliVersion,
+        record: &Preimage,
         compute: impl FnOnce() -> Result<Option<Produced<P>>>,
     ) -> Result<Option<Obtained<P>>> {
         let key = inputs.key();
@@ -580,7 +655,7 @@ impl Store {
         // reports.
         if self.mode != Mode::Bypass {
             if let Err(e) = self
-                .store(inputs, cli, &key, &dir, &produced)
+                .store(inputs, cli, record, &key, &dir, &produced)
                 .with_context(|| format!("storing cache entry {}", key.as_str()))
             {
                 eprintln!("  cache: NOT stored, publishing anyway: {e:#}");
@@ -704,6 +779,7 @@ impl Store {
         &self,
         inputs: &KeyInputs<'_>,
         cli: &CliVersion,
+        record: &Preimage,
         key: &CacheKey,
         dir: &Path,
         produced: &Produced<P>,
@@ -723,6 +799,19 @@ impl Store {
         std::fs::create_dir_all(staging.join("agent"))?;
 
         produced.sealed.export_into(&staging.join("code"))?;
+        // The INPUT beside the output. Five of the eight key components are recorded in cleartext
+        // in `meta.json` and are their own value; three are digests whose preimage was discarded
+        // after hashing, so a change to `normalise`, to `Recipe::digest`'s framing or to
+        // `hash_tree` emptied the store instead of re-keying it. `input/` is stored verbatim rather
+        // than as a manifest of per-file hashes: it re-derives ANY future digest, and it raises no
+        // question about encoding a non-UTF-8 filename losslessly -- which `hash_tree` already has
+        // to care about, since it hashes `as_encoded_bytes` precisely because a lossy name
+        // collapses distinct bytes.
+        record.seed.export_into(&staging.join("input"))?;
+        std::fs::write(
+            staging.join("key-preimage.json"),
+            serde_json::to_string_pretty(&record.document(key, inputs))? + "\n",
+        )?;
         if produced.log.is_file() {
             std::fs::copy(&produced.log, staging.join("agent").join("run.log"))?;
         }
@@ -873,6 +962,30 @@ pub(crate) mod tests {
     /// The recorded-but-not-keyed CLI build. A helper rather than a field of the key inputs,
     /// because no value passed here can change a key -- which is what
     /// `two_sweeps_under_different_cli_versions_share_an_entry` asserts.
+    /// A preimage for tests. Nothing in it reaches a key, so any value serves -- which is exactly
+    /// what `two_sweeps_under_different_cli_versions_share_an_entry` asserts about `cli` too.
+    fn test_record() -> Preimage {
+        // A REAL, tiny directory: `store` copies the seed into `input/`, so a nonexistent path
+        // would make every store fail -- which is how the first draft of this helper was caught.
+        // Under `target/tmp`, the suite scratch root the repo-root `.cargo/config.toml` pins.
+        // A path per CALL, not one shared directory: the suite runs in parallel and 30 call sites
+        // writing the same fixture raced, so one test hashed a seed another was mid-write in.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("target/tmp/seed-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("seed.txt"), "the input the key names").unwrap();
+        // An `Ignore`-class file, which the DIGEST does not cover but a complete export must still
+        // carry: without it the round-trip below passes under any `Carry` that admits
+        // `StoreAndHash`, so it could not tell a complete export from a lossy one.
+        std::fs::write(dir.join("notes.bak"), "not hashed, still part of the input").unwrap();
+        Preimage {
+            seed: crate::artifact::Seed::FromArtifact(dir),
+            prompt: "the normalised prompt".into(),
+            recipe: serde_json::json!({"session_shape": "s", "policy_shape": null}),
+        }
+    }
+
     fn test_cli() -> CliVersion {
         CliVersion("2.1.231.653 (Claude Code)".into())
     }
@@ -901,6 +1014,10 @@ pub(crate) mod tests {
                 recipe: &self.recipe,
                 input_tree: &self.tree,
             }
+        }
+
+        fn tree_for_test(&self) -> &str {
+            self.tree.as_str()
         }
 
         fn key(&self) -> CacheKey {
@@ -1358,6 +1475,7 @@ pub(crate) mod tests {
             .store(
                 &inputs,
                 &test_cli(),
+                &test_record(),
                 &key,
                 &store.entry_dir(&inputs, &key),
                 &Produced {
@@ -1388,7 +1506,7 @@ pub(crate) mod tests {
 
         let mut runs = 0;
         let first = store
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 runs += 1;
                 Ok(Some(produced(&f.case, "pub fn a() { /* v1 */ }")))
             })
@@ -1398,7 +1516,7 @@ pub(crate) mod tests {
         assert_eq!(runs, 1);
 
         let second = store
-            .obtain::<Verify>(&inputs, &test_cli(), || {
+            .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || {
                 runs += 1;
                 panic!("the agent must NOT be invoked on a hit — that is the entire point");
             })
@@ -1426,7 +1544,7 @@ pub(crate) mod tests {
         let inputs = owned.key_inputs();
 
         let out = store
-            .obtain::<Verify>(&inputs, &test_cli(), || Ok(None))
+            .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || Ok(None))
             .unwrap();
         assert!(out.is_none());
         assert_eq!(
@@ -1437,7 +1555,7 @@ pub(crate) mod tests {
 
         let mut ran = false;
         store
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 ran = true;
                 Ok(Some(produced(&f.case, "pub fn a() { /* recovered */ }")))
             })
@@ -1456,7 +1574,7 @@ pub(crate) mod tests {
         let inputs = owned.key_inputs();
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        rw.obtain(&inputs, &test_cli(), || {
+        rw.obtain(&inputs, &test_cli(), &test_record(), || {
             Ok(Some(produced(&f.case, "pub fn a() {}")))
         })
         .unwrap();
@@ -1465,7 +1583,7 @@ pub(crate) mod tests {
         let off = Store::open(&f.repo, Mode::Bypass).unwrap();
         let mut ran = false;
         let got = off
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 ran = true;
                 Ok(Some(produced(&f.case, "pub fn a() { /* again */ }")))
             })
@@ -1488,7 +1606,7 @@ pub(crate) mod tests {
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let old = rw
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(produced(&f.case, "pub fn a() { /* old */ }")))
             })
             .unwrap()
@@ -1496,7 +1614,7 @@ pub(crate) mod tests {
 
         let refresh = Store::open(&f.repo, Mode::Refresh).unwrap();
         let new = refresh
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(produced(&f.case, "pub fn a() { /* new */ }")))
             })
             .unwrap()
@@ -1506,7 +1624,7 @@ pub(crate) mod tests {
 
         // The point of --cache refresh is that the suspect entry is GONE, not shadowed.
         let after = rw
-            .obtain::<Verify>(&inputs, &test_cli(), || panic!("must hit"))
+            .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || panic!("must hit"))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1527,7 +1645,7 @@ pub(crate) mod tests {
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let paid_for = rw
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(produced(&f.case, "pub fn a() { /* paid for */ }")))
             })
             .unwrap()
@@ -1535,7 +1653,7 @@ pub(crate) mod tests {
 
         let aborted = Store::open(&f.repo, Mode::Refresh)
             .unwrap()
-            .obtain::<Verify>(&inputs, &test_cli(), || Ok(None))
+            .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || Ok(None))
             .unwrap();
         assert!(aborted.is_none(), "the forced run produced nothing");
 
@@ -1545,7 +1663,7 @@ pub(crate) mod tests {
             "so the entry it was going to replace must still be there"
         );
         let served = rw
-            .obtain::<Verify>(&inputs, &test_cli(), || {
+            .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || {
                 panic!("the entry must still be servable")
             })
             .unwrap()
@@ -1575,7 +1693,7 @@ pub(crate) mod tests {
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let old = rw
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(produced(&f.case, "pub fn a() { /* suspect */ }")))
             })
             .unwrap()
@@ -1583,7 +1701,7 @@ pub(crate) mod tests {
 
         Store::open(&f.repo, Mode::Refresh)
             .unwrap()
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(produced(&f.case, "pub fn a() { /* new */ }")))
             })
             .unwrap()
@@ -1606,7 +1724,7 @@ pub(crate) mod tests {
         // A second refresh must not land on the first copy, nor lose it.
         Store::open(&f.repo, Mode::Refresh)
             .unwrap()
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(produced(&f.case, "pub fn a() { /* newer */ }")))
             })
             .unwrap()
@@ -1634,13 +1752,13 @@ pub(crate) mod tests {
         let key = inputs.key();
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        rw.obtain(&inputs, &test_cli(), || {
+        rw.obtain(&inputs, &test_cli(), &test_record(), || {
             Ok(Some(produced(&f.case, "pub fn a() {}")))
         })
         .unwrap();
         Store::open(&f.repo, Mode::Refresh)
             .unwrap()
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(produced(&f.case, "pub fn a() { /* new */ }")))
             })
             .unwrap();
@@ -1678,7 +1796,7 @@ pub(crate) mod tests {
         let log = f.repo.join("live-run.log");
         std::fs::write(&log, "the transcript the invocation teed\n").unwrap();
         store
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(Produced {
                     sealed: seal_verify(&f.case, "pub fn a() {}"),
                     log: log.clone(),
@@ -1710,7 +1828,7 @@ pub(crate) mod tests {
         let inputs = held.key_inputs();
         let key = inputs.key();
         store
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(produced(&f.case, "pub fn a() {}")))
             })
             .unwrap();
@@ -1722,7 +1840,7 @@ pub(crate) mod tests {
 
         let mut ran = false;
         let got = store
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 ran = true;
                 Ok(Some(produced(&f.case, "pub fn a() { /* honest */ }")))
             })
@@ -1733,6 +1851,91 @@ pub(crate) mod tests {
             "an entry that cannot say what it cost must be recomputed"
         );
         assert_eq!(got.provenance["duration_secs"], 42);
+    }
+
+    /// THE test this feature exists for: an entry must be able to recompute the key it is filed
+    /// under, from what it stores and nothing else. If it can, a change to `normalise`, to
+    /// `Recipe::digest`'s framing or to `hash_tree` is a RE-KEY of the entries on disk instead of a
+    /// cache wipe.
+    #[test]
+    fn an_entry_can_recompute_the_key_it_is_filed_under() {
+        let f = fixture();
+        let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        let record = test_record();
+        let seed_dir = match &record.seed {
+            crate::artifact::Seed::FromArtifact(p) => p.clone(),
+            crate::artifact::Seed::FromCorpus(p) => p.clone(),
+        };
+        // The key must name the digest of the tree actually being stored, or the round-trip below
+        // is asserting against a fabricated value rather than against the export.
+        let mut held = Inputs::new();
+        held.tree = record.seed.digest_at(&seed_dir).unwrap();
+        let inputs = held.key_inputs();
+        let key = inputs.key();
+
+        store
+            .obtain(&inputs, &test_cli(), &record, || {
+                Ok(Some(produced(&f.case, "pub fn a() {}")))
+            })
+            .unwrap()
+            .unwrap();
+
+        let dir = store.entry_dir(&inputs, &key);
+
+        // 1. the input tree, re-hashed from `input/` with the predicate that produced the digest
+        let redone = record.seed.digest_at(&dir.join("input")).unwrap();
+        assert_eq!(
+            redone.as_str(),
+            held.tree_for_test(),
+            "input/ must re-hash to the input_tree the key names, or the export and the digest \
+             disagree and the entry cannot be re-keyed"
+        );
+
+        // 2. and 3. the two small preimages, straight from the record on disk
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("key-preimage.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            doc["prompt"].as_str(),
+            Some(record.prompt.as_str()),
+            "the normalised prompt must be recorded verbatim"
+        );
+        assert_eq!(doc["recipe"], record.recipe, "as must the recipe shape");
+        assert_eq!(
+            doc["algorithms"]["key"].as_str(),
+            Some(KEY_ALGORITHM),
+            "and which algorithm produced each digest, or a re-key cannot tell what it is \
+             converting from"
+        );
+
+        // 4. the key itself, from the entry's own record
+        assert_eq!(
+            doc["key"].as_str(),
+            Some(key.as_str()),
+            "the recorded key must be the one the entry is filed under"
+        );
+        assert!(
+            dir.ends_with(key.as_str()),
+            "which is the directory name: {}",
+            dir.display()
+        );
+
+        // Completeness, which the digest cannot check: the digest covers only `StoreAndHash`, so
+        // an export that dropped everything else would still re-hash correctly while storing an
+        // incomplete input -- useless for the future re-key this whole feature exists for.
+        assert!(
+            dir.join("input/notes.bak").is_file(),
+            "input/ must carry what the digest does not hash, or it is not the input"
+        );
+
+        // Non-vacuity: a byte flipped in input/ must change what it re-hashes to.
+        crate::artifact::set_read_only(&dir, Access::Writable).unwrap();
+        std::fs::write(dir.join("input/seed.txt"), "tampered").unwrap();
+        let after = record.seed.digest_at(&dir.join("input")).unwrap();
+        assert_ne!(
+            after, redone,
+            "a flipped byte in input/ must change its digest, or storing it proves nothing"
+        );
     }
 
     /// A store failure must never cost the artifact the agent was paid to produce. `obtain`
@@ -1747,7 +1950,7 @@ pub(crate) mod tests {
 
         // Non-vacuity first: with the store writable, this very call DOES produce an entry.
         let ok = store
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(produced(&f.case, "pub fn a() {}")))
             })
             .expect("a writable store must store")
@@ -1762,7 +1965,7 @@ pub(crate) mod tests {
         let cache_root = f.repo.join("results/.cache");
         crate::artifact::set_read_only(&cache_root, Access::ReadOnly).unwrap();
 
-        let out = store.obtain(&other_inputs, &test_cli(), || {
+        let out = store.obtain(&other_inputs, &test_cli(), &test_record(), || {
             Ok(Some(produced(&f.case, "pub fn b() {}")))
         });
 
@@ -1798,14 +2001,14 @@ pub(crate) mod tests {
         crate::artifact::set_read_only(&staging, Access::ReadOnly).unwrap();
 
         store
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(produced(&f.case, "pub fn a() {}")))
             })
             .expect("a stale locked staging dir must not block the write")
             .unwrap();
         assert!(
             store
-                .obtain::<Verify>(&inputs, &test_cli(), || panic!("must hit"))
+                .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || panic!("must hit"))
                 .unwrap()
                 .unwrap()
                 .replayed
@@ -1822,7 +2025,7 @@ pub(crate) mod tests {
         let inputs = owned.key_inputs();
         let key = inputs.key();
         store
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(produced(&f.case, "pub fn a() {}")))
             })
             .unwrap();
@@ -1847,13 +2050,13 @@ pub(crate) mod tests {
         let owned = Inputs::new();
         let inputs = owned.key_inputs();
         store
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(produced(&f.case, "pub fn a() {}")))
             })
             .unwrap();
 
         let replay = store
-            .obtain::<Verify>(&inputs, &test_cli(), || panic!("must hit"))
+            .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || panic!("must hit"))
             .unwrap()
             .unwrap();
         assert!(replay.replayed);
@@ -1875,7 +2078,7 @@ pub(crate) mod tests {
         let inputs = owned.key_inputs();
         let key = inputs.key();
         store
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(produced(&f.case, "pub fn a() {}")))
             })
             .unwrap();
@@ -1891,7 +2094,7 @@ pub(crate) mod tests {
 
         let mut ran = false;
         let got = store
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 ran = true;
                 Ok(Some(produced(&f.case, "pub fn a() { /* honest */ }")))
             })
@@ -1917,7 +2120,7 @@ pub(crate) mod tests {
         let owned = Inputs::new();
         let inputs = owned.key_inputs();
         store
-            .obtain(&inputs, &test_cli(), || {
+            .obtain(&inputs, &test_cli(), &test_record(), || {
                 Ok(Some(produced(&f.case, "pub fn a() {}")))
             })
             .unwrap();
