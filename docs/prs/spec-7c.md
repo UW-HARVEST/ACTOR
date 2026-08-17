@@ -1,70 +1,65 @@
-# PR 7c — Shared-source groups: one key, N publishes
+# PR 7c — Shared-source groups: SHELVED, and this spec's premise was wrong
 
-## Depends on 7b
+**Status: attempted, not merged.** The work is preserved on branch `pr7c-shared-groups`
+(`0e0ce41`, +731/−84 in `translate.rs`, all eleven gates green). Do not resume it from that branch
+without reading this first — the design needs rethinking, not another review round.
 
-7b caches the agentic **single-case** path. This extends it to shared-source groups. If 7b has
-not landed, stop.
+## Why it was shelved
 
-## What a shared-source group is
+**1. The value is small and in the wrong place.** Measured: all **129** symlinked `test_case`
+directories are in Test-Corpus (two groups — `B02_synthetic/macrodepth_*` at 3 configs and
+`P01_sphincs_plus` at 128). Harvest-bench is **7 independent projects with no shared groups at
+all.** So this saves nothing on the workload that costs a measured $795.59 per sweep, only on
+Test-Corpus, where translate is cheap.
 
-One agent invocation serves N configurations. `translate_one_shared` (`translate.rs:269`)
-translates `group.real_case`, then `propagate_config` (called at `:201`) derives each follower
-config from it. The followers are **not copies**: they differ in default features, in the
-`[lib]` name, and `propagate_config_phase` strips `main.rs` and tests from them.
+**2. It introduces a wrong published number.** Keying the group's real case means an ordinary
+replay deletes the real case's `verified/` (via `Translate::INVALIDATES`) while every follower
+keeps its own. The group then straddles two phases and the battery's headline score silently loses
+a case. On `main` this is unreachable, because 7b deliberately left shared groups at
+`Mode::Bypass`.
 
-## The rule: one key, not N
+**3. This spec's central premise was false**, which is why the attempt ballooned from "wire up
+what exists" to +731 lines.
 
-The N followers are *derived* trees, so they can never be byte-identical to the stored
-artifact. Therefore:
+## The false premise, stated plainly so it is not repeated
 
-- **Key and store the real case only.** Publish it from `run_cached`, then run the existing
-  propagate loop over the followers exactly as the code does today.
-- **Do not give followers their own cache keys.** That would key N invocations that never
-  happened, and a hit on a follower key would serve a derived tree as if an agent had produced
-  it.
+This spec said:
 
-The propagate loop already runs on the skip path (the "already done" branch at `:179`), so it
-is replay-safe as written — a replay of the real case followed by propagation produces the same
-followers a fresh run would. **Verify that claim rather than assuming it**; it is the crux of
-this PR.
+> Publish it from `run_cached`, then run the existing propagate loop over the followers **exactly
+> as the code does today**. … The propagate loop already runs on the skip path, so it is
+> replay-safe as written.
 
-## The digest subtlety, already established
+That is true only while the phase is **unkeyed**. Once the real case is keyed, PR 12's
+`SkipCheck::Keyed` makes `already_done` return `false` unconditionally, so the real case is never
+`skipped` — and the old follower skip (`has_crate(follower)` → `continue`) therefore leaves every
+follower holding the **previous** translation while the real case has a new one. The loop is not
+replay-safe once keyed; it was only ever replay-safe because nothing replayed.
 
-All N configs' `test_case` directories are **symlinks** to the real case's, and
-`artifact::digest_tree`/`CorpusDir` follow symlinks to hash content. So the input digest is
-shared by construction across the group — which is exactly what makes one key correct. Do not
-add a per-config component to the group key; that resurrects N keys.
+The implementer was right to change it, and right that the spec forbade doing so. That contradiction
+is the spec's fault, not the implementation's.
 
-Confirm the symlink claim on the current tree before relying on it, and say what you found.
+## What a future attempt has to solve
 
-## Required tests
+Four things, all found by review of the shelved branch and all confirmed against the code:
 
-1. **A replayed group produces the same followers as a fresh one.** Translate a group, capture
-   every follower tree, clear the published output, translate again from the cache, and assert
-   the followers are identical. This is the property the whole design rests on.
-2. **A follower is never served from the store as if it were an invocation.** Assert the store
-   holds exactly one entry for a group of N, and that the follower configs have no entry of
-   their own.
+1. **Followers must be re-derived whenever the real case was not itself skipped**, and that decision
+   must be **gated by a test**. On the branch it lives in an inline `if/else` inside
+   `run_test_corpus`, which no test can reach (it needs `preflight_check` and a real `claude` on
+   PATH), and both tests hand the value in as a literal — so collapsing the mapping to either
+   constant leaves the whole suite green. Lift it into a pure function over the result shape and
+   assert it exhaustively, the way PR 12 made `translate_skip_check` pure for exactly this reason.
+2. **`propagate_config_phase` never clears its destination.** It replaces `src/` and `c_src/` but
+   leaves everything else, so re-deriving over a follower that already holds a complete crate can
+   leave a stale file from the previous translation. `clear_phase`/`Sealed::publish` exist for this.
+3. **The group must not straddle two phases.** Whatever invalidates the real case's `verified/`
+   must invalidate the followers' too, or the score loses cases. This is the wrong-number defect
+   above and it is the hard one.
+4. **`Translating::independent` duplicates `PromptKind::independent` verbatim** on one code path —
+   one definition per concept.
 
-Named after the failure, per `CLAUDE.md`.
+## If you resume it
 
-## Constraints
-
-- No visibility widening; report instead.
-- No `#[allow]`/`#[expect]`/`#[ignore]`, no ALLOWED growth, no weakened assertion, no
-  `.stderr` re-record beyond a path/column shift.
-- Never write to `/tmp`; scratch under `/local/home/scheschb/scratch/<yours>`, deleted with one
-  absolute path; if the delete is denied, report the path and move on.
-- Answer for every check your diff touches: **after my change, what input still makes this
-  check fail?**
-
-## Acceptance criteria
-
-The nine gates (see `docs/HANDOFF.md`), plus the golden fingerprint passing and not skipping,
-plus: the verify cache key for a fixed input unchanged, and `SCHEMA` unmoved with evidence.
-
-## Commit message
-
-Whether the propagate loop was already replay-safe and how you verified it; the symlink finding;
-that the group takes one key and followers take none; and the two tests with evidence each can
-fail.
+Rewrite this spec first, from what the code does now rather than from what it did before 7b and 12
+landed. Then decide whether the value in item 1 above justifies solving item 3 — and note that
+"leave shared groups bypassed" remains a correct, cheap answer that costs only Test-Corpus re-run
+time. `main` is in that state today and is consistent.

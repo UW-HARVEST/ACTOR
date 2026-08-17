@@ -32,7 +32,7 @@ crate, enforced by `the_store_is_obtained_from_exactly_one_place`. Verify runs t
 |---|---|---|---|
 | 12 | **the skip check consults the store**, not the presence of a `Cargo.toml` | `docs/prs/spec-12.md` | in flight; this is what makes 7b pay |
 | 11 | **an entry records the inputs its key came from** — store `input/` and the digest preimages | `docs/prs/spec-11.md` | ready; land before the next sweep |
-| 7c | shared-source groups: one key, N publishes | `docs/prs/spec-7c.md` | ready |
+| ~~7c~~ | shared-source groups | `docs/prs/spec-7c.md` | **SHELVED** — value is Test-Corpus-only, introduces a wrong number, and the spec's premise was false |
 | 8 | `cache/` + `dataset/` split; `cache_mode` off `Paths` | `docs/prs/spec-8.md` | ready; breaks `battery ↔ cache`, `cache ↔ cli` |
 | 15 | five seams the 7b review exposed, led by a store failure losing a paid artifact | `docs/prs/spec-15.md` | ready; item 1 is a money bug |
 | 17 | **invariant I1 holds only on the keyed path** — five unkeyed translate paths uncovered | `docs/prs/spec-17.md` | ready; a wrong published number |
