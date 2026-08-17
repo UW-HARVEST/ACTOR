@@ -390,6 +390,7 @@ fn compile_fail_cases_still_assert_what_they_were_written_for() {
         ("sealed_is_not_a_command_cwd", "E0277"),    // AsRef<Path> not satisfied
         ("phases_are_not_interchangeable", "E0308"), // mismatched types
         ("completed_cannot_be_forged", "E0603"),     // private constructor
+        ("oracle_cannot_be_forged", "E0603"),        // private constructor
         ("worktree_cannot_be_used_after_scrub", "E0382"), // scrub() consumed it
         ("scrubbed_cannot_be_used_after_seal", "E0382"), // seal() consumed it
         ("materialise_at_refuses_a_results_tree_path", "E0308"), // needs a Cwd, not a Path

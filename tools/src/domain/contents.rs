@@ -19,8 +19,9 @@ pub enum Carry {
     /// exclude nothing [`classify`] hashes, or a stored copy cannot re-derive the digest
     /// recorded beside it and every cache read fails validation — a cache that looks
     /// enabled and never hits. Re-carrying `c_src` over the copy seeded from the previous
-    /// phase is therefore a no-op: [`crate::artifact::Scrubbed::seal`] refuses an artifact
-    /// whose C oracle differs from the one the agent was given.
+    /// phase therefore rewrites the same bytes: [`crate::artifact::Scrubbed::seal`] refuses
+    /// an artifact whose C oracle differs from the one the agent was given, other than by
+    /// what building it produced, which seal deletes before it hashes anything.
     FromArtifact,
     /// Seeding a tree from the preceding phase. `logs/` stays behind: it is harness
     /// output, and the current phase's own log is being written live.
@@ -65,7 +66,7 @@ const ROOT_ONLY_IGNORED: &[&str] = &[
 const ROOT_ONLY_IGNORED_DIRS: &[&str] = &["logs", ".claude"];
 
 /// The C oracle. Nothing under it is ever [`Disposition::Ignore`]:
-/// [`crate::artifact::Scrubbed::seal`] grades a run by comparing this subtree's digest
+/// [`crate::artifact::Scrubbed::seal`] grades a run by comparing this subtree file by file
 /// before and after, so a rule firing inside it hides a change to the reference. 26 real
 /// `c_src/doc/footer.html.bak` files sat in that blind spot.
 pub(crate) const C_ORACLE_DIR: &str = "c_src";
@@ -160,7 +161,7 @@ mod tests {
         );
     }
 
-    /// `Scrubbed::seal` grades a run on the c_src digest before vs after. Anything
+    /// `Scrubbed::seal` grades a run on the c_src file set before vs after. Anything
     /// excluded there is a change to the reference that nothing detects — and
     /// `c_src/doc/footer.html.bak` is a real upstream file in 26 stored cases.
     #[test]
