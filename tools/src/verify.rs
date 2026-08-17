@@ -461,9 +461,11 @@ fn verify_case(
     // Resolved once, here: every root that decides the key is then a value, and the two
     // digests below cannot disagree about what machine they were taken on.
     let roots = Roots::resolve(work.root(), &paths.repo_root);
-    let prompt_digest = cache::prompt_digest(&prompt, &roots);
+    let rendered = cache::prompt(&prompt, &roots);
+    let prompt_digest = rendered.digest.clone();
     let policy = inv.backend.policy_shape(paths.enforcement, &roots)?;
-    let recipe = cache::Recipe::new(&inv.session, policy)?.digest();
+    let recipe_shape = cache::Recipe::new(&inv.session, policy)?;
+    let recipe = recipe_shape.digest();
 
     let outcome = run_cached(
         PhaseRun {
@@ -476,6 +478,8 @@ fn verify_case(
             toolchain: &toolchain,
             prompt: &prompt_digest,
             recipe: &recipe,
+            prompt_text: &rendered.normalised,
+            recipe_record: recipe_shape.shape_record(),
         },
         store,
         |work| run_verify_agent(case_dir, &inv, work, &prompt, &log_path, paths),

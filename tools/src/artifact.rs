@@ -212,6 +212,51 @@ impl SeededBy<Sealed<Translate>> for Verify {
     const AT: SeedAt = SeedAt::CrateRoot;
 }
 
+/// The tree a work dir was materialised FROM, kept so an entry can record the input its key names
+/// and not merely a digest of it. Two variants, not one path plus a flag: the two phases hash their
+/// seed through DIFFERENT predicates, and an export that does not match the digest's predicate
+/// cannot re-derive `meta.input_tree`. Putting the predicate in the variant is what makes that
+/// impossible to get wrong at a call site.
+#[derive(Clone, Debug)]
+pub enum Seed {
+    /// Translate's input: the C corpus, hashed by the oracle predicate: everything but build output.
+    FromCorpus(PathBuf),
+    /// Verify's input: a sealed translation, hashed by the artifact predicate: StoreAndHash only.
+    FromArtifact(PathBuf),
+}
+
+impl Seed {
+    /// Copy the seed somewhere the store can keep it. The `Carry` per variant admits at least
+    /// everything the matching digest hashes, and MORE than that on purpose: the digest covers only
+    /// part of the tree, and a stored input that dropped the rest would re-hash correctly while
+    /// being useless for the future re-key this exists for.
+    pub fn export_into(&self, dest: &Path) -> Result<()> {
+        match self {
+            Seed::FromCorpus(root) => copy_carrying(root, dest, Carry::IntoWorkTree),
+            Seed::FromArtifact(root) => copy_carrying(root, dest, Carry::FromArtifact),
+        }
+    }
+
+    /// Re-derive, from a COPY of this seed, the digest the original contributed to the key. If this
+    /// does not equal `meta.input_tree`, the export and the digest disagree and the entry cannot be
+    /// re-keyed.
+    pub fn digest_at(&self, root: &Path) -> Result<TreeDigest> {
+        match self {
+            Seed::FromCorpus(_) => hash_tree(root, &oracle_admits),
+            Seed::FromArtifact(_) => digest_tree(root),
+        }
+    }
+
+    /// Which algorithm produced the digest, recorded in the entry so a future re-key knows what it
+    /// is converting FROM.
+    pub fn algorithm(&self) -> &'static str {
+        match self {
+            Seed::FromCorpus(_) => ORACLE_TREE_ALGORITHM,
+            Seed::FromArtifact(_) => TREE_ALGORITHM,
+        }
+    }
+}
+
 /// The C sources an agent translates: an INPUT, never an output. Not a [`Phase`]: a
 /// `Sealed<Corpus>` would inherit [`Sealed::publish`], and with `DIR = "test_case"` that
 /// deletes the experiment's own input.
@@ -231,6 +276,11 @@ impl Corpus {
         Ok(Self {
             c: CDir(dir.to_path_buf()),
         })
+    }
+
+    /// Where this corpus lives, so the store can record the tree the key was computed from.
+    pub fn as_seed(&self) -> Seed {
+        Seed::FromCorpus(self.c.0.clone())
     }
 
     /// The corpus as the agent will see it. Through [`CDir`], never `digest_tree`: with
@@ -397,6 +447,11 @@ fn feed(h: &mut Sha256, bytes: &[u8]) {
 /// `harvest_core::fs::hash_dir`, plus a classification filter, the length prefixing above,
 /// and following symlinks to hash content rather than the link target — the links around
 /// phase dirs are staging artifacts whose targets are per-run paths.
+/// Named so the entry's record and the hasher cannot disagree about which algorithm ran.
+pub const TREE_ALGORITHM: &str = "harvest-tree-v1";
+/// The oracle walk hashes a different file set, so it is a different algorithm.
+pub const ORACLE_TREE_ALGORITHM: &str = "harvest-oracle-tree-v1";
+
 fn digest_tree(root: &Path) -> Result<TreeDigest> {
     hash_tree(root, &|d| d == Disposition::StoreAndHash)
 }
@@ -930,6 +985,13 @@ impl<P: Phase> Sealed<P> {
     /// Takes a destination and returns nothing, so there is still no expression that
     /// yields a path *to* a sealed artifact. Uses the same [`Carry`] variant as the
     /// results-tree overlay, so a replay cannot differ from a fresh run.
+    /// Where this artifact lives, so a work dir seeded from it can tell the store what its key
+    /// named. Returns a [`Seed`], not a path, so `Sealed` still yields no `Path` and
+    /// `sealed_has_no_path` keeps holding.
+    pub fn as_seed(&self) -> Seed {
+        Seed::FromArtifact(self.root.clone())
+    }
+
     pub fn export_into(&self, dest: &Path) -> Result<()> {
         copy_carrying(&self.root, dest, Carry::FromArtifact)
     }
