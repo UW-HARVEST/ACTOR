@@ -12,8 +12,8 @@ fn main() {
     let scratch = harvest_tools::artifact::Scratch::new("t-").unwrap();
     let work: harvest_tools::artifact::WorkTree<harvest_tools::artifact::Verify> =
         sealed.materialise_into(scratch).unwrap();
+    let c_before = work.c().snapshot().unwrap();
     let scrubbed = work.scrub().unwrap();
-    let c_before = sealed.digest();
-    let _sealed = scrubbed.seal(proof(), c_before).unwrap();
+    let _sealed = scrubbed.seal(proof(), &c_before).unwrap();
     let _ = scrubbed.rewritten();
 }

@@ -1211,7 +1211,7 @@ pub(crate) mod tests {
         let work: WorkTree<Verify> = translated
             .materialise_into(Scratch::new("cache-test-").unwrap())
             .unwrap();
-        let c_before = work.c().digest().unwrap();
+        let c_before = work.c().snapshot().unwrap();
         std::fs::write(work.crate_dir().join("src/lib.rs"), edit).unwrap();
         work.scrub()
             .unwrap()

@@ -10,18 +10,20 @@ use std::path::{Path, PathBuf};
 /// one anything can execute in), and on `finish` requires proof that the agent completed
 /// before the result may reach the phase dir.
 ///
-/// The two digests travel WITH the tree rather than beside it, so
+/// The input digest and the oracle travel WITH the tree rather than beside it, so
 /// [`crate::agents::run::run_cached`] reads the key's input component off the very tree it
 /// hands the agent: a key naming another tree is unrepresentable rather than avoided.
 pub struct IsolatedWorkDir<P: crate::artifact::Phase> {
     work: crate::artifact::WorkTree<P>,
     /// Digest of the artifact or corpus this was materialised from.
     input: crate::artifact::TreeDigest,
-    /// Digest of the C oracle as handed to the agent, compared on `finish`: the C
+    /// The C oracle as handed to the agent, compared file by file on `finish`: the C
     /// side is the reference being graded against, so a run that modified it has not
     /// been verified against the original program. `verify.md` contains no rule
-    /// forbidding that, so this check is the only thing catching it.
-    c_before: crate::artifact::TreeDigest,
+    /// forbidding that, so this check is the only thing catching it. A file set rather than
+    /// a digest because building the oracle is instructed, and only the file set tells the
+    /// build's output apart from an edit to the reference.
+    c_before: crate::artifact::Oracle,
 }
 
 /// Translate is the first phase, so it is seeded from the C corpus — an INPUT, and the only
@@ -34,7 +36,7 @@ impl IsolatedWorkDir<crate::artifact::Translate> {
         let scratch = crate::artifact::Scratch::new("harvest-translate-")?;
         let input = corpus.digest()?;
         let work = corpus.materialise_into::<crate::artifact::Translate>(scratch)?;
-        let c_before = work.c().digest()?;
+        let c_before = work.c().snapshot()?;
         Ok(Self {
             work,
             input,
@@ -52,7 +54,7 @@ impl IsolatedWorkDir<crate::artifact::Verify> {
         let scratch = crate::artifact::Scratch::new("harvest-work-")?;
         let input = translated.digest().clone();
         let work = translated.materialise_into::<crate::artifact::Verify>(scratch)?;
-        let c_before = work.c().digest()?;
+        let c_before = work.c().snapshot()?;
         Ok(Self {
             work,
             input,

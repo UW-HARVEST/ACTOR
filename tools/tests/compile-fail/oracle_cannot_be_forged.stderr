@@ -1,0 +1,16 @@
+error[E0603]: tuple struct constructor `Oracle` is private
+ --> tests/compile-fail/oracle_cannot_be_forged.rs:4:44
+  |
+4 |     let _forged = harvest_tools::artifact::Oracle;
+  |                                            ^^^^^^ private tuple struct constructor
+  |
+ ::: src/artifact.rs
+  |
+  | pub struct Oracle(Reference);
+  |                   --------- a constructor is private if any of the fields is private
+  |
+note: the tuple struct constructor `Oracle` is defined here
+ --> src/artifact.rs
+  |
+  | pub struct Oracle(Reference);
+  | ^^^^^^^^^^^^^^^^^

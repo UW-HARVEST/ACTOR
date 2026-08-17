@@ -494,22 +494,290 @@ impl<P: Phase> WorkTree<P> {
     }
 }
 
-/// This crate cannot modify the oracle: no `&Path`, no writes. The agent subprocess holds
-/// [`WorkTree::path`] and *can*, hence the before/after compare in [`Scrubbed::seal`].
+/// Hands out no `&Path` and writes nothing, so nothing reached through it can alter the
+/// reference. The agent subprocess holds [`WorkTree::path`] and *can*, hence the compare in
+/// [`Scrubbed::seal`] — which then deletes only what that compare judged to be build output.
 pub struct CDir(PathBuf);
 
+/// The oracle's traversal predicate, spelled once for [`CDir::digest`], which keys the translate
+/// cache, and for the seal guard. Wider than [`digest_tree`]'s: from `c_src` as its own root the
+/// root-anchored rules cannot see the prefix, so [`classify`] calls `.bak`/`.log`/`.sha256`
+/// `Ignore` although they are reference source — narrowing it loses 26 stored cases' files.
+fn oracle_admits(d: Disposition) -> bool {
+    d != Disposition::BuildOutput
+}
+
 impl CDir {
-    /// Everything but build output — the same files [`classify`] keeps under `c_src/`
-    /// when reached from the artifact root. This walk sees `c_src` as its own root, where
-    /// the root-anchored rules cannot recognise the prefix, so the predicate is spelled
-    /// here instead.
+    /// Everything but build output — the files [`classify`] keeps under `c_src/` from the root.
     pub fn digest(&self) -> Result<TreeDigest> {
         if self.0.is_dir() {
-            hash_tree(&self.0, &|d| d != Disposition::BuildOutput)
+            hash_tree(&self.0, &oracle_admits)
         } else {
             Ok(TreeDigest("sha256:absent".into()))
         }
     }
+
+    /// The oracle as a file set, not one number, which is what [`Scrubbed::seal`] compares.
+    pub fn snapshot(&self) -> Result<Oracle> {
+        if !self.0.is_dir() {
+            return Ok(Oracle(Reference::Ungraded));
+        }
+        let mut files = std::collections::BTreeMap::new();
+        for (rel, abs) in self.contents()? {
+            files.insert(rel, file_digest(&abs)?);
+        }
+        if files.is_empty() {
+            return Err(crate::refusal::Refusal::OracleEmpty {
+                at: self.0.display().to_string(),
+            }
+            .into());
+        }
+        Ok(Oracle(Reference::Graded(OracleFiles(files))))
+    }
+
+    /// The files [`Self::digest`] hashes, by path.
+    fn contents(&self) -> Result<std::collections::BTreeMap<RelPath, PathBuf>> {
+        let mut files = std::collections::BTreeMap::new();
+        if !self.0.is_dir() {
+            return Ok(files);
+        }
+        refuse_symlink(&self.0, Path::new(C_ORACLE_DIR))?;
+        self.walk(&self.0, false, &mut files)?;
+        Ok(files)
+    }
+
+    /// Not [`visit`], which sniffs the directory it STARTS in — a `CMakeCache.txt` at the oracle
+    /// root would read the whole reference as build output and hide every addition beside it, while
+    /// sub-directories must still be sniffed. It also descends on `is_dir()`, which follows:
+    /// refusing a link at DESCENT, not at emission, is what covers a directory link whose subtree
+    /// emits nothing — an empty target, or one holding only `build/` — and is otherwise unnamed.
+    fn walk(
+        &self,
+        dir: &Path,
+        in_build_dir: bool,
+        files: &mut std::collections::BTreeMap<RelPath, PathBuf>,
+    ) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let Ok(Ok(rel)) = path.strip_prefix(&self.0).map(RelPath::new) else {
+                continue;
+            };
+            if !oracle_admits(classify(&rel, in_build_dir)) {
+                continue;
+            }
+            refuse_symlink(&path, rel.as_path())?;
+            if path.is_dir() {
+                self.walk(&path, in_build_dir || is_cmake_build_dir(&path), files)?;
+            } else {
+                files.insert(rel, path);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Refused, not skipped, and only for the oracle root and the admitted paths beneath it: the rest
+/// of the `WorkTree` the agent holds is uncovered and needs none, since nothing here reads or
+/// unlinks outside `c_src`. [`drop_build_products`] unlinks what the walk named and `remove_file`
+/// resolves all but the last component, so a link anywhere on a path deletes what we do not own.
+fn refuse_symlink(abs: &Path, named: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(abs)
+        .with_context(|| format!("inspecting {}", abs.display()))?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(crate::refusal::Refusal::OracleModified {
+            change: crate::refusal::OracleChange::Symlinked,
+            file: named.display().to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The C reference as the agent was handed it, file by file. A whole-directory digest answers
+/// "did anything differ", the wrong question: the translate prompt tells the agent to build the C
+/// library and `nm -D` the resulting `.so`, so a difference is what compliance looks like — 532 of
+/// 6,312 stored `translated/*/c_src` trees hold 3,276 compiled artefacts at paths this walk
+/// covers. The invariant is "the reference we grade against is the one we shipped", not "nothing
+/// differs". Never empty, `NONE` aside: [`CDir::snapshot`] refuses rather than record nothing.
+#[derive(Debug)]
+pub struct OracleFiles(std::collections::BTreeMap<RelPath, [u8; 32]>);
+
+/// Proof that the oracle was READ, and the only thing [`Scrubbed::seal`] grades against. The
+/// private field IS the invariant: a public field-less variant compiled from outside the crate, and
+/// a caller passing it sealed an edited or deleted reference silently, where a digest refused loud.
+#[derive(Debug)]
+pub struct Oracle(Reference);
+
+/// Whether the tree handed to the agent HELD a reference to grade against. An empty file set stood
+/// for both "nothing to check" and "the check saw nothing", and the second cannot fire: with no
+/// recorded file, no edit, deletion or hiding is reachable and [`Scrubbed::seal`] seals whatever it
+/// is handed. Both are real — 678 of 6,990 stored translations hold no `c_src` at all: c2saferrust
+/// and smartc2rust entirely (338 each, seeded from a sibling backend's tree, not the corpus), plus
+/// `CRUST/kiro/impcheck` and one Test-Corpus case — so only the second refuses.
+#[derive(Debug)]
+enum Reference {
+    Graded(OracleFiles),
+    /// No reference was handed over, so the one rule left is that the run may not invent one.
+    Ungraded,
+}
+
+impl Oracle {
+    fn judge(&self, artifact: &Path) -> Result<OracleVerdict> {
+        match &self.0 {
+            Reference::Graded(files) => files.judge(artifact),
+            Reference::Ungraded => OracleFiles::NONE.judge(artifact),
+        }
+    }
+}
+
+enum OracleVerdict {
+    Tampered(crate::refusal::Refusal),
+    /// What building the reference left — absolute, because [`drop_build_products`] deletes it.
+    BuiltInPlace(Vec<PathBuf>),
+}
+
+impl OracleFiles {
+    /// Only `Reference::Ungraded` reaches it: judging additions against nothing IS "invent none".
+    const NONE: Self = Self(std::collections::BTreeMap::new());
+
+    /// Gone, edited, or no longer in the artifact is tampering; so is an unexplained addition.
+    fn judge(&self, artifact: &Path) -> Result<OracleVerdict> {
+        use crate::refusal::{OracleChange, Refusal};
+        let tampered = |change, rel: &RelPath| {
+            Ok(OracleVerdict::Tampered(Refusal::OracleModified {
+                change,
+                file: rel.as_path().display().to_string(),
+            }))
+        };
+        let now = CDir(artifact.join(C_ORACLE_DIR));
+        let carried = oracle_paths_in_artifact(artifact)?;
+        for (rel, before) in &self.0 {
+            let abs = now.0.join(rel.as_path());
+            if !abs.is_file() {
+                return tampered(OracleChange::Removed, rel);
+            }
+            if !carried.contains(rel) {
+                return tampered(OracleChange::Hidden, rel);
+            }
+            if &file_digest(&abs)? != before {
+                return tampered(OracleChange::Edited, rel);
+            }
+        }
+        let mut built = Vec::new();
+        for (rel, abs) in now.contents()? {
+            if self.0.contains_key(&rel) {
+                continue;
+            }
+            if !is_build_product(&rel, &head(&abs)?) {
+                return tampered(OracleChange::Added, &rel);
+            }
+            built.push(abs);
+        }
+        Ok(OracleVerdict::BuiltInPlace(built))
+    }
+}
+
+/// The reference as the artifact will actually contain it, relative to the oracle. Walked from the
+/// artifact root, where [`digest_tree`] and [`copy_carrying`] start and every directory is sniffed
+/// as they descend: one empty `c_src/CMakeFiles/` leaves the reference on disk but out of the seal.
+fn oracle_paths_in_artifact(artifact: &Path) -> Result<std::collections::BTreeSet<RelPath>> {
+    let mut under_oracle = std::collections::BTreeSet::new();
+    visit(
+        artifact,
+        artifact,
+        false,
+        &|d| Carry::FromArtifact.admits(d),
+        &mut |rel, _| {
+            if let Ok(Ok(rel)) = rel.as_path().strip_prefix(C_ORACLE_DIR).map(RelPath::new) {
+                under_oracle.insert(rel);
+            }
+            Ok(())
+        },
+    )?;
+    Ok(under_oracle)
+}
+
+/// Delete what building the reference left rather than hash and store it: a build product is where
+/// the per-run scratch path gets baked in (22 of 201 stored `.o` files at digest-covered paths hold
+/// one) and `scrub` cannot reach it, reading UTF-8 and skipping a binary silently — so the digest of
+/// byte-identical Rust would differ every run and the verify entry it keys never hit. Deleted, not
+/// reclassified: [`classify`] is what the pinned golden digests measure. Reported, not silent, and
+/// unlinked by this process rather than the agent, so every path came through [`refuse_symlink`].
+fn drop_build_products(products: &[PathBuf]) -> Result<()> {
+    for abs in products {
+        std::fs::remove_file(abs)
+            .with_context(|| format!("removing the build product {}", abs.display()))?;
+    }
+    if !products.is_empty() {
+        eprintln!(
+            "  dropped {} file(s) that building the C reference left under {C_ORACLE_DIR}/",
+            products.len()
+        );
+    }
+    Ok(())
+}
+
+fn file_digest(path: &Path) -> Result<[u8; 32]> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(Sha256::digest(&bytes).into())
+}
+
+/// The longest magic below. Not `fs::read`: an added `.so` runs to megabytes.
+const MAGIC_BYTES: u64 = 8;
+
+fn head(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .with_context(|| format!("opening {}", path.display()))?
+        .take(MAGIC_BYTES)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(bytes)
+}
+
+/// What a C build leaves beside the sources it compiled: `.d`/`.la` text, `.gcda`/`.gcno`
+/// coverage counters, all of it generated.
+const BUILD_PRODUCT_EXTS: &[&str] = &[
+    "o", "a", "so", "lo", "la", "obj", "d", "gch", "pch", "dylib", "gcda", "gcno",
+];
+
+/// ELF, an `ar` archive, Mach-O in both byte orders plus its fat header, and gcov's own pair.
+const BUILD_PRODUCT_MAGIC: &[&[u8]] = &[
+    b"\x7fELF",
+    b"!<arch>\n",
+    &[0xfe, 0xed, 0xfa, 0xce],
+    &[0xce, 0xfa, 0xed, 0xfe],
+    &[0xfe, 0xed, 0xfa, 0xcf],
+    &[0xcf, 0xfa, 0xed, 0xfe],
+    &[0xca, 0xfe, 0xba, 0xbe],
+    b"adcg",
+    b"oncg",
+];
+
+/// Did building the reference produce this file, rather than the reference shipping it?
+/// Sniffed as well as matched on the extension: of the 532 stored trees that built the oracle
+/// in place, 294 hold a product the extension list cannot name (`c_src/test_runner`,
+/// `c_src/main` — compiled, and with no extension at all).
+fn is_build_product(rel: &RelPath, head: &[u8]) -> bool {
+    if BUILD_PRODUCT_MAGIC.iter().any(|m| head.starts_with(m)) {
+        return true;
+    }
+    let Some(name) = rel.as_path().file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let mut rest = name;
+    // `libfoo.so.1.2.3`: strip the version tail, then judge the extension under it.
+    while let Some((stem, last)) = rest.rsplit_once('.') {
+        if !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()) {
+            rest = stem;
+            continue;
+        }
+        return BUILD_PRODUCT_EXTS.contains(&last);
+    }
+    false
 }
 
 /// Output whose per-run paths have been normalised. The only input to a digest.
@@ -525,24 +793,11 @@ impl<P: Phase> Scrubbed<P> {
         &self.rewritten
     }
 
-    pub fn seal(self, _proof: &Completed, c_before: &TreeDigest) -> Result<Sealed<P>> {
-        let c_after = CDir(self.root.join("c_src")).digest()?;
-        if &c_after != c_before {
-            return Err(crate::refusal::Refusal::OracleModified {
-                before: c_before.as_str().to_string(),
-                after: c_after.as_str().to_string(),
-            }
-            .into());
+    pub fn seal(self, _proof: &Completed, c_before: &Oracle) -> Result<Sealed<P>> {
+        match c_before.judge(&self.root)? {
+            OracleVerdict::Tampered(refusal) => return Err(refusal.into()),
+            OracleVerdict::BuiltInPlace(products) => drop_build_products(&products)?,
         }
-        let c_after = CDir(self.root.join(C_ORACLE_DIR)).digest()?;
-        anyhow::ensure!(
-            &c_after == c_before,
-            "the agent modified the C oracle source: {} before, {} after. \
-             The C side is the reference the translation is graded against; a run that \
-             changes it has not been verified against the original program.",
-            c_before.as_str(),
-            c_after.as_str()
-        );
         let digest = digest_tree(&self.root)?;
         Ok(Sealed {
             root: self.root,
@@ -792,33 +1047,36 @@ mod tests {
         assert_ne!(digest_of(b"a\xff"), digest_of(b"a\xfe"));
     }
 
-    /// The oracle guard walks `c_src` as its OWN root, where the root-anchored rules in
-    /// `classify` cannot see the `c_src` prefix. Both walks must cover the same files or
-    /// the guard is blind to exactly what the artifact digest records.
+    /// The guard walks `c_src` as its OWN root, where the root-anchored rules in `classify`
+    /// cannot see the `c_src` prefix, so oracle source reads `Ignore` there and
+    /// `StoreAndHash` from the artifact root that carries it. Narrow the guard's predicate to
+    /// the digest's and it stops recording the file, and an agent may rewrite the reference.
     #[test]
     fn the_oracle_guard_sees_a_bak_file_change() {
-        let tmp = crate::io::workdir::test_tempdir().unwrap();
-        let c = tmp.path().join("c_src");
-        tree(
-            &c,
-            &[
-                ("src/lib.c", "int a(void){return 0;}"),
-                ("doc/footer.html.bak", "upstream"),
-            ],
-        );
-
-        let before = CDir(c.clone()).digest().unwrap();
-        std::fs::write(c.join("doc/footer.html.bak"), "the agent edited the oracle").unwrap();
-        assert_ne!(
-            before,
-            CDir(c.clone()).digest().unwrap(),
-            "a .bak edit must move the digest"
-        );
-
+        let (work, c_before, _) = seeded_oracle();
         assert_eq!(
-            classify(&rel("c_src/doc/footer.html.bak"), false),
-            Disposition::StoreAndHash,
-            "and the artifact digest must cover the same file",
+            (
+                classify(&rel("doc/footer.html.bak"), false),
+                classify(&rel("c_src/doc/footer.html.bak"), false),
+            ),
+            (Disposition::Ignore, Disposition::StoreAndHash),
+            "fixture assumption: the same file, classified from the two roots"
+        );
+
+        std::fs::write(
+            work.c().0.join("doc/footer.html.bak"),
+            "the agent edited the oracle",
+        )
+        .unwrap();
+
+        let err = seal_as_completed(work, &c_before).expect_err("an edited reference must refuse");
+        assert_eq!(
+            crate::refusal::Refusal::in_chain(&err),
+            Some(&crate::refusal::Refusal::OracleModified {
+                change: crate::refusal::OracleChange::Edited,
+                file: "doc/footer.html.bak".into(),
+            }),
+            "{err:#}"
         );
     }
 
@@ -994,7 +1252,7 @@ mod tests {
         );
 
         // Stand in for the agent: edit the Rust, and bake a scratch path into a note.
-        let c_before = work.c().digest().unwrap();
+        let c_before = work.c().snapshot().unwrap();
         std::fs::write(
             crate_dir.join("src/lib.rs"),
             "pub fn a() { /* verified */ }",
@@ -1092,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn seal_refuses_when_the_agent_modified_the_c_oracle() {
+    fn an_edited_oracle_source_is_still_refused() {
         let case = crate::io::workdir::test_tempdir().unwrap();
         tree(
             &case.path().join(crate::battery::TRANSLATED),
@@ -1105,7 +1363,11 @@ mod tests {
         let work: WorkTree<Verify> = sealed
             .materialise_into(Scratch::new("t-").unwrap())
             .unwrap();
-        let c_before = work.c().digest().unwrap();
+        let c_before = work.c().snapshot().unwrap();
+        assert!(
+            matches!(&c_before.0, Reference::Graded(f) if f.0.contains_key(&rel("src/lib.c"))),
+            "non-vacuity: the file this test edits must be one the snapshot recorded"
+        );
 
         std::fs::write(
             work.crate_dir().join("c_src/src/lib.c"),
@@ -1118,34 +1380,366 @@ mod tests {
             .unwrap()
             .seal(&crate::domain::health::Completed::for_test(), &c_before)
             .expect_err("modifying the oracle must be refused");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("modified the C oracle"), "{msg}");
+        assert_eq!(
+            crate::refusal::Refusal::in_chain(&err),
+            Some(&crate::refusal::Refusal::OracleModified {
+                change: crate::refusal::OracleChange::Edited,
+                file: "src/lib.c".into(),
+            }),
+            "{err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("modified the C oracle"),
+            "{err:#}"
+        );
     }
 
-    /// Sealing refuses ADDITIONS to `c_src/`, not only edits, so a run that compiled the oracle in
-    /// place now fails where it used to publish. `CMakeCache.txt` AT the hash root is the worst:
-    /// it makes `is_cmake_build_dir` true for the oracle, so [`CDir::digest`] admits nothing below.
+    /// A translate work tree as handed over: the oracle as a file set, and as the digest it used.
+    fn seeded_oracle() -> (WorkTree<Translate>, Oracle, TreeDigest) {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let src = tmp.path().join("corpus");
+        tree(
+            &src,
+            &[
+                ("src/lib.c", "int a(void){return 0;}"),
+                ("include/a.h", "int a(void);"),
+                // Reference source that reads as `Ignore` from the oracle root: 26 stored cases
+                // hold this file, and only a predicate wider than the digest's records it.
+                ("doc/footer.html.bak", "upstream"),
+            ],
+        );
+        let work: WorkTree<Translate> = Corpus::adopt(&src)
+            .unwrap()
+            .materialise_into(Scratch::new("t-").unwrap())
+            .unwrap();
+        let files = work.c().snapshot().unwrap();
+        let digest = work.c().digest().unwrap();
+        assert!(
+            matches!(&files.0, Reference::Graded(f) if f.0.len() == 3),
+            "non-vacuity for every test below: they all judge against THIS snapshot, and one \
+             that recorded nothing would make each of them green while inspecting no file"
+        );
+        tree(&work.crate_dir(), &[("Cargo.toml", "[package]")]);
+        (work, files, digest)
+    }
+
+    fn seal_as_completed(work: WorkTree<Translate>, c_before: &Oracle) -> Result<()> {
+        work.scrub()?
+            .seal(&crate::domain::health::Completed::for_test(), c_before)
+            .map(|_| ())
+    }
+
+    /// The prompt tells the agent to build the C library and `nm -D` the `.so`, so an in-tree
+    /// `make` is compliance: 71 of 6,312 stored trees hold a `.o`, `.a` or `.so` it refused.
+    /// The product is accepted and then dropped, so it never reaches the digest.
     #[test]
-    fn a_translation_that_built_the_c_oracle_in_place_is_refused() {
-        for left_behind in ["driver", "CMakeCache.txt"] {
-            let tmp = crate::io::workdir::test_tempdir().unwrap();
-            let src = tmp.path().join("corpus");
-            tree(&src, &[("src/lib.c", "int a(void){return 0;}")]);
-            let work: WorkTree<Translate> = Corpus::adopt(&src)
+    fn an_added_object_file_beside_its_source_is_not_an_oracle_modification() {
+        let (work, c_before, digest_before) = seeded_oracle();
+        tree(
+            &work.c().0,
+            &[("src/foo.o", "not even ELF, just object bytes")],
+        );
+        assert_ne!(
+            digest_before,
+            work.c().digest().unwrap(),
+            "fixture assumption: the digest the old check compared really did move"
+        );
+        seal_as_completed(work, &c_before).expect("a compiled artefact is not tampering");
+    }
+
+    /// The measured case `c_src/test_runner`: a bare ELF with no extension to match. 294 of the
+    /// 532 affected trees hold one, so an extension list on its own would miss most of them.
+    #[test]
+    fn an_extensionless_compiled_binary_at_the_oracle_root_is_not_an_oracle_modification() {
+        let (work, c_before, digest_before) = seeded_oracle();
+        std::fs::write(
+            work.c().0.join("test_runner"),
+            b"\x7fELF\x02\x01\x01\x00 and the rest of a binary",
+        )
+        .unwrap();
+        assert_ne!(
+            digest_before,
+            work.c().digest().unwrap(),
+            "fixture assumption: the digest the old check compared really did move"
+        );
+        assert!(
+            !is_build_product(&rel("test_runner"), b"#!/bin/sh\n"),
+            "and the acceptance must come from the content, not from the bare name"
+        );
+        seal_as_completed(work, &c_before).expect("building the oracle is what the prompt asks");
+    }
+
+    /// Coverage output is as much "the reference's own build produced this" as an object file is,
+    /// and in 203 stored trees it is the ONLY build product present. gcov names its files after the
+    /// object rather than the source, so the extension list alone can miss them; both magics match.
+    #[test]
+    fn gcov_output_from_building_the_reference_is_not_an_oracle_modification() {
+        for (name, magic) in [
+            ("src/lib.gcda", &b"adcg\x42\x30\x37\x2a"[..]),
+            ("src/lib-cov-2", b"oncg\x42\x30\x37\x2a"),
+        ] {
+            let (work, c_before, digest_before) = seeded_oracle();
+            std::fs::write(work.c().0.join(name), magic).unwrap();
+            assert_ne!(
+                digest_before,
+                work.c().digest().unwrap(),
+                "fixture assumption for {name}: the digest the old check compared did move"
+            );
+            assert_eq!(
+                is_build_product(&rel(name), b"whatever text"),
+                name.ends_with(".gcda"),
+                "{name}: the second case must be carried by the magic, not by its name"
+            );
+            seal_as_completed(work, &c_before).expect(name);
+        }
+    }
+
+    /// A deletion was only ever implied by a digest difference, which names no file and no kind.
+    #[test]
+    fn a_deleted_oracle_source_is_refused_and_says_so() {
+        let (work, c_before, _) = seeded_oracle();
+        std::fs::remove_file(work.c().0.join("include/a.h")).unwrap();
+        let err = seal_as_completed(work, &c_before).expect_err("a deleted reference must refuse");
+        assert_eq!(
+            crate::refusal::Refusal::in_chain(&err),
+            Some(&crate::refusal::Refusal::OracleModified {
+                change: crate::refusal::OracleChange::Removed,
+                file: "include/a.h".into(),
+            }),
+            "{err:#}"
+        );
+        assert!(format!("{err:#}").contains("was removed"), "{err:#}");
+    }
+
+    /// The shadowing hazard: a new `.h` pre-empts an include, a new `.c` is swept up by a glob.
+    #[test]
+    fn an_added_header_is_still_refused() {
+        let (work, c_before, _) = seeded_oracle();
+        tree(&work.c().0, &[("include/shim.h", "#define a() 1")]);
+        let err = seal_as_completed(work, &c_before).expect_err("an added header must refuse");
+        assert_eq!(
+            crate::refusal::Refusal::in_chain(&err),
+            Some(&crate::refusal::Refusal::OracleModified {
+                change: crate::refusal::OracleChange::Added,
+                file: "include/shim.h".into(),
+            }),
+            "{err:#}"
+        );
+    }
+
+    /// `is_cmake_build_dir` is an OR, and either leg blinds the walk that hashes and publishes:
+    /// `digest_tree` and `copy_carrying` sniff every directory as they descend into `c_src`, so a
+    /// recorded file the guard just stat'd can be absent from the artifact it seals. A stored case
+    /// does this: `B02_synthetic/tu_linkage` holds both legs at the oracle root, and of the 13 files
+    /// the guard records there — 9 corpus reference source, the rest cmake's own — none is carried.
+    #[test]
+    fn a_run_that_makes_the_reference_read_as_build_output_is_refused() {
+        for (left_behind, hidden) in [
+            ("CMakeFiles/TargetDirectories.txt", "doc/footer.html.bak"),
+            ("CMakeCache.txt", "doc/footer.html.bak"),
+            ("src/CMakeFiles/dep.make", "src/lib.c"),
+            ("src/CMakeCache.txt", "src/lib.c"),
+        ] {
+            let (work, c_before, _) = seeded_oracle();
+            tree(&work.c().0, &[(left_behind, "cmake internals")]);
+            assert!(
+                work.c().0.join(hidden).is_file(),
+                "{left_behind}: the reference is still on disk, so no stat can catch this"
+            );
+            let out = crate::io::workdir::test_tempdir().unwrap();
+            let published = out.path().join("published");
+            copy_carrying(&work.crate_dir(), &published, Carry::FromArtifact).unwrap();
+            assert!(
+                !published.join(C_ORACLE_DIR).join(hidden).exists(),
+                "fixture assumption for {left_behind}: the artifact really does lose it"
+            );
+
+            let err = seal_as_completed(work, &c_before).expect_err(left_behind);
+            assert_eq!(
+                crate::refusal::Refusal::in_chain(&err),
+                Some(&crate::refusal::Refusal::OracleModified {
+                    change: crate::refusal::OracleChange::Hidden,
+                    file: hidden.into(),
+                }),
+                "{left_behind}: {err:#}"
+            );
+        }
+    }
+
+    /// Nothing can scrub a build product — `scrub` reads UTF-8 and skips a binary silently — so one
+    /// inside the digest makes two runs whose Rust is byte-identical seal differently, and the
+    /// verify entry that digest keys never hits. Measured: 22 of 201 stored `.o` files hold one.
+    #[test]
+    fn a_build_product_the_scrub_cannot_reach_reaches_neither_digest_nor_store() {
+        let seal_after_building = |built: bool| -> Sealed<Translate> {
+            let (work, c_before, _) = seeded_oracle();
+            if built {
+                let mut object = b"\x7fELF\x02\x01\x01\x00\xff".to_vec();
+                object.extend_from_slice(work.path().as_os_str().as_encoded_bytes());
+                object.extend_from_slice(b"/c_src/src/lib.gcda");
+                std::fs::write(work.c().0.join("src/lib.o"), object).unwrap();
+            }
+            work.scrub()
+                .unwrap()
+                .seal(&crate::domain::health::Completed::for_test(), &c_before)
+                .unwrap()
+        };
+        let one = seal_after_building(true);
+        assert_eq!(
+            seal_after_building(true).digest(),
+            one.digest(),
+            "each run bakes its own scratch path into the object file, so two runs that \
+             both built the reference must still seal alike"
+        );
+        assert_eq!(
+            seal_after_building(false).digest(),
+            one.digest(),
+            "and building the reference must not change the artifact's identity at all"
+        );
+
+        let out = crate::io::workdir::test_tempdir().unwrap();
+        let stored = out.path().join("code");
+        one.export_into(&stored).unwrap();
+        assert!(
+            stored.join("c_src/src/lib.c").is_file(),
+            "the reference itself must still be stored"
+        );
+        assert!(
+            !stored.join("c_src/src/lib.o").exists(),
+            "the store must not receive a file holding this host's scratch path"
+        );
+    }
+
+    /// The harness, not the sandboxed agent, unlinks what building the reference left, and the walk
+    /// naming those files descends on `is_dir()` — which follows. So a directory link the agent
+    /// plants is a delete of somebody else's file. Four shapes: inside the oracle, the oracle root
+    /// replaced by one (no component for the walk to reach), and two whose subtree emits NOTHING —
+    /// an empty target and one holding only `build/` — where a guard at emission never runs at all.
+    #[test]
+    fn a_symlink_inside_the_oracle_is_refused_rather_than_followed() {
+        type Plant = fn(&Path, &Path);
+        let below_the_root: Plant = |oracle, elsewhere| {
+            std::os::unix::fs::symlink(elsewhere, oracle.join("out")).unwrap();
+        };
+        let at_the_root: Plant = |oracle, elsewhere| {
+            copy_carrying(oracle, elsewhere, Carry::IntoWorkTree).unwrap();
+            std::fs::remove_dir_all(oracle).unwrap();
+            std::os::unix::fs::symlink(elsewhere, oracle).unwrap();
+        };
+
+        let theirs = &[("keep.o", "somebody else's file")][..];
+        let unadmitted = &[("build/keep.o", "in a BUILD_DIR, so never emitted")][..];
+        for (plant, named, behind) in [
+            (below_the_root, "out", theirs),
+            (at_the_root, C_ORACLE_DIR, theirs),
+            (below_the_root, "out", unadmitted),
+            (below_the_root, "out", &[][..]),
+        ] {
+            let outside = crate::io::workdir::test_tempdir().unwrap();
+            let elsewhere = outside.path().join("not-ours");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            tree(&elsewhere, behind);
+
+            let (work, c_before, _) = seeded_oracle();
+            assert!(
+                !elsewhere.starts_with(work.path()),
+                "fixture assumption: the link target is outside the work tree"
+            );
+            plant(&work.c().0, &elsewhere);
+
+            let outcome = seal_as_completed(work, &c_before);
+            assert!(
+                elsewhere.is_dir() && behind.iter().all(|(f, _)| elsewhere.join(f).is_file()),
+                "{named}: the harness reached through the link into {}",
+                elsewhere.display()
+            );
+            let err = outcome.expect_err(named);
+            assert_eq!(
+                crate::refusal::Refusal::in_chain(&err),
+                Some(&crate::refusal::Refusal::OracleModified {
+                    change: crate::refusal::OracleChange::Symlinked,
+                    file: named.into(),
+                }),
+                "{named}: {err:#}"
+            );
+        }
+    }
+
+    /// `judge` compares recorded files, so an empty record reports nothing and seals whatever
+    /// it was handed. No such value exists to seal with: finding no file refuses instead.
+    #[test]
+    fn an_empty_oracle_snapshot_cannot_seal() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let src = tmp.path().join("corpus");
+        std::fs::create_dir_all(&src).unwrap();
+        let work: WorkTree<Translate> = Corpus::adopt(&src)
+            .unwrap()
+            .materialise_into(Scratch::new("t-").unwrap())
+            .unwrap();
+        let c = work.c();
+        assert!(
+            c.0.is_dir() && c.contents().unwrap().is_empty(),
+            "fixture assumption: the oracle dir exists and the walk sees nothing in it"
+        );
+
+        let err = c
+            .snapshot()
+            .expect_err("an oracle with no files must refuse");
+        assert_eq!(
+            crate::refusal::Refusal::in_chain(&err),
+            Some(&crate::refusal::Refusal::OracleEmpty {
+                at: c.0.display().to_string(),
+            }),
+            "{err:#}"
+        );
+
+        tree(&src, &[("src/lib.c", "int a(void){return 0;}")]);
+        let work: WorkTree<Translate> = Corpus::adopt(&src)
+            .unwrap()
+            .materialise_into(Scratch::new("t-").unwrap())
+            .unwrap();
+        tree(&work.crate_dir(), &[("Cargo.toml", "[package]")]);
+        let c_before = work.c().snapshot().unwrap();
+        seal_as_completed(work, &c_before)
+            .expect("non-vacuity: the same corpus seals once its oracle has one file in it");
+    }
+
+    /// The other state an empty record stood for: 678 of 6,990 stored translations hold no
+    /// `c_src` at all, so they must still seal — and the rule left is that they invent none.
+    #[test]
+    fn a_tree_that_never_had_an_oracle_seals_but_may_not_invent_one() {
+        let seal_after = |invents: bool| -> Result<()> {
+            let case = crate::io::workdir::test_tempdir().unwrap();
+            tree(
+                &case.path().join(crate::battery::TRANSLATED),
+                &[("Cargo.toml", "[package]"), ("src/lib.rs", "pub fn a() {}")],
+            );
+            let work: WorkTree<Verify> = Sealed::<Translate>::adopt(case.path())
                 .unwrap()
                 .materialise_into(Scratch::new("t-").unwrap())
                 .unwrap();
-            let c_before = work.c().digest().unwrap();
-            tree(&work.crate_dir(), &[("Cargo.toml", "[package]")]);
-            tree(&work.c().0, &[(left_behind, "\x7fELF")]);
-
-            let err = work
-                .scrub()
-                .unwrap()
+            let c_before = work.c().snapshot().unwrap();
+            assert!(
+                matches!(c_before.0, Reference::Ungraded),
+                "fixture assumption: a translation with no c_src is handed no reference"
+            );
+            if invents {
+                tree(&work.c().0, &[("src/mine.c", "int a(void){return 1;}")]);
+            }
+            work.scrub()?
                 .seal(&crate::domain::health::Completed::for_test(), &c_before)
-                .expect_err(left_behind);
-            assert!(format!("{err:#}").contains("C oracle"), "{err:#}");
-        }
+                .map(|_| ())
+        };
+        seal_after(false).expect("a translation that never had a reference must still seal");
+        let err = seal_after(true).expect_err("inventing the reference must refuse");
+        assert_eq!(
+            crate::refusal::Refusal::in_chain(&err),
+            Some(&crate::refusal::Refusal::OracleModified {
+                change: crate::refusal::OracleChange::Added,
+                file: "src/mine.c".into(),
+            }),
+            "{err:#}"
+        );
     }
 
     #[test]
