@@ -789,6 +789,18 @@ fn preflight_check(agent: Agent) -> Result<()> {
         }
     }
 
+    // REFUSE BEFORE THE MONEY. `ToolchainId::detect` is a key component and it refuses when
+    // `RUSTUP_TOOLCHAIN` disagrees with `rust-toolchain.toml`. Resolved per case it would let a
+    // sweep translate case 1, spend real money, and then refuse case 2 for a condition that was
+    // already true at launch -- which is the exact failure CLAUDE.md records ("a 3h20m sweep
+    // completed and then had all seven verifications refused for a variable that was already set
+    // at launch"). Probing it here costs one subprocess and moves that refusal to before the first
+    // invocation. The per-case call stays: it is what the key is built from, and it now cannot be
+    // the first thing to notice.
+    let toolchain = crate::cache::ToolchainId::detect()
+        .context("the pinned Rust toolchain must be resolvable before any agent is invoked")?;
+    println!("  toolchain {}", toolchain.as_str());
+
     Ok(())
 }
 

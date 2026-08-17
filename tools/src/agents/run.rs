@@ -239,6 +239,7 @@ mod tests {
         fn new(repo: &Path) -> Self {
             let roots = Roots {
                 work: PathBuf::from("/w"),
+                repo_parent: repo.parent().map(|p| p.to_path_buf()),
                 repo: repo.to_path_buf(),
                 work_base: None,
                 home: None,

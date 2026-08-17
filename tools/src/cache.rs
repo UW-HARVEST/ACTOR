@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Bump to invalidate every entry, e.g. if the key composition changes.
-pub const SCHEMA: u32 = 3;
+pub const SCHEMA: u32 = 4;
 
 macro_rules! digest_newtype {
     ($(#[$m:meta])* $name:ident) => {
@@ -265,6 +265,9 @@ pub fn normalise(text: &str, roots: &Roots) -> String {
     let mut subs: Vec<(&str, &str)> = [
         (Some(roots.work.as_path()), "$WORK"),
         (Some(roots.repo.as_path()), "$REPO"),
+        // Longest-first below puts $REPO ahead of this, so a path under the repo is never
+        // rewritten as `$REPOPARENT/ACTOR/...` and the checkout's own name stays out of the key.
+        (roots.repo_parent.as_deref(), "$REPOPARENT"),
         (roots.work_base.as_deref(), "$WORKBASE"),
         (roots.home.as_deref(), "$HOME"),
     ]
@@ -568,9 +571,20 @@ impl Store {
         let Some(produced) = compute()? else {
             return Ok(None);
         };
+        // LOUD BUT NOT FATAL. By this line the agent has run and the money is spent -- translate is
+        // a measured $795.59 per harvest-bench sweep -- and `produced.sealed` exists. Propagating a
+        // store failure here would return before `run_cached` reaches `publish`, so an ENOSPC or a
+        // leftover read-only staging dir would DESTROY a paid artifact to protect an optimisation.
+        // Storing is the optimisation; publishing is the deliverable. A failed store costs exactly
+        // one cache miss: the next run recomputes, because `replayed: false` is what it already
+        // reports.
         if self.mode != Mode::Bypass {
-            self.store(inputs, cli, &key, &dir, &produced)
-                .with_context(|| format!("storing cache entry {}", key.as_str()))?;
+            if let Err(e) = self
+                .store(inputs, cli, &key, &dir, &produced)
+                .with_context(|| format!("storing cache entry {}", key.as_str()))
+            {
+                eprintln!("  cache: NOT stored, publishing anyway: {e:#}");
+            }
         }
         Ok(Some(Obtained {
             sealed: produced.sealed,
@@ -1026,9 +1040,11 @@ pub(crate) mod tests {
     /// The roots as VALUES: no environment is consulted, so the substitution set is
     /// exactly what a test writes here.
     fn roots(work: &str, repo: &str) -> Roots {
+        let repo = PathBuf::from(repo);
         Roots {
             work: PathBuf::from(work),
-            repo: PathBuf::from(repo),
+            repo_parent: repo.parent().map(|p| p.to_path_buf()),
+            repo,
             work_base: None,
             home: None,
         }
@@ -1119,6 +1135,43 @@ pub(crate) mod tests {
     #[test]
     fn key_is_stable_for_identical_inputs() {
         assert_eq!(Inputs::new().key(), Inputs::new().key());
+    }
+
+    /// The store is meant to be pushed to the `results` submodule and reused. It could not be:
+    /// `denied_read_roots` denies the repo's PARENT, that path reaches `Recipe::digest` through the
+    /// policy shape, and `normalise` had no token for it — so the checkout's parent directory NAME
+    /// survived into both keys and a clone at another path shared nothing.
+    #[test]
+    fn the_same_policy_from_two_checkout_paths_normalises_the_same() {
+        let a = normalise(
+            "deny /local/home/bob/research/ACTOR and /local/home/bob/research; work /w/x",
+            &roots("/w/x", "/local/home/bob/research/ACTOR"),
+        );
+        let b = normalise(
+            "deny /local/home/bob/scratch/ACTOR and /local/home/bob/scratch; work /w/x",
+            &roots("/w/x", "/local/home/bob/scratch/ACTOR"),
+        );
+        assert_eq!(
+            a, b,
+            "identical inputs from differently-located checkouts must normalise identically, or the \
+             store can never be shared"
+        );
+        assert!(
+            !a.contains("research") && !a.contains("scratch"),
+            "and the parent directory name must not survive: got {a}"
+        );
+    }
+
+    /// The anti-loosening guard for the token above: tokenising taken too far ends in a recipe
+    /// digest that is a constant, and a wrong key is worse than no cache.
+    #[test]
+    fn a_policy_that_denies_a_different_root_still_normalises_differently() {
+        let base = normalise("deny /w/x", &roots("/w/x", "/r/ACTOR"));
+        let other = normalise("deny /somewhere/else", &roots("/w/x", "/r/ACTOR"));
+        assert_ne!(
+            base, other,
+            "a genuinely different policy must still produce a different shape"
+        );
     }
 
     /// THE reason the store never served a hit: `cli` was keyed, the agent CLIs auto-update
@@ -1680,6 +1733,48 @@ pub(crate) mod tests {
             "an entry that cannot say what it cost must be recomputed"
         );
         assert_eq!(got.provenance["duration_secs"], 42);
+    }
+
+    /// A store failure must never cost the artifact the agent was paid to produce. `obtain`
+    /// propagated it with `?` after `compute()` had already spent the money, so `run_cached` never
+    /// reached `publish` and an ENOSPC destroyed a translation to protect an optimisation.
+    #[test]
+    fn a_store_that_cannot_write_still_publishes_the_artifact_it_was_given() {
+        let f = fixture();
+        let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        let held = Inputs::new();
+        let inputs = held.key_inputs();
+
+        // Non-vacuity first: with the store writable, this very call DOES produce an entry.
+        let ok = store
+            .obtain(&inputs, &test_cli(), || {
+                Ok(Some(produced(&f.case, "pub fn a() {}")))
+            })
+            .expect("a writable store must store")
+            .expect("and must publish");
+        assert!(!ok.replayed);
+        assert_eq!(store.stats().unwrap().0, 1, "the fixture really can store");
+
+        // Now make writing impossible, on a key that has no entry yet, and demand the artifact.
+        let mut other = Inputs::new();
+        other.prompt = PromptDigest("sha256:unstorable".into());
+        let other_inputs = other.key_inputs();
+        let cache_root = f.repo.join("results/.cache");
+        crate::artifact::set_read_only(&cache_root, Access::ReadOnly).unwrap();
+
+        let out = store.obtain(&other_inputs, &test_cli(), || {
+            Ok(Some(produced(&f.case, "pub fn b() {}")))
+        });
+
+        crate::artifact::set_read_only(&cache_root, Access::Writable).unwrap();
+
+        let obtained = out
+            .expect("a store failure must NOT propagate: the agent already ran and was paid for")
+            .expect("and the sealed artifact must still be handed back to be published");
+        assert!(
+            !obtained.replayed,
+            "an unstored artifact is fresh, so the next run recomputes rather than expecting a hit"
+        );
     }
 
     #[test]
