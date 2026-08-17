@@ -49,8 +49,20 @@ backend, and it is one more reason the bypass list should shrink.
 **The published tree is not the cache.** Do not "promote" an existing unkeyed `translated/`
 into the store: nothing records what produced it, which is the whole defect. An unkeyed tree
 present on disk must be treated as absent by the keyed path, and it will be overwritten by
-`Sealed::publish` — which clears the phase dir and keeps `logs/`, so `verified/`,
-`test_vectors/` and `runner/` survive.
+`Sealed::publish`.
+
+Corrected while implementing, because the sentence that stood here was wrong about the code and
+a commit message built on it would have been wrong too: `publish` clears `translated/` but keeps
+its own `logs/`, and it removes the sibling `verified/` **whole, `logs/` included**, because a
+verification of the previous translation is not a verification of this one
+(`Translate::INVALIDATES`, and `artifact.rs` says why keeping just its logs would be worse — the
+"already verified" skip keys on `verified/logs/verify.log`). `test_vectors/` and `runner/` belong
+to the case rather than the phase, and do survive. Measured on the harvest-bench tree
+(`du -sck results/HarvestBench/claude/*/verified` = 143,392 KB), a keyed re-translate therefore
+destroys **140 MB** of `verified/` across the seven projects — four verified crates plus
+lz4/mujs/zstd's 4.1/12.4/22.1 MB abort transcripts. Every statement of this figure is that one
+measurement: adding up seven `du -sm` values instead reads 144, because each rounds up
+separately. That is correct behaviour and an operator decision, not a free retry.
 
 ## The cost this changes, stated plainly
 

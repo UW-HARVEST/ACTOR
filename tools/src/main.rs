@@ -123,7 +123,7 @@ fn main() -> Result<()> {
                 agent,
                 dataset,
                 model,
-                cache.into(),
+                cache.honouring(cli::Reuse::from_force_flag(force)),
                 harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),
@@ -235,8 +235,9 @@ fn run_test(
             anyhow::bail!(
                 "{report}\n\
                  Refusing to score. An infrastructure failure is not a result.\n\
-                 Re-run those cases (`verify <target> --force` after fixing the cause), \
-                 or pass --allow-infra-failures to score anyway.\n\
+                 Re-run those cases after fixing the cause: a dead run stores no cache entry, \
+                 so `verify <target>` re-runs it, and `--force` is needed only under \
+                 `--cache off`. Or pass --allow-infra-failures to score anyway.\n\
                  Details written to {}/INFRA_FAILURES.json",
                 paths.results_dir.display()
             );

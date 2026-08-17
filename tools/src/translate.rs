@@ -4,7 +4,7 @@ use crate::agents::exit::{
 use crate::agents::invocation::{
     assert_pins_honoured, claude_model, Backend, Invocation, KIRO_UNPINNED_MODEL,
 };
-use crate::agents::run::{run_cached, write_phase_metrics, Outcome, PhaseRun, Recorded};
+use crate::agents::run::{run_cached, write_phase_metrics, Outcome, PhaseRun, Recorded, SkipCheck};
 use crate::agents::session::{ClaudeRun, Session};
 use crate::agents::work::IsolatedWorkDir;
 use crate::agents::Semaphore;
@@ -112,6 +112,7 @@ pub fn run_test_corpus(
     parallel: usize,
 ) -> Result<()> {
     preflight_check(paths.agent)?;
+    let skip = translate_skip_check(paths);
 
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
@@ -141,7 +142,7 @@ pub fn run_test_corpus(
                     c.name.clone(),
                     s.spawn(|| {
                         let _permit = sem.acquire();
-                        translate_one_independent(paths, &output_dir, battery_name, c, &store)
+                        translate_one_independent(paths, &output_dir, battery_name, c, &store, skip)
                     }),
                 )
             })
@@ -233,11 +234,14 @@ fn translate_one_independent(
     battery_name: &str,
     case: &battery::IndependentCase,
     store: &Store,
+    skip: SkipCheck,
 ) -> CaseResult {
-    if crate::battery::has_crate(&crate::battery::phase_dir(
-        &output_dir.join(&case.name),
-        crate::battery::TRANSLATED,
-    )) {
+    if skip.already_done(|| {
+        crate::battery::has_crate(&crate::battery::phase_dir(
+            &output_dir.join(&case.name),
+            crate::battery::TRANSLATED,
+        ))
+    }) {
         return CaseResult {
             name: case.name.clone(),
             elapsed_secs: 0,
@@ -276,6 +280,8 @@ fn translate_one_independent(
     )
 }
 
+/// A group's store is [`SHARED_SOURCE_CACHE`], i.e. bypassed, and a follower's crate is DERIVED
+/// rather than keyed — so a published crate is all either skip here can ask, as the test pins.
 fn translate_one_shared(
     paths: &Paths,
     output_dir: &Path,
@@ -549,11 +555,14 @@ fn dispatch_translate(
     }
 }
 
-/// Bypassed, with the store opened here so no caller can hand this path a keyed one: one
-/// invocation serves N configs that `propagate_config` DERIVES from the published real case, and
-/// whether a replay derives identical followers is what spec-7c exists to demonstrate.
+/// The shared-source path's store: one invocation serves N configs `propagate_config` DERIVES
+/// from the published real case, and spec-7c exists to show a replay derives identical ones.
+/// Named because it is also what justifies [`translate_one_shared`] reading a published crate.
+const SHARED_SOURCE_CACHE: cache::Mode = cache::Mode::Bypass;
+
+/// Bypassed, with the store opened here so no caller can hand this path a keyed one.
 fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result<RecordedBy> {
-    let store = Store::open(&paths.repo_root, cache::Mode::Bypass)?;
+    let store = Store::open(&paths.repo_root, SHARED_SOURCE_CACHE)?;
     match paths.agent {
         Agent::Laertes => uncached(laertes_translate_case(paths, battery, name)),
         Agent::C2SaferRust => uncached(c2saferrust_translate_case(paths, battery, name, true)),
@@ -589,6 +598,7 @@ pub fn run_harvest_bench(
         no_in_tool_translate(&paths.agent_key)
     );
     preflight_check(paths.agent)?;
+    let skip = translate_skip_check(paths);
 
     // A harvest-bench test_case/ is always a C library the suite links by ABI, so the
     // library prompt applies to every project — no project-type dispatch. Empty only
@@ -617,7 +627,7 @@ pub fn run_harvest_bench(
                     name,
                     s.spawn(move || {
                         let _permit = sem.acquire();
-                        translate_one_harvest_bench(paths, p, prompt, store)
+                        translate_one_harvest_bench(paths, p, prompt, store, skip)
                     }),
                 )
             })
@@ -658,14 +668,17 @@ fn translate_one_harvest_bench(
     project: &battery::HarvestBenchProject,
     prompt: &str,
     store: &Store,
+    skip: SkipCheck,
 ) -> CaseResult {
     let name = project.name();
     let case_dir = paths.output_dir(name);
 
-    if crate::battery::has_crate(&crate::battery::phase_dir(
-        &case_dir,
-        crate::battery::TRANSLATED,
-    )) {
+    if skip.already_done(|| {
+        crate::battery::has_crate(&crate::battery::phase_dir(
+            &case_dir,
+            crate::battery::TRANSLATED,
+        ))
+    }) {
         return CaseResult {
             name: name.into(),
             elapsed_secs: 0,
@@ -905,6 +918,27 @@ fn resolve_launch(paths: &Paths, backend: InTool) -> Result<Launch> {
         InTool::Codex { model, region } => Launch::Codex { model, region },
         InTool::C2rust => Launch::C2rust,
     })
+}
+
+/// Which backends have a key at all: exactly those [`resolve_launch`] answers [`Launch::Keyed`]
+/// for, which is why it probes a CLI for those two and no other. Read off [`InTool`] so the skip
+/// decision stays pure and testable; both matches are exhaustive, so a new backend decides in both.
+fn skip_check(backend: InTool) -> SkipCheck {
+    match backend {
+        InTool::Kiro | InTool::Claude => SkipCheck::Keyed,
+        InTool::OpenCode | InTool::Codex { .. } | InTool::C2rust => SkipCheck::WhateverIsPublished,
+    }
+}
+
+/// THE whole of "already translated?": the backend's half and the store's, narrowed here so a sweep
+/// has one value to pass on and no mode of its own to get wrong. `None` is a docker pipeline or a
+/// single API call — no [`Launch`] at all, so no key.
+fn translate_skip_check(paths: &Paths) -> SkipCheck {
+    match in_tool_translate(paths.agent) {
+        None => SkipCheck::WhateverIsPublished,
+        Some(backend) => skip_check(backend),
+    }
+    .through(paths.cache_mode)
 }
 
 /// The agentic-translation core: materialises the C corpus into an isolated work tree, invokes
@@ -2578,6 +2612,236 @@ mod tests {
             case.join("test_vectors/in.txt").is_file(),
             "and what translate does not own is never its to delete"
         );
+    }
+
+    /// A `Paths` in a tempdir (`paths_for` names the real repo root). Agent AND mode are parameters:
+    /// they are what [`translate_skip_check`] answers from, and fixing one hides the other's error.
+    fn paths_at(
+        root: &Path,
+        agent: Agent,
+        dataset: crate::cli::Dataset,
+        cache: cache::Mode,
+    ) -> Paths {
+        let model = match agent {
+            Agent::OpenCode => Some("amazon-bedrock/us.anthropic.claude-sonnet-5"),
+            Agent::Oneshot | Agent::Kimi => Some("openai/gpt-5.4"),
+            _ => None,
+        };
+        Paths::new(
+            root,
+            agent,
+            dataset,
+            model,
+            cache,
+            crate::io::sandbox::Enforcement::AllowUnsandboxed,
+        )
+        .expect("Paths")
+    }
+
+    struct Site<'a> {
+        what: &'a str,
+        published: std::path::PathBuf,
+        run: &'a dyn Fn(SkipCheck) -> CaseResult,
+    }
+
+    fn publish_a_crate(case_dir: &Path) -> std::path::PathBuf {
+        let dir = crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
+        dir
+    }
+
+    /// A published `translated/` records nothing about the invocation that wrote it, so a skip check
+    /// reading one accepts another model's crate as this model's, and publishes numbers. Both values
+    /// go to BOTH keyed sites: a site that stops consulting the one it was given is the same bug.
+    #[test]
+    fn a_published_translation_from_a_different_model_is_not_accepted_as_done() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let corpus = paths_at(
+            tmp.path(),
+            Agent::Oneshot,
+            crate::cli::Dataset::TestCorpus,
+            cache::Mode::Bypass,
+        );
+        let hb = paths_at(
+            tmp.path(),
+            Agent::Oneshot,
+            crate::cli::Dataset::HarvestBench,
+            cache::Mode::Bypass,
+        );
+        let store = cache::Store::open(tmp.path(), corpus.cache_mode).unwrap();
+
+        let battery = "B01_organic";
+        let output_dir = corpus.output_dir(battery);
+        let case = battery::IndependentCase {
+            name: "strcmp".to_owned(),
+            is_lib: true,
+        };
+        for sub in ["test_case", "gtest_suite"] {
+            std::fs::create_dir_all(hb.corpus_dir.join("libpng").join(sub)).unwrap();
+        }
+        let project = battery::HarvestBenchProject::resolve(&hb.corpus_dir, "libpng").unwrap();
+
+        let one_ind =
+            |skip| translate_one_independent(&corpus, &output_dir, battery, &case, &store, skip);
+        let one_bench = |skip| translate_one_harvest_bench(&hb, &project, "", &store, skip);
+        let sites = [
+            Site {
+                what: "independent",
+                published: publish_a_crate(&output_dir.join(&case.name)),
+                run: &one_ind,
+            },
+            Site {
+                what: "harvest-bench",
+                published: publish_a_crate(&hb.output_dir(project.name())),
+                run: &one_bench,
+            },
+        ];
+
+        for site in sites {
+            let what = site.what;
+            assert!(
+                (site.run)(SkipCheck::WhateverIsPublished).skipped,
+                "{what}: the fixture must be the tree the old check answered done on, or \
+                 nothing here is being tested"
+            );
+            let keyed = (site.run)(SkipCheck::Keyed);
+            assert!(
+                !keyed.skipped,
+                "{what}: a `translated/` names no model, prompt, CLI or toolchain, so it \
+                 cannot say WHICH invocation produced it and must not answer for the store"
+            );
+            assert!(
+                !keyed.success,
+                "{what}: and it reached the backend, which has no corpus here: {:?}",
+                keyed.error
+            );
+            assert!(
+                crate::battery::has_crate(&site.published),
+                "{what}: a run that produced nothing leaves the previous translation standing"
+            );
+        }
+    }
+
+    /// The honest limit of a bypass: where no key can be asked about, "is something published here"
+    /// is all there is to ask, and it stays — both for a keyless backend and for a store that never
+    /// reads. Keyed either way, the case is re-run and re-billed on every sweep.
+    #[test]
+    fn a_bypassed_backend_still_skips_on_a_published_crate() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        // `ReadWrite`, so a store that never reads is not what makes the answers below unkeyed.
+        let corpus = crate::cli::Dataset::TestCorpus;
+        let paths = paths_at(tmp.path(), Agent::Oneshot, corpus, cache::Mode::ReadWrite);
+        let (battery, name) = ("B01_organic", "strcmp");
+        let output_dir = paths.output_dir(battery);
+        let translated = publish_a_crate(&output_dir.join(name));
+        let store = cache::Store::open(&paths.repo_root, paths.cache_mode).unwrap();
+        let case = battery::IndependentCase {
+            name: name.to_owned(),
+            is_lib: true,
+        };
+
+        let r = translate_one_independent(
+            &paths,
+            &output_dir,
+            battery,
+            &case,
+            &store,
+            translate_skip_check(&paths),
+        );
+        assert!(
+            r.skipped && r.success,
+            "a single API call resolves no `Launch`, so there is nothing else to ask: {:?}",
+            r.error
+        );
+        assert!(
+            crate::battery::has_crate(&translated),
+            "and the crate it answered from is untouched"
+        );
+
+        // The other half, every agent's shared-source group: a bypassed store, keyed agent.
+        let keyed_agent = paths_at(tmp.path(), Agent::Claude, corpus, cache::Mode::ReadWrite);
+        let group = battery::SharedSourceGroup {
+            real_case: "macrodepth_add_5".to_owned(),
+            configs: Vec::new(),
+        };
+        let real = publish_a_crate(&output_dir.join(&group.real_case));
+        let g = translate_one_shared(&keyed_agent, &output_dir, battery, &group);
+        assert!(
+            g.skipped && g.success,
+            "the group's store never loads, so there is no entry to replay and `translated/` \
+             is all there is to read: {:?}",
+            g.error
+        );
+        assert!(crate::battery::has_crate(&real));
+        assert_eq!(
+            SkipCheck::Keyed.through(SHARED_SOURCE_CACHE),
+            SkipCheck::WhateverIsPublished,
+            "which is exactly what the group's mode answers, and the only thing that licenses \
+             those two sites to read a published crate without asking"
+        );
+
+        // THE WHOLE DECISION, both halves, as a sweep resolves it — here, because a sweep needs a CLI
+        // and a corpus. Keyed without a key re-bills every case; keyed through a store that never
+        // reads deletes that path's only check; unkeyed claude by default reverts this PR.
+        for (agent, mode, expected) in [
+            (Agent::Claude, cache::Mode::ReadWrite, SkipCheck::Keyed),
+            (Agent::Claude, cache::Mode::Refresh, SkipCheck::Keyed),
+            (
+                Agent::Claude,
+                cache::Mode::Bypass,
+                SkipCheck::WhateverIsPublished,
+            ),
+            (Agent::Kiro, cache::Mode::ReadWrite, SkipCheck::Keyed),
+            (
+                Agent::OpenCode,
+                cache::Mode::ReadWrite,
+                SkipCheck::WhateverIsPublished,
+            ),
+            (
+                Agent::CodexGpt55,
+                cache::Mode::ReadWrite,
+                SkipCheck::WhateverIsPublished,
+            ),
+            (
+                Agent::C2rust,
+                cache::Mode::ReadWrite,
+                SkipCheck::WhateverIsPublished,
+            ),
+            (
+                Agent::Oneshot,
+                cache::Mode::ReadWrite,
+                SkipCheck::WhateverIsPublished,
+            ),
+        ] {
+            assert_eq!(
+                translate_skip_check(&paths_at(tmp.path(), agent, corpus, mode)),
+                expected,
+                "--agent {agent:?} --cache {mode:?}"
+            );
+        }
+
+        // And the pairing: a backend `skip_check` calls keyless must be one `resolve_launch` answers
+        // no `Launch::Keyed` for. Only these three need no CLI on PATH — which is the same line.
+        for backend in [
+            InTool::OpenCode,
+            InTool::Codex {
+                model: "openai.gpt-5.5",
+                region: "us-east-2",
+            },
+            InTool::C2rust,
+        ] {
+            let launch = resolve_launch(
+                &paths_at(tmp.path(), Agent::OpenCode, corpus, cache::Mode::ReadWrite),
+                backend,
+            )
+            .unwrap();
+            assert!(
+                !matches!(launch, Launch::Keyed(_)),
+                "{:?} is skipped on its published crate, so it must reach the store under no key",
+                skip_check(backend)
+            );
+        }
     }
 
     /// `--agent laertes translate HB/<project>` reached `translate_case_at`, hit an

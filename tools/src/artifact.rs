@@ -103,15 +103,7 @@ pub(crate) fn clear_phase<P: Phase>(case_dir: &Path) -> Result<()> {
                 .with_context(|| format!("removing the stale {}", dir.display()))?;
         }
     }
-    let dst = crate::battery::phase_dir(case_dir, P::DIR);
-    if !dst.exists() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(&dst)? {
-        let entry = entry?;
-        if entry.file_name() == "logs" {
-            continue;
-        }
+    for entry in artifact_children::<P>(case_dir)? {
         let p = entry.path();
         if entry.file_type()?.is_dir() {
             std::fs::remove_dir_all(&p)
@@ -120,6 +112,78 @@ pub(crate) fn clear_phase<P: Phase>(case_dir: &Path) -> Result<()> {
         }
         .with_context(|| format!("clearing {}", p.display()))?;
     }
+    Ok(())
+}
+
+/// What a fresh result of this phase replaces: everything in the phase dir but `logs/`, which holds
+/// the transcript being written live. Shared, so [`clear_phase`] and [`displace_phase`] agree.
+fn artifact_children<P: Phase>(case_dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
+    let dst = crate::battery::phase_dir(case_dir, P::DIR);
+    children_but_logs(std::fs::read_dir(&dst), &dst)
+}
+
+/// ONLY `NotFound` is an empty phase. A `--parallel` sweep at the process fd limit fails `read_dir`
+/// on a dir that IS there, and calling that "no artifact" makes [`clear_phase`] remove nothing while
+/// the new files land on top of the old, publishing a union that hashes as neither run. Takes the
+/// `io::Result` because a test cannot reach the fd limit.
+fn children_but_logs(
+    entries: std::io::Result<std::fs::ReadDir>,
+    dst: &Path,
+) -> Result<Vec<std::fs::DirEntry>> {
+    let entries = match entries {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        other => other.with_context(|| format!("reading the phase dir {}", dst.display()))?,
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading an entry of {}", dst.display()))?;
+        if entry.file_name() != "logs" {
+            out.push(entry);
+        }
+    }
+    Ok(out)
+}
+
+/// Move this phase's artifact OUT of the phase dir, keeping `logs/`, and say where it went.
+///
+/// [`clear_phase`]'s counterpart for a run that published nothing. It may not delete: an artifact
+/// from a `--cache off` sweep, or from before the store existed, is replayable from nowhere, so a
+/// delete makes a transient failure permanent. It may not leave it either — the failed run's
+/// transcript and metrics are in that phase dir already, so [`crate::battery::crate_dir`] and the
+/// enrichers would score the earlier crate as this run's. A sibling is in no digest, no reader's
+/// path and no `INVALIDATES` list.
+pub(crate) fn displace_phase<P: Phase>(case_dir: &Path) -> Result<Option<PathBuf>> {
+    // The crate, because that is what a reader scores; a metrics file is not an artifact, and moving
+    // one aside would overwrite what an earlier displacement left here.
+    let dir = crate::battery::phase_dir(case_dir, P::DIR);
+    if !crate::battery::has_crate(&dir) {
+        return Ok(None);
+    }
+    let moving = artifact_children::<P>(case_dir)?;
+    ensure_displaceable(&dir, moving.len())?;
+    let aside = case_dir.join(format!("{}.displaced", P::DIR));
+    if aside.exists() {
+        std::fs::remove_dir_all(&aside).with_context(|| format!("clearing {}", aside.display()))?;
+    }
+    std::fs::create_dir_all(&aside).with_context(|| format!("creating {}", aside.display()))?;
+    for entry in moving {
+        let from = entry.path();
+        let to = aside.join(entry.file_name());
+        std::fs::rename(&from, &to)
+            .with_context(|| format!("moving {} aside to {}", from.display(), to.display()))?;
+    }
+    Ok(Some(aside))
+}
+
+/// `has_crate` is a `stat` and the walk is a `read_dir`, so they can disagree. Checked before the
+/// sibling is created, because a caller told "the previous verified/ is at <aside>" with the crate
+/// still in the phase dir beside the failed run's transcript is worse off than one told nothing.
+fn ensure_displaceable(dir: &Path, moving: usize) -> Result<()> {
+    anyhow::ensure!(
+        moving > 0,
+        "{} holds a crate but walking it found nothing to move aside",
+        dir.display()
+    );
     Ok(())
 }
 
@@ -899,6 +963,87 @@ mod tests {
             std::fs::create_dir_all(f.parent().unwrap()).unwrap();
             std::fs::write(f, c).unwrap();
         }
+    }
+
+    fn chmod(dir: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn a_crate_at(dir: &Path) {
+        tree(
+            dir,
+            &[("Cargo.toml", "[package]"), ("src/lib.rs", "pub fn a() {}")],
+        );
+    }
+
+    /// [`Sealed::publish`] clears the phase dir and then copies onto it, so a `read_dir` failure read
+    /// as "nothing here" publishes the UNION of two runs: a tree whose digest matches neither.
+    #[test]
+    fn a_phase_dir_that_cannot_be_read_is_not_cleared_to_nothing() {
+        let case = crate::io::workdir::test_tempdir().unwrap();
+        let dir = case.path().join(crate::battery::TRANSLATED);
+        a_crate_at(&dir);
+
+        chmod(&dir, 0o000);
+        let cleared = clear_phase::<Translate>(case.path());
+        chmod(&dir, 0o755);
+
+        let err = cleared.expect_err("an unreadable phase dir must not pass for an empty one");
+        assert!(
+            format!("{err:#}").contains("reading the phase dir"),
+            "{err:#}"
+        );
+        assert!(
+            dir.join("Cargo.toml").is_file(),
+            "and the crate is still there, so reporting the clear as done was the lie"
+        );
+    }
+
+    /// The half that must not regress with it: a case's first run has no phase dir at all, and
+    /// refusing there would refuse every fresh case instead of the corrupt ones.
+    #[test]
+    fn an_absent_phase_dir_is_nothing_to_clear_and_nothing_to_displace() {
+        let case = crate::io::workdir::test_tempdir().unwrap();
+        let dir = case.path().join(crate::battery::VERIFIED);
+        assert!(!dir.exists(), "fixture: nothing has run for this case yet");
+
+        clear_phase::<Verify>(case.path()).expect("a first run must have room made for it");
+        assert!(displace_phase::<Verify>(case.path()).unwrap().is_none());
+    }
+
+    /// `has_crate` is a `stat`, which answers yes on a dir the walk cannot read (mode `0o111` here,
+    /// the fd limit in a sweep). Reported as a move, the operator is told the phase dir is clear
+    /// while the earlier crate sits in it beside this run's transcript and `success: false`.
+    #[test]
+    fn a_displacement_that_moved_nothing_is_refused_rather_than_announced() {
+        let case = crate::io::workdir::test_tempdir().unwrap();
+        let dir = case.path().join(crate::battery::VERIFIED);
+        a_crate_at(&dir);
+
+        chmod(&dir, 0o111);
+        let stat_says_crate = crate::battery::has_crate(&dir);
+        let displaced = displace_phase::<Verify>(case.path());
+        chmod(&dir, 0o755);
+
+        assert!(stat_says_crate, "fixture: the stat must still answer yes");
+        let err = displaced.expect_err("a displacement that moved nothing must refuse");
+        assert!(
+            format!("{err:#}").contains("reading the phase dir"),
+            "{err:#}"
+        );
+        assert!(
+            !case.path().join("verified.displaced").exists(),
+            "and no empty sibling is left claiming to hold the crate"
+        );
+        assert!(
+            dir.join("Cargo.toml").is_file(),
+            "which is still here, {err:#}"
+        );
+
+        // Unreachable from the filesystem now that the walk propagates, so it is pinned here.
+        assert!(ensure_displaceable(&dir, 0).is_err());
+        ensure_displaceable(&dir, 1).expect("one child is a displacement");
     }
 
     #[test]
