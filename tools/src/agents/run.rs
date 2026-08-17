@@ -144,13 +144,7 @@ where
         // is beside it — one phase dir describing two runs, and the enrichers stamp this log's model,
         // CLI and cost onto that crate's `result.json`. So the artifact moves: after the run, never
         // before, and moved, not deleted — a failure may not destroy the only copy of a paid crate.
-        if let Some(aside) = crate::artifact::displace_phase::<P>(case_dir)? {
-            eprintln!(
-                "  ⚠️  this run published nothing; the previous {}/ is at {}",
-                P::DIR,
-                aside.display()
-            );
-        }
+        displace_and_warn::<P>(case_dir)?;
         let mut provenance = serde_json::json!({
             "agent": agent.as_str(),
             "duration_secs": start.elapsed().as_secs(),
@@ -190,6 +184,21 @@ where
         },
     );
     Ok(Outcome::Published(obtained.sealed))
+}
+
+/// [`crate::artifact::displace_phase`] and the operator's only notice that it happened, in one
+/// place: this is the sole caller, so the keyed failure path here and the unkeyed one in
+/// `translate::run_and_record` cannot come to disagree on either half. Called AFTER the run,
+/// never before — a displacement up front would move aside a crate this run then republishes.
+pub(crate) fn displace_and_warn<P: Phase>(case_dir: &Path) -> Result<()> {
+    if let Some(aside) = crate::artifact::displace_phase::<P>(case_dir)? {
+        eprintln!(
+            "  ⚠️  this run published nothing; the previous {}/ is at {}",
+            P::DIR,
+            aside.display()
+        );
+    }
+    Ok(())
 }
 
 /// Whose invocation the `provenance` beside it describes: on a replay, the ORIGINAL one, so
