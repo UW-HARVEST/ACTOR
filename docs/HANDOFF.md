@@ -7,7 +7,7 @@ not in any of those and that a fresh context would otherwise rediscover expensiv
 
 ## Where the work stands
 
-Twenty-two PRs merged (#89–#110). The layered architecture is most of the way in:
+Twenty-three PRs merged (#89–#111). The layered architecture is most of the way in:
 
 ```
 tools/src/
@@ -24,14 +24,21 @@ tools/src/
 directions by `a_module_cycle_may_only_shrink`.
 
 `run_cached<P>` exists in `agents/run.rs` and is the **only** `store.obtain` call site in the
-crate, enforced by `the_store_is_obtained_from_exactly_one_place`. Verify runs through it.
+crate, enforced by `the_store_is_obtained_from_exactly_one_place`. Both phases run through it.
+
+**The cache can now actually serve a hit, which it never could before tonight.** Four things had to
+land for that: the store is consulted at all rather than short-circuited by `has_crate` (#108); the
+key no longer moves when the agent CLI auto-updates (#109) or when the repo sits at a different path
+(#110); and a failed store no longer destroys the artifact you paid for (#110). An entry also now
+records the INPUT its key was computed from, not just the output (#111), so a change to `normalise`,
+to `Recipe::digest`'s framing or to `hash_tree` is a re-key rather than a cache wipe. `SCHEMA` is 4.
 
 ## What remains
 
 | # | PR | spec | state |
 |---|---|---|---|
 | 12 | **the skip check consults the store**, not the presence of a `Cargo.toml` | `docs/prs/spec-12.md` | in flight; this is what makes 7b pay |
-| 11 | **an entry records the inputs its key came from** — store `input/` and the digest preimages | `docs/prs/spec-11.md` | in flight (rewritten after two stalls) |
+| ~~11~~ | an entry records the inputs its key came from | `docs/prs/spec-11.md` | **DONE** as #111 — `input/` verbatim plus `key-preimage.json` |
 | ~~20~~ | c2rust scores | `docs/prs/spec-20.md` | **WITHDRAWN** — measured locally, harness correct, stored == actual; CI-runner-only |
 | ~~19~~ | `validate-translations` red for six weeks | `docs/prs/spec-19.md` | **DEFERRED** by operator decision; CI is out of scope |
 | ~~7c~~ | shared-source groups | `docs/prs/spec-7c.md` | **SHELVED** — value is Test-Corpus-only, introduces a wrong number, and the spec's premise was false |
