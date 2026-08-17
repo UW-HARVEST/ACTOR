@@ -141,6 +141,12 @@ pub fn tempdir(prefix: &str) -> Result<tempfile::TempDir> {
 pub struct Roots {
     pub work: PathBuf,
     pub repo: PathBuf,
+    /// The repo's PARENT, because [`crate::io::sandbox::denied_read_roots`] denies it and that
+    /// path therefore reaches `Recipe::digest` through the policy shape. Without a token of its
+    /// own, the checkout's parent DIRECTORY NAME survived into both cache keys, so a clone at a
+    /// differently-named path produced different keys for identical inputs and the store could
+    /// never be shared.
+    pub repo_parent: Option<PathBuf>,
     pub work_base: Option<PathBuf>,
     pub home: Option<PathBuf>,
 }
@@ -150,12 +156,21 @@ impl Roots {
     /// them — and where `$HOME` and the scratch base are already this module's business.
     /// A key-affecting function that consults the environment cannot be reasoned about
     /// from its arguments, and could not be tested without setting one.
+    /// Roots are CANONICALISED, because `denied_read_roots` canonicalises the roots it writes
+    /// into the policy. While these did not, `$HOME` only matched the policy's
+    /// `/local/home/<user>/...` as a SUBSTRING of the uncanonicalised `/home/<user>` — an accident
+    /// that happened to tokenise the machine-specific middle and left the parent's name behind.
+    /// Agreeing by construction rather than by coincidence is what makes the tokens reliable, and
+    /// it is why this needed a `SCHEMA` bump.
     pub fn resolve(work: &Path, repo: &Path) -> Self {
+        let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
+        let repo = canon(repo.to_path_buf());
         Self {
-            work: work.to_path_buf(),
-            repo: repo.to_path_buf(),
-            work_base: base().ok(),
-            home: std::env::var_os("HOME").map(PathBuf::from),
+            work: canon(work.to_path_buf()),
+            repo_parent: repo.parent().map(|p| p.to_path_buf()),
+            repo,
+            work_base: base().ok().map(canon),
+            home: std::env::var_os("HOME").map(PathBuf::from).map(canon),
         }
     }
 }
