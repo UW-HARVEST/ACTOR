@@ -4,7 +4,9 @@ use crate::agents::exit::{
 use crate::agents::invocation::{
     assert_pins_honoured, claude_model, Backend, Invocation, KIRO_UNPINNED_MODEL,
 };
-use crate::agents::run::{run_cached, write_phase_metrics, Outcome, PhaseRun, Recorded, SkipCheck};
+use crate::agents::run::{
+    displace_and_warn, run_cached, write_phase_metrics, Outcome, PhaseRun, Recorded, SkipCheck,
+};
 use crate::agents::session::{ClaudeRun, Session};
 use crate::agents::work::IsolatedWorkDir;
 use crate::agents::Semaphore;
@@ -378,12 +380,34 @@ fn run_and_record(
         }
         Err(e) => {
             let elapsed = start.elapsed().as_secs();
-            write_translation_metrics(case_dir, agent, elapsed, false);
+            // The earlier artifact leaves BEFORE this run's record arrives. Every reader of
+            // `Phase::METRICS` — `agent_health::audit`, the `oracle/` enrichers,
+            // `battery::extract_agent_meta` — resolves it from the phase dir, and the
+            // transcript was teed there before the outcome was known, so a `translation.json`
+            // written next to the previous run's crate is that crate scored as this run's
+            // result. Moved, never deleted: an unkeyed backend has no store entry to replay.
+            // Staging the transcript instead does not remove the need: this record lands in the
+            // phase dir either way, and `audit` finds a case only by a transcript already there,
+            // so a staged one blinds the infra gate on exactly the runs that fail.
+            let error = match displace_and_warn::<Translate>(case_dir) {
+                Ok(()) => {
+                    write_translation_metrics(case_dir, agent, elapsed, false);
+                    e.to_string()
+                }
+                // Neither swallowed nor recorded: a record written now would be the very
+                // corruption the move exists to prevent, so the failure travels out as this
+                // case's error instead of as a silent `if let Ok(..)`.
+                Err(moving) => format!(
+                    "{e}; and the earlier {} could not be moved aside, so this run's \
+                     record was withheld rather than written beside it: {moving:#}",
+                    crate::battery::TRANSLATED
+                ),
+            };
             CaseResult {
                 name: name.to_owned(),
                 elapsed_secs: elapsed,
                 success: false,
-                error: Some(e.to_string()),
+                error: Some(error),
                 skipped: false,
             }
         }
@@ -998,15 +1022,12 @@ fn translate_case_at(
 
     let launch = resolve_launch(paths, backend)?;
     let Launch::Keyed(inv) = &launch else {
-        // Published as before this PR — copied, not sealed. Sealing demands a `Completed` none of
-        // these three transcripts can mint (see [`Launch`]), so routing them through the driver
-        // would refuse every healthy run rather than cache one.
+        // Not sealed: sealing demands a `Completed` none of these three transcripts can mint
+        // (see [`Launch`]), so routing them through the driver would refuse every healthy run
+        // rather than cache one. The TREE they publish is the sealed path's, though, which is
+        // what `publish_unsealed` is for.
         run_translate_agent(paths, &launch, &work, &prompt, &log_path)?;
-        crate::artifact::clear_phase::<Translate>(case_dir)?;
-        copy_dir_all(
-            &work.translated_rust(),
-            &crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED),
-        )?;
+        crate::artifact::publish_unsealed::<Translate>(&work.translated_rust(), case_dir)?;
         return Ok(RecordedBy::Caller);
     };
 
@@ -1565,11 +1586,7 @@ fn oneshot_llm_translate(
         anyhow::bail!("no Cargo.toml in LLM response");
     }
 
-    crate::artifact::clear_phase::<Translate>(&case_dir)?;
-    copy_dir_all(
-        staged.path(),
-        &crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED),
-    )?;
+    crate::artifact::publish_unsealed::<Translate>(staged.path(), &case_dir)?;
     Ok(())
 }
 
@@ -1897,7 +1914,6 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
     let case_dir = paths.case_dir(battery, name);
     std::fs::create_dir_all(crate::artifact::phase_logs::<Translate>(&case_dir))?;
     let log_path = crate::artifact::phase_log::<Translate>(&case_dir);
-    let translated = crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED);
 
     // Staged in scratch like its c2saferrust neighbour: the container gets this mounted
     // read-write, and the compile check writes `target/` plus a `Cargo.lock` that is part
@@ -1963,8 +1979,7 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
         }
     )?;
 
-    crate::artifact::clear_phase::<Translate>(&case_dir)?;
-    copy_dir_filtered(&work, &translated, &["target"])?;
+    crate::artifact::publish_unsealed::<Translate>(&work, &case_dir)?;
     Ok(())
 }
 
@@ -2165,8 +2180,7 @@ fn c2saferrust_translate_case(
         )?;
         work_rust.clone()
     };
-    crate::artifact::clear_phase::<Translate>(&case_dir)?;
-    copy_dir_filtered(&source_dir, &translated, &["target"])?;
+    crate::artifact::publish_unsealed::<Translate>(&source_dir, &case_dir)?;
     for junk in [
         "callgraph.dot",
         "callgraph.pdf",
@@ -2732,11 +2746,389 @@ mod tests {
                 "{what}: and it reached the backend, which has no corpus here: {:?}",
                 keyed.error
             );
+            let aside = displaced(&site.published);
             assert!(
-                crate::battery::has_crate(&site.published),
-                "{what}: a run that produced nothing leaves the previous translation standing"
+                crate::battery::has_crate(&aside),
+                "{what}: a run that produced nothing may not destroy the previous translation, \
+                 which nothing replays: {}",
+                aside.display()
+            );
+            assert!(
+                !crate::battery::has_crate(&site.published),
+                "{what}: nor leave it in the phase dir, where this run's record now says the \
+                 translation failed"
             );
         }
+    }
+
+    /// Where [`crate::artifact::displace_phase`] leaves what a failed run could not replace.
+    fn displaced(phase_dir: &Path) -> std::path::PathBuf {
+        phase_dir.with_file_name(format!("{}.displaced", crate::battery::TRANSLATED))
+    }
+
+    fn translated(case_dir: &Path) -> std::path::PathBuf {
+        crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED)
+    }
+
+    /// The battery and case every fixture below uses.
+    const A_CASE: (&str, &str) = ("B01_organic", "strcmp");
+
+    const RUN_A_CRATE: &str = "pub fn a() { /* run A's translation */ }";
+    const RUN_A_LOG: &str = "run A's transcript\n";
+    const RUN_B_LOG: &str = "=== OPENROUTER REQUEST ===\nrun B's transcript, over run A's\n";
+
+    /// The state a failing run arrives into: the previous sweep's crate, the `result.json` the
+    /// enrichers rewrite in place, that run's own record, and its transcript.
+    fn a_previous_translation(case_dir: &Path) {
+        let dir = crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        for (rel, body) in [
+            ("Cargo.toml", "[package]\nname=\"x\""),
+            ("src/lib.rs", RUN_A_CRATE),
+            ("result.json", r#"{"tests_passed":5}"#),
+            ("translation.json", r#"{"agent":"oneshot","success":true}"#),
+        ] {
+            std::fs::write(dir.join(rel), body).unwrap();
+        }
+        let log = crate::artifact::phase_log::<Translate>(case_dir);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, RUN_A_LOG).unwrap();
+        assert_eq!(
+            crate::battery::crate_dir(case_dir),
+            dir,
+            "the fixture must be the crate the scorer reads, or there is no wrong number to leave"
+        );
+    }
+
+    /// The unkeyed translate paths, by the two shapes their failures take: the docker arms refuse
+    /// before they tee anything, and the one-shot LLM arms tee over the previous transcript first.
+    #[derive(Copy, Clone)]
+    enum Unkeyed {
+        Docker,
+        OneShotLlm,
+    }
+
+    impl Unkeyed {
+        const ALL: &'static [Unkeyed] = &[Unkeyed::Docker, Unkeyed::OneShotLlm];
+
+        fn what(self) -> &'static str {
+            match self {
+                Unkeyed::Docker => "laertes",
+                Unkeyed::OneShotLlm => "oneshot",
+            }
+        }
+
+        fn paths(self, root: &Path) -> Paths {
+            let paths = paths_at(
+                root,
+                match self {
+                    Unkeyed::Docker => Agent::Laertes,
+                    Unkeyed::OneShotLlm => Agent::Oneshot,
+                },
+                crate::cli::Dataset::TestCorpus,
+                cache::Mode::Bypass,
+            );
+            // `require_prompt` refuses an absent one, which would fail ahead of the tee.
+            std::fs::create_dir_all(&paths.prompts_dir).unwrap();
+            for f in ["translate-library.md", "translate-executable.md"] {
+                std::fs::write(
+                    paths.prompts_dir.join(f),
+                    "translate this C project into Rust.".repeat(8),
+                )
+                .unwrap();
+            }
+            paths
+        }
+
+        /// The transcript in the phase dir once this arm has failed.
+        fn teed(self) -> &'static str {
+            match self {
+                Unkeyed::Docker => RUN_A_LOG,
+                Unkeyed::OneShotLlm => RUN_B_LOG,
+            }
+        }
+
+        /// `dispatch_translate`'s own composition for this agent, wrapped as the sweep wraps it.
+        /// Only the LLM call is stood in for — as in
+        /// `a_translation_that_fails_leaves_the_previous_result_standing`, it is the one
+        /// injectable failure of the four, and the docker arm needs none.
+        fn fail(self, paths: &Paths) -> CaseResult {
+            let (battery, name) = A_CASE;
+            run_and_record(
+                name,
+                &paths.case_dir(battery, name),
+                &paths.agent_key,
+                || match self {
+                    Unkeyed::Docker => uncached(laertes_translate_case(paths, battery, name)),
+                    Unkeyed::OneShotLlm => uncached(oneshot_llm_translate(
+                        paths,
+                        battery,
+                        name,
+                        false,
+                        None,
+                        |_, log| {
+                            std::fs::write(log, RUN_B_LOG).unwrap();
+                            anyhow::bail!(
+                                "api_error 403: the security token included in the request is \
+                                 expired"
+                            )
+                        },
+                    )),
+                },
+                || Ok(()),
+            )
+        }
+    }
+
+    /// Run A published a translation; run B is one of the unkeyed paths, failing the way that
+    /// backend really fails.
+    fn a_failed_unkeyed_translation(root: &Path, backend: Unkeyed) -> (Paths, std::path::PathBuf) {
+        let paths = backend.paths(root);
+        let (battery, name) = A_CASE;
+        let test_case = paths.input_dir(battery).join(name).join("test_case");
+        std::fs::create_dir_all(&test_case).unwrap();
+        std::fs::write(test_case.join("main.c"), "int main(void){return 0;}").unwrap();
+        let case = paths.case_dir(battery, name);
+        a_previous_translation(&case);
+
+        let r = backend.fail(&paths);
+        assert!(
+            !r.success,
+            "{}: the injected failure must fail the case: {:?}",
+            backend.what(),
+            r.error
+        );
+        (paths, case)
+    }
+
+    /// INVARIANT 1 on the five unkeyed paths. `run_and_record`'s `Err` arm writes
+    /// `translation.json` into the phase dir, and every reader of `Phase::METRICS` resolves it
+    /// from there — so with run A's crate still standing, `battery::crate_dir` hands that crate to
+    /// the scorer and the enrichers stamp run B's agent, model, cost and timestamp onto its
+    /// `result.json`.
+    #[test]
+    fn a_failed_unkeyed_translation_does_not_leave_its_metrics_beside_an_earlier_crate() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        for backend in Unkeyed::ALL {
+            let what = backend.what();
+            let (_, case) = a_failed_unkeyed_translation(tmp.path(), *backend);
+            let dir = translated(&case);
+
+            let m: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(crate::artifact::phase_metrics::<Translate>(&case))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                m["success"],
+                serde_json::json!(false),
+                "{what}: the failure is recorded rather than withheld: {m}"
+            );
+            assert!(
+                !crate::battery::has_crate(&dir),
+                "{what}: and run A's crate is not beside that record, where it would be scored \
+                 as run B's result with run B's agent, model and cost"
+            );
+            assert!(
+                !dir.join("result.json").exists(),
+                "{what}: nor its score, which is what the enrichers rewrite in place"
+            );
+            assert!(
+                !crate::battery::has_crate(&crate::battery::crate_dir(&case)),
+                "{what}: so the scorer finds no crate for this case rather than the wrong one"
+            );
+            assert_eq!(
+                std::fs::read_to_string(crate::artifact::phase_log::<Translate>(&case)).unwrap(),
+                backend.teed(),
+                "{what}: while whatever transcript the phase dir holds stays — it is the \
+                 post-mortem, and all the infra gate reads this case through"
+            );
+        }
+    }
+
+    /// INVARIANT 2 where there is no store entry to fall back on: an unkeyed backend writes none,
+    /// so a delete here turns one 403 into the permanent loss of a paid crate.
+    #[test]
+    fn a_failed_unkeyed_translation_does_not_make_the_earlier_crate_unrecoverable() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        for backend in Unkeyed::ALL {
+            let what = backend.what();
+            let (paths, case) = a_failed_unkeyed_translation(tmp.path(), *backend);
+
+            let aside = displaced(&translated(&case));
+            assert!(
+                crate::battery::has_crate(&aside),
+                "{what}: run A's crate must still be on disk, whole: {}",
+                aside.display()
+            );
+            assert_eq!(
+                std::fs::read_to_string(aside.join("src/lib.rs")).unwrap(),
+                RUN_A_CRATE,
+                "{what}: and be run A's crate rather than an empty shell of one"
+            );
+            for kept in ["result.json", "translation.json"] {
+                assert!(
+                    aside.join(kept).is_file(),
+                    "{what}: with the {kept} it was measured at, which is run A's too"
+                );
+            }
+            assert_eq!(
+                cache::Store::open(&paths.repo_root, paths.cache_mode)
+                    .unwrap()
+                    .stats()
+                    .unwrap()
+                    .0,
+                0,
+                "{what}: non-vacuity for this whole test — these paths store no entry, so the \
+                 copy that was moved is the only one there is"
+            );
+        }
+    }
+
+    /// The consequence that reaches a published number. `SkipCheck::WhateverIsPublished` is all
+    /// these paths have, so a phase dir left holding run A's crate reads as done on the next
+    /// sweep: the case is never re-run and the mismatched pair is scored as a result for good.
+    #[test]
+    fn a_case_the_previous_sweep_failed_is_not_read_as_done() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        // The docker arm, because it fails with no network and no CLI, so the sweep's own entry
+        // point can be driven whole rather than stood in for.
+        let backend = Unkeyed::Docker;
+        let paths = backend.paths(tmp.path());
+        let (battery, name) = A_CASE;
+        let output_dir = paths.output_dir(battery);
+        let case = battery::IndependentCase {
+            name: name.to_owned(),
+            is_lib: true,
+        };
+        let store = cache::Store::open(&paths.repo_root, paths.cache_mode).unwrap();
+        // The resolver's own answer, not a literal: `Keyed` here would skip nothing whatever the
+        // phase dir holds, and this test would pass while asserting nothing.
+        let sweep = || {
+            translate_one_independent(
+                &paths,
+                &output_dir,
+                battery,
+                &case,
+                &store,
+                translate_skip_check(&paths),
+            )
+        };
+
+        a_previous_translation(&paths.case_dir(battery, name));
+        assert!(
+            sweep().skipped,
+            "non-vacuity: a published crate IS read as done here — that is the whole of what \
+             this path's skip check can ask"
+        );
+
+        assert!(!backend.fail(&paths).success);
+        let next = sweep();
+        assert!(
+            !next.skipped,
+            "a case whose last run failed must be translated again, not counted as translated"
+        );
+        assert!(
+            !next.success,
+            "and it really reached the backend: {:?}",
+            next.error
+        );
+    }
+
+    const DRIVER_CRATE: &str = "pub fn a() { /* what the driver published */ }";
+    const DRIVER_ENTRY: &str = "translate/deadbeef";
+
+    /// What [`run_cached`] leaves behind for a completed run or a hit: a sealed crate published
+    /// into the phase dir, and the record naming the entry it came from.
+    fn a_driver_published_translation(root: &Path, case_dir: &Path) {
+        let corpus = root.join("corpus");
+        std::fs::create_dir_all(&corpus).unwrap();
+        std::fs::write(corpus.join("lib.c"), "int a(void){return 0;}").unwrap();
+        let work = IsolatedWorkDir::<Translate>::from_corpus(&corpus).unwrap();
+        let crate_dir = work.translated_rust();
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        std::fs::write(crate_dir.join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        std::fs::write(crate_dir.join("src/lib.rs"), DRIVER_CRATE).unwrap();
+        work.finish(&crate::domain::health::Completed::for_test())
+            .unwrap()
+            .publish(case_dir)
+            .unwrap();
+        write_phase_metrics::<Translate>(
+            case_dir,
+            &serde_json::json!({"agent": "claude", "duration_secs": 42, "success": true}),
+            Recorded::Fresh {
+                entry: Some(DRIVER_ENTRY),
+            },
+        );
+    }
+
+    /// The hazard in giving the unkeyed paths a displacement: [`run_and_record`] wraps the KEYED
+    /// path too, where the driver has already published this run's crate and recorded the entry it
+    /// came from. Displaced unconditionally — up front, or in both arms — that moves a paid,
+    /// scoreable result out of the tree the scorer reads.
+    #[test]
+    fn a_driver_published_artifact_is_never_displaced() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        // Over the whole of `RecordedBy` rather than one hand-picked variant: the decision is on
+        // the `Result`, so every `Ok` must leave the artifact where its publisher put it.
+        for (what, recorded) in [
+            ("driver", RecordedBy::Driver),
+            ("caller", RecordedBy::Caller),
+        ] {
+            let case = tmp.path().join(what);
+            a_driver_published_translation(tmp.path(), &case);
+
+            let r = run_and_record(
+                A_CASE.1,
+                &case,
+                &test_agent_key(),
+                || Ok(recorded),
+                || Ok(()),
+            );
+            assert!(r.success, "{what}: {:?}", r.error);
+            assert_eq!(
+                std::fs::read_to_string(translated(&case).join("src/lib.rs")).unwrap_or_default(),
+                DRIVER_CRATE,
+                "{what}: the crate must stay in the phase dir it was published into"
+            );
+            assert!(
+                !displaced(&translated(&case)).exists(),
+                "{what}: and nothing may be moved aside"
+            );
+        }
+
+        let entry_of = |what: &str| -> serde_json::Value {
+            let p = crate::artifact::phase_metrics::<Translate>(&tmp.path().join(what));
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(p).unwrap()).unwrap()
+                ["cache_key"]
+                .clone()
+        };
+        assert_eq!(
+            entry_of("driver"),
+            serde_json::json!(DRIVER_ENTRY),
+            "the driver's record carries the entry that was served; a second write blanks it"
+        );
+        assert_eq!(
+            entry_of("caller"),
+            serde_json::Value::Null,
+            "while a caller-recorded run reached no store and has no entry to name, which is what \
+             the two variants are for"
+        );
+
+        // Non-vacuity: the same fixture, failing, IS displaced — so the assertions above hold
+        // because the run succeeded and not because nothing here ever moves.
+        let case = tmp.path().join("failed");
+        a_driver_published_translation(tmp.path(), &case);
+        let r = run_and_record(
+            A_CASE.1,
+            &case,
+            &test_agent_key(),
+            || anyhow::bail!("the agent did not complete"),
+            || Ok(()),
+        );
+        assert!(!r.success);
+        assert!(!crate::battery::has_crate(&translated(&case)));
+        assert!(crate::battery::has_crate(&displaced(&translated(&case))));
     }
 
     /// The honest limit of a bypass: where no key can be asked about, "is something published here"

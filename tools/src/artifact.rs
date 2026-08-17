@@ -498,11 +498,33 @@ fn visit(
         if !admits(classify(&rel, build_here)) {
             continue;
         }
-        if path.is_dir() {
-            visit(root, &path, build_here, admits, emit)?;
+        let ft = entry.file_type()?;
+        let ft = if ft.is_symlink() {
+            // Resolved rather than emitted, because this traversal follows links deliberately
+            // (see [`digest_tree`]); one whose per-run target is gone has nothing to follow, and
+            // the shipped `results/` holds 17 of those, 16 inside a published phase dir.
+            // NotFound only, propagating the rest, mirroring `children_but_logs` above. Swallowing
+            // every error here would drop an unresolvable entry from BOTH the copy AND the digest,
+            // so the two would agree, the store would validate the truncated tree, and nothing
+            // could report it -- where the base behaviour was a loud refusal from `read`/`copy`.
+            // ELOOP is the input that proves the difference: a symlink cycle must still refuse.
+            match std::fs::metadata(&path) {
+                Ok(m) => m.file_type(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| format!("resolving {}", path.display())),
+            }
         } else {
+            ft
+        };
+        if ft.is_dir() {
+            visit(root, &path, build_here, admits, emit)?;
+        } else if ft.is_file() {
             emit(&rel, &path)?;
         }
+        // Anything else is skipped. Agent workspaces hold non-regular files — CRUST's
+        // `impcheck` creates `.pipe` FIFOs — and `std::fs::copy`/`std::fs::read` open before
+        // they stat, so a FIFO blocks until a writer appears: one stray pipe hangs a publish,
+        // a digest, and the sweep worker whose permit is held across both.
     }
     Ok(())
 }
@@ -1026,12 +1048,50 @@ impl<P: Phase> Sealed<P> {
     /// Factored out of [`Self::publish`] so that "what this phase's tree contains" —
     /// published, or copied to compile-check — has exactly one answer.
     pub fn assemble_into(&self, case_dir: &Path, dst: &Path) -> Result<()> {
-        let translated = crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED);
-        if translated.is_dir() && P::DIR != crate::battery::TRANSLATED {
-            copy_carrying(&translated, dst, Carry::FromPreviousPhase)?;
-        }
-        copy_carrying(&self.root, dst, Carry::FromArtifact)
+        assemble::<P>(&self.root, case_dir, dst)
     }
+}
+
+/// THE answer to "what does this phase's tree contain", for a sealed artifact and for the
+/// unkeyed trees [`publish_unsealed`] takes — so `translated/` cannot mean a different file
+/// set depending on which backend produced it.
+fn assemble<P: Phase>(from: &Path, case_dir: &Path, dst: &Path) -> Result<()> {
+    let translated = crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED);
+    if translated.is_dir() && P::DIR != crate::battery::TRANSLATED {
+        copy_carrying(&translated, dst, Carry::FromPreviousPhase)?;
+    }
+    copy_carrying(from, dst, Carry::FromArtifact)
+}
+
+/// Publish a tree that no [`Completed`] can prove, carrying exactly what [`Sealed::publish`]
+/// would have carried FROM THE SAME INPUT -- which is not the same as publishing the same tree,
+/// and the difference is measured below.
+///
+/// Translate's unkeyed backends cannot become a [`Sealed`]: opencode's `run --format json`
+/// mints no `Completed`, c2rust records no exit for the classifier to read, and the docker and
+/// one-shot arms assemble their output in scratch with no [`WorkTree`] to scrub. So they publish
+/// by copy — and each copy chose its own exclusions, `copy_dir_all` carrying `target/` and a
+/// `skip = ["target"]` filter still carrying `c_src/build/`, which made `translated/` a
+/// different file set per backend and the comparison across backends a comparison of two
+/// shapes. Grants nothing a seal grants: no digest, no store entry, and no `Sealed` to
+/// materialise or export from, so the three invariants in this module's header are untouched.
+///
+/// ONE DIVERGENCE REMAINS, and it is not closable here. The keyed path reaches this copy only
+/// after [`Scrubbed::seal`], which runs [`drop_build_products`] over `c_src/` first, so a keyed
+/// publish drops build products left among the oracle sources and an unkeyed one keeps them.
+/// Measured with a probe: a work tree carrying `c_src/test_runner` (ELF magic) and `c_src/lib.o`
+/// publishes them as absent on the keyed path and present on the unkeyed one. It is not a corner
+/// case -- [`is_build_product`] records 294 of 532 stored trees holding `c_src/test_runner` or
+/// `c_src/main`, and the shipped tree has 12 `.o`/`.a` files under
+/// `CRUST/codex-gpt54/*/translated/c_src/`. So `translated/` still depends on which backend
+/// produced it: Kiro and Claude drop that class, every other arm keeps it.
+///
+/// It cannot be fixed by calling `drop_build_products` here, because that step takes an
+/// [`Oracle`] and an unkeyed path has no `Completed` with which to obtain one. Closing it means
+/// giving the unkeyed backends a completion proof -- backlog #38 -- not widening this function.
+pub(crate) fn publish_unsealed<P: Phase>(from: &Path, case_dir: &Path) -> Result<()> {
+    clear_phase::<P>(case_dir)?;
+    assemble::<P>(from, case_dir, &crate::battery::phase_dir(case_dir, P::DIR))
 }
 
 #[cfg(test)]
@@ -1946,6 +2006,159 @@ mod tests {
                 file: "src/mine.c".into(),
             }),
             "{err:#}"
+        );
+    }
+
+    /// Every file under `root`, admitting everything, so the comparison below cannot pass by
+    /// both sides sharing an exclusion the walk also applies.
+    fn file_set(root: &Path) -> std::collections::BTreeSet<RelPath> {
+        let mut out = std::collections::BTreeSet::new();
+        visit(root, root, false, &|_| true, &mut |rel, _| {
+            out.insert(rel.clone());
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    /// A FIFO, a link whose target is gone, and a link to a file. `mkfifo`, because no std call
+    /// makes one: a `.pipe` is what `impcheck` leaves in a work tree, and it is the entry an
+    /// unguarded walk hangs on. `tmp/symlink -> ./tmp/file` is the shape of every one of the 17
+    /// links in the shipped `results/` tree, all of which dangle.
+    fn non_regular_entries(root: &Path) {
+        use std::os::unix::fs::FileTypeExt;
+        let pipe = root.join("c_src/tests/x.pipe");
+        std::fs::create_dir_all(pipe.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&pipe)
+                .status()
+                .unwrap()
+                .success()
+                && std::fs::symlink_metadata(&pipe)
+                    .unwrap()
+                    .file_type()
+                    .is_fifo(),
+            "the fixture must hold a real FIFO, or nothing here is being guarded against"
+        );
+        std::os::unix::fs::symlink("./tmp/file", root.join("tmp/symlink")).unwrap();
+        std::os::unix::fs::symlink("lib.rs", root.join("src/linked.rs")).unwrap();
+        assert!(
+            std::fs::metadata(root.join("tmp/symlink")).is_err()
+                && std::fs::metadata(root.join("src/linked.rs"))
+                    .unwrap()
+                    .is_file(),
+            "and one link that resolves to a file beside one that resolves to nothing"
+        );
+    }
+
+    /// What `translated/` CONTAINS may not depend on which backend produced it: the keyed path
+    /// publishes through [`Sealed::publish`] and the unkeyed ones through [`publish_unsealed`],
+    /// and while those were two hand-rolled copies — `copy_dir_all` carrying `target/`, a
+    /// `skip = ["target"]` filter still carrying `c_src/build/` — comparing two backends
+    /// compared two file sets.
+    ///
+    /// Also that BOTH publishes return at all: the copy helpers the unkeyed sites gave up skipped
+    /// non-regular files because `std::fs::copy` on a FIFO blocks until a writer appears, and
+    /// [`digest_tree`]'s `std::fs::read` blocks the keyed side identically — so this fixture holds
+    /// one, and a walk that emits it never reaches an assertion.
+    #[test]
+    fn both_publish_paths_share_one_copy_body_and_one_exclusion_set() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let produced = tmp.path().join("produced");
+        tree(
+            &produced,
+            &[
+                ("Cargo.toml", "[package]"),
+                ("src/lib.rs", "pub fn a() {}"),
+                (".cargo/config.toml", "[build]"),
+                ("c_src/src/lib.c", "int a(void){return 0;}"),
+                ("c_src/doc/footer.html.bak", "upstream"),
+                ("target/debug/junk", "build output"),
+                ("c_src/build/CMakeCache.txt", "/dead/scratch/path"),
+            ],
+        );
+        non_regular_entries(&produced);
+
+        type Publish = fn(&Path, &Path) -> Result<()>;
+        let mut shapes = Vec::new();
+        let sealed: Publish = |from, case| Sealed::<Translate>::from_cache(from)?.publish(case);
+        for (what, publish) in [
+            ("sealed", sealed),
+            ("copied", publish_unsealed::<Translate>),
+        ] {
+            let case = tmp.path().join(what);
+            publish(&produced, &case).unwrap();
+            let dst = crate::battery::phase_dir(&case, crate::battery::TRANSLATED);
+            for admitted in [
+                "Cargo.toml",
+                "src/lib.rs",
+                ".cargo/config.toml",
+                "c_src/src/lib.c",
+                "c_src/doc/footer.html.bak",
+                // Followed, not skipped by file type: the links around phase dirs are staging
+                // artifacts, and dropping them would drop content the digest counts.
+                "src/linked.rs",
+            ] {
+                assert!(
+                    dst.join(admitted).is_file(),
+                    "{what}: {admitted} is hashed, so a publish that drops it publishes a \
+                     different crate from the other path's"
+                );
+            }
+            for excluded in ["target", "c_src/build"] {
+                assert!(
+                    !dst.join(excluded).exists(),
+                    "{what}: {excluded} bakes in a dead scratch path and is 9x the bytes"
+                );
+            }
+            for skipped in ["c_src/tests/x.pipe", "tmp/symlink"] {
+                assert!(
+                    std::fs::symlink_metadata(dst.join(skipped)).is_err(),
+                    "{what}: {skipped} has no content to publish, and copying it either blocks \
+                     forever or fails the whole publish"
+                );
+            }
+            shapes.push(file_set(&dst));
+        }
+
+        assert!(
+            produced.join("target/debug/junk").is_file()
+                && produced.join("c_src/build/CMakeCache.txt").is_file(),
+            "fixture assumption: the tree really holds what both publishes must drop"
+        );
+        assert_eq!(
+            shapes[0], shapes[1],
+            "the two publishes must agree file for file, or `translated/` means one thing for \
+             a keyed backend and another for an unkeyed one"
+        );
+    }
+
+    /// A symlink CYCLE is the input that separates "skip what cannot be resolved" from "swallow
+    /// every resolution error". A dangling link has nothing to follow and is skipped; a cycle
+    /// returns ELOOP, and swallowing it would drop the entry from BOTH the copy and the digest --
+    /// so the two would agree, the store would validate a truncated tree, and nothing could report
+    /// it. It must refuse instead.
+    #[test]
+    fn a_symlink_cycle_is_refused_rather_than_silently_dropped() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let root = tmp.path().join("cycle");
+        tree(&root, &[("Cargo.toml", "[package]")]);
+        std::os::unix::fs::symlink("b.rs", root.join("src/a.rs")).ok();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::os::unix::fs::symlink("b.rs", root.join("src/a.rs")).unwrap();
+        std::os::unix::fs::symlink("a.rs", root.join("src/b.rs")).unwrap();
+        assert!(
+            std::fs::metadata(root.join("src/a.rs")).is_err(),
+            "the fixture must really be an unresolvable cycle, not a dangling link"
+        );
+
+        let err = digest_tree(&root).expect_err("a cycle must refuse, not hash a tree without it");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("resolving") || text.contains("a.rs") || text.contains("b.rs"),
+            "and must name what it could not resolve: {text}"
         );
     }
 
