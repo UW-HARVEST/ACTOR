@@ -1,7 +1,14 @@
-# PR 16 — Two things make the cache unable to accumulate
+# PR 16 — Make the cache able to accumulate, and never lose a paid artifact
 
-Both are key-composition defects, both need a `SCHEMA` bump, and doing them in one PR means one
-bump instead of two. **Part A is the more important one.**
+Four parts, batched because they share one verification method: **a measured key on both sides, plus
+one test per failure.** Nothing here is a refactor and nothing here is cosmetic. A and B are why the
+store has never served a hit; C and D are why it can cost real money. One `SCHEMA` bump covers A
+and B.
+
+Absorbs items 1 and 3 of `spec-15.md`.
+
+**Do Part A first and verify it on its own**, because it is the cheapest change that makes the cache
+work at all.
 
 # Part A — `cli` must not be a key component
 
@@ -157,7 +164,45 @@ not skipping with 40 digests unchanged, plus:
 - **Part B:** the measured before/after keys from two checkout paths, showing they differed and
   now agree;
 - `SCHEMA` bumped once, with the old and new values stated;
-- all six tests, with evidence each can fail.
+- **Part C:** a store failure publishing rather than losing the artifact;
+- **Part D:** the refusal happening before the first case, not during it;
+- all eight tests, with evidence each can fail.
+
+# Part C — a store failure must not destroy a paid artifact
+
+`Store::obtain` does this:
+
+    let Some(produced) = compute()? else { return Ok(None) };
+    if self.mode != Mode::Bypass {
+        self.store(inputs, &key, &dir, &produced)
+            .with_context(|| format!("storing cache entry {}", key.as_str()))?;
+
+By that line the agent has run, the money is spent and `produced.sealed` exists. If `store` fails,
+`?` returns `Err`, `run_cached` never reaches `publish`, and **the translation is lost.** ENOSPC is
+the realistic trigger on a multi-GB store; a leftover read-only staging dir is another, since
+entries are chmod'd `0o555` and a delete inside one fails EACCES.
+
+Storing is an optimisation. Publishing is the deliverable. A failed store must be **loud and
+non-fatal**: report it, publish anyway, and return `replayed: false` so the next run recomputes —
+which is exactly the cost of a cache miss. Pre-existing, but 7b made it expensive: translate is a
+measured $795.59 per sweep.
+
+**Test: `a_store_that_cannot_write_still_publishes_the_artifact_it_was_given`.** Make the store root
+unwritable, assert the artifact is published, the failure is reported, and no entry exists.
+Non-vacuity: assert the run *would* have stored one had the root been writable.
+
+# Part D — refuse before the money, not per case
+
+`cache::ToolchainId::detect()` runs **once per keyed case**, inside the loop, and refuses when
+`RUSTUP_TOOLCHAIN` disagrees with the pin. `preflight_check` does not cover it. That is exactly the
+failure `CLAUDE.md` records: *"A 3h20m sweep completed and then had all seven verifications refused
+for a variable that was already set at launch."* A sweep can now translate case 1, spend real money,
+and refuse case 2 for a condition that was already true before it started.
+
+Probe the toolchain in `preflight_check`, once, and refuse there. Per-case detection may stay as a
+cheap consistency assertion, but the *refusal* belongs before the money.
+
+**Test: `a_toolchain_that_will_refuse_every_case_refuses_before_the_first_one`.**
 
 ## Commit message
 

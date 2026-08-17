@@ -70,11 +70,19 @@ not at all, and I1 holds for free on all five paths instead of being enforced fi
 
 If you take the displacement route instead, say why staging was rejected.
 
-**Related, and worth doing in the same PR if it falls out naturally:** `docs/prs/spec-15.md`
-item 2 records that the keyed and unkeyed paths publish *different trees* — the keyed one through
-`Carry::FromArtifact`, the unkeyed one by recursive copy — so what `translated/` contains depends
-on the backend. Both are symptoms of the unkeyed path not going through the artifact machinery.
-Fixing the transcript ordering does not fix that, but a reviewer will ask.
+**IN SCOPE, absorbed from `spec-15.md` item 2:** the keyed and unkeyed paths publish *different
+trees* — the keyed one through `Carry::FromArtifact`, the unkeyed one by recursive copy — so what
+`translated/` contains depends on which backend produced it, which is a measurement hazard rather
+than a tidiness one.
+
+That is the same root cause as the invariant gap above: the unkeyed path does not go through the
+artifact machinery. So fix both together — route the unkeyed publish through the same
+`Sealed::publish`/`Carry::FromArtifact` the keyed path uses. If it genuinely cannot be (no `Sealed`
+without a `Completed`), say precisely why and record the difference in ONE place rather than leaving
+it implicit in two copy helpers.
+
+**Test: `every_backend_publishes_the_same_tree_shape`** — one table-driven test over both paths
+asserting the same admitted and excluded set.
 
 ## Required tests
 
