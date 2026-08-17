@@ -20,6 +20,57 @@ gate than the per-item review that three separate PRs would have received. So th
 does not belong here.** Take it out, say so, and leave it. A single behaviour change hiding inside a
 pure-move PR is exactly what makes a large diff unreviewable.
 
+## MEASURED ON `main` AT f831919, so you do not have to look
+
+Two earlier PRs in this sequence stalled agents that spent their whole budget reading before writing
+a line. Everything below is already measured. Re-verify anything you rely on, but do not go
+exploring for it.
+
+### The cycle: one half is TEST-ONLY
+
+`CYCLE_BASELINE` is `["agents", "artifact", "battery", "cache", "cli"]` at
+`tools/tests/architecture.rs:1190`.
+
+**`cache -> battery` exists only in tests.** `#[cfg(test)]` begins at `tools/src/cache.rs:924`, and
+every `crate::battery::` reference in that file is after it — lines **996, 1427, 1808, 2065**
+(`VERIFIED`, `TRANSLATED`, `phase_dir`). The DAG rule lexes the whole file including test modules, so
+the edge is real to the rule and free to cut: those tests can take their phase naming from
+`<Verify as Phase>::DIR`, which `cache` already depends on. **Do this one first — it is four lines.**
+
+**`battery -> cache` is production code**, four references in `tools/src/battery.rs`:
+line **635** `pub agent_key: crate::cache::AgentKey`, **640** `pub cache_mode: crate::cache::Mode`,
+**651** a `cache_mode` parameter, **657** `AgentKey::new`. `Paths` is a layout type and cache policy
+is not layout, so `cache_mode` comes off it; `cli::CacheMode`/`cli::Reuse`/`CacheMode::honouring`
+already exist from PR 12, so check what is actually left to move.
+
+### The renames: 6 string literals in 4 rules are the whole hazard
+
+| name | in `src` | in `tests` | **in string literals** |
+|---|---|---|---|
+| `Sealed` | 50 | 24 | **3** |
+| `Scratch` | 26 | 5 | **1** |
+| `Scrubbed` | 15 | 3 | **2** |
+| `CDir` | 11 | 0 | 0 |
+
+The literals, each of which makes a rule inspect nothing if missed:
+
+- `tools/tests/architecture.rs:162` — `REQUIRED: &["Sealed", "WorkTree", "Scrubbed", "Corpus", "TreeDigest"]`
+- `tools/tests/architecture.rs:231` — `if type_name(&imp.self_ty) != "Sealed"`, the
+  `sealed_implements_only_debug` check. **This is the dangerous one:** rename the type and not this
+  and the rule inspects zero impls and reports green.
+- `tools/tests/architecture.rs:273` — `("Scratch", "path")`
+- `tools/tests/architecture.rs:1095` — `TYPESTATE_ORDER: &["WorkTree", "Scrubbed", "Sealed"]`
+
+`CDir` has zero literals and zero test references, so `CDir -> OracleDir` is the cheapest rename of
+the four. Note PR 11 added a `Seed` enum whose variants are `FromCorpus`/`FromArtifact`, named that
+way because `Seed::Corpus` shadowed the `Corpus` struct enough to change a trybuild diagnostic —
+so **check for that class of collision before choosing any new name**, and prefer a name that leaves
+the `.stderr` files untouched. PR 11 avoided a re-record entirely that way.
+
+### Eleven compile-fail cases, not ten
+
+`oracle_cannot_be_forged` was added by PR 14 and is pinned to `E0603` in the expected map.
+
 ## Part 1 — Break the last two dependency cycles
 
 `CYCLE_BASELINE` is `["agents", "artifact", "battery", "cache", "cli"]`. Two mutual pairs remain,
