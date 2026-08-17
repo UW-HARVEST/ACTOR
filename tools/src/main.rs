@@ -10,7 +10,7 @@ fn main() -> Result<()> {
     let repo_root = find_repo_root()?;
     let agent = cli.agent;
     let model = cli.model.as_deref();
-    let cache = cli.cache;
+    let cache = cli.cache_mode();
 
     // Before, not after, a run that can take hours: a binary that does not match the
     // checkout cannot produce an attributable measurement.
@@ -58,7 +58,7 @@ fn main() -> Result<()> {
                 agent,
                 dataset,
                 model,
-                cache.into(),
+                cache,
                 harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),
@@ -98,7 +98,7 @@ fn main() -> Result<()> {
                 agent,
                 dataset,
                 model,
-                cache.into(),
+                cache,
                 harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),
@@ -123,7 +123,7 @@ fn main() -> Result<()> {
                 agent,
                 dataset,
                 model,
-                cache.honouring(cli::Reuse::from_force_flag(force)),
+                cli::honouring(cache, cli::Reuse::from_force_flag(force)),
                 harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),
@@ -171,7 +171,7 @@ fn main() -> Result<()> {
                 agent,
                 dataset,
                 model,
-                cache.into(),
+                cache,
                 harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),
@@ -201,7 +201,7 @@ fn main() -> Result<()> {
                 agent,
                 dataset,
                 model,
-                cache.into(),
+                cache,
                 harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),

@@ -79,6 +79,38 @@ fn resolve_harvest_bench_projects(
     }
 }
 
+/// The one filter for a case list, from the two places a caller can name one.
+///
+/// `--include-regex` was accepted, documented in `--help`, threaded through `main.rs` into this
+/// trait -- and then discarded by every impl, which took it as `_filter`. So asking for one case
+/// silently ran the whole battery, and at harvest-bench prices that is a four-figure mistake
+/// rather than a small one. `battery::discover` applies ONE regex, and this crate's `regex` has no
+/// lookahead to and them together, so naming a case in the target AND passing the flag is refused
+/// rather than resolved by preferring one -- silently dropping either is the bug being fixed.
+fn one_filter(from_target: Option<String>, from_flag: Option<&str>) -> Result<Option<String>> {
+    match (from_target, from_flag) {
+        (Some(t), Some(f)) => anyhow::bail!(
+            "the target names a case ({t}) and --include-regex was also given ({f}); both filter \
+             the same list and only one can apply, so pass one or the other"
+        ),
+        (Some(t), None) => Ok(Some(t)),
+        (None, Some(f)) => Ok(Some(f.to_string())),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Harvest-bench's unit is a project, not a case, and nothing below it filters -- so a filter
+/// here cannot be honoured. Refuse instead of accepting it and doing nothing.
+fn no_filter_here(from_flag: Option<&str>) -> Result<()> {
+    if let Some(f) = from_flag {
+        anyhow::bail!(
+            "--include-regex ({f}) does not apply to harvest-bench: its unit is a project, and \
+             nothing under it filters by case. Name the project in the target instead"
+        );
+    }
+    Ok(())
+}
+
 /// Split a `battery` or `battery/case` target into (battery, optional case regex).
 fn parse_target(target: &str) -> (String, Option<String>) {
     if let Some((battery, case)) = target.split_once('/') {
@@ -103,7 +135,7 @@ impl Benchmark for TestCorpus {
         &self,
         paths: &Paths,
         target: &str,
-        _filter: Option<&str>,
+        filter_flag: Option<&str>,
         parallel: usize,
     ) -> Result<()> {
         let batteries = resolve_batteries(&paths.corpus_dir, target)?;
@@ -124,6 +156,7 @@ impl Benchmark for TestCorpus {
                 for bat in &shared_bats {
                     handles.push(s.spawn(move || -> Result<()> {
                         let (name, filter) = parse_target(bat);
+                        let filter = one_filter(filter, filter_flag)?;
                         translate::run_test_corpus(paths, &name, filter.as_deref(), 1)
                     }));
                 }
@@ -131,6 +164,7 @@ impl Benchmark for TestCorpus {
                     handles.push(s.spawn(|| -> Result<()> {
                         for bat in &indie_bats {
                             let (name, filter) = parse_target(bat);
+                            let filter = one_filter(filter, filter_flag)?;
                             translate::run_test_corpus(
                                 paths,
                                 &name,
@@ -156,6 +190,7 @@ impl Benchmark for TestCorpus {
         } else {
             for bat in &batteries {
                 let (name, filter) = parse_target(bat);
+                let filter = one_filter(filter, filter_flag)?;
                 translate::run_test_corpus(paths, &name, filter.as_deref(), parallel)?;
             }
         }
@@ -169,7 +204,7 @@ impl Benchmark for TestCorpus {
         _repo_root: &Path,
         paths: &Paths,
         target: &str,
-        _filter: Option<&str>,
+        filter_flag: Option<&str>,
         force: bool,
         parallel: usize,
     ) -> Result<()> {
@@ -179,6 +214,7 @@ impl Benchmark for TestCorpus {
         } else {
             for bat in &batteries {
                 let (name, filter) = parse_target(bat);
+                let filter = one_filter(filter, filter_flag)?;
                 verify::run(paths, &name, filter.as_deref(), force, parallel)?;
             }
             Ok(())
@@ -223,9 +259,10 @@ impl Benchmark for HarvestBench {
         &self,
         paths: &Paths,
         target: &str,
-        _filter: Option<&str>,
+        filter_flag: Option<&str>,
         parallel: usize,
     ) -> Result<()> {
+        no_filter_here(filter_flag)?;
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
         translate::run_harvest_bench(paths, &projects, parallel)
     }
@@ -235,10 +272,11 @@ impl Benchmark for HarvestBench {
         _repo_root: &Path,
         paths: &Paths,
         target: &str,
-        _filter: Option<&str>,
+        filter_flag: Option<&str>,
         force: bool,
         parallel: usize,
     ) -> Result<()> {
+        no_filter_here(filter_flag)?;
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
         verify::run_harvest_bench(paths, &projects, parallel, force)
     }
@@ -252,5 +290,56 @@ impl Benchmark for HarvestBench {
         // HB results sit per-project directly under results/HarvestBench/<agent>/ with no
         // battery grouping, which is the shape enrich_test_corpus sees for an empty battery.
         oracle::enrich_test_corpus(paths, "")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--include-regex` was accepted, documented, threaded into this trait and then discarded by
+    /// every impl as `_filter`, so asking for one case ran the whole battery. Nothing tested the
+    /// flag, which is why it survived — so these pin the mapping itself rather than any one caller.
+    #[test]
+    fn a_case_named_in_the_target_becomes_the_filter() {
+        assert_eq!(
+            parse_target("B01_synthetic/001_helloworld"),
+            ("B01_synthetic".into(), Some("001_helloworld$".into())),
+            "anchored at the end, so 001_helloworld does not also select 001_helloworld_lib"
+        );
+        assert_eq!(
+            parse_target("B01_synthetic"),
+            ("B01_synthetic".into(), None)
+        );
+    }
+
+    #[test]
+    fn the_include_regex_flag_reaches_the_case_list() {
+        assert_eq!(
+            one_filter(None, Some("01[0-9]_")).unwrap(),
+            Some("01[0-9]_".to_string()),
+            "a flag with no case in the target must be the filter, not be dropped"
+        );
+    }
+
+    #[test]
+    fn a_filter_named_twice_is_refused_rather_than_half_applied() {
+        let err = one_filter(Some("001_helloworld$".into()), Some("01[0-9]_"))
+            .expect_err("two filters for one list cannot both apply");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("001_helloworld$") && text.contains("01[0-9]_"),
+            "and the refusal must name both, or the operator cannot tell which to drop: {text}"
+        );
+    }
+
+    #[test]
+    fn a_filter_harvest_bench_cannot_honour_is_refused_rather_than_ignored() {
+        assert!(no_filter_here(None).is_ok(), "no flag is not an error");
+        let err = no_filter_here(Some("libsodium")).expect_err(
+            "harvest-bench filters nothing below a project, so accepting this would be the \
+             silent-ignore bug again",
+        );
+        assert!(format!("{err:#}").contains("libsodium"));
     }
 }

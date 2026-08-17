@@ -245,7 +245,7 @@ mod tests {
     use crate::battery::{has_crate, phase_dir, TRANSLATED, VERIFIED};
     use crate::cache::tests::fixture;
     use crate::cache::{fake_program, prompt_digest, Mode, Recipe};
-    use crate::cli::{Agent, CacheMode, Reuse};
+    use crate::cli::{honouring, Agent, Reuse};
     use crate::domain::health::Completed;
     use crate::io::workdir::Roots;
     use std::path::PathBuf;
@@ -471,7 +471,7 @@ mod tests {
         };
 
         const DISPUTED: &str = "pub fn a() { /* the result the operator distrusts */ }";
-        let reusing = Store::open(&f.repo, CacheMode::On.honouring(Reuse::Permitted)).unwrap();
+        let reusing = Store::open(&f.repo, honouring(Mode::ReadWrite, Reuse::Permitted)).unwrap();
         assert!(verify_once(&reusing, DISPUTED), "nothing is stored yet");
         assert!(
             !verify_once(&reusing, "pub fn a() { /* never reached */ }"),
@@ -480,7 +480,7 @@ mod tests {
         );
 
         const RERUN: &str = "pub fn a() { /* what a second look produced */ }";
-        let forced = Store::open(&f.repo, CacheMode::On.honouring(Reuse::Refused)).unwrap();
+        let forced = Store::open(&f.repo, honouring(Mode::ReadWrite, Reuse::Refused)).unwrap();
         assert!(
             verify_once(&forced, RERUN),
             "--force must reach the store, or it changes nothing a keyed phase does"
@@ -492,7 +492,7 @@ mod tests {
         );
 
         assert_eq!(
-            CacheMode::Off.honouring(Reuse::Refused),
+            honouring(Mode::Bypass, Reuse::Refused),
             Mode::Bypass,
             "while an operator who asked for no cache must not be given one: there --force \
              overrides the published-log check instead, which is all that path has"
