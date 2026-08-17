@@ -182,34 +182,32 @@ pub fn run_test_corpus(
     // ── Sequential: shared-source groups ───────────────────────────────
     for group in &shared {
         current += 1;
-        let r = translate_one_shared(paths, &output_dir, battery_name, group);
+        let r = translate_one_shared(paths, &output_dir, battery_name, group, &store, skip);
 
-        if r.skipped {
+        let real = if r.skipped {
             translated += 1;
             println!("[{current}/{total}] ⏭️  {} (already done)", group.real_case);
+            RealCase::StoodAlready
         } else if r.success {
             translated += 1;
             println!("  ✅ {} ({}s)", group.real_case, r.elapsed_secs);
+            RealCase::Published
         } else {
             failed += 1;
             let err = r.error.as_deref().unwrap_or("unknown error");
             println!("  ❌ {} — {err} ({}s)", group.real_case, r.elapsed_secs);
             current += group.configs.len();
             continue;
-        }
+        };
 
         for cfg in &group.configs {
             current += 1;
-            if crate::battery::has_crate(&crate::battery::phase_dir(
-                &output_dir.join(&cfg.name),
-                crate::battery::TRANSLATED,
-            )) {
-                translated += 1;
-                println!("[{current}/{total}] ⏭️  {} (already done)", cfg.name);
-                continue;
-            }
-            match propagate_config(paths, battery_name, &group.real_case, cfg) {
-                Ok(()) => {
+            match derive_follower(paths, battery_name, &group.real_case, cfg, real) {
+                Ok(Derived::AlreadyStanding) => {
+                    translated += 1;
+                    println!("[{current}/{total}] ⏭️  {} (already done)", cfg.name);
+                }
+                Ok(Derived::Propagated) => {
                     translated += 1;
                     println!("[{current}/{total}] 🔗 {} → {}", cfg.name, group.real_case);
                 }
@@ -255,7 +253,15 @@ fn translate_one_independent(
         &case.name,
         &output_dir.join(&case.name),
         &paths.agent_key,
-        || dispatch_translate(paths, battery_name, &case.name, case.is_lib, store),
+        || {
+            dispatch_translate(
+                paths,
+                battery_name,
+                &case.name,
+                Translating::independent(case.is_lib),
+                store,
+            )
+        },
         || {
             if paths.agent == Agent::ClaudeCrossPrompt {
                 // E4: the agent's lib-vs-bin choice IS the experiment, so it must not
@@ -280,19 +286,25 @@ fn translate_one_independent(
     )
 }
 
-/// A group's store is [`SHARED_SOURCE_CACHE`], i.e. bypassed, and a follower's crate is DERIVED
-/// rather than keyed — so a published crate is all either skip here can ask, as the test pins.
+/// ONE key for the whole group: the real case is keyed and stored exactly as an independent case
+/// is, and each follower is then DERIVED from the published crate by [`propagate_config`]. A
+/// follower may take no key of its own — its `test_case` is a symlink to the real case's, so it
+/// would collide on the real case's key and be served that tree as if an agent had produced it.
 fn translate_one_shared(
     paths: &Paths,
     output_dir: &Path,
     battery_name: &str,
     group: &battery::SharedSourceGroup,
+    store: &Store,
+    skip: SkipCheck,
 ) -> CaseResult {
     let real_dir = output_dir.join(&group.real_case);
-    if crate::battery::has_crate(&crate::battery::phase_dir(
-        &real_dir,
-        crate::battery::TRANSLATED,
-    )) {
+    if skip.already_done(|| {
+        crate::battery::has_crate(&crate::battery::phase_dir(
+            &real_dir,
+            crate::battery::TRANSLATED,
+        ))
+    }) {
         return CaseResult {
             name: group.real_case.clone(),
             elapsed_secs: 0,
@@ -311,34 +323,84 @@ fn translate_one_shared(
         &group.real_case,
         &real_dir,
         &paths.agent_key,
-        || dispatch_translate_shared(paths, battery_name, &group.real_case),
         || {
-            if let Ok(mut cargo) = CargoToml::open(
-                &crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED)
-                    .join("Cargo.toml"),
-            ) {
-                cargo.add_workspace();
-                let features = battery::extract_features_from_path(
-                    &paths
-                        .input_dir(battery_name)
-                        .join(&group.real_case)
-                        .join("CMakePresets.json"),
-                )
-                .unwrap_or_default();
-                let resolved = battery::resolve_features(
-                    &crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED)
-                        .join("Cargo.toml"),
-                    &features,
-                )
-                .unwrap_or_default();
-                if !resolved.is_empty() {
-                    cargo.set_default_features(&resolved);
-                }
-                let _ = cargo.save();
-            }
-            Ok(())
+            dispatch_translate(
+                paths,
+                battery_name,
+                &group.real_case,
+                Translating::Shared,
+                store,
+            )
         },
+        || post_process_shared(paths, battery_name, &group.real_case),
     )
+}
+
+/// The real case's half of a group, named rather than inline because a replay publishes the tree
+/// the agent produced and this runs over it afterwards — so the followers a replay derives are the
+/// followers a fresh run derives only if the sweep and the test that pins that apply the same one.
+fn post_process_shared(paths: &Paths, battery: &str, real_case: &str) -> Result<()> {
+    let cargo_path = crate::battery::phase_dir(
+        &paths.case_dir(battery, real_case),
+        crate::battery::TRANSLATED,
+    )
+    .join("Cargo.toml");
+    if let Ok(mut cargo) = CargoToml::open(&cargo_path) {
+        cargo.add_workspace();
+        let features = battery::extract_features_from_path(
+            &paths
+                .input_dir(battery)
+                .join(real_case)
+                .join("CMakePresets.json"),
+        )
+        .unwrap_or_default();
+        let resolved = battery::resolve_features(&cargo_path, &features).unwrap_or_default();
+        if !resolved.is_empty() {
+            cargo.set_default_features(&resolved);
+        }
+        let _ = cargo.save();
+    }
+    Ok(())
+}
+
+/// Whether the crate now in the real case is the one the followers beside it were derived FROM.
+///
+/// [`SkipCheck::Keyed`] re-enters the real case on every sweep, so a store miss re-translates it —
+/// and a publish clears the real case's phase dir only, never a follower's. A standing follower may
+/// therefore only be honoured when the real case stood too: honoured after a re-translation, one
+/// group holds two translations at once, `runtests` scores `translated/` case by case, and the
+/// sweep reports every one of them as translated.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RealCase {
+    StoodAlready,
+    Published,
+}
+
+enum Derived {
+    AlreadyStanding,
+    Propagated,
+}
+
+/// THE derivation of one follower, called by the sweep and by the test that pins a replayed group's
+/// followers against a fresh one's — so the followers that test compares cannot be a second
+/// definition of the ones the sweep writes.
+fn derive_follower(
+    paths: &Paths,
+    battery: &str,
+    real_case: &str,
+    cfg: &battery::Config,
+    real: RealCase,
+) -> Result<Derived> {
+    if real == RealCase::StoodAlready
+        && crate::battery::has_crate(&crate::battery::phase_dir(
+            &paths.case_dir(battery, &cfg.name),
+            crate::battery::TRANSLATED,
+        ))
+    {
+        return Ok(Derived::AlreadyStanding);
+    }
+    propagate_config(paths, battery, real_case, cfg)?;
+    Ok(Derived::Propagated)
 }
 
 // ── DRY dispatch helpers ───────────────────────────────────────────────
@@ -530,13 +592,56 @@ fn uncached(r: Result<()>) -> Result<RecordedBy> {
     r.map(|()| RecordedBy::Caller)
 }
 
+/// What is being translated, in the three flavours a translation has — [`PromptKind`] minus
+/// `Verify`, so no translate dispatch can be handed the verify prompt. A group's real case is a
+/// library to the backends that take no prompt at all: every follower is derived from it as one.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Translating {
+    Library,
+    Executable,
+    Shared,
+}
+
+impl Translating {
+    fn independent(is_lib: bool) -> Self {
+        if is_lib {
+            Translating::Library
+        } else {
+            Translating::Executable
+        }
+    }
+
+    fn prompt(self) -> PromptKind {
+        match self {
+            Translating::Library => PromptKind::Library,
+            Translating::Executable => PromptKind::Executable,
+            Translating::Shared => PromptKind::Shared,
+        }
+    }
+
+    fn is_lib(self) -> bool {
+        !matches!(self, Translating::Executable)
+    }
+
+    #[cfg(test)]
+    const ALL: &'static [Translating] = &[
+        Translating::Library,
+        Translating::Executable,
+        Translating::Shared,
+    ];
+}
+
+/// ONE table from agent to launch, for every flavour: a second copy is what decides which arm a
+/// backend occupies, and `Mode::Bypass` for laertes/c2saferrust is expressed by nothing but that
+/// arm — so moving one there while a copy keeps the old arm is not a compile error anywhere.
 fn dispatch_translate(
     paths: &Paths,
     battery: &str,
     name: &str,
-    is_lib: bool,
+    what: Translating,
     store: &Store,
 ) -> Result<RecordedBy> {
+    let is_lib = what.is_lib();
     match paths.agent {
         Agent::Laertes => uncached(laertes_translate_case(paths, battery, name)),
         Agent::C2SaferRust => uncached(c2saferrust_translate_case(paths, battery, name, is_lib)),
@@ -549,33 +654,8 @@ fn dispatch_translate(
         | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures
         | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
         | Agent::CodexGpt55 | Agent::CodexGpt54 => {
-            let prompt = require_prompt(paths, PromptKind::independent(is_lib))?;
+            let prompt = require_prompt(paths, what.prompt())?;
             translate_case(paths, battery, name, &prompt, store)
-        }
-    }
-}
-
-/// The shared-source path's store: one invocation serves N configs `propagate_config` DERIVES
-/// from the published real case, and spec-7c exists to show a replay derives identical ones.
-/// Named because it is also what justifies [`translate_one_shared`] reading a published crate.
-const SHARED_SOURCE_CACHE: cache::Mode = cache::Mode::Bypass;
-
-/// Bypassed, with the store opened here so no caller can hand this path a keyed one.
-fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result<RecordedBy> {
-    let store = Store::open(&paths.repo_root, SHARED_SOURCE_CACHE)?;
-    match paths.agent {
-        Agent::Laertes => uncached(laertes_translate_case(paths, battery, name)),
-        Agent::C2SaferRust => uncached(c2saferrust_translate_case(paths, battery, name, true)),
-        Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
-        Agent::Kimi => uncached(kimi_translate_case(paths, battery, name, true)),
-        Agent::Oneshot => uncached(oneshot_translate_case(paths, battery, name, true)),
-        Agent::C2rust => translate_case(paths, battery, name, "", &store),
-        Agent::Kiro | Agent::Claude | Agent::OpenCode | Agent::ClaudeCombined
-        | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures
-        | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
-        | Agent::CodexGpt55 | Agent::CodexGpt54 => {
-            let prompt = require_prompt(paths, PromptKind::Shared)?;
-            translate_case(paths, battery, name, &prompt, &store)
         }
     }
 }
@@ -2498,6 +2578,7 @@ fn invoke_opencode_with_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::tests::fixture;
     use std::process::Command;
 
     /// ExitStatus cannot be constructed directly, so shell out for a real one.
@@ -2653,7 +2734,8 @@ mod tests {
 
     /// A published `translated/` records nothing about the invocation that wrote it, so a skip check
     /// reading one accepts another model's crate as this model's, and publishes numbers. Both values
-    /// go to BOTH keyed sites: a site that stops consulting the one it was given is the same bug.
+    /// go to ALL THREE keyed sites: a site that stops consulting the one it was given is the same
+    /// bug, and a shared-source group's real case is now keyed like any other invocation.
     #[test]
     fn a_published_translation_from_a_different_model_is_not_accepted_as_done() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
@@ -2682,9 +2764,16 @@ mod tests {
         }
         let project = battery::HarvestBenchProject::resolve(&hb.corpus_dir, "libpng").unwrap();
 
+        let group = battery::SharedSourceGroup {
+            real_case: "macrodepth_add_5".to_owned(),
+            configs: Vec::new(),
+        };
+
         let one_ind =
             |skip| translate_one_independent(&corpus, &output_dir, battery, &case, &store, skip);
         let one_bench = |skip| translate_one_harvest_bench(&hb, &project, "", &store, skip);
+        let one_group =
+            |skip| translate_one_shared(&corpus, &output_dir, battery, &group, &store, skip);
         let sites = [
             Site {
                 what: "independent",
@@ -2695,6 +2784,11 @@ mod tests {
                 what: "harvest-bench",
                 published: publish_a_crate(&hb.output_dir(project.name())),
                 run: &one_bench,
+            },
+            Site {
+                what: "shared-source group",
+                published: publish_a_crate(&output_dir.join(&group.real_case)),
+                run: &one_group,
             },
         ];
 
@@ -2759,27 +2853,29 @@ mod tests {
             "and the crate it answered from is untouched"
         );
 
-        // The other half, every agent's shared-source group: a bypassed store, keyed agent.
-        let keyed_agent = paths_at(tmp.path(), Agent::Claude, corpus, cache::Mode::ReadWrite);
+        // The other half, a shared-source group under `--cache off`: keyed agent, no store to ask.
+        let bypassed = paths_at(tmp.path(), Agent::Claude, corpus, cache::Mode::Bypass);
         let group = battery::SharedSourceGroup {
             real_case: "macrodepth_add_5".to_owned(),
             configs: Vec::new(),
         };
         let real = publish_a_crate(&output_dir.join(&group.real_case));
-        let g = translate_one_shared(&keyed_agent, &output_dir, battery, &group);
+        let store_off = cache::Store::open(&bypassed.repo_root, bypassed.cache_mode).unwrap();
+        let g = translate_one_shared(
+            &bypassed,
+            &output_dir,
+            battery,
+            &group,
+            &store_off,
+            translate_skip_check(&bypassed),
+        );
         assert!(
             g.skipped && g.success,
-            "the group's store never loads, so there is no entry to replay and `translated/` \
-             is all there is to read: {:?}",
+            "a bypassed store never loads, so there is no entry to replay and `translated/` is \
+             all there is to read: {:?}",
             g.error
         );
         assert!(crate::battery::has_crate(&real));
-        assert_eq!(
-            SkipCheck::Keyed.through(SHARED_SOURCE_CACHE),
-            SkipCheck::WhateverIsPublished,
-            "which is exactly what the group's mode answers, and the only thing that licenses \
-             those two sites to read a published crate without asking"
-        );
 
         // THE WHOLE DECISION, both halves, as a sweep resolves it — here, because a sweep needs a CLI
         // and a corpus. Keyed without a key re-bills every case; keyed through a store that never
@@ -2842,6 +2938,557 @@ mod tests {
                 skip_check(backend)
             );
         }
+    }
+
+    // ── Shared-source groups: one key, N publishes ──────────────────────
+
+    const GROUP_BATTERY: &str = "P01_sphincs_plus";
+    const REAL_CASE: &str = "005_sphincs_blake_128f_simple";
+
+    /// Where `extract_features_from_path` reads a case's features: the SECOND configure preset.
+    fn presets(backend: &str, thash: &str) -> String {
+        format!(
+            r#"{{"configurePresets":[{{"name":"base"}},{{"name":"cfg","cacheVariables":{{"HASH_BACKEND":"{backend}","THASH":"{thash}"}}}}]}}"#
+        )
+    }
+
+    /// What the paid invocation leaves in the work tree. A `[[bin]]`, a `tests/` and a
+    /// `[features]` table, so what `propagate_config` does to a follower — strip the binary and
+    /// the tests, set `default = [...]` — is observable rather than a no-op.
+    const CRATE_MANIFEST: &str = "[package]\nname = \"sphincs\"\nversion = \"0.1.0\"\n\n\
+         [[bin]]\nname = \"driver\"\npath = \"src/main.rs\"\n\n\
+         [features]\ndefault = []\nblake = []\nsha2 = []\nrobust = []\nsimple = []\n";
+
+    /// What varies between two passes of one sweep: the model the key names, and the crate the
+    /// stand-in agent writes. A second pass naming another model is the key move the field really
+    /// suffers — the CLIs auto-update through a shim, and a `SCHEMA` bump does the same — so the
+    /// group MISSES and is re-translated with every follower still standing beside it.
+    #[derive(Copy, Clone)]
+    struct Pass<'a> {
+        model: &'a str,
+        lib_rs: &'a str,
+    }
+
+    const FIRST_PASS: Pass<'static> = Pass {
+        model: "claude-opus-5[1m]",
+        lib_rs: "pub fn sign() {}",
+    };
+
+    const AFTER_A_KEY_MOVE: Pass<'static> = Pass {
+        model: "claude-sonnet-5",
+        lib_rs: "pub fn sign() { /* what the re-run produced */ }",
+    };
+
+    fn the_agent_writes_a_crate(crate_dir: &Path, lib_rs: &str) {
+        for rel in ["src", "tests"] {
+            std::fs::create_dir_all(crate_dir.join(rel)).unwrap();
+        }
+        for (rel, body) in [
+            ("Cargo.toml", CRATE_MANIFEST),
+            ("src/lib.rs", lib_rs),
+            ("src/main.rs", "fn main() {}"),
+            ("tests/it.rs", "#[test]\nfn signs() {}"),
+            // `Disposition::Ignore`, so the digest does NOT hash it while `Carry::FromArtifact`
+            // still carries it: a store that dropped this would pass validation and a replay
+            // would publish — and propagate — a tree the fresh run did not.
+            ("src/lib.rs.bak", "pub fn sign() { todo!() }"),
+        ] {
+            std::fs::write(crate_dir.join(rel), body).unwrap();
+        }
+    }
+
+    /// A group as the corpus really lays one out: each follower's `test_case` is a SYMLINK to the
+    /// real case's, which is what makes ONE input digest serve the whole group. Read back through
+    /// [`battery::discover`] rather than hand-built, so the test cannot disagree with the sweep
+    /// about which case is the invocation and which are derived.
+    ///
+    /// `fixture()` owns the tree: it is the one root that can be deleted after a [`Store`] has
+    /// written `0o555` entries into it.
+    fn a_shared_source_group(
+        f: &crate::cache::tests::Fixture,
+    ) -> (Paths, battery::SharedSourceGroup) {
+        let paths = paths_at(
+            &f.repo,
+            Agent::Claude,
+            crate::cli::Dataset::TestCorpus,
+            cache::Mode::ReadWrite,
+        );
+        let input = paths.input_dir(GROUP_BATTERY);
+        let sources = input.join(REAL_CASE).join("test_case");
+        std::fs::create_dir_all(sources.join("src")).unwrap();
+        std::fs::write(sources.join("src/sign.c"), "int sign(void){return 0;}").unwrap();
+        std::fs::create_dir_all(input.join(REAL_CASE).join("test_vectors")).unwrap();
+        std::fs::write(
+            input.join(REAL_CASE).join("CMakePresets.json"),
+            presets("BLAKE", "simple"),
+        )
+        .unwrap();
+
+        for (name, backend, thash, lib) in [
+            ("006_sphincs_blake_128f_robust_lib", "BLAKE", "robust", true),
+            ("007_sphincs_sha2_128s_simple", "SHA2", "simple", false),
+        ] {
+            let dir = input.join(name);
+            std::fs::create_dir_all(dir.join("test_vectors")).unwrap();
+            std::os::unix::fs::symlink(&sources, dir.join("test_case")).unwrap();
+            std::fs::write(dir.join("CMakePresets.json"), presets(backend, thash)).unwrap();
+            if lib {
+                std::fs::create_dir_all(dir.join("runner/src")).unwrap();
+                std::fs::write(
+                    dir.join("runner/src/main.rs"),
+                    "let cfg = Config { library: \"sphincs_robust\" };",
+                )
+                .unwrap();
+            }
+        }
+
+        let discovered = battery::discover(&paths.corpus_dir, GROUP_BATTERY, None).unwrap();
+        let mut groups = discovered.cases.iter().filter_map(|c| match c {
+            Case::SharedSource(g) => Some(g.clone()),
+            Case::Independent(_) => None,
+        });
+        let group = groups
+            .next()
+            .expect("the fixture must BE a shared-source group, or nothing here is tested");
+        assert!(groups.next().is_none(), "and exactly one");
+        assert_eq!(
+            group.real_case, REAL_CASE,
+            "the invocation is the real case"
+        );
+        assert_eq!(
+            group.configs.len(),
+            2,
+            "N must exceed 1, or 'one key, not N' cannot be told from 'one key each'"
+        );
+        (paths, group)
+    }
+
+    /// One pass of the sweep's group step: the real case through [`run_cached`] — what
+    /// `translate_case_at` does for a [`Launch::Keyed`] backend, which is unreachable from a test
+    /// without a `claude` on PATH — then [`derive_follower`], the definition `run_test_corpus`
+    /// calls, over each follower.
+    ///
+    /// Returns whether the stand-in agent ran: outside, a replay and a re-run differ in nothing
+    /// else. Every key component is rebuilt per pass, as a second sweep rebuilds them, so a hit is
+    /// one because the inputs are identical rather than because a fixture was shared.
+    fn sweep_the_group(
+        paths: &Paths,
+        group: &battery::SharedSourceGroup,
+        store: &Store,
+        pass: Pass<'_>,
+    ) -> bool {
+        let case_dir = paths.case_dir(GROUP_BATTERY, &group.real_case);
+        let log = crate::artifact::phase_log::<Translate>(&case_dir);
+        std::fs::create_dir_all(log.parent().expect("a logs dir")).unwrap();
+        std::fs::write(&log, "the transcript the invocation teed\n").unwrap();
+
+        let roots = Roots {
+            work: std::path::PathBuf::from("/w"),
+            repo: paths.repo_root.clone(),
+            work_base: None,
+            home: None,
+        };
+        let agent = crate::cache::AgentKey::new(Agent::Claude, None).unwrap();
+        let model = ModelId::new(pass.model).unwrap();
+        let cli = CliVersion::probe(&cache::fake_program(
+            &paths.repo_root,
+            "claude",
+            "echo '2.1.231.653 (Claude Code)'",
+        ))
+        .unwrap();
+        let toolchain = cache::ToolchainId::for_test("1.94.0 x86_64-unknown-linux-gnu");
+        let prompt = cache::prompt_digest("translate every configuration from one source", &roots);
+        let recipe = cache::Recipe::new(&Session::claude(TRANSLATE_TIMEOUT_SECS), None)
+            .unwrap()
+            .digest();
+
+        let ran = std::cell::Cell::new(false);
+        let outcome = run_cached(
+            PhaseRun {
+                work: IsolatedWorkDir::<Translate>::from_corpus(
+                    &paths
+                        .input_dir(GROUP_BATTERY)
+                        .join(&group.real_case)
+                        .join("test_case"),
+                )
+                .unwrap(),
+                case_dir: &case_dir,
+                log_path: &log,
+                agent: &agent,
+                model: &model,
+                cli: &cli,
+                toolchain: &toolchain,
+                prompt: &prompt,
+                recipe: &recipe,
+            },
+            store,
+            |work| {
+                ran.set(true);
+                the_agent_writes_a_crate(&work.translated_rust(), pass.lib_rs);
+                Ok(Some(Produced::new(
+                    work.finish(&crate::domain::health::Completed::for_test())?,
+                    log.clone(),
+                    serde_json::json!({"agent": "claude", "duration_secs": 42}),
+                )))
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, Outcome::Published(_)),
+            "a completed run must publish"
+        );
+
+        post_process_shared(paths, GROUP_BATTERY, &group.real_case).unwrap();
+        derive_the_followers(paths, group, RealCase::Published);
+        ran.get()
+    }
+
+    /// The follower half of that step: no copy of the loop, just the same [`derive_follower`] per
+    /// config, so a change to what the sweep derives cannot leave this test asserting the old one.
+    fn derive_the_followers(
+        paths: &Paths,
+        group: &battery::SharedSourceGroup,
+        real: RealCase,
+    ) -> Vec<Derived> {
+        group
+            .configs
+            .iter()
+            .map(|cfg| derive_follower(paths, GROUP_BATTERY, &group.real_case, cfg, real).unwrap())
+            .collect()
+    }
+
+    type PublishedTree = std::collections::BTreeMap<String, Vec<u8>>;
+
+    /// A published tree by relative path, MINUS the phase record: a follower carries a copy of the
+    /// real case's `translation.json`, and that record honestly differs on a replay (`replayed`,
+    /// and on a real sweep the original invocation's cost) — which is asserted separately.
+    fn published_crate(paths: &Paths, case: &str) -> PublishedTree {
+        fn walk(root: &Path, dir: &Path, out: &mut PublishedTree) -> Result<()> {
+            for e in std::fs::read_dir(dir)? {
+                let path = e?.path();
+                if path.is_dir() {
+                    walk(root, &path, out)?;
+                } else {
+                    let rel = path
+                        .strip_prefix(root)?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.insert(rel, std::fs::read(&path)?);
+                }
+            }
+            Ok(())
+        }
+        let dir = crate::battery::phase_dir(
+            &paths.case_dir(GROUP_BATTERY, case),
+            crate::battery::TRANSLATED,
+        );
+        assert!(
+            dir.is_dir(),
+            "{case} published nothing at {}, and two empty trees compare equal",
+            dir.display()
+        );
+        let mut out = PublishedTree::new();
+        walk(&dir, &dir, &mut out).unwrap();
+        out.remove("translation.json");
+        out
+    }
+
+    fn manifest(tree: &PublishedTree) -> String {
+        String::from_utf8_lossy(tree.get("Cargo.toml").expect("a published Cargo.toml"))
+            .into_owned()
+    }
+
+    /// File by file and in BYTES: a whole-map `assert_eq!` prints two trees as decimal byte
+    /// vectors, and a lossy compare would call two bodies equal that differ in one invalid byte.
+    fn same_tree(what: &str, before: &PublishedTree, after: &PublishedTree) {
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>(),
+            "{what}: the published FILE SET differs"
+        );
+        for (rel, body) in before {
+            let now = after.get(rel).expect("a key both trees hold");
+            assert_eq!(
+                String::from_utf8_lossy(now),
+                String::from_utf8_lossy(body),
+                "{what}: {rel} differs"
+            );
+            assert_eq!(
+                now, body,
+                "{what}: {rel} differs in bytes a lossy view hides"
+            );
+        }
+    }
+
+    /// THE property the design rests on. The group takes one key, so N followers are re-DERIVED
+    /// from a replayed real case — and if that derivation is not the one a fresh run performs, a
+    /// cached sweep publishes N configs no run ever produced, and nothing downstream can tell.
+    #[test]
+    fn a_replayed_group_derives_the_same_followers_a_fresh_one_did() {
+        let f = fixture();
+        let (paths, group) = a_shared_source_group(&f);
+        let store = Store::open(&paths.repo_root, paths.cache_mode).unwrap();
+
+        assert!(
+            sweep_the_group(&paths, &group, &store, FIRST_PASS),
+            "nothing is stored yet, so the first sweep pays the agent"
+        );
+
+        let real = published_crate(&paths, &group.real_case);
+        let fresh: Vec<_> = group
+            .configs
+            .iter()
+            .map(|c| published_crate(&paths, &c.name))
+            .collect();
+        for (cfg, tree) in group.configs.iter().zip(&fresh) {
+            assert!(
+                tree.contains_key("Cargo.toml") && tree.contains_key("src/lib.rs"),
+                "{}: nothing was derived, so the comparison below is between two empty trees",
+                cfg.name
+            );
+            assert_ne!(
+                manifest(tree),
+                manifest(&real),
+                "{}: a follower equal to the real case's crate could be keyed WITH it, and \
+                 there would be no derived tree to get wrong",
+                cfg.name
+            );
+            assert_eq!(
+                tree.contains_key("src/main.rs") || tree.contains_key("tests/it.rs"),
+                !cfg.is_lib,
+                "{}: a library config is stripped of the binary and the tests, which is the \
+                 other half of why it can never be the stored artifact",
+                cfg.name
+            );
+        }
+        assert_ne!(
+            manifest(&fresh[0]),
+            manifest(&fresh[1]),
+            "and the two followers differ from each other, or one tree is standing in for N"
+        );
+
+        // Everything published, gone: a second pass can only be serving the store.
+        std::fs::remove_dir_all(paths.output_dir(GROUP_BATTERY)).unwrap();
+        assert!(
+            !crate::battery::has_crate(&crate::battery::phase_dir(
+                &paths.case_dir(GROUP_BATTERY, &group.real_case),
+                crate::battery::TRANSLATED
+            )),
+            "the fixture must remove what the replay republishes"
+        );
+
+        assert!(
+            !sweep_the_group(&paths, &group, &store, FIRST_PASS),
+            "the group's one key is stored, so no agent may be paid for this group again"
+        );
+        for (cfg, before) in group.configs.iter().zip(&fresh) {
+            same_tree(
+                &format!(
+                    "{}: a replay derived a DIFFERENT follower than the fresh run did, so a \
+                     cached sweep would publish a config no run ever produced",
+                    cfg.name
+                ),
+                before,
+                &published_crate(&paths, &cfg.name),
+            );
+            assert_eq!(
+                std::fs::read(crate::artifact::phase_metrics::<Translate>(
+                    &paths.case_dir(GROUP_BATTERY, &cfg.name)
+                ))
+                .unwrap(),
+                std::fs::read(crate::artifact::phase_metrics::<Translate>(
+                    &paths.case_dir(GROUP_BATTERY, &group.real_case)
+                ))
+                .unwrap(),
+                "{}: and the one file that may differ between the passes is the real case's own \
+                 record, carried across verbatim rather than invented per follower",
+                cfg.name
+            );
+        }
+
+        // The third path a follower is derived on: the sweep's "already done" branch, which never
+        // reaches the store at all. One follower deleted on its own must come back the same, or a
+        // group heals into a mixture of two translations.
+        let orphan = &group.configs[0];
+        std::fs::remove_dir_all(paths.case_dir(GROUP_BATTERY, &orphan.name)).unwrap();
+        let derived = derive_the_followers(&paths, &group, RealCase::StoodAlready);
+        assert!(
+            matches!(derived[..], [Derived::Propagated, Derived::AlreadyStanding]),
+            "a real case that stood still honours the follower standing beside it, or every \
+             skipped group re-derives N crates it already has"
+        );
+        same_tree(
+            &format!(
+                "{}: re-derived from the crate already standing in the real case, so the \
+                 propagate loop is not a function of how that crate got there",
+                orphan.name
+            ),
+            &fresh[0],
+            &published_crate(&paths, &orphan.name),
+        );
+
+        // The fourth, and the one a keyed skip newly makes reachable: the key MOVES — a CLI
+        // auto-update, another model, a `SCHEMA` bump — so the real case misses, is re-translated,
+        // and every follower beside it is still standing from the translation before. A publish
+        // clears the real case's phase dir alone.
+        for cfg in &group.configs {
+            assert!(
+                crate::battery::has_crate(&crate::battery::phase_dir(
+                    &paths.case_dir(GROUP_BATTERY, &cfg.name),
+                    crate::battery::TRANSLATED
+                )),
+                "{}: every follower must be STANDING here, or the skip under test is not reached",
+                cfg.name
+            );
+        }
+        assert!(
+            sweep_the_group(&paths, &group, &store, AFTER_A_KEY_MOVE),
+            "another model's key is not this group's stored key, so the agent runs again"
+        );
+        for (cfg, before) in group.configs.iter().zip(&fresh) {
+            let now = published_crate(&paths, &cfg.name);
+            assert_eq!(
+                String::from_utf8_lossy(now.get("src/lib.rs").expect("a derived src/lib.rs")),
+                AFTER_A_KEY_MOVE.lib_rs,
+                "{}: a follower left standing is the PREVIOUS translation while the real case \
+                 beside it is the new one — one group holding two, and runtests scores each",
+                cfg.name
+            );
+            assert_ne!(
+                before.get("src/lib.rs"),
+                now.get("src/lib.rs"),
+                "{}: the two translations must differ, or 'it was re-derived' is unobservable",
+                cfg.name
+            );
+        }
+    }
+
+    /// A follower must never be served from the store as if it were an invocation. It has no key of
+    /// its own — its `test_case` is a symlink to the real case's, so a keyed follower would COLLIDE
+    /// on the real case's key and be handed that tree, published as N configs' agentic output.
+    #[test]
+    fn a_group_of_n_configs_files_one_entry_and_no_follower_files_its_own() {
+        let f = fixture();
+        let (paths, group) = a_shared_source_group(&f);
+        let store = Store::open(&paths.repo_root, paths.cache_mode).unwrap();
+        assert_eq!(
+            store.stats().unwrap().0,
+            0,
+            "an empty store, or the count below is counting somebody else's entries"
+        );
+
+        assert!(sweep_the_group(&paths, &group, &store, FIRST_PASS));
+
+        // Every config really was published, so the count below is over a group of 1 + N.
+        for case in std::iter::once(group.real_case.as_str())
+            .chain(group.configs.iter().map(|c| c.name.as_str()))
+        {
+            assert!(
+                crate::battery::has_crate(&crate::battery::phase_dir(
+                    &paths.case_dir(GROUP_BATTERY, case),
+                    crate::battery::TRANSLATED
+                )),
+                "{case} was not published, so this group is not the N it claims to be"
+            );
+        }
+        assert_eq!(
+            store.stats().unwrap().0,
+            1,
+            "one invocation happened, so one entry: an entry per config would key {} more \
+             invocations that never ran",
+            group.configs.len()
+        );
+
+        let input_digest = |case: &str| {
+            IsolatedWorkDir::<Translate>::from_corpus(
+                &paths.input_dir(GROUP_BATTERY).join(case).join("test_case"),
+            )
+            .unwrap()
+            .input_digest()
+            .clone()
+        };
+
+        // And the one entry holds what the INVOCATION produced — not the post-processed real case,
+        // and not any follower's derived crate, each of which differs from it here.
+        let filed = paths
+            .repo_root
+            .join("results/.cache")
+            .join(cache::SCHEMA.to_string())
+            .join(crate::battery::TRANSLATED)
+            .join(paths.agent_key.as_str());
+        let entry = std::fs::read_dir(&filed)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .next()
+            .expect("the entry must be filed under the phase and agent that ran");
+        assert_eq!(
+            std::fs::read_to_string(entry.join("code/Cargo.toml")).unwrap(),
+            CRATE_MANIFEST,
+            "the entry is the agent's own output; a stored follower would carry that config's \
+             features and no [[bin]]"
+        );
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(entry.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            meta["input_tree"],
+            serde_json::json!(input_digest(&group.real_case).as_str()),
+            "filed for the corpus the whole group shares, under the phase and agent that ran"
+        );
+        for case in std::iter::once(group.real_case.as_str())
+            .chain(group.configs.iter().map(|c| c.name.as_str()))
+        {
+            assert_ne!(
+                manifest(&published_crate(&paths, case)),
+                CRATE_MANIFEST,
+                "{case}: every published tree is post-processed or derived, so none of them is \
+                 the entry — the assertion above discriminates"
+            );
+        }
+
+        // The collision itself: the followers' corpus IS the real case's, by symlink.
+        for cfg in &group.configs {
+            assert!(
+                paths
+                    .input_dir(GROUP_BATTERY)
+                    .join(&cfg.name)
+                    .join("test_case")
+                    .is_symlink(),
+                "{}: the fixture must symlink, or this is not the corpus the sweep sees",
+                cfg.name
+            );
+            assert_eq!(
+                input_digest(&cfg.name),
+                input_digest(&group.real_case),
+                "{}: a keyed follower would be a HIT on the real case's entry, served a tree \
+                 that was not its own",
+                cfg.name
+            );
+        }
+    }
+
+    /// The group and the independent cases now share ONE dispatch table, so which arm a backend
+    /// occupies — and `Mode::Bypass` for laertes and c2saferrust is nothing but that arm — is
+    /// chosen once. What the collapsed parameter still has to get right is the flavour: a `Shared`
+    /// that stopped naming the shared prompt would silently retire E2 and E6, whose entire
+    /// experiment is that prompt, and a `Verify` reaching a translation would translate against the
+    /// verify prompt.
+    #[test]
+    fn a_translation_can_be_dispatched_for_every_prompt_but_the_verify_one() {
+        let reachable: Vec<PromptKind> = Translating::ALL.iter().map(|t| t.prompt()).collect();
+        for kind in PromptKind::ALL {
+            assert_eq!(
+                reachable.contains(kind),
+                *kind != PromptKind::Verify,
+                "{kind:?} is reachable from the translate dispatch: {reachable:?}"
+            );
+        }
+        assert!(
+            Translating::Shared.is_lib(),
+            "the backends that read no prompt take a bool instead, and a group's real case is what \
+             every follower is derived from as a library — `false` here asks kimi, oneshot and \
+             c2saferrust for a binary that propagation then strips"
+        );
     }
 
     /// `--agent laertes translate HB/<project>` reached `translate_case_at`, hit an
