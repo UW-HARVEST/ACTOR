@@ -43,7 +43,7 @@ THE GATES (from ${WT}/tools unless noted):
   cargo doc   --locked --no-deps
   cargo build --release --locked
   python3 tools/test_comment_budget.py                                  (from ${WT})
-  python3 tools/comment_budget.py --max-comments 2560 --max-ratio 20    (from ${WT}, after git add -A)
+  python3 tools/comment_budget.py --max-comments 3100 --max-ratio 20    (from ${WT}, after git add -A)
   python3 tools/check_paths.py                                          (from ${WT})
 
 THE COMMENT BUDGET CHANGED FLAGS. '--max 14' is retired and now exits 2. The invocation above

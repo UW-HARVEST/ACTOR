@@ -160,7 +160,7 @@ def classify_text(text: str, ext: str):
 
 def main() -> int:
     # `allow_abbrev=False` rejects unambiguous prefixes: argparse's default accepts
-    # `--max-c 2560 --max-r 20`, and the spelling `type-safety.yaml` uses should be the only
+    # `--max-c 3100 --max-r 20`, and the spelling `type-safety.yaml` uses should be the only
     # one that works. It is NOT what rejects the retired `--max 14`, which exits 2 either
     # way — with abbreviation on, "ambiguous option: --max could match --max-comments,
     # --max-ratio"; with it off, "the following arguments are required".

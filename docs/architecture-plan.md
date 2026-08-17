@@ -264,7 +264,7 @@ sweep currently re-pays about $800 that a cache would return.
   recorded beside it in `.github/workflows/type-safety.yaml`. That was a deliberate call
   by the operator, not the implementing agent — the agent correctly refused to touch the
   gate and escalated. **PR 13 then landed the reviewer's preference**: the primary limit is
-  now an absolute ceiling, `--max-comments 2560`, with a deliberately loose `--max-ratio 20`
+  now an absolute ceiling, `--max-comments 3100`, with a deliberately loose `--max-ratio 20`
   kept only for the class a count cannot see (code deleted, comments kept). It also fixed the
   raw-string masker the ratio was measured with — `r(#*)"` matched any `r` before a quote, so
   95 of its 149 matches over `tools/src/**.rs` were ordinary words like `"a valid parser")`

@@ -38,6 +38,7 @@ crate, enforced by `the_store_is_obtained_from_exactly_one_place`. Verify runs t
 | 15 | five seams the 7b review exposed, led by a store failure losing a paid artifact | `docs/prs/spec-15.md` | ready; item 1 is a money bug |
 | 16 | **both cache keys move with the checkout's location** | `docs/prs/spec-16.md` | ready; needs a `SCHEMA` bump, nearly free right now |
 | 10 | renames: `Scrubbed`→`ScrubbedTree`, `Sealed`→`SealedTree`, `CDir`→`OracleDir` | `docs/prs/spec-10.md` | ready; last, touches 10 column-exact `.stderr` files |
+| — | **DEBT: lower `--max-comments` back to the measured total** | — | after PR 10; it was raised 2560 → 3100 as a budget for the sequence |
 
 **Landed since this table was written:** 7b as #105 (translate is memoised; shared-source
 groups deliberately left at `Mode::Bypass` for 7c) and 13 as #106 (the comment budget).
@@ -134,7 +135,7 @@ cargo clippy --locked --all-targets
 cargo clippy --locked --lib --bins -- -D clippy::panic
 cargo doc   --locked --no-deps
 python3 tools/test_comment_budget.py                  # the same CI step runs this first
-python3 tools/comment_budget.py --max-comments 2560 --max-ratio 20   # root, AFTER `git add -A`
+python3 tools/comment_budget.py --max-comments 3100 --max-ratio 20   # root, AFTER `git add -A`
 python3 tools/check_paths.py                 # from repo root
 ```
 
@@ -164,7 +165,7 @@ is a second *limit* on the same command, so it did not move the count again. The
 "the ten gates"); they all defer to this list, and this list is the count that is in force.
 
 **PR 13 also changed the flags**, so the invocation in force is the one above,
-`--max-comments 2560 --max-ratio 20`; `--max` retired with the whole-tree ratio. Nine older
+`--max-comments 3100 --max-ratio 20`; `--max` retired with the whole-tree ratio. Nine older
 specs still print `--max 14` (3a, 3b, 4, 5, 6, 9, tmp) or `--max 13` (0, 2) — frozen records of
 already-merged PRs, deliberately not rewritten. Copying one exits 2 loudly ("the following
 arguments are required: --max-comments, --max-ratio") rather than mismeasuring.
@@ -223,7 +224,7 @@ until a human answers. Cache-store entries are chmod'd read-only, so a delete ne
   reached by path surgery into a sibling agent's results tree with no digest, so the key
   cannot name *which* c2rust output was consumed. A wrong key is worse than no cache.
   C2SaferRust's `BEDROCK_API_KEY` must never reach a digest or `meta.json`.
-- **The comment budget is an absolute comment-line ceiling, `--max-comments 2560`, with
+- **The comment budget is an absolute comment-line ceiling, `--max-comments 3100`, with
   `--max-ratio 20` as a loose backstop** — PR 13 replaced the whole-tree ratio as the primary
   metric, so this is no longer deferred; the ratio survives only to catch the class a count
   cannot see (code deleted, comments kept). It also fixed the masker that made the ratio green

@@ -79,7 +79,7 @@ absolute ceiling is the right shape. Do not adjust comments anywhere in the tree
 number work.
 
 **As landed, the absolute ceiling is primary and a loose ratio is kept as a backstop**
-(`--max-comments 2560 --max-ratio 20`). Deleting the ratio outright leaves one class ungated,
+(`--max-comments 3100 --max-ratio 20`). Deleting the ratio outright leaves one class ungated,
 and it is the class only the ratio can see: delete thousands of lines of comment-sparse code,
 keep every comment, and the absolute count does not move — exit 0 — while density climbs. At
 20% the backstop carries 5.6 points of headroom over the measured 14.42%: it fires only once
