@@ -7,7 +7,7 @@ not in any of those and that a fresh context would otherwise rediscover expensiv
 
 ## Where the work stands
 
-Eighteen PRs merged (#89–#106). The layered architecture is most of the way in:
+Twenty-two PRs merged (#89–#110). The layered architecture is most of the way in:
 
 ```
 tools/src/
@@ -31,15 +31,15 @@ crate, enforced by `the_store_is_obtained_from_exactly_one_place`. Verify runs t
 | # | PR | spec | state |
 |---|---|---|---|
 | 12 | **the skip check consults the store**, not the presence of a `Cargo.toml` | `docs/prs/spec-12.md` | in flight; this is what makes 7b pay |
-| 11 | **an entry records the inputs its key came from** — store `input/` and the digest preimages | `docs/prs/spec-11.md` | ready; land before the next sweep |
+| 11 | **an entry records the inputs its key came from** — store `input/` and the digest preimages | `docs/prs/spec-11.md` | in flight (rewritten after two stalls) |
 | ~~20~~ | c2rust scores | `docs/prs/spec-20.md` | **WITHDRAWN** — measured locally, harness correct, stored == actual; CI-runner-only |
 | ~~19~~ | `validate-translations` red for six weeks | `docs/prs/spec-19.md` | **DEFERRED** by operator decision; CI is out of scope |
 | ~~7c~~ | shared-source groups | `docs/prs/spec-7c.md` | **SHELVED** — value is Test-Corpus-only, introduces a wrong number, and the spec's premise was false |
-| 8 | `cache/` + `dataset/` split; `cache_mode` off `Paths` | `docs/prs/spec-8.md` | ready; breaks `battery ↔ cache`, `cache ↔ cli` |
-| 15 | five seams the 7b review exposed, led by a store failure losing a paid artifact | `docs/prs/spec-15.md` | ready; item 1 is a money bug |
-| 17 | **invariant I1 holds only on the keyed path** — five unkeyed translate paths uncovered | `docs/prs/spec-17.md` | ready; a wrong published number |
-| 16 | **both cache keys move with the checkout's location** | `docs/prs/spec-16.md` | ready; needs a `SCHEMA` bump, nearly free right now |
-| 10 | renames: `Scrubbed`→`ScrubbedTree`, `Sealed`→`SealedTree`, `CDir`→`OracleDir` | `docs/prs/spec-10.md` | ready; last, touches 10 column-exact `.stderr` files |
+| ~~8~~, ~~10~~ | split, renames | `docs/prs/spec-18.md` | **SUPERSEDED by 18**, the structural pass |
+| ~~15~~ | five seams | `docs/prs/spec-15.md` | **SUPERSEDED** — items 1,3 landed in #110; item 2 folded into 17; items 4,5 into 18 |
+| 17 | **invariant I1 holds only on the keyed path** — five unkeyed translate paths uncovered | `docs/prs/spec-17.md` | in flight |
+| ~~16~~ | make the cache able to accumulate | `docs/prs/spec-16.md` | **DONE** — Part A as #109, Parts B/C/D as #110; SCHEMA now 4 |
+| 18 | **the structural pass** — split, rename, delete; no behaviour change | `docs/prs/spec-18.md` | ready; last, one mechanical check for the whole batch |
 | — | **DEBT: lower `--max-comments` back to the measured total** | — | after PR 10; it was raised 2560 → 3100 as a budget for the sequence |
 
 **Landed since this table was written:** 7b as #105 (translate is memoised; shared-source
