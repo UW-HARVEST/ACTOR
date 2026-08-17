@@ -174,9 +174,25 @@ pub struct Cli {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// How to use the agent-invocation cache.
-    #[arg(long, value_enum, default_value_t = CacheMode::On)]
-    pub cache: CacheMode,
+    /// Do not read or write the agent-invocation cache. For sampling how much an agent
+    /// varies between runs, which memoising would defeat.
+    ///
+    /// The cache is ON by default: a sweep that re-pays for a translation it already has is
+    /// a measured $795.59 per harvest-bench pass. Opting out is the unusual case, so it is
+    /// the flag.
+    #[arg(long, conflicts_with = "refresh_cache")]
+    pub no_cache: bool,
+
+    /// Re-run even when a result is stored, and replace what was there. For when the stored
+    /// artifact is suspect: leaving it in place would keep serving it. The replaced entry is
+    /// kept under `results/.cache/quarantine/`, since it is the artifact being disputed.
+    ///
+    /// `conflicts_with` on the pair above, so "ignore the cache" and "replace the cache" --
+    /// which mean opposite things to the store -- cannot both be asked for. Rejected at parse
+    /// time rather than resolved by precedence: two bools that can disagree is exactly the
+    /// shape CLAUDE.md forbids, and the CLI is the edge where it gets parsed away.
+    #[arg(long)]
+    pub refresh_cache: bool,
 
     /// Produce artifacts even though the code cannot be identified — an
     /// uncommitted tree, or a binary built from a different commit.
@@ -199,31 +215,14 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// The user-facing spelling of [`crate::cache::Mode`].
-///
-/// Kept separate from the internal enum so the CLI vocabulary and the store's
-/// behaviour can be documented in their own terms, and so `clap` derives stay out
-/// of the cache module.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
-pub enum CacheMode {
-    /// Reuse a stored result when every key input matches; store new ones.
-    On,
-    /// Ignore the cache entirely — neither read nor write. For sampling how much an
-    /// agent varies between runs, which memoising would defeat.
-    Off,
-    /// Re-run even when a result is stored, and replace what was there. For when the
-    /// stored artifact is suspect: leaving it in place would keep serving it. The
-    /// replaced entry is kept under `results/.cache/quarantine/`, since it is the
-    /// artifact being disputed.
-    Refresh,
-}
-
-impl From<CacheMode> for crate::cache::Mode {
-    fn from(m: CacheMode) -> Self {
-        match m {
-            CacheMode::On => crate::cache::Mode::ReadWrite,
-            CacheMode::Off => crate::cache::Mode::Bypass,
-            CacheMode::Refresh => crate::cache::Mode::Refresh,
+impl Cli {
+    /// THE mapping from what the operator typed to what the store does. `clap` has already
+    /// rejected the illegal pair, so this is total without a fallback arm.
+    pub fn cache_mode(&self) -> crate::cache::Mode {
+        match (self.no_cache, self.refresh_cache) {
+            (true, _) => crate::cache::Mode::Bypass,
+            (_, true) => crate::cache::Mode::Refresh,
+            _ => crate::cache::Mode::ReadWrite,
         }
     }
 }
@@ -247,19 +246,17 @@ impl Reuse {
     }
 }
 
-impl CacheMode {
-    /// The store mode a sweep runs under, `--force` included.
-    ///
-    /// As a predicate on the skip check the flag decided nothing once a keyed phase asks the store
-    /// — `SkipCheck::Keyed` never answers "done" — so the operator who distrusted a result was
-    /// handed that very entry, replayed. `Refresh` is what "do not reuse" means to a store, and it
-    /// quarantines rather than deletes. `Off` is NOT upgraded: an operator who asked for no cache
-    /// must not get entries written, and there `--force` still overrides the published-log check.
-    pub fn honouring(self, reuse: Reuse) -> crate::cache::Mode {
-        match (crate::cache::Mode::from(self), reuse) {
-            (crate::cache::Mode::ReadWrite, Reuse::Refused) => crate::cache::Mode::Refresh,
-            (mode, _) => mode,
-        }
+/// The store mode a sweep runs under once `--force` is taken into account.
+///
+/// As a predicate on the skip check the flag decided nothing once a keyed phase asks the store —
+/// `SkipCheck::Keyed` never answers "done" — so the operator who distrusted a result was handed
+/// that very entry, replayed. `Refresh` is what "do not reuse" means to a store, and it
+/// quarantines rather than deletes. `Bypass` is NOT upgraded: an operator who asked for no cache
+/// must not get entries written, and there `--force` still overrides the published-log check.
+pub fn honouring(mode: crate::cache::Mode, reuse: Reuse) -> crate::cache::Mode {
+    match (mode, reuse) {
+        (crate::cache::Mode::ReadWrite, Reuse::Refused) => crate::cache::Mode::Refresh,
+        (mode, _) => mode,
     }
 }
 
