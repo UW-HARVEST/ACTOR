@@ -80,6 +80,24 @@ contains the trap, that the old path really refused what the new one accepts, th
 inspection found something to inspect. A green test that inspects nothing is worse than
 no test.
 
+**A test that hands in the value under test proves nothing about how it is produced.**
+This is the most repeated defect in this repo's history: three PRs in one night shipped a
+test that passed a literal where the function being tested should have produced it. One
+handed `SkipCheck::Keyed` straight in while nothing anywhere asserted the resolver ever
+returns `Keyed`, so the resolver could be reverted to its pre-PR answer — undoing the whole
+change on exactly the sweep it was written for — with the suite still green. Assert the
+mapping, exhaustively over the input type, not one hand-built output.
+
+**A fixture that pins a parameter makes that parameter untestable.** A `paths_at` helper
+hardcoded `Mode::Bypass`, and the code under test collapsed every value under `Bypass`, so
+the value being resolved was unobservable through the only door the tests used. When a
+fixture fixes a value, ask which assertion that fixing silently disables.
+
+**Mutate before you claim.** Never write "a regression here fails this test" without
+breaking the named thing and watching it go red. Each of the tests above carried a comment
+asserting exactly the coverage it did not have, and a false comment about coverage is worse
+than no comment: it stops the next reader from checking.
+
 ### Verification
 
 **A check that can pass while seeing nothing is worse than no check.** `rust_sources()`
