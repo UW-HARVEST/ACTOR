@@ -7,7 +7,7 @@ not in any of those and that a fresh context would otherwise rediscover expensiv
 
 ## Where the work stands
 
-Twenty-three PRs merged (#89–#111). The layered architecture is most of the way in:
+Twenty-six PRs merged (#89–#113). The layered architecture is most of the way in:
 
 ```
 tools/src/
@@ -44,9 +44,9 @@ to `Recipe::digest`'s framing or to `hash_tree` is a re-key rather than a cache 
 | ~~7c~~ | shared-source groups | `docs/prs/spec-7c.md` | **SHELVED** — value is Test-Corpus-only, introduces a wrong number, and the spec's premise was false |
 | ~~8~~, ~~10~~ | split, renames | `docs/prs/spec-18.md` | **SUPERSEDED by 18**, the structural pass |
 | ~~15~~ | five seams | `docs/prs/spec-15.md` | **SUPERSEDED** — items 1,3 landed in #110; item 2 folded into 17; items 4,5 into 18 |
-| 17 | **invariant I1 holds only on the keyed path** — five unkeyed translate paths uncovered | `docs/prs/spec-17.md` | in flight |
+| ~~17~~ | one publish path, one invariant | `docs/prs/spec-17.md` | **DONE** as #112 |
 | ~~16~~ | make the cache able to accumulate | `docs/prs/spec-16.md` | **DONE** — Part A as #109, Parts B/C/D as #110; SCHEMA now 4 |
-| 18 | **the structural pass** — split, rename, delete; no behaviour change | `docs/prs/spec-18.md` | ready; last, one mechanical check for the whole batch |
+| 18 | **the structural pass** — the remainder | `docs/prs/spec-18.md` | PARTLY DONE as #113; see below |
 | — | **DEBT: lower `--max-comments` back to the measured total** | — | after PR 10; it was raised 2560 → 3100 as a budget for the sequence |
 
 **Landed since this table was written:** 7b as #105 (translate is memoised; shared-source
@@ -65,6 +65,21 @@ reference from an added build artefact: `Edited`/`Removed`/`Added`/`Hidden`/`Sym
 Measured before merging: zero stored trees newly refuse, and of the 329 the old check refused the
 new one accepts about 307. Coverage output counts as build output — in 203 stored trees it is the
 only build product present.
+
+**What is left of 18, and what it is worth.** #113 landed the two bounded pieces: the `cache ->
+battery` edge (which was entirely test-only — `cfg(test)` starts at `cache.rs:924` and all six
+references were after it) and `CDir -> OracleDir` (11 refs, zero string literals, no `.stderr`
+movement). Still open, with the measurements already in `spec-18.md`:
+
+- **`cache_mode` off `Paths`**, which is what actually shrinks `CYCLE_BASELINE`. Verified, not
+  assumed: dropping `cache` from the baseline still fails with *"cache is in a cycle the baseline
+  does not record"*, because the `battery -> cache` half remains. It needs six production readers
+  rethreaded AND `AgentKey` relocated — and `AgentKey` is how a run is spelled in the cache key, so
+  touching it for a cleanliness point is a bad trade. Do it deliberately or not at all.
+- **The god-module splits** (`battery.rs` → `dataset/*`, `cache.rs` → `cache/{key,store}.rs`).
+- **The `Sealed`/`Scrubbed`/`Scratch` renames**, whose hazard is 6 string literals across 4 rules,
+  listed by file and line in `spec-18.md`. `architecture.rs:231` is the one that makes
+  `sealed_implements_only_debug` inspect zero impls and report green if missed.
 
 **PR T (the `/tmp` fix) landed as #98 — and looking for it in the obvious place says
 otherwise.** Worth spelling out, because this handoff briefly claimed it was unlanded on
