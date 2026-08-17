@@ -36,10 +36,19 @@ crate, enforced by `the_store_is_obtained_from_exactly_one_place`. Verify runs t
 | 7c | shared-source groups: one key, N publishes | `docs/prs/spec-7c.md` | ready |
 | 8 | `cache/` + `dataset/` split; `cache_mode` off `Paths` | `docs/prs/spec-8.md` | ready; breaks `battery ↔ cache`, `cache ↔ cli` |
 | 15 | five seams the 7b review exposed, led by a store failure losing a paid artifact | `docs/prs/spec-15.md` | ready; item 1 is a money bug |
+| 16 | **both cache keys move with the checkout's location** | `docs/prs/spec-16.md` | ready; needs a `SCHEMA` bump, nearly free right now |
 | 10 | renames: `Scrubbed`→`ScrubbedTree`, `Sealed`→`SealedTree`, `CDir`→`OracleDir` | `docs/prs/spec-10.md` | ready; last, touches 10 column-exact `.stderr` files |
 
 **Landed since this table was written:** 7b as #105 (translate is memoised; shared-source
 groups deliberately left at `Mode::Bypass` for 7c) and 13 as #106 (the comment budget).
+
+**The four cached entries are already unreachable.** They record
+`cli claude 2.1.232.657 (ASBX Claude Code, channel stable)`; the installed CLI reports
+`2.1.233.669`. `cli` is a deliberate key component because the CLIs auto-update through a shim,
+so those entries were stranded by their own key before any of tonight's work — the
+provenance-blind `has_crate` skip was hiding it by never asking. Consequences: the next default
+sweep re-verifies all four, `HARVEST_CLI_VERSION` is the documented lever for replaying them
+deliberately, and a `SCHEMA` bump (PR 16) costs nothing while this is true.
 
 **NO SWEEP UNTIL 14 LANDS.** 7b routes translate through `Scrubbed::seal`, which refuses any
 run that changed `c_src/` — including one that merely *added* a build artefact, while the
