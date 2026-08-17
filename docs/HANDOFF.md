@@ -30,12 +30,12 @@ crate, enforced by `the_store_is_obtained_from_exactly_one_place`. Verify runs t
 
 | # | PR | spec | state |
 |---|---|---|---|
-| 14 | **the oracle check must judge the oracle**, not the directory it sits in | `docs/prs/spec-14.md` | in flight; **blocks the next sweep** |
 | 12 | **the skip check consults the store**, not the presence of a `Cargo.toml` | `docs/prs/spec-12.md` | in flight; this is what makes 7b pay |
 | 11 | **an entry records the inputs its key came from** — store `input/` and the digest preimages | `docs/prs/spec-11.md` | ready; land before the next sweep |
 | 7c | shared-source groups: one key, N publishes | `docs/prs/spec-7c.md` | ready |
 | 8 | `cache/` + `dataset/` split; `cache_mode` off `Paths` | `docs/prs/spec-8.md` | ready; breaks `battery ↔ cache`, `cache ↔ cli` |
 | 15 | five seams the 7b review exposed, led by a store failure losing a paid artifact | `docs/prs/spec-15.md` | ready; item 1 is a money bug |
+| 17 | **invariant I1 holds only on the keyed path** — five unkeyed translate paths uncovered | `docs/prs/spec-17.md` | ready; a wrong published number |
 | 16 | **both cache keys move with the checkout's location** | `docs/prs/spec-16.md` | ready; needs a `SCHEMA` bump, nearly free right now |
 | 10 | renames: `Scrubbed`→`ScrubbedTree`, `Sealed`→`SealedTree`, `CDir`→`OracleDir` | `docs/prs/spec-10.md` | ready; last, touches 10 column-exact `.stderr` files |
 | — | **DEBT: lower `--max-comments` back to the measured total** | — | after PR 10; it was raised 2560 → 3100 as a budget for the sequence |
@@ -51,12 +51,11 @@ provenance-blind `has_crate` skip was hiding it by never asking. Consequences: t
 sweep re-verifies all four, `HARVEST_CLI_VERSION` is the documented lever for replaying them
 deliberately, and a `SCHEMA` bump (PR 16) costs nothing while this is true.
 
-**NO SWEEP UNTIL 14 LANDS.** 7b routes translate through `Scrubbed::seal`, which refuses any
-run that changed `c_src/` — including one that merely *added* a build artefact, while the
-translate prompt tells the agent to build the C library and run `nm -D` on the resulting `.so`.
-71 of 6,312 stored `translated/*/c_src` trees already hold a `.o`/`.a`/`.so` at a non-build
-path, so a sweep run before 14 lands would report a lower translation success rate for a reason
-that is not the agent's fault.
+**PR 14 landed (#107), so the sweep is unblocked.** It taught the oracle check to tell a modified
+reference from an added build artefact: `Edited`/`Removed`/`Added`/`Hidden`/`Symlinked`, each named.
+Measured before merging: zero stored trees newly refuse, and of the 329 the old check refused the
+new one accepts about 307. Coverage output counts as build output — in 203 stored trees it is the
+only build product present.
 
 **PR T (the `/tmp` fix) landed as #98 — and looking for it in the obvious place says
 otherwise.** Worth spelling out, because this handoff briefly claimed it was unlanded on
