@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Bump to invalidate every entry, e.g. if the key composition changes.
-pub const SCHEMA: u32 = 2;
+pub const SCHEMA: u32 = 3;
 
 macro_rules! digest_newtype {
     ($(#[$m:meta])* $name:ident) => {
@@ -353,7 +353,6 @@ pub struct KeyInputs<'a> {
     /// per backend, because a key naming claude's model for an opencode run makes two
     /// sweeps at different `--model` values share an entry.
     pub model: &'a ModelId,
-    pub cli: &'a CliVersion,
     pub toolchain: &'a ToolchainId,
     pub prompt: &'a PromptDigest,
     pub recipe: &'a RecipeDigest,
@@ -368,7 +367,6 @@ impl KeyInputs<'_> {
             phase,
             agent,
             model,
-            cli,
             toolchain,
             prompt,
             recipe,
@@ -381,7 +379,6 @@ impl KeyInputs<'_> {
             *phase,
             agent.as_str(),
             model.as_str(),
-            cli.as_str(),
             toolchain.as_str(),
             prompt.as_str(),
             recipe.as_str(),
@@ -401,19 +398,21 @@ impl KeyInputs<'_> {
         "phase",
         "agent",
         "model",
-        "cli",
         "toolchain",
         "prompt",
         "recipe",
         "input_tree",
     ];
 
-    fn meta(&self, key: &CacheKey) -> serde_json::Value {
+    /// `cli` is a parameter rather than a field of [`KeyInputs`]: it is recorded for audit and
+    /// deliberately NOT keyed, and `the_key_deriving_functions_keep_their_exhaustive_patterns`
+    /// requires every field of `KeyInputs` to be fed to the hash — which is the right contract,
+    /// because it makes "in the struct" and "in the key" the same statement.
+    fn meta(&self, key: &CacheKey, cli: &CliVersion) -> serde_json::Value {
         let Self {
             phase,
             agent,
             model,
-            cli,
             toolchain,
             prompt,
             recipe,
@@ -529,16 +528,20 @@ impl Store {
     /// such phase — stores nothing at all, deliberately: a failure is a property of the
     /// moment (an API outage, a timeout), not of the inputs, so memoising it would make
     /// a transient failure permanent and identical on every future run.
+    /// `cli` is recorded in the entry but is not a key component, so it travels beside
+    /// [`KeyInputs`] rather than inside it: every field of `KeyInputs` is fed to the hash, which
+    /// is what makes "in the struct" and "in the key" the same statement.
     pub fn obtain<P: Phase>(
         &self,
         inputs: &KeyInputs<'_>,
+        cli: &CliVersion,
         compute: impl FnOnce() -> Result<Option<Produced<P>>>,
     ) -> Result<Option<Obtained<P>>> {
         let key = inputs.key();
         let dir = self.entry_dir(inputs, &key);
 
         match self.mode {
-            Mode::ReadWrite => match self.load(inputs, &key, &dir) {
+            Mode::ReadWrite => match self.load(inputs, cli, &key, &dir) {
                 Ok(Some(Loaded { sealed, provenance })) => {
                     return Ok(Some(Obtained {
                         sealed,
@@ -566,7 +569,7 @@ impl Store {
             return Ok(None);
         };
         if self.mode != Mode::Bypass {
-            self.store(inputs, &key, &dir, &produced)
+            self.store(inputs, cli, &key, &dir, &produced)
                 .with_context(|| format!("storing cache entry {}", key.as_str()))?;
         }
         Ok(Some(Obtained {
@@ -618,6 +621,7 @@ impl Store {
     fn load<P: Phase>(
         &self,
         inputs: &KeyInputs<'_>,
+        cli: &CliVersion,
         key: &CacheKey,
         dir: &Path,
     ) -> Result<Option<Loaded<P>>> {
@@ -627,7 +631,7 @@ impl Store {
         let meta: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json"))?)
                 .context("parsing meta.json")?;
-        let want = inputs.meta(key);
+        let want = inputs.meta(key, cli);
         for k in KeyInputs::VALIDATED {
             anyhow::ensure!(
                 meta.get(k) == want.get(k),
@@ -685,6 +689,7 @@ impl Store {
     fn store<P: Phase>(
         &self,
         inputs: &KeyInputs<'_>,
+        cli: &CliVersion,
         key: &CacheKey,
         dir: &Path,
         produced: &Produced<P>,
@@ -713,7 +718,7 @@ impl Store {
         )?;
         // `output_tree` is the result, so it cannot be a key component; it is recorded so
         // a read can prove the artifact is the one that was written.
-        let mut meta = inputs.meta(key);
+        let mut meta = inputs.meta(key, cli);
         meta["output_tree"] = serde_json::json!(produced.sealed.digest().as_str());
         std::fs::write(
             staging.join("meta.json"),
@@ -851,6 +856,13 @@ pub(crate) mod tests {
         tree: TreeDigest,
     }
 
+    /// The recorded-but-not-keyed CLI build. A helper rather than a field of the key inputs,
+    /// because no value passed here can change a key -- which is what
+    /// `two_sweeps_under_different_cli_versions_share_an_entry` asserts.
+    fn test_cli() -> CliVersion {
+        CliVersion("2.1.231.653 (Claude Code)".into())
+    }
+
     impl Inputs {
         fn new() -> Self {
             Self {
@@ -870,7 +882,6 @@ pub(crate) mod tests {
                 phase: self.phase,
                 agent: &self.agent,
                 model: &self.model,
-                cli: &self.cli,
                 toolchain: &self.toolchain,
                 prompt: &self.prompt,
                 recipe: &self.recipe,
@@ -1077,7 +1088,12 @@ pub(crate) mod tests {
 
         let mut v = Inputs::new();
         v.cli = CliVersion("2.1.232.657 (Claude Code)".into());
-        assert_ne!(base, v.key(), "the CLI build must matter");
+        assert_eq!(
+            base,
+            v.key(),
+            "the CLI build must NOT matter: it auto-updates through a shim, and keying it \
+             emptied the store on every vendor release"
+        );
 
         let mut v = Inputs::new();
         v.toolchain = ToolchainId("1.97.1 x86_64-unknown-linux-gnu".into());
@@ -1103,6 +1119,42 @@ pub(crate) mod tests {
     #[test]
     fn key_is_stable_for_identical_inputs() {
         assert_eq!(Inputs::new().key(), Inputs::new().key());
+    }
+
+    /// THE reason the store never served a hit: `cli` was keyed, the agent CLIs auto-update
+    /// through a shim, and every vendor release therefore stranded every entry. Measured on the
+    /// four entries that existed before this change -- written under `2.1.232.657`, installed
+    /// `2.1.233.669`, zero hits ever served.
+    #[test]
+    fn two_sweeps_under_different_cli_versions_share_an_entry() {
+        let mut old = Inputs::new();
+        old.cli = CliVersion("2.1.232.657 (ASBX Claude Code, channel stable)".into());
+        let mut new = Inputs::new();
+        new.cli = CliVersion("2.1.233.669 (ASBX Claude Code, channel stable)".into());
+        assert_eq!(
+            old.key(),
+            new.key(),
+            "a CLI patch bump must not strand an entry: it is client-side, and SCHEMA is the \
+             lever for a release that genuinely changes what the agent produces"
+        );
+    }
+
+    /// Not keyed is not the same as not recorded: an artifact must still say what produced it,
+    /// and `load` must not start refusing entries over a field it no longer compares.
+    #[test]
+    fn the_cli_version_is_still_recorded_even_though_it_is_not_keyed() {
+        let inputs = Inputs::new();
+        let meta = inputs.key_inputs().meta(&inputs.key(), &inputs.cli);
+        assert_eq!(
+            meta.get("cli").and_then(|v| v.as_str()),
+            Some(inputs.cli.as_str()),
+            "the CLI build must survive in meta.json for audit"
+        );
+        assert!(
+            !KeyInputs::VALIDATED.contains(&"cli"),
+            "and must not be re-compared by load, or an entry is refused over a field that no \
+             longer contributes to its key"
+        );
     }
 
     #[test]
@@ -1252,6 +1304,7 @@ pub(crate) mod tests {
         store
             .store(
                 &inputs,
+                &test_cli(),
                 &key,
                 &store.entry_dir(&inputs, &key),
                 &Produced {
@@ -1263,7 +1316,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let loaded = store
-            .load::<Verify>(&inputs, &key, &store.entry_dir(&inputs, &key))
+            .load::<Verify>(&inputs, &test_cli(), &key, &store.entry_dir(&inputs, &key))
             .expect("a freshly written entry must validate")
             .expect("and must be found");
         assert_eq!(
@@ -1282,7 +1335,7 @@ pub(crate) mod tests {
 
         let mut runs = 0;
         let first = store
-            .obtain(&inputs, || {
+            .obtain(&inputs, &test_cli(), || {
                 runs += 1;
                 Ok(Some(produced(&f.case, "pub fn a() { /* v1 */ }")))
             })
@@ -1292,7 +1345,7 @@ pub(crate) mod tests {
         assert_eq!(runs, 1);
 
         let second = store
-            .obtain::<Verify>(&inputs, || {
+            .obtain::<Verify>(&inputs, &test_cli(), || {
                 runs += 1;
                 panic!("the agent must NOT be invoked on a hit — that is the entire point");
             })
@@ -1319,7 +1372,9 @@ pub(crate) mod tests {
         let owned = Inputs::new();
         let inputs = owned.key_inputs();
 
-        let out = store.obtain::<Verify>(&inputs, || Ok(None)).unwrap();
+        let out = store
+            .obtain::<Verify>(&inputs, &test_cli(), || Ok(None))
+            .unwrap();
         assert!(out.is_none());
         assert_eq!(
             store.stats().unwrap().0,
@@ -1329,7 +1384,7 @@ pub(crate) mod tests {
 
         let mut ran = false;
         store
-            .obtain(&inputs, || {
+            .obtain(&inputs, &test_cli(), || {
                 ran = true;
                 Ok(Some(produced(&f.case, "pub fn a() { /* recovered */ }")))
             })
@@ -1348,14 +1403,16 @@ pub(crate) mod tests {
         let inputs = owned.key_inputs();
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
-            .unwrap();
+        rw.obtain(&inputs, &test_cli(), || {
+            Ok(Some(produced(&f.case, "pub fn a() {}")))
+        })
+        .unwrap();
         assert_eq!(rw.stats().unwrap().0, 1);
 
         let off = Store::open(&f.repo, Mode::Bypass).unwrap();
         let mut ran = false;
         let got = off
-            .obtain(&inputs, || {
+            .obtain(&inputs, &test_cli(), || {
                 ran = true;
                 Ok(Some(produced(&f.case, "pub fn a() { /* again */ }")))
             })
@@ -1378,7 +1435,7 @@ pub(crate) mod tests {
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let old = rw
-            .obtain(&inputs, || {
+            .obtain(&inputs, &test_cli(), || {
                 Ok(Some(produced(&f.case, "pub fn a() { /* old */ }")))
             })
             .unwrap()
@@ -1386,7 +1443,7 @@ pub(crate) mod tests {
 
         let refresh = Store::open(&f.repo, Mode::Refresh).unwrap();
         let new = refresh
-            .obtain(&inputs, || {
+            .obtain(&inputs, &test_cli(), || {
                 Ok(Some(produced(&f.case, "pub fn a() { /* new */ }")))
             })
             .unwrap()
@@ -1396,7 +1453,7 @@ pub(crate) mod tests {
 
         // The point of --cache refresh is that the suspect entry is GONE, not shadowed.
         let after = rw
-            .obtain::<Verify>(&inputs, || panic!("must hit"))
+            .obtain::<Verify>(&inputs, &test_cli(), || panic!("must hit"))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1417,7 +1474,7 @@ pub(crate) mod tests {
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let paid_for = rw
-            .obtain(&inputs, || {
+            .obtain(&inputs, &test_cli(), || {
                 Ok(Some(produced(&f.case, "pub fn a() { /* paid for */ }")))
             })
             .unwrap()
@@ -1425,7 +1482,7 @@ pub(crate) mod tests {
 
         let aborted = Store::open(&f.repo, Mode::Refresh)
             .unwrap()
-            .obtain::<Verify>(&inputs, || Ok(None))
+            .obtain::<Verify>(&inputs, &test_cli(), || Ok(None))
             .unwrap();
         assert!(aborted.is_none(), "the forced run produced nothing");
 
@@ -1435,7 +1492,9 @@ pub(crate) mod tests {
             "so the entry it was going to replace must still be there"
         );
         let served = rw
-            .obtain::<Verify>(&inputs, || panic!("the entry must still be servable"))
+            .obtain::<Verify>(&inputs, &test_cli(), || {
+                panic!("the entry must still be servable")
+            })
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1463,7 +1522,7 @@ pub(crate) mod tests {
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let old = rw
-            .obtain(&inputs, || {
+            .obtain(&inputs, &test_cli(), || {
                 Ok(Some(produced(&f.case, "pub fn a() { /* suspect */ }")))
             })
             .unwrap()
@@ -1471,7 +1530,7 @@ pub(crate) mod tests {
 
         Store::open(&f.repo, Mode::Refresh)
             .unwrap()
-            .obtain(&inputs, || {
+            .obtain(&inputs, &test_cli(), || {
                 Ok(Some(produced(&f.case, "pub fn a() { /* new */ }")))
             })
             .unwrap()
@@ -1494,7 +1553,7 @@ pub(crate) mod tests {
         // A second refresh must not land on the first copy, nor lose it.
         Store::open(&f.repo, Mode::Refresh)
             .unwrap()
-            .obtain(&inputs, || {
+            .obtain(&inputs, &test_cli(), || {
                 Ok(Some(produced(&f.case, "pub fn a() { /* newer */ }")))
             })
             .unwrap()
@@ -1522,11 +1581,13 @@ pub(crate) mod tests {
         let key = inputs.key();
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        rw.obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
-            .unwrap();
+        rw.obtain(&inputs, &test_cli(), || {
+            Ok(Some(produced(&f.case, "pub fn a() {}")))
+        })
+        .unwrap();
         Store::open(&f.repo, Mode::Refresh)
             .unwrap()
-            .obtain(&inputs, || {
+            .obtain(&inputs, &test_cli(), || {
                 Ok(Some(produced(&f.case, "pub fn a() { /* new */ }")))
             })
             .unwrap();
@@ -1564,7 +1625,7 @@ pub(crate) mod tests {
         let log = f.repo.join("live-run.log");
         std::fs::write(&log, "the transcript the invocation teed\n").unwrap();
         store
-            .obtain(&inputs, || {
+            .obtain(&inputs, &test_cli(), || {
                 Ok(Some(Produced {
                     sealed: seal_verify(&f.case, "pub fn a() {}"),
                     log: log.clone(),
@@ -1596,7 +1657,9 @@ pub(crate) mod tests {
         let inputs = held.key_inputs();
         let key = inputs.key();
         store
-            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .obtain(&inputs, &test_cli(), || {
+                Ok(Some(produced(&f.case, "pub fn a() {}")))
+            })
             .unwrap();
 
         let dir = store.entry_dir(&inputs, &key);
@@ -1606,7 +1669,7 @@ pub(crate) mod tests {
 
         let mut ran = false;
         let got = store
-            .obtain(&inputs, || {
+            .obtain(&inputs, &test_cli(), || {
                 ran = true;
                 Ok(Some(produced(&f.case, "pub fn a() { /* honest */ }")))
             })
@@ -1640,12 +1703,14 @@ pub(crate) mod tests {
         crate::artifact::set_read_only(&staging, Access::ReadOnly).unwrap();
 
         store
-            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .obtain(&inputs, &test_cli(), || {
+                Ok(Some(produced(&f.case, "pub fn a() {}")))
+            })
             .expect("a stale locked staging dir must not block the write")
             .unwrap();
         assert!(
             store
-                .obtain::<Verify>(&inputs, || panic!("must hit"))
+                .obtain::<Verify>(&inputs, &test_cli(), || panic!("must hit"))
                 .unwrap()
                 .unwrap()
                 .replayed
@@ -1662,7 +1727,9 @@ pub(crate) mod tests {
         let inputs = owned.key_inputs();
         let key = inputs.key();
         store
-            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .obtain(&inputs, &test_cli(), || {
+                Ok(Some(produced(&f.case, "pub fn a() {}")))
+            })
             .unwrap();
 
         let code = store.entry_dir(&inputs, &key).join("code");
@@ -1685,11 +1752,13 @@ pub(crate) mod tests {
         let owned = Inputs::new();
         let inputs = owned.key_inputs();
         store
-            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .obtain(&inputs, &test_cli(), || {
+                Ok(Some(produced(&f.case, "pub fn a() {}")))
+            })
             .unwrap();
 
         let replay = store
-            .obtain::<Verify>(&inputs, || panic!("must hit"))
+            .obtain::<Verify>(&inputs, &test_cli(), || panic!("must hit"))
             .unwrap()
             .unwrap();
         assert!(replay.replayed);
@@ -1711,7 +1780,9 @@ pub(crate) mod tests {
         let inputs = owned.key_inputs();
         let key = inputs.key();
         store
-            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .obtain(&inputs, &test_cli(), || {
+                Ok(Some(produced(&f.case, "pub fn a() {}")))
+            })
             .unwrap();
 
         // Defeat the read-only bit first: this is the scenario the digest check exists for.
@@ -1725,7 +1796,7 @@ pub(crate) mod tests {
 
         let mut ran = false;
         let got = store
-            .obtain(&inputs, || {
+            .obtain(&inputs, &test_cli(), || {
                 ran = true;
                 Ok(Some(produced(&f.case, "pub fn a() { /* honest */ }")))
             })
@@ -1751,7 +1822,9 @@ pub(crate) mod tests {
         let owned = Inputs::new();
         let inputs = owned.key_inputs();
         store
-            .obtain(&inputs, || Ok(Some(produced(&f.case, "pub fn a() {}"))))
+            .obtain(&inputs, &test_cli(), || {
+                Ok(Some(produced(&f.case, "pub fn a() {}")))
+            })
             .unwrap();
 
         let per_agent = f.repo.join("results/Test-Corpus/claude");
@@ -1776,7 +1849,7 @@ pub(crate) mod tests {
         // commit would empty the cache.
         let owned = Inputs::new();
         let ki = owned.key_inputs();
-        let meta = ki.meta(&ki.key());
+        let meta = ki.meta(&ki.key(), &test_cli());
         assert!(
             meta.get("harness")
                 .and_then(|v| v.as_str())
