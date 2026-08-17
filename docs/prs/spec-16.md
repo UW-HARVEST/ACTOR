@@ -1,4 +1,60 @@
-# PR 16 — Both cache keys move with the checkout's location
+# PR 16 — Two things make the cache unable to accumulate
+
+Both are key-composition defects, both need a `SCHEMA` bump, and doing them in one PR means one
+bump instead of two. **Part A is the more important one.**
+
+# Part A — `cli` must not be a key component
+
+## The defect
+
+`CliVersion` is fed to the key (`cache.rs:356`, and `"cli"` is in `KeyInputs::VALIDATED`), with
+the recorded reason that "the CLIs auto-update through a shim". That reason is an argument for
+**recording** it, not for keying it — and the file already contains the correct precedent, sitting
+beside `harness` in `KeyInputs::meta`:
+
+> Recorded for audit, deliberately NOT keyed and not among the fields `load` re-compares: every
+> harness commit would otherwise empty the cache, including commits that cannot affect an
+> artifact. When a change genuinely alters what an artifact IS, bump `SCHEMA` by hand.
+
+That applies to `cli` verbatim, and more forcefully. The harness commit changes when *we* change
+it; the agent CLI auto-updates on a vendor's release schedule, several times a month. A key
+component that turns over weekly means the store can never accumulate.
+
+**Measured, and this is the whole argument:** `results/.cache` holds four entries, 102 MB, all
+`phase=verified agent=claude`. Every one is unreachable, because they record
+`cli claude 2.1.232.657 (ASBX Claude Code, channel stable)` and the installed CLI reports
+`2.1.233.669`. The cache has never served a single hit in production for this reason. Translate is
+a measured $795.59 per harvest-bench sweep and verify about $970; keying `cli` throws that saving
+away on every vendor release.
+
+What actually determines the artifact is the **model**, the **prompt**, the **corpus** and the
+**toolchain** — all four already keyed. A CLI patch bump is client-side.
+
+## The change
+
+Move `cli` from the key to the record: keep it in `meta.json` for audit, remove it from the
+hashed components and from `VALIDATED`. `SCHEMA` is the lever for the case where a CLI release
+genuinely changes what the agent produces, exactly as it is for the harness.
+
+Do **not** delete `CliVersion` or stop probing it. Provenance still needs it, `preflight_check`
+still refuses on it, and an artifact must still record what produced it.
+
+## Required tests
+
+1. **`two_runs_under_different_cli_versions_share_an_entry`** — same model, prompt, corpus and
+   toolchain, different `CliVersion`, one key. Show it red before the change; that failure is the
+   defect.
+2. **`the_cli_version_is_still_recorded_in_the_entry`** — it must not vanish from `meta.json`, and
+   `load` must not start refusing entries over it.
+3. **`the_model_still_matters`** — the anti-loosening guard. Removing a component from a key is a
+   loosening by construction, so assert every remaining component still changes the key. There is
+   an existing test of this shape (`model must matter`, `agent must matter`, …); confirm it covers
+   all seven survivors and fails if one stops being fed.
+
+Test 3 is what stops Part A from being a hole. If a component can be dropped and no test notices,
+the next one will be dropped by accident.
+
+# Part B — both keys move with the checkout's location
 
 ## The defect
 
@@ -54,16 +110,16 @@ Do not solve it by removing the parent from `denied_read_roots`. That deny root 
 an agent really did read a sibling results tree, and weakening the sandbox to stabilise a digest
 would trade a correctness property for a caching one.
 
-## This changes every key, so it needs a `SCHEMA` bump
+## Both parts change every key, so ONE `SCHEMA` bump covers them
 
 `SCHEMA` is the manual lever for "a change genuinely alters what a key means". Bump it, and say
 in the commit message why.
 
-**Land it soon, because it is nearly free right now.** `results/.cache` holds four entries,
-102 MB, all `phase=verified agent=claude` — and they are **already unreachable**: they record
-`cli claude 2.1.232.657` while the installed CLI reports `2.1.233.669`, so their keys no longer
-match anything. Bumping `SCHEMA` today strands nothing that is not already stranded. Every week
-this waits, it costs more.
+**Land it soon, because it is nearly free right now.** The four entries on disk are already
+unreachable (Part A), so bumping `SCHEMA` today strands nothing that is not already stranded.
+After this PR the store can finally accumulate: a vendor CLI release stops invalidating it, and a
+differently-located checkout stops producing different keys. Every week this waits, it costs
+another sweep.
 
 ## Required tests
 
@@ -96,13 +152,22 @@ a shape that describes every policy identically, and a wrong key is worse than n
 The ten gates plus the release build (see `docs/HANDOFF.md`), the golden fingerprint passing and
 not skipping with 40 digests unchanged, plus:
 
-- the measured before/after keys from two checkout paths, showing they differed and now agree;
-- `SCHEMA` bumped, with the old and new values stated;
-- the three tests, with evidence each can fail.
+- **Part A:** two `CliVersion` values producing one key, measured; `cli` still present in
+  `meta.json`; every remaining component still shown to matter;
+- **Part B:** the measured before/after keys from two checkout paths, showing they differed and
+  now agree;
+- `SCHEMA` bumped once, with the old and new values stated;
+- all six tests, with evidence each can fail.
 
 ## Commit message
 
-That both keys moved with the checkout location and why (`denied_read_roots` denies the repo's
+For Part A: that `cli` was keyed while `harness` -- the same class of value, changing less often --
+was deliberately not, quoting that precedent; the measured evidence that the four stored entries
+were already unreachable because the CLI moved 2.1.232.657 -> 2.1.233.669; what still determines
+the artifact (model, prompt, corpus, toolchain, all keyed); and that SCHEMA remains the lever for a
+CLI release that genuinely changes output.
+
+For Part B: that both keys moved with the checkout location and why (`denied_read_roots` denies the repo's
 parent, which had no token); that `$HOME` was previously tokenising it only by substring
 accident because `Roots::resolve` did not canonicalise while `denied_read_roots` did; the
 measured keys from two paths before and after; the `SCHEMA` bump and that it stranded nothing,
