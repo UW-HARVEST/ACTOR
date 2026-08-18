@@ -221,6 +221,20 @@ MIT's `runtests` is invoked as `python3 -m runtests.rust --root <dir> --subset <
   `stage_phase_for_runtests` symlink trick exists only because the crate lived in a phase dir; here
   the crate is materialised at the name `runtests` hardcodes, so the symlink staging, its guard and
   `unstage_phase` all go.
+
+  **This is also the exact mechanism behind site 18**, and it is worth knowing before touching it.
+  `runtests/discovery/rust.py:14` is `build_project_dir = (case_root / "translated_rust").resolve()`,
+  and `target_dir = build_project_dir / "target"`. `.resolve()` follows the symlink, so the scoring
+  build's output lands **inside the phase dir in `results/`** — which is how 666 `target/` directories
+  got there while the two post-publish tests that assert `target/` is absent both still pass. Point
+  `translated_rust` at a real directory in the eval tree and `target/` lands in the tree that is
+  deleted, with no exclusion list to maintain.
+
+  Note also `_is_case_dir_rust`: a case is discovered **iff** it has both `translated_rust/` and
+  `test_vectors/`. So the eval tree must carry `test_vectors/` for every case that is meant to be
+  scored, and a case missing it is silently not discovered rather than reported. Count what was
+  materialised against what was scored and refuse on a mismatch — a silently smaller denominator is
+  the defect class `spec-16.md` and PR #114 were both about.
 - **Every byte is materialised this run**, from the cache entry for translate or verify plus the
   corpus for the oracle inputs. Nothing is copied out of `results/`.
 
