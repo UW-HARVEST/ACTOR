@@ -68,6 +68,34 @@ removes it by making the scored bytes younger than the run rather than by checki
 | 18 | nothing to exclude: build output lands in the deleted tree |
 | 19 | `copy_test_artifacts`'s `!tv_dst.exists()` guard — copying into an empty tree makes the "don't re-copy" branch unreachable, so an older corpus revision's oracle inputs cannot be reused |
 
+## Site 20, found while PR 21 was in flight: the infra gate audits the wrong tree
+
+`agent_health::audit(results_dir, format)` recurses from `results_dir` and collects **every case dir
+beneath it**, and it is called with `paths.results_dir` — the whole agent tree — not the battery being
+scored. It then picks one log per case off disk, preferring `verified/logs/verify.log` over
+`translated/logs/translation.log`.
+
+**Measured just now.** With all 85 B01_synthetic cases freshly translated and verified, scoring
+B01_synthetic refused:
+
+```
+Error: 27 of 209 agent runs did not complete for infrastructure reasons.
+Refusing to score. An infrastructure failure is not a result.
+```
+
+All 27 are `api_error`, and **none of them is in B01_synthetic** — 16 are in B02_synthetic, 9 in
+B01_organic, 2 in B02_organic. So a battery whose every case is fresh could not be scored because of
+dead-run transcripts in batteries that were not being scored. `--allow-infra-failures` was needed to
+get the number, on a battery where the flag launders nothing.
+
+This is worse than site 9 and belongs here rather than in a follow-up, because the eval tree is the fix:
+**audit the runs in the manifest, not the directories under a root.** The gate then grades exactly the
+runs whose results are being scored — which is what it was written to do — and one battery's failures
+stop blocking another's. Keep the refusal itself: it is correct and it caught a real thing on 2026-08-14.
+
+Pin it with a test: two batteries under one root, one clean and one holding a dead-run log, and scoring
+the clean one must succeed.
+
 **`results/` becomes write-only.** It is a shipped submodule the paper reads, so it keeps its layout
 and keeps receiving artifacts, logs, metrics and scores — written from the resolved artifacts, never
 read back as input during a run.
