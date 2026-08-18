@@ -1,5 +1,22 @@
 # PR 21 — One pipeline run: resolve every phase through the cache, then evaluate in a folder that did not exist a second ago
 
+> ## RE-SCOPED BY THE OPERATOR: §B.2 MOVES TO `spec-22.md`
+>
+> PR 21 lands **§B.1** (resolve each phase through the cache and thread it), **§B.3's type work**
+> (`Sealed::adopt` deleted, `crate_dir` NOT yet, post-processing onto `Publishing<P>`) and **§B.4**
+> (failed runs and their transcripts recorded where `Store::load` cannot see them). Acceptance
+> criteria **6–11** apply to it.
+>
+> **§B.2 — the evaluation tree — and criteria 1–5 are `docs/prs/spec-22.md`.** They are the half that
+> makes staleness *absent*; PR 21 is the half that makes the phase hand-off go through the cache. The
+> split is by verification method, per `spec-18.md`'s lesson: "does a phase resolve through the store"
+> and "are the scored bytes younger than the run" are two questions, and one diff answering both is
+> unreviewable.
+>
+> **Nothing in PR 21 may be read as criteria 1–5 having been met.** Until `spec-22.md` lands, one stale
+> `verified/Cargo.toml` still throws the battery-scope switch at `runtests.rs:137` and a hand-edited
+> `results/` still changes the score.
+
 **This spec has been rewritten twice, and both earlier versions were worse.** The first added a
 provenance stamp, a resolver and a `--allow-stale` flag — machinery to *detect* stale artifacts. The
 second threaded a manifest so that readers iterated the run's own output instead of the filesystem.
