@@ -291,7 +291,7 @@ mod test_artifacts {
 
 mod artifact_fingerprint {
     use super::*;
-    use harvest_tools::artifact::{Sealed, Translate};
+    use harvest_tools::artifact::{Fingerprint, Translate};
     use harvest_tools::battery::{has_crate, phase_dir, TRANSLATED};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -364,7 +364,9 @@ mod artifact_fingerprint {
     }
 
     /// The plan calls every reorganisation ahead a pure move; this is what "pure" is measured
-    /// against. `Sealed::adopt` re-hashes exactly the files `publish` wrote, by the same rules.
+    /// against. [`Fingerprint`] re-hashes exactly the files `publish` wrote, by the same rules, and is a
+    /// measurement and nothing else — where `Sealed::adopt` served a whole artifact with it: one with no
+    /// `Completed`, which then seeded verify.
     #[test]
     fn a_published_translation_still_digests_to_what_it_did_before() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden-digests.json");
@@ -396,10 +398,10 @@ mod artifact_fingerprint {
                 ));
                 continue;
             };
-            let sealed = Sealed::<Translate>::adopt(&results.join(case))
-                .unwrap_or_else(|e| panic!("adopting {case}: {e}"));
+            let measured = Fingerprint::of_phase_dir::<Translate>(&results.join(case))
+                .unwrap_or_else(|e| panic!("measuring {case}: {e}"));
             compared += 1;
-            let got = sealed.digest().as_str();
+            let got = measured.as_str();
             if got != want {
                 wrong.push(format!("{case}: {got} != {want}"));
             }

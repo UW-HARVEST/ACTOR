@@ -115,13 +115,13 @@ jobs:
         # was needed. An absolute count cannot be tripped by deleting code.
         #
         # --max-ratio 20 is the backstop for the one class the count cannot see. Measured
-        # on a copy of this tree with 5,000 code lines deleted and every comment kept: the
-        # comment count did not move at all, the ratio went 14.37% -> 20.44%, exit 1.
-        # Measured now: 2468 comment / 17107 counted = 14.43%, so it fires only once the
-        # counted tree shrinks by 4,767 lines (28%) with not one comment removed --
-        # deliberately loose, unlike the 0.01-point margin `--max 14` was passing by. It
+        # on a copy of this tree with 6,100 code lines deleted and every comment kept: the
+        # comment count did not move at all, the ratio went 14.41% -> 20.11%, exit 1.
+        # Measured now (PR 21): 3097 comment / 21498 counted = 14.41%, so it fires only
+        # once the counted tree shrinks by 6,013 lines (28%) with not one comment removed
+        # -- deliberately loose, unlike the 0.01-point margin `--max 14` was passing by. It
         # cannot pre-empt the count either: growing comments to 3100 puts the ratio at
-        # 14.88%, so an addition always hits --max-comments first.
+        # 14.42%, so an addition always hits --max-comments first.
         #
         # 3100 is a BUDGET FOR A SEQUENCE, not a snapshot plus epsilon, and that is why it
         # was raised once, deliberately, by the operator. 2560 was derived as "the tree

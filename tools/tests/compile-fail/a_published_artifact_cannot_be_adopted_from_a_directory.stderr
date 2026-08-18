@@ -1,0 +1,16 @@
+error[E0599]: no function or associated item named `adopt` found for struct `harvest_tools::artifact::Sealed<P>` in the current scope
+  --> tests/compile-fail/a_published_artifact_cannot_be_adopted_from_a_directory.rs:11:27
+   |
+11 |     let _sealed = Sealed::adopt(case);
+   |                           ^^^^^ function or associated item not found in `harvest_tools::artifact::Sealed<harvest_tools::artifact::Translate>`
+
+error[E0624]: associated function `unkeyed_from_phase_dir` is private
+  --> tests/compile-fail/a_published_artifact_cannot_be_adopted_from_a_directory.rs:12:33
+   |
+12 |     let _published = Published::unkeyed_from_phase_dir(case);
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^ private associated function
+   |
+  ::: src/artifact.rs
+   |
+   |     pub(crate) fn unkeyed_from_phase_dir(case_dir: &Path) -> Result<Self> {
+   |     --------------------------------------------------------------------- private associated function defined here

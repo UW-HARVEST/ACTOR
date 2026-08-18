@@ -159,7 +159,15 @@ fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
     // minus 2, so a merge landing a file needs no edit here while deleting three fails
     // instead of quietly narrowing what every rule below inspects. Add files, raise it.
     const MIN_FILES: usize = 33;
-    const REQUIRED: &[&str] = &["Sealed", "WorkTree", "Scrubbed", "Corpus", "TreeDigest"];
+    const REQUIRED: &[&str] = &[
+        "Sealed",
+        "Publishing",
+        "Published",
+        "WorkTree",
+        "Scrubbed",
+        "Corpus",
+        "TreeDigest",
+    ];
 
     let found = rust_sources();
     assert!(
@@ -216,19 +224,21 @@ fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
 
 // ── A1 ─────────────────────────────────────────────────────────────────────
 
-/// `Sealed<P>` may implement nothing that yields a path, directly or by deref.
+/// `Sealed<P>` and the two types that carry it out of the pipeline may implement nothing that yields a
+/// path, directly or by deref — an `AsRef<Path>` on `Publishing` or `Published` would put the published
+/// phase dir back in reach of `Command::current_dir`.
 ///
-/// Scans every module, not just `artifact.rs`: the orphan rule permits
-/// `impl AsRef<Path> for Sealed<P>` anywhere in the crate.
+/// Scans every module, not just `artifact.rs`: the orphan rule permits such an impl anywhere.
 #[test]
 fn sealed_implements_only_debug() {
     const ALLOWED: &[&str] = &["Debug"];
+    const GUARDED: &[&str] = &["Sealed", "Publishing", "Published"];
     let mut found: Vec<(String, String)> = Vec::new();
 
     for path in rust_sources() {
         for item in parse(&path).items {
             let syn::Item::Impl(imp) = item else { continue };
-            if type_name(&imp.self_ty) != "Sealed" {
+            if !GUARDED.contains(&type_name(&imp.self_ty).as_str()) {
                 continue;
             }
             let name = match &imp.trait_ {
@@ -247,9 +257,9 @@ fn sealed_implements_only_debug() {
     }
     assert!(
         found.is_empty(),
-        "Sealed<P> gained trait impls beyond {ALLOWED:?}: {found:?}.\n\
-         Nothing may run in a published artifact, and that holds only while Sealed\n\
-         yields no path. If a new impl is genuinely needed, prove it cannot leak one\n\
+        "{GUARDED:?} gained trait impls beyond {ALLOWED:?}: {found:?}.\n\
+         Nothing may run in a published artifact, and that holds only while these types\n\
+         yield no path. If a new impl is genuinely needed, prove it cannot leak one\n\
          and add it to ALLOWED here."
     );
 }
@@ -385,19 +395,25 @@ fn digests_cannot_be_fabricated() {
 /// assertions silently cease to exist. Pinning the code is what makes that visible.
 #[test]
 fn compile_fail_cases_still_assert_what_they_were_written_for() {
-    let expected: BTreeMap<&str, &str> = [
-        ("sealed_has_no_path", "E0599"),             // no method named `path`
-        ("sealed_is_not_a_command_cwd", "E0277"),    // AsRef<Path> not satisfied
-        ("phases_are_not_interchangeable", "E0308"), // mismatched types
-        ("completed_cannot_be_forged", "E0603"),     // private constructor
-        ("oracle_cannot_be_forged", "E0603"),        // private constructor
-        ("worktree_cannot_be_used_after_scrub", "E0382"), // scrub() consumed it
-        ("scrubbed_cannot_be_used_after_seal", "E0382"), // seal() consumed it
-        ("materialise_at_refuses_a_results_tree_path", "E0308"), // needs a Cwd, not a Path
-        ("a_verification_cannot_seed_a_translation", "E0277"), // no such SeededBy impl
-        ("phase_cannot_be_implemented_downstream", "E0277"), // sealed supertrait
-        ("sealed_does_not_display", "E0277"),        // no Display impl
-        ("materialise_at_refuses_a_results_tree_path", "E0308"), // not a ScratchPath
+    let expected: BTreeMap<&str, Vec<&str>> = [
+        ("sealed_has_no_path", vec!["E0599"]), // no method named `path`
+        ("sealed_is_not_a_command_cwd", vec!["E0277"]), // AsRef<Path> not satisfied
+        ("phases_are_not_interchangeable", vec!["E0308"]), // mismatched types
+        ("completed_cannot_be_forged", vec!["E0603"]), // private constructor
+        ("oracle_cannot_be_forged", vec!["E0603"]), // private constructor
+        ("worktree_cannot_be_used_after_scrub", vec!["E0382"]), // scrub() consumed it
+        ("scrubbed_cannot_be_used_after_seal", vec!["E0382"]), // seal() consumed it
+        ("materialise_at_refuses_a_results_tree_path", vec!["E0308"]), // needs a Cwd, not a Path
+        ("a_verification_cannot_seed_a_translation", vec!["E0277"]), // no such SeededBy impl
+        ("phase_cannot_be_implemented_downstream", vec!["E0277"]), // sealed supertrait
+        ("sealed_does_not_display", vec!["E0277"]), // no Display impl
+        ("materialise_at_refuses_a_results_tree_path", vec!["E0308"]), // not a ScratchPath
+        // Both doors that once minted from a directory: E0599 is `Sealed::adopt`, gone; E0624 is
+        // `Published::unkeyed_from_phase_dir`, gone the moment that `pub(crate)` widens.
+        (
+            "a_published_artifact_cannot_be_adopted_from_a_directory",
+            vec!["E0599", "E0624"],
+        ),
     ]
     .into_iter()
     .collect();
@@ -422,13 +438,16 @@ fn compile_fail_cases_still_assert_what_they_were_written_for() {
         let stderr = dir.join(format!("{case}.stderr"));
         let text = std::fs::read_to_string(&stderr)
             .unwrap_or_else(|e| panic!("{}: {e}", stderr.display()));
-        assert!(
-            text.contains(want),
-            "{case}.stderr no longer contains {want}.\n\
-             It was written to assert that specific rejection. If the compiler's code\n\
-             legitimately changed, update `expected` deliberately — do not just\n\
-             re-record, which would leave the case passing while asserting nothing."
-        );
+        // EVERY code the case pins: a second refusal that stopped being reported leaves the first.
+        for want in want {
+            assert!(
+                text.contains(want),
+                "{case}.stderr no longer contains {want}.\n\
+                 It was written to assert that specific rejection. If the compiler's code\n\
+                 legitimately changed, update `expected` deliberately — do not just\n\
+                 re-record, which would leave the case passing while asserting nothing."
+            );
+        }
     }
     assert_eq!(
         cases.len(),
@@ -1090,9 +1109,114 @@ fn the_digest_path_is_lossless() {
     );
 }
 
+// ── A12 ────────────────────────────────────────────────────────────────────
+
+/// `results/` is written and never read: a phase directory is an OUTPUT, so naming one is the pipeline's
+/// business and nobody else's. Shrink-only over the SET OF MODULES, both directions, exactly as
+/// [`CYCLE_BASELINE`] is: one that STARTS naming a phase dir fails, which is what stops a twentieth
+/// site. It does not cap the count INSIDE a listed module — `oracle` and `analyse` still resolve a
+/// crate from disk, which is §B.2.
+const PHASE_DIR_READERS: &[&str] = &[
+    "analyse::report",
+    "artifact",
+    "oracle",
+    "oracle::gtest",
+    "oracle::runtests",
+    "translate",
+];
+
+/// Every spelling `battery` exports for a case's layout: the three resolvers AND the two phase names,
+/// since `case_dir(b, c).join(battery::VERIFIED)` resolves one while naming no resolver.
+const PHASE_DIR_VOCABULARY: &[&str] = &[
+    "phase_dir",
+    "crate_dir",
+    "has_crate",
+    "TRANSLATED",
+    "VERIFIED",
+];
+
+/// Everything before the file's `#[cfg(test)]` MODULE: it also marks single functions mid-file, and cutting
+/// at the first of those would drop most of `artifact.rs` from the rule.
+fn production_prefix(text: &str) -> &str {
+    ["#[cfg(test)]\nmod ", "#[cfg(test)]\npub(crate) mod "]
+        .iter()
+        .filter_map(|marker| text.find(marker))
+        .min()
+        .map_or(text, |at| &text[..at])
+}
+
+/// Lexed, so a `//` comment (stripped) and a doc comment (a string literal) cannot count.
+fn battery_refs(text: &str) -> BTreeSet<String> {
+    fn walk(stream: TokenStream, out: &mut BTreeSet<String>) {
+        let tokens: Vec<TokenTree> = stream.into_iter().collect();
+        for (i, token) in tokens.iter().enumerate() {
+            if let TokenTree::Group(g) = token {
+                walk(g.stream(), out);
+            }
+            let TokenTree::Ident(id) = token else {
+                continue;
+            };
+            if id != "battery" {
+                continue;
+            }
+            if let Some((_, tail)) = after_path_sep(&tokens, i) {
+                head_names(tail, out);
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(text.parse().expect("src/ lexes as Rust tokens"), &mut out);
+    out
+}
+
+#[test]
+fn only_the_pipeline_names_a_phase_directory() {
+    let mut naming: BTreeSet<String> = BTreeSet::new();
+    let mut sites = 0usize;
+    for path in rust_sources() {
+        let module = module_path(&path);
+        // `battery` DEFINES the vocabulary, so it names it unqualified and is not a reader of it.
+        if module == "battery" {
+            continue;
+        }
+        let refs = battery_refs(production_prefix(&read(&path)));
+        let named: Vec<&&str> = PHASE_DIR_VOCABULARY
+            .iter()
+            .filter(|v| refs.contains(**v))
+            .collect();
+        if !named.is_empty() {
+            sites += named.len();
+            naming.insert(module);
+        }
+    }
+
+    let baseline: BTreeSet<String> = PHASE_DIR_READERS.iter().map(|s| s.to_string()).collect();
+    let added: Vec<&String> = naming.difference(&baseline).collect();
+    let gone: Vec<&String> = baseline.difference(&naming).collect();
+    assert!(
+        added.is_empty(),
+        "{added:?} name a phase directory and are not on PHASE_DIR_READERS.\n\
+         A phase dir is an OUTPUT: the pipeline writes `results/` and nothing reads a case's\n\
+         state back out of it. Take the artifact as a value — `Published<P>` — instead of\n\
+         resolving one from a path. This list may only shrink."
+    );
+    assert!(
+        gone.is_empty(),
+        "{gone:?} no longer name a phase directory, so PHASE_DIR_READERS is stale and this\n\
+         rule is looser than the code. Strike them off — the list ratchets DOWN."
+    );
+    // Anti-vacuity: a lexer returning nothing passes every assertion above. 20 sites, 6 modules.
+    assert!(
+        sites >= 6 && naming.len() == baseline.len(),
+        "found {sites} site(s) across {naming:?}, which is too few to be inspecting anything"
+    );
+}
+
 // ── A11 ────────────────────────────────────────────────────────────────────
 
-const TYPESTATE_ORDER: &[&str] = &["WorkTree", "Scrubbed", "Sealed"];
+/// The forward chain, in order. `Publishing` and `Published` are on it because site 17 WAS a backward
+/// step: `Sealed::publish` took `&self`, so a `Sealed` outlived its own publish.
+const TYPESTATE_ORDER: &[&str] = &["WorkTree", "Scrubbed", "Sealed", "Publishing", "Published"];
 
 #[test]
 fn typestates_have_private_fields_and_consuming_transitions() {

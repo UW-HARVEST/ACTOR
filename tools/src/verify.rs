@@ -4,11 +4,12 @@ use crate::agents::run::{run_cached, Outcome, PhaseRun, SkipCheck};
 use crate::agents::session::{ClaudeRun, Session};
 use crate::agents::work::IsolatedWorkDir;
 use crate::agents::Semaphore;
-use crate::artifact::Verify;
+use crate::artifact::{Published, Verify};
 use crate::battery::{self, Case, Paths};
 use crate::cache::{self, CliVersion, ModelId};
 use crate::cli::Agent;
 use crate::io::workdir::Roots;
+use crate::translate::Translations;
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -26,12 +27,19 @@ pub fn run(
     filter: Option<&str>,
     force: bool,
     parallel: usize,
+    translations: &Translations,
 ) -> Result<()> {
     let sem = Arc::new(Semaphore::new(parallel));
-    run_with_semaphore(paths, battery_name, filter, force, &sem)
+    run_with_semaphore(paths, battery_name, filter, force, &sem, translations)
 }
 
-pub fn run_all(paths: &Paths, batteries: &[String], force: bool, parallel: usize) -> Result<()> {
+pub fn run_all(
+    paths: &Paths,
+    batteries: &[String],
+    force: bool,
+    parallel: usize,
+    translations: &Translations,
+) -> Result<()> {
     let sem = Arc::new(Semaphore::new(parallel));
 
     let errors: Vec<anyhow::Error> = std::thread::scope(|s| {
@@ -39,7 +47,9 @@ pub fn run_all(paths: &Paths, batteries: &[String], force: bool, parallel: usize
             .iter()
             .map(|bat| {
                 let sem = sem.clone();
-                s.spawn(move || -> Result<()> { run_with_semaphore(paths, bat, None, force, &sem) })
+                s.spawn(move || -> Result<()> {
+                    run_with_semaphore(paths, bat, None, force, &sem, translations)
+                })
             })
             .collect();
 
@@ -59,12 +69,61 @@ pub fn run_all(paths: &Paths, batteries: &[String], force: bool, parallel: usize
     Ok(())
 }
 
+/// `Absent` and `AlreadyVerified` were one "skipped" line, which is how a sweep that verified NOTHING
+/// read like one that verified everything. Only the first is refused.
+enum Verdict {
+    Absent,
+    AlreadyVerified,
+    Verified,
+    Failed,
+}
+
+/// Names, capped: one shared-source group is 127 followers, and the list would bury the sentence.
+fn first_few(names: &[&str]) -> String {
+    let shown: Vec<&str> = names.iter().take(8).copied().collect();
+    if names.len() > shown.len() {
+        return format!(
+            "{} … and {} more",
+            shown.join(", "),
+            names.len() - shown.len()
+        );
+    }
+    shown.join(", ")
+}
+
+/// Beside the verify count, where the number is produced. NOT a refusal: opencode must verify.
+fn report_unkeyed_seeds(unkeyed: usize) {
+    if unkeyed > 0 {
+        println!(
+            "{unkeyed} of these were seeded from a translation no key names, so their inputs \
+             cannot be attributed to this run (see the ⚠️ lines above)"
+        );
+    }
+}
+
+/// A sweep that verified nothing must not exit 0: `§B.2`'s evaluation tree is not in this PR, so
+/// the scorer still reads whatever `verified/` is on disk.
+fn refuse_absent(absent: &[&str], how_to_translate: &str) -> Result<()> {
+    anyhow::ensure!(
+        absent.is_empty(),
+        "{} case(s) went unverified: this run resolved no translation for {}. A verification is \
+         seeded from a translation THIS RUN resolved, so there is no verification for these cases \
+         and no number derived from them is measured. Translate them deliberately ({}) and verify \
+         after.",
+        absent.len(),
+        first_few(absent),
+        how_to_translate,
+    );
+    Ok(())
+}
+
 fn run_with_semaphore(
     paths: &Paths,
     battery_name: &str,
     filter: Option<&str>,
     force: bool,
     sem: &Arc<Semaphore>,
+    translations: &Translations,
 ) -> Result<()> {
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
@@ -83,33 +142,40 @@ fn run_with_semaphore(
     let total = independent.len() + shared.len();
     println!("=== Verifying {battery_name} ({total} cases) ===");
 
-    let ind_results: Vec<(String, Option<bool>, bool)> = std::thread::scope(|s| {
+    let ind_results: Vec<(String, Verdict, bool)> = std::thread::scope(|s| {
         let handles: Vec<_> = independent
             .iter()
             .map(|c| {
                 let handle = s.spawn(|| {
                     let _permit = sem.acquire();
                     let case_dir = output_dir.join(&c.name);
-                    if !crate::battery::has_crate(&crate::battery::phase_dir(
-                        &case_dir,
-                        crate::battery::TRANSLATED,
-                    )) {
-                        return (c.name.clone(), None);
-                    }
+                    // Verify used to gate on one `stat` of the directory it then seeded from.
+                    let Some(translated) = translations.get(&case_dir) else {
+                        return (c.name.clone(), Verdict::Absent);
+                    };
                     if !force
                         && skip.already_done(|| {
                             crate::artifact::phase_log::<Verify>(&case_dir).exists()
                         })
                     {
-                        return (c.name.clone(), None);
+                        return (c.name.clone(), Verdict::AlreadyVerified);
                     }
                     let cmake_flags = get_cmake_flags(paths, battery_name, &c.name);
-                    let outcome =
-                        verify_case(&case_dir, &prompt_template, &cmake_flags, "", paths, &store);
-                    (
-                        c.name.clone(),
-                        Some(crate::refusal::record(&c.name, outcome)),
-                    )
+                    let outcome = verify_case(
+                        &case_dir,
+                        translated,
+                        &prompt_template,
+                        &cmake_flags,
+                        "",
+                        paths,
+                        &store,
+                    );
+                    let verdict = if crate::refusal::record(&c.name, outcome) {
+                        Verdict::Verified
+                    } else {
+                        Verdict::Failed
+                    };
+                    (c.name.clone(), verdict)
                 });
                 (c.name.clone(), handle)
             })
@@ -123,7 +189,7 @@ fn run_with_semaphore(
                 Ok((n, r)) => (n, r, false),
                 Err(_) => {
                     eprintln!("  ⚠️  {name}: verify thread panicked — counting as failed");
-                    (name, Some(false), true)
+                    (name, Verdict::Failed, true)
                 }
             })
             .collect()
@@ -137,15 +203,22 @@ fn run_with_semaphore(
     let mut verified = 0usize;
     let mut failed = 0usize;
     let mut current = 0usize;
+    let mut absent: Vec<&str> = Vec::new();
     for (name, result, _) in &ind_results {
         current += 1;
         match result {
-            None => println!("[{current}/{total}] ⏭️  {name} (skipped)"),
-            Some(true) => {
+            Verdict::Absent => {
+                absent.push(name);
+                println!("[{current}/{total}] ⏭️  {name} (no translation resolved this run)");
+            }
+            Verdict::AlreadyVerified => {
+                println!("[{current}/{total}] ⏭️  {name} (already verified)")
+            }
+            Verdict::Verified => {
                 verified += 1;
                 println!("[{current}/{total}] ✅ {name}");
             }
-            Some(false) => {
+            Verdict::Failed => {
                 failed += 1;
                 println!("[{current}/{total}] ❌ {name}");
             }
@@ -156,12 +229,16 @@ fn run_with_semaphore(
         current += 1;
         let real_dir = output_dir.join(&group.real_case);
 
-        if !crate::battery::has_crate(&crate::battery::phase_dir(
-            &real_dir,
-            crate::battery::TRANSLATED,
-        )) {
+        // The propagation below derives every follower's `verified/` from this one, so an unresolved
+        // group is refused rather than propagated from what it left last time.
+        let Some(translated) = translations.get(&real_dir) else {
+            absent.push(&group.real_case);
+            println!(
+                "[{current}/{total}] ⏭️  {} (no translation resolved this run)",
+                group.real_case
+            );
             continue;
-        }
+        };
 
         if !force && skip.already_done(|| crate::artifact::phase_log::<Verify>(&real_dir).exists())
         {
@@ -179,6 +256,7 @@ fn run_with_semaphore(
             let configs_text = build_configs_text(paths, battery_name, group);
             let ok = verify_case(
                 &real_dir,
+                translated,
                 &prompt_template,
                 &cmake_flags,
                 &configs_text,
@@ -206,12 +284,11 @@ fn run_with_semaphore(
             group.configs.len()
         );
         for cfg in &group.configs {
-            crate::translate::propagate_config_phase(
+            crate::translate::propagate_config_phase::<Verify>(
                 paths,
                 battery_name,
                 &group.real_case,
                 cfg,
-                crate::battery::VERIFIED,
             )?;
         }
         println!("Propagated to {} cases", group.configs.len());
@@ -219,6 +296,10 @@ fn run_with_semaphore(
 
     println!();
     println!("Verified: {verified}, Failed: {failed} (of {total})");
+    report_unkeyed_seeds(crate::translate::unkeyed_seeds(translations, &output_dir));
+    if let Some(line) = store.tally_line() {
+        println!("{line}");
+    }
     // A worker panic is an infrastructure failure, not a measurement, and #67's rule is
     // that scoring must refuse one. Reporting it only on stdout while exiting 0 would let
     // a panic that hit every worker produce a plausible-looking verify rate that was never
@@ -231,7 +312,7 @@ fn run_with_semaphore(
         panicked.len(),
         panicked.join(", ")
     );
-    Ok(())
+    refuse_absent(&absent, &format!("harvest-tools translate {battery_name}"))
 }
 
 /// Deliberately shares `verify.md` and `verify_case` with Test-Corpus so both
@@ -242,6 +323,7 @@ pub fn run_harvest_bench(
     projects: &[battery::HarvestBenchProject],
     parallel: usize,
     force: bool,
+    translations: &Translations,
 ) -> Result<()> {
     let sem = Arc::new(Semaphore::new(parallel));
     let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))
@@ -252,7 +334,7 @@ pub fn run_harvest_bench(
     let total = projects.len();
     println!("=== Verifying harvest-bench ({total} projects) ===");
 
-    let results: Vec<(String, Option<bool>, bool)> = std::thread::scope(|s| {
+    let results: Vec<(String, Verdict, bool)> = std::thread::scope(|s| {
         let handles: Vec<_> = projects
             .iter()
             .map(|p| {
@@ -265,24 +347,28 @@ pub fn run_harvest_bench(
                     move || {
                         let _permit = sem.acquire();
                         let case_dir = paths.output_dir(&name);
-                        if !crate::battery::has_crate(&crate::battery::phase_dir(
-                            &case_dir,
-                            crate::battery::TRANSLATED,
-                        )) {
-                            return (name, None);
-                        }
+                        let Some(translated) = translations.get(&case_dir) else {
+                            return (name, Verdict::Absent);
+                        };
                         if !force
                             && skip.already_done(|| {
                                 crate::artifact::phase_log::<Verify>(&case_dir).exists()
                             })
                         {
-                            return (name, None);
+                            return (name, Verdict::AlreadyVerified);
                         }
                         let ok = crate::refusal::record(
                             &name,
-                            verify_case(&case_dir, prompt, "", "", paths, store),
+                            verify_case(&case_dir, translated, prompt, "", "", paths, store),
                         );
-                        (name, Some(ok))
+                        (
+                            name,
+                            if ok {
+                                Verdict::Verified
+                            } else {
+                                Verdict::Failed
+                            },
+                        )
                     }
                 });
                 (name, handle)
@@ -296,7 +382,7 @@ pub fn run_harvest_bench(
                 Ok((n, r)) => (n, r, false),
                 Err(_) => {
                     eprintln!("  ⚠️  {name}: verify thread panicked — counting as failed");
-                    (name, Some(false), true)
+                    (name, Verdict::Failed, true)
                 }
             })
             .collect()
@@ -308,23 +394,33 @@ pub fn run_harvest_bench(
         .collect();
 
     let (mut verified, mut failed) = (0usize, 0usize);
+    let mut absent: Vec<&str> = Vec::new();
     for (i, (name, result, _)) in results.iter().enumerate() {
         let n = i + 1;
         match result {
-            None => {
-                println!("[{n}/{total}] ⏭️  {name} (skipped: no translated/ or already verified)")
+            Verdict::Absent => {
+                absent.push(name);
+                println!("[{n}/{total}] ⏭️  {name} (no translation resolved this run)");
             }
-            Some(true) => {
+            Verdict::AlreadyVerified => println!("[{n}/{total}] ⏭️  {name} (already verified)"),
+            Verdict::Verified => {
                 verified += 1;
                 println!("[{n}/{total}] ✅ {name}");
             }
-            Some(false) => {
+            Verdict::Failed => {
                 failed += 1;
                 println!("[{n}/{total}] ❌ {name}");
             }
         }
     }
     println!("\nHB verify: {verified}/{total} verified, {failed} failed");
+    report_unkeyed_seeds(crate::translate::unkeyed_seeds(
+        translations,
+        &paths.results_dir,
+    ));
+    if let Some(line) = store.tally_line() {
+        println!("{line}");
+    }
     // See run_with_semaphore: a panic is an infrastructure failure, not a result.
     crate::refusal::bail_if_any()?;
     anyhow::ensure!(
@@ -333,7 +429,7 @@ pub fn run_harvest_bench(
         panicked.len(),
         panicked.join(", ")
     );
-    Ok(())
+    refuse_absent(&absent, "harvest-tools translate HB")
 }
 
 /// Resolves the backend a verify phase will use; `None` means no verify phase. Consulted
@@ -424,6 +520,7 @@ fn verify_skip_check(paths: &Paths) -> SkipCheck {
 /// agent phase, where the store, the publish and the metrics live for both phases.
 fn verify_case(
     case_dir: &Path,
+    translated: &Published<crate::artifact::Translate>,
     prompt_template: &str,
     cmake_flags: &str,
     configs_text: &str,
@@ -444,7 +541,7 @@ fn verify_case(
     // consulted because the prompt embeds this path and the prompt is part of the key —
     // on a hit the copy is wasted, but the prompt hashed and the prompt shown to the
     // agent are provably the same string.
-    let work = IsolatedWorkDir::new(case_dir)?;
+    let work = IsolatedWorkDir::new(translated)?;
 
     let mut prompt = prompt_template
         .replace("CASE_DIR_PLACEHOLDER", &work.root().to_string_lossy())
@@ -489,9 +586,8 @@ fn verify_case(
     Ok(matches!(outcome, Outcome::Published(_)))
 }
 
-/// `Ok(None)` means "nothing worth keeping" — API error, abort, or a crate that does
-/// not compile. The store keeps no entry for it, so a transient failure is not memoised
-/// into a permanent one.
+/// [`cache::Attempt::Nothing`] is "nothing worth keeping" — API error, abort, or a crate that does not
+/// compile. Recorded where the loader cannot see it: see [`cache::Store::record_failure`].
 fn run_verify_agent(
     case_dir: &Path,
     inv: &Invocation,
@@ -499,7 +595,7 @@ fn run_verify_agent(
     prompt: &str,
     log_path: &Path,
     paths: &Paths,
-) -> Result<Option<cache::Produced<crate::artifact::Verify>>> {
+) -> Result<cache::Attempt<crate::artifact::Verify>> {
     let start = std::time::Instant::now();
 
     // Cleared so a skipped or absent CLI run records no spend, and so a replay
@@ -579,7 +675,11 @@ fn run_verify_agent(
             case_dir.display(),
             health
         );
-        return Ok(None);
+        return Ok(cache::Attempt::Nothing(
+            cache::NotProduced::DidNotComplete {
+                health: format!("{health:?}"),
+            },
+        ));
     };
     let sealed = work.finish(&proof)?;
 
@@ -598,11 +698,11 @@ fn run_verify_agent(
         // The second clause holds because `run_cached` moves a stale `verified/` crate aside when
         // it publishes nothing; left standing, `battery::crate_dir` keeps preferring the old one.
         eprintln!("  ⚠️  verify produced a non-compiling crate — not publishing; scorer will use translated/");
-        return Ok(None);
+        return Ok(cache::Attempt::Nothing(cache::NotProduced::DoesNotCompile));
     }
     println!("  verified artifact {:?}", sealed.digest());
 
-    Ok(Some(cache::Produced::new(
+    Ok(cache::Attempt::Produced(cache::Produced::new(
         sealed,
         log_path.to_path_buf(),
         crate::agents::exit::agent_provenance(&paths.agent_key, start.elapsed().as_secs()),
@@ -681,6 +781,7 @@ fn get_cmake_flags(paths: &Paths, battery: &str, case_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact::{Keying, Translate};
 
     /// The one decision written twice, and since `has_verify_phase` moved to `agents/`,
     /// written in two files. Nothing else connects them: `translate.rs` pins
@@ -782,6 +883,119 @@ mod tests {
                 "and an agent with no verify phase has no key to ask about either way: {mode:?}"
             );
         }
+    }
+
+    /// A case absent from the hand-off is not verified — and a sweep that verified NOTHING must not
+    /// exit 0. It did: `Verified: 0, Failed: 0 (of 85)`, leaving the scorer the old `verified/`
+    /// dirs. The absent case is `014_dead_code_lib` in its MEASURED shape, and the two cases no key
+    /// can name must complete THE SAME sweep or refusing them is what makes them unverifiable.
+    #[test]
+    fn a_case_with_no_resolved_translation_is_refused_rather_than_counted_as_a_pass() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        // Oneshot has no verify backend, so `verify_case` is "nothing to do, ok" and no agent runs.
+        let paths = Paths::new(
+            tmp.path(),
+            Agent::Oneshot,
+            crate::cli::Dataset::TestCorpus,
+            Some("openai/gpt-5.4"),
+            cache::Mode::Bypass,
+            crate::io::sandbox::Enforcement::AllowUnsandboxed,
+        )
+        .unwrap();
+        let bat = "B01_synthetic";
+        let (absent, seeded, group, follower) = (
+            "014_dead_code_lib",
+            "013_poor_quality_addition",
+            "macrodepth_add_5",
+            "macrodepth_add_5_cfg",
+        );
+        for name in [absent, seeded, group] {
+            for dir in ["test_case", "test_vectors"] {
+                std::fs::create_dir_all(paths.input_dir(bat).join(name).join(dir)).unwrap();
+            }
+        }
+        // The symlinked `test_case` IS what makes a group, and why its store is bypassed.
+        std::fs::create_dir_all(paths.input_dir(bat).join(follower).join("test_vectors")).unwrap();
+        std::os::unix::fs::symlink(
+            format!("../{group}/test_case"),
+            paths.input_dir(bat).join(follower).join("test_case"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&paths.prompts_dir).unwrap();
+        std::fs::write(
+            paths.prompts_dir.join("verify.md"),
+            "verify CASE_DIR_PLACEHOLDER",
+        )
+        .unwrap();
+        assert_eq!(
+            battery::discover(&paths.corpus_dir, bat, None)
+                .unwrap()
+                .cases
+                .iter()
+                .filter(|c| matches!(c, Case::SharedSource(_)))
+                .count(),
+            1,
+            "fixture: without a group the bypassed-store half of this test is never exercised"
+        );
+
+        let crate_at = |dir: &Path| {
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+            std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}").unwrap();
+        };
+        let phase =
+            |name: &str, which| crate::battery::phase_dir(&paths.output_dir(bat).join(name), which);
+        let absent_dir = paths.output_dir(bat).join(absent);
+        std::fs::create_dir_all(crate::artifact::phase_logs::<Verify>(&absent_dir)).unwrap();
+        std::fs::create_dir_all(
+            crate::artifact::phase_log::<Translate>(&absent_dir)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            crate::artifact::phase_log::<Translate>(&absent_dir),
+            "the transcript of the run that published nothing",
+        )
+        .unwrap();
+        crate_at(&phase(absent, crate::battery::VERIFIED));
+        crate_at(&phase(seeded, crate::battery::TRANSLATED));
+        crate_at(&phase(group, crate::battery::TRANSLATED));
+
+        // What the translate sweep hands over for those two: the published tree, digested this run.
+        let sem = Arc::new(Semaphore::new(1));
+        let mut resolved = Translations::new();
+        for name in [seeded, group] {
+            let dir = paths.output_dir(bat).join(name);
+            let published = Published::<Translate>::unkeyed_from_phase_dir(&dir).unwrap();
+            assert_eq!(published.keying(), Keying::Unkeyable);
+            resolved.insert(dir, published);
+        }
+        assert_eq!(
+            crate::translate::unkeyed_seeds(&resolved, &paths.output_dir(bat)),
+            2,
+            "the count printed beside the verify number must be the seeds under THIS battery"
+        );
+        let err = run_with_semaphore(&paths, bat, None, false, &sem, &resolved)
+            .expect_err("a sweep that verified nothing is not a measurement");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(absent) && text.contains("unverified"),
+            "the refusal names the case, or the operator cannot tell what went unmeasured: {text}"
+        );
+        assert!(
+            !text.contains(seeded) && !text.contains(group),
+            "and it names ONLY the case whose chain stopped — a battery-wide refusal would make \
+             the two seedable configurations unverifiable again: {text}"
+        );
+
+        crate_at(&phase(absent, crate::battery::TRANSLATED));
+        resolved.insert(
+            absent_dir.clone(),
+            Published::<Translate>::unkeyed_from_phase_dir(&absent_dir).unwrap(),
+        );
+        run_with_semaphore(&paths, bat, None, false, &sem, &resolved)
+            .expect("a case whose translation this run resolved is verified, not refused");
     }
 
     #[test]

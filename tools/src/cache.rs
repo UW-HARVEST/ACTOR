@@ -1,12 +1,7 @@
-//! Memoisation of the verify phase. There is no cached-vs-uncached fork: the phase
-//! runs through [`Store::obtain`], and `--no-cache` is a [`Mode`] of the store rather
-//! than an `if` at the call site, so the two paths cannot drift.
-//!
-//! **Verify only.** Translate and test are not memoised. Verify is ~92% of the
-//! available saving, and translate's input is the C corpus rather than a [`Sealed`], so
-//! it needs an input digest this module does not compute. Said here because the phrase
-//! "every phase runs through `Store::obtain`" used to appear above and is not true: it
-//! led a 3h20m sweep to be launched expecting translation to populate the store.
+//! Memoisation of the two AGENT phases — translate and verify, not test (~350 s of a 19.5 h sweep).
+//! There is no cached-vs-uncached fork: a phase runs through [`Store::obtain`] and `--no-cache` is a
+//! [`Mode`], not an `if`. It said "verify only" until translate was ported, and that false statement
+//! once launched a 3h20m sweep expecting translation to populate the store.
 //!
 //! [`Produced`] is constructible only from a [`Sealed`], which requires
 //! [`crate::domain::health::Completed`], so "never cache an infra failure" is
@@ -527,6 +522,8 @@ pub enum Mode {
     /// replaced entry is quarantined, not deleted — it is the reason the operator
     /// reached for `refresh`, so it is evidence.
     Refresh,
+    /// Read an entry, and on a miss refuse rather than invoke: what `verify` needs of translate.
+    ReplayOnly,
 }
 
 /// Constructible only from a [`Sealed`], hence only with a `Completed` proof.
@@ -548,6 +545,62 @@ impl<P: Phase> Produced<P> {
     }
 }
 
+/// What one agent invocation left behind. Not an `Option`: a failure's reason is a RECORD to write.
+pub enum Attempt<P: Phase> {
+    Produced(Produced<P>),
+    Nothing(NotProduced),
+}
+
+/// Why a phase produced nothing worth keeping. RECORDED, never served: see [`FAILED`].
+#[derive(Debug, Clone)]
+pub enum NotProduced {
+    /// The health classification: decided too deep inside the phase to be re-derived here.
+    DidNotComplete {
+        health: String,
+    },
+    DoesNotCompile,
+}
+
+impl NotProduced {
+    /// A closed vocabulary, so a post-mortem can group by it; `Debug` is not a contract.
+    pub fn outcome(&self) -> &'static str {
+        match self {
+            NotProduced::DidNotComplete { .. } => "did_not_complete",
+            NotProduced::DoesNotCompile => "does_not_compile",
+        }
+    }
+
+    fn health(&self) -> Option<&str> {
+        match self {
+            NotProduced::DidNotComplete { health } => Some(health),
+            NotProduced::DoesNotCompile => None,
+        }
+    }
+}
+
+pub enum Resolved<P: Phase> {
+    Obtained(Obtained<P>),
+    Nothing(NotProduced),
+    /// No entry, and [`Mode::ReplayOnly`] forbade producing one: unlike `Nothing`, no agent ran.
+    Unavailable,
+}
+
+#[cfg(test)]
+impl<P: Phase> Resolved<P> {
+    /// A panic NAMING the reason, so a test expecting a replay does not report the wrong defect.
+    fn obtained(self) -> Obtained<P> {
+        match self {
+            Resolved::Obtained(o) => o,
+            Resolved::Nothing(why) => panic!("expected an artifact, got {why:?}"),
+            Resolved::Unavailable => panic!("expected an artifact, got no entry at all"),
+        }
+    }
+
+    fn is_nothing(&self) -> bool {
+        matches!(self, Resolved::Nothing(_))
+    }
+}
+
 pub struct Obtained<P: Phase> {
     pub sealed: Sealed<P>,
     /// True if a stored result was replayed and no agent ran. Callers must not report a
@@ -564,6 +617,63 @@ struct Loaded<P: Phase> {
     provenance: serde_json::Value,
 }
 
+/// Where a run that produced nothing is recorded. A directory NAME, not a flag: the loader joins
+/// `<SCHEMA>/<phase>/<agent>/<key>`, and no phase is spelled this.
+pub const FAILED: &str = "failed";
+
+/// A run that produced nothing, as it will be recorded. Fields private: a path field would escape.
+pub struct Failure<'a> {
+    why: &'a NotProduced,
+    /// The next attempt tees over this path in `results/`, so a copy is the only survivor.
+    log: &'a Path,
+    provenance: &'a serde_json::Value,
+}
+
+impl<'a> Failure<'a> {
+    pub fn new(
+        why: &'a NotProduced,
+        log: &'a Path,
+        provenance: &'a serde_json::Value,
+    ) -> Failure<'a> {
+        Failure {
+            why,
+            log,
+            provenance,
+        }
+    }
+}
+
+fn children(p: &Path) -> Result<Vec<PathBuf>> {
+    let rd = match std::fs::read_dir(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        other => other.with_context(|| format!("reading {}", p.display()))?,
+    };
+    rd.map(|e| Ok(e?.path()))
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| format!("reading {}", p.display()))
+}
+
+fn name_of(p: &Path) -> String {
+    p.file_name().unwrap_or_default().to_string_lossy().into()
+}
+
+fn next_attempt(per_key: &Path) -> Result<usize> {
+    let taken: std::collections::BTreeSet<usize> = children(per_key)?
+        .iter()
+        .filter_map(|p| name_of(p).parse().ok())
+        .collect();
+    (1..=taken.len() + 1)
+        .find(|n| !taken.contains(n))
+        .context("no free attempt number, which cannot happen for a set of that size")
+}
+
+/// `invocations` counts every ASK, a miss included: "0 misses" after paying for three is a lie.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Counts {
+    pub hits: usize,
+    pub invocations: usize,
+}
+
 pub struct Store {
     /// Never escapes this module: `entry_dir` is private, `load` hands back a
     /// [`Sealed`] (which yields no path), and `stats` hands back numbers — so no
@@ -571,6 +681,8 @@ pub struct Store {
     /// none can run a command in one.
     root: PathBuf,
     mode: Mode,
+    /// So "two hits per case" is OBSERVABLE: on the `Store`, not a process global.
+    tally: std::sync::Mutex<std::collections::BTreeMap<&'static str, Counts>>,
 }
 
 use crate::artifact::set_read_only;
@@ -578,16 +690,45 @@ use crate::artifact::set_read_only;
 impl Store {
     /// Open the store at `<repo>/results/.cache/`.
     ///
-    /// The level is load-bearing: every tree-walker is handed
-    /// `results/<dataset>/<agent>` or deeper (`oracle::runtests::discover_batteries` treats each
-    /// child as a battery, `stage_phase_for_runtests` symlinks each grandchild), so
+    /// The level is load-bearing: every tree-walker is handed `results/<dataset>/<agent>` or deeper, so
     /// sitting two levels above them all is what stops a cached crate being staged,
     /// built, or graded as if it were a case.
     pub fn open(repo_root: &Path, mode: Mode) -> Result<Self> {
         let root = repo_root.join("results").join(".cache");
         std::fs::create_dir_all(root.join("tmp"))
             .with_context(|| format!("creating cache at {}", root.display()))?;
-        Ok(Self { root, mode })
+        Ok(Self {
+            root,
+            mode,
+            tally: Default::default(),
+        })
+    }
+
+    fn count(&self, phase: &'static str, one: impl FnOnce(&mut Counts)) {
+        if let Ok(mut t) = self.tally.lock() {
+            one(t.entry(phase).or_default());
+        }
+    }
+
+    pub fn tally(&self) -> std::collections::BTreeMap<&'static str, Counts> {
+        self.tally.lock().map(|t| t.clone()).unwrap_or_default()
+    }
+
+    /// The line a sweep prints, `None` when nothing went through: zeroes read as "all cached".
+    pub fn tally_line(&self) -> Option<String> {
+        let t = self.tally();
+        if t.is_empty() {
+            return None;
+        }
+        let per_phase: Vec<String> = t
+            .iter()
+            .map(|(phase, c)| format!("{phase} {} hit / {} run", c.hits, c.invocations))
+            .collect();
+        let invocations: usize = t.values().map(|c| c.invocations).sum();
+        Some(format!(
+            "🗃️  cache: {} ({invocations} agent invocation(s))",
+            per_phase.join(", ")
+        ))
     }
 
     fn entry_dir(&self, inputs: &KeyInputs<'_>, key: &CacheKey) -> PathBuf {
@@ -598,13 +739,21 @@ impl Store {
             .join(key.as_str())
     }
 
+    /// A SIBLING of the phase dirs [`Self::entry_dir`] names, out of the loader's reach.
+    fn failed_dir(&self, inputs: &KeyInputs<'_>, key: &CacheKey) -> PathBuf {
+        self.root
+            .join(SCHEMA.to_string())
+            .join(FAILED)
+            .join(inputs.phase)
+            .join(inputs.agent.as_str())
+            .join(key.as_str())
+    }
+
     /// **The** execution path for an agent phase: a hit and a miss return the same type
     /// and are published identically, so the two cannot drift.
     ///
-    /// `compute` returning `Ok(None)` — the agent did not complete, or this agent has no
-    /// such phase — stores nothing at all, deliberately: a failure is a property of the
-    /// moment (an API outage, a timeout), not of the inputs, so memoising it would make
-    /// a transient failure permanent and identical on every future run.
+    /// [`Attempt::Nothing`] stores no SERVABLE entry, deliberately: a failure is a property of the
+    /// moment, not of the inputs, so memoising it would make a transient one permanent.
     /// `cli` is recorded in the entry but is not a key component, so it travels beside
     /// [`KeyInputs`] rather than inside it: every field of `KeyInputs` is fed to the hash, which
     /// is what makes "in the struct" and "in the key" the same statement.
@@ -613,15 +762,16 @@ impl Store {
         inputs: &KeyInputs<'_>,
         cli: &CliVersion,
         record: &Preimage,
-        compute: impl FnOnce() -> Result<Option<Produced<P>>>,
-    ) -> Result<Option<Obtained<P>>> {
+        compute: impl FnOnce() -> Result<Attempt<P>>,
+    ) -> Result<Resolved<P>> {
         let key = inputs.key();
         let dir = self.entry_dir(inputs, &key);
 
         match self.mode {
-            Mode::ReadWrite => match self.load(inputs, cli, &key, &dir) {
+            Mode::ReadWrite | Mode::ReplayOnly => match self.load(inputs, cli, &key, &dir) {
                 Ok(Some(Loaded { sealed, provenance })) => {
-                    return Ok(Some(Obtained {
+                    self.count(inputs.phase, |c| c.hits += 1);
+                    return Ok(Resolved::Obtained(Obtained {
                         sealed,
                         replayed: true,
                         key,
@@ -643,8 +793,17 @@ impl Store {
             Mode::Bypass => {}
         }
 
-        let Some(produced) = compute()? else {
-            return Ok(None);
+        // Above `compute`, which is where the money is: refusing instead is the whole mode.
+        if self.mode == Mode::ReplayOnly {
+            return Ok(Resolved::Unavailable);
+        }
+
+        // Counted before the outcome is known, because what it counts is that the agent RAN.
+        let attempt = compute()?;
+        self.count(inputs.phase, |c| c.invocations += 1);
+        let produced = match attempt {
+            Attempt::Produced(p) => p,
+            Attempt::Nothing(why) => return Ok(Resolved::Nothing(why)),
         };
         // LOUD BUT NOT FATAL. By this line the agent has run and the money is spent -- translate is
         // a measured $795.59 per harvest-bench sweep -- and `produced.sealed` exists. Propagating a
@@ -661,12 +820,96 @@ impl Store {
                 eprintln!("  cache: NOT stored, publishing anyway: {e:#}");
             }
         }
-        Ok(Some(Obtained {
+        Ok(Resolved::Obtained(Obtained {
             sealed: produced.sealed,
             replayed: false,
             key,
             provenance: produced.provenance,
         }))
+    }
+
+    /// Record a run that produced nothing, in a tree the loader cannot see: nothing is MEMOISED and the
+    /// evidence is KEPT — the next attempt tees over the transcript in `results/`, which is how three
+    /// `api_error` attempts became unexaminable. `<attempt>` counts existing records, so retries
+    /// accumulate; staged then renamed; and nothing here reads C2SaferRust's environment.
+    pub fn record_failure(
+        &self,
+        inputs: &KeyInputs<'_>,
+        cli: &CliVersion,
+        key: &CacheKey,
+        failure: &Failure<'_>,
+    ) -> Result<()> {
+        // An operator who asked for no cache did not ask for a tree of records in one.
+        if self.mode == Mode::Bypass {
+            return Ok(());
+        }
+        let per_key = self.failed_dir(inputs, key);
+        let attempt = next_attempt(&per_key)?;
+        let dest = per_key.join(attempt.to_string());
+
+        let staging = self
+            .root
+            .join("tmp")
+            .join(format!("{}.failed.{attempt}.partial", key.as_str()));
+        if staging.exists() {
+            set_read_only(&staging, Access::Writable)?;
+            std::fs::remove_dir_all(&staging)
+                .with_context(|| format!("clearing stale staging dir {}", staging.display()))?;
+        }
+        std::fs::create_dir_all(staging.join("agent"))?;
+
+        let mut meta = inputs.meta(key, cli);
+        meta["outcome"] = serde_json::json!(failure.why.outcome());
+        if let Some(h) = failure.why.health() {
+            meta["health"] = serde_json::json!(h);
+        }
+        meta["attempt"] = serde_json::json!(attempt);
+        // Merged rather than restated, so this and `<phase>.json` cannot disagree.
+        if let Some(fields) = failure.provenance.as_object() {
+            for (k, v) in fields {
+                meta[k] = v.clone();
+            }
+        }
+        std::fs::write(
+            staging.join("meta.json"),
+            serde_json::to_string_pretty(&meta)? + "\n",
+        )?;
+        if failure.log.is_file() {
+            std::fs::copy(failure.log, staging.join("agent").join("run.log"))
+                .with_context(|| format!("copying the transcript {}", failure.log.display()))?;
+        }
+
+        for e in std::fs::read_dir(&staging)? {
+            set_read_only(&e?.path(), Access::ReadOnly)?;
+        }
+        std::fs::create_dir_all(&per_key)?;
+        std::fs::rename(&staging, &dest)
+            .with_context(|| format!("renaming {} into place", staging.display()))?;
+        set_read_only(&dest, Access::ReadOnly)?;
+        eprintln!("  cache: recorded the failed run at {}", dest.display());
+        Ok(())
+    }
+
+    /// For `harvest-tools cache failures`: a record nobody can list is not a record.
+    pub fn failures(&self) -> Result<Vec<(String, String, String, String)>> {
+        let mut out = Vec::new();
+        let root = self.root.join(SCHEMA.to_string()).join(FAILED);
+        for phase in children(&root)? {
+            for agent in children(&phase)? {
+                for key in children(&agent)? {
+                    for attempt in children(&key)? {
+                        out.push((
+                            name_of(&phase),
+                            name_of(&agent),
+                            name_of(&key),
+                            name_of(&attempt),
+                        ));
+                    }
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     /// Move a suspect entry aside, keeping it readable for a post-mortem. Reports failure
@@ -868,20 +1111,11 @@ impl Store {
     }
 
     /// Entry count and byte size of the servable entries, for `harvest-tools cache stats`:
-    /// quarantined and half-written trees sit outside the schema dir and are not counted.
+    /// quarantined and half-written trees sit outside the schema dir and are not counted, and neither
+    /// are recorded failures: a walk taking [`FAILED`] for a phase would count its agents as entries.
     /// A read failure is reported, never counted as zero — an unreadable store is not an
     /// empty one.
     pub fn stats(&self) -> Result<(usize, u64)> {
-        /// A missing directory is an empty store, not a fault: nothing has been stored yet.
-        fn children(p: &Path) -> Result<Vec<PathBuf>> {
-            let rd = match std::fs::read_dir(p) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-                other => other.with_context(|| format!("reading {}", p.display()))?,
-            };
-            rd.map(|e| Ok(e?.path()))
-                .collect::<Result<Vec<_>>>()
-                .with_context(|| format!("reading {}", p.display()))
-        }
         fn bytes(p: &Path) -> Result<u64> {
             let mut total = 0;
             for child in children(p)? {
@@ -899,6 +1133,9 @@ impl Store {
         let mut entries = 0usize;
         let mut total = 0u64;
         for phase in children(&self.root.join(SCHEMA.to_string()))? {
+            if phase.file_name().is_some_and(|n| n == FAILED) {
+                continue;
+            }
             for agent in children(&phase)? {
                 for key in children(&agent)? {
                     entries += 1;
@@ -1438,7 +1675,8 @@ pub(crate) mod tests {
 
     /// `edit` stands in for the agent's change to the crate.
     fn seal_verify(case: &Path, edit: &str) -> Sealed<Verify> {
-        let translated = Sealed::<Translate>::adopt(case).unwrap();
+        let translated =
+            crate::artifact::Published::<Translate>::unkeyed_from_phase_dir(case).unwrap();
         let work: WorkTree<Verify> = translated
             .materialise_into(Scratch::new("cache-test-").unwrap())
             .unwrap();
@@ -1508,10 +1746,13 @@ pub(crate) mod tests {
         let first = store
             .obtain(&inputs, &test_cli(), &test_record(), || {
                 runs += 1;
-                Ok(Some(produced(&f.case, "pub fn a() { /* v1 */ }")))
+                Ok(Attempt::Produced(produced(
+                    &f.case,
+                    "pub fn a() { /* v1 */ }",
+                )))
             })
             .unwrap()
-            .unwrap();
+            .obtained();
         assert!(!first.replayed);
         assert_eq!(runs, 1);
 
@@ -1521,7 +1762,7 @@ pub(crate) mod tests {
                 panic!("the agent must NOT be invoked on a hit — that is the entire point");
             })
             .unwrap()
-            .unwrap();
+            .obtained();
         assert!(
             second.replayed,
             "the second obtain must be served from the store"
@@ -1534,6 +1775,205 @@ pub(crate) mod tests {
         );
     }
 
+    /// A run that produced nothing is RECORDED — reason, transcript, key components — never SERVED.
+    #[test]
+    fn a_failed_run_is_recorded_where_the_loader_cannot_see_it() {
+        let f = fixture();
+        let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        let held = Inputs::new();
+        let inputs = held.key_inputs();
+        let key = inputs.key();
+
+        let why = NotProduced::DidNotComplete {
+            health:
+                "Infra { reason: \"api_error\", detail: \"terminal_reason=api_error (HTTP 403)\" }"
+                    .into(),
+        };
+        let provenance = serde_json::json!({
+            "agent": "claude", "duration_secs": 91, "success": false,
+            "exit_code": 124, "timed_out": true, "timestamp": "2026-08-17T20:23:00Z",
+        });
+        let attempt_1 = f.repo.join("attempt-1.log");
+        std::fs::write(&attempt_1, "attempt 1: 40 tool calls, then a 403\n").unwrap();
+
+        let outcome = store
+            .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || {
+                Ok(Attempt::Nothing(why.clone()))
+            })
+            .unwrap();
+        assert!(outcome.is_nothing(), "the attempt produced nothing");
+        store
+            .record_failure(
+                &inputs,
+                &test_cli(),
+                &key,
+                &Failure::new(&why, &attempt_1, &provenance),
+            )
+            .unwrap();
+
+        for phase in [<Translate as Phase>::DIR, <Verify as Phase>::DIR] {
+            assert_ne!(
+                phase, FAILED,
+                "a phase named {FAILED} would put a recorded failure on a servable path"
+            );
+        }
+        let recorded = f
+            .repo
+            .join("results/.cache")
+            .join(SCHEMA.to_string())
+            .join(FAILED)
+            .join(<Verify as Phase>::DIR)
+            .join(held.agent.as_str())
+            .join(key.as_str())
+            .join("1");
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(recorded.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["outcome"], serde_json::json!("did_not_complete"));
+        assert!(
+            meta["health"].as_str().is_some_and(|h| h.contains("403")),
+            "the classification is the whole of WHY, and it is decided too deep in the phase to \
+             be re-derived here: {meta}"
+        );
+        assert_eq!(meta["exit_code"], serde_json::json!(124), "{meta}");
+        assert_eq!(meta["timed_out"], serde_json::json!(true), "{meta}");
+        assert_eq!(
+            meta["input_tree"].as_str(),
+            Some(held.tree_for_test()),
+            "and every key component, so the record can be matched back to the request: {meta}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(recorded.join("agent/run.log")).unwrap(),
+            "attempt 1: 40 tool calls, then a 403\n",
+            "the transcript is the entire post-mortem; the next attempt tees over the one in \
+             results/, so this copy is the only one that survives"
+        );
+        assert!(
+            std::fs::write(recorded.join("meta.json"), "tampered").is_err(),
+            "and evidence must not be editable in place, as a success entry is not"
+        );
+
+        let mut fields: Vec<&str> = meta
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "agent",
+                "attempt",
+                "cli",
+                "duration_secs",
+                "exit_code",
+                "harness",
+                "health",
+                "input_tree",
+                "key",
+                "model",
+                "outcome",
+                "phase",
+                "prompt",
+                "recipe",
+                "schema",
+                "success",
+                "timed_out",
+                "timestamp",
+                "toolchain",
+            ]
+        );
+
+        let mut ran = false;
+        let got = store
+            .obtain(&inputs, &test_cli(), &test_record(), || {
+                ran = true;
+                Ok(Attempt::Produced(produced(
+                    &f.case,
+                    "pub fn a() { /* the retry that worked */ }",
+                )))
+            })
+            .unwrap()
+            .obtained();
+        assert!(ran, "a recorded failure must never be replayed as a result");
+        assert!(!got.replayed);
+        assert_eq!(
+            store.stats().unwrap().0,
+            1,
+            "and it is not a servable entry: `failed/` is a sibling of the phase dirs, so a walk \
+             that took it for one would count every agent under it as an entry"
+        );
+
+        let attempt_2 = f.repo.join("attempt-2.log");
+        std::fs::write(&attempt_2, "attempt 2: died before the first tool call\n").unwrap();
+        store
+            .record_failure(
+                &inputs,
+                &test_cli(),
+                &key,
+                &Failure::new(&NotProduced::DoesNotCompile, &attempt_2, &provenance),
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(recorded.join("agent/run.log")).unwrap(),
+            "attempt 1: 40 tool calls, then a 403\n",
+            "the first attempt's transcript must survive the second"
+        );
+        assert_eq!(
+            std::fs::read_to_string(recorded.with_file_name("2").join("agent/run.log")).unwrap(),
+            "attempt 2: died before the first tool call\n"
+        );
+        assert_eq!(
+            store.failures().unwrap(),
+            vec![
+                (
+                    <Verify as Phase>::DIR.to_string(),
+                    held.agent.as_str().to_string(),
+                    key.as_str().to_string(),
+                    "1".to_string()
+                ),
+                (
+                    <Verify as Phase>::DIR.to_string(),
+                    held.agent.as_str().to_string(),
+                    key.as_str().to_string(),
+                    "2".to_string()
+                ),
+            ],
+            "and both are listable, because a record nobody can list is not a record"
+        );
+    }
+
+    #[test]
+    fn a_bypassed_store_records_no_failure() {
+        let f = fixture();
+        let store = Store::open(&f.repo, Mode::Bypass).unwrap();
+        let held = Inputs::new();
+        let inputs = held.key_inputs();
+        let log = f.repo.join("bypassed.log");
+        std::fs::write(&log, "a transcript\n").unwrap();
+        store
+            .record_failure(
+                &inputs,
+                &test_cli(),
+                &inputs.key(),
+                &Failure::new(&NotProduced::DoesNotCompile, &log, &serde_json::json!({})),
+            )
+            .unwrap();
+        assert!(store.failures().unwrap().is_empty());
+
+        // Non-vacuity: the same call against a read-write store DOES record one.
+        let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
+        rw.record_failure(
+            &inputs,
+            &test_cli(),
+            &inputs.key(),
+            &Failure::new(&NotProduced::DoesNotCompile, &log, &serde_json::json!({})),
+        )
+        .unwrap();
+        assert_eq!(rw.failures().unwrap().len(), 1);
+    }
+
     #[test]
     fn a_failed_invocation_is_not_stored() {
         // An API outage is a property of the moment, not of the inputs; memoising it
@@ -1544,9 +1984,11 @@ pub(crate) mod tests {
         let inputs = owned.key_inputs();
 
         let out = store
-            .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || Ok(None))
+            .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || {
+                Ok(Attempt::Nothing(NotProduced::DoesNotCompile))
+            })
             .unwrap();
-        assert!(out.is_none());
+        assert!(out.is_nothing());
         assert_eq!(
             store.stats().unwrap().0,
             0,
@@ -1557,10 +1999,13 @@ pub(crate) mod tests {
         store
             .obtain(&inputs, &test_cli(), &test_record(), || {
                 ran = true;
-                Ok(Some(produced(&f.case, "pub fn a() { /* recovered */ }")))
+                Ok(Attempt::Produced(produced(
+                    &f.case,
+                    "pub fn a() { /* recovered */ }",
+                )))
             })
             .unwrap()
-            .unwrap();
+            .obtained();
         assert!(
             ran,
             "a later run must get another chance, not a cached failure"
@@ -1575,7 +2020,7 @@ pub(crate) mod tests {
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         rw.obtain(&inputs, &test_cli(), &test_record(), || {
-            Ok(Some(produced(&f.case, "pub fn a() {}")))
+            Ok(Attempt::Produced(produced(&f.case, "pub fn a() {}")))
         })
         .unwrap();
         assert_eq!(rw.stats().unwrap().0, 1);
@@ -1585,10 +2030,13 @@ pub(crate) mod tests {
         let got = off
             .obtain(&inputs, &test_cli(), &test_record(), || {
                 ran = true;
-                Ok(Some(produced(&f.case, "pub fn a() { /* again */ }")))
+                Ok(Attempt::Produced(produced(
+                    &f.case,
+                    "pub fn a() { /* again */ }",
+                )))
             })
             .unwrap()
-            .unwrap();
+            .obtained();
         assert!(ran, "bypass must not read");
         assert!(!got.replayed);
         assert_eq!(
@@ -1607,18 +2055,24 @@ pub(crate) mod tests {
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let old = rw
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(produced(&f.case, "pub fn a() { /* old */ }")))
+                Ok(Attempt::Produced(produced(
+                    &f.case,
+                    "pub fn a() { /* old */ }",
+                )))
             })
             .unwrap()
-            .unwrap();
+            .obtained();
 
         let refresh = Store::open(&f.repo, Mode::Refresh).unwrap();
         let new = refresh
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(produced(&f.case, "pub fn a() { /* new */ }")))
+                Ok(Attempt::Produced(produced(
+                    &f.case,
+                    "pub fn a() { /* new */ }",
+                )))
             })
             .unwrap()
-            .unwrap();
+            .obtained();
         assert!(!new.replayed, "refresh must re-run");
         assert_ne!(old.sealed.digest(), new.sealed.digest());
 
@@ -1626,7 +2080,7 @@ pub(crate) mod tests {
         let after = rw
             .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || panic!("must hit"))
             .unwrap()
-            .unwrap();
+            .obtained();
         assert_eq!(
             after.sealed.digest(),
             new.sealed.digest(),
@@ -1646,16 +2100,21 @@ pub(crate) mod tests {
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let paid_for = rw
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(produced(&f.case, "pub fn a() { /* paid for */ }")))
+                Ok(Attempt::Produced(produced(
+                    &f.case,
+                    "pub fn a() { /* paid for */ }",
+                )))
             })
             .unwrap()
-            .unwrap();
+            .obtained();
 
         let aborted = Store::open(&f.repo, Mode::Refresh)
             .unwrap()
-            .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || Ok(None))
+            .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || {
+                Ok(Attempt::Nothing(NotProduced::DoesNotCompile))
+            })
             .unwrap();
-        assert!(aborted.is_none(), "the forced run produced nothing");
+        assert!(aborted.is_nothing(), "the forced run produced nothing");
 
         assert_eq!(
             rw.stats().unwrap().0,
@@ -1667,7 +2126,7 @@ pub(crate) mod tests {
                 panic!("the entry must still be servable")
             })
             .unwrap()
-            .unwrap();
+            .obtained();
         assert_eq!(
             served.sealed.digest(),
             paid_for.sealed.digest(),
@@ -1694,18 +2153,24 @@ pub(crate) mod tests {
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let old = rw
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(produced(&f.case, "pub fn a() { /* suspect */ }")))
+                Ok(Attempt::Produced(produced(
+                    &f.case,
+                    "pub fn a() { /* suspect */ }",
+                )))
             })
             .unwrap()
-            .unwrap();
+            .obtained();
 
         Store::open(&f.repo, Mode::Refresh)
             .unwrap()
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(produced(&f.case, "pub fn a() { /* new */ }")))
+                Ok(Attempt::Produced(produced(
+                    &f.case,
+                    "pub fn a() { /* new */ }",
+                )))
             })
             .unwrap()
-            .unwrap();
+            .obtained();
 
         let kept = f.repo.join("results/.cache/quarantine").join(key.as_str());
         assert!(
@@ -1725,10 +2190,13 @@ pub(crate) mod tests {
         Store::open(&f.repo, Mode::Refresh)
             .unwrap()
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(produced(&f.case, "pub fn a() { /* newer */ }")))
+                Ok(Attempt::Produced(produced(
+                    &f.case,
+                    "pub fn a() { /* newer */ }",
+                )))
             })
             .unwrap()
-            .unwrap();
+            .obtained();
         assert!(
             kept.is_dir(),
             "the first copy must survive a second refresh"
@@ -1753,13 +2221,16 @@ pub(crate) mod tests {
 
         let rw = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         rw.obtain(&inputs, &test_cli(), &test_record(), || {
-            Ok(Some(produced(&f.case, "pub fn a() {}")))
+            Ok(Attempt::Produced(produced(&f.case, "pub fn a() {}")))
         })
         .unwrap();
         Store::open(&f.repo, Mode::Refresh)
             .unwrap()
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(produced(&f.case, "pub fn a() { /* new */ }")))
+                Ok(Attempt::Produced(produced(
+                    &f.case,
+                    "pub fn a() { /* new */ }",
+                )))
             })
             .unwrap();
 
@@ -1797,7 +2268,7 @@ pub(crate) mod tests {
         std::fs::write(&log, "the transcript the invocation teed\n").unwrap();
         store
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(Produced {
+                Ok(Attempt::Produced(Produced {
                     sealed: seal_verify(&f.case, "pub fn a() {}"),
                     log: log.clone(),
                     provenance: serde_json::Value::Null,
@@ -1831,7 +2302,7 @@ pub(crate) mod tests {
         let key = inputs.key();
         store
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(produced(&f.case, "pub fn a() {}")))
+                Ok(Attempt::Produced(produced(&f.case, "pub fn a() {}")))
             })
             .unwrap();
 
@@ -1844,10 +2315,13 @@ pub(crate) mod tests {
         let got = store
             .obtain(&inputs, &test_cli(), &test_record(), || {
                 ran = true;
-                Ok(Some(produced(&f.case, "pub fn a() { /* honest */ }")))
+                Ok(Attempt::Produced(produced(
+                    &f.case,
+                    "pub fn a() { /* honest */ }",
+                )))
             })
             .unwrap()
-            .unwrap();
+            .obtained();
         assert!(
             ran,
             "an entry that cannot say what it cost must be recomputed"
@@ -1877,10 +2351,10 @@ pub(crate) mod tests {
 
         store
             .obtain(&inputs, &test_cli(), &record, || {
-                Ok(Some(produced(&f.case, "pub fn a() {}")))
+                Ok(Attempt::Produced(produced(&f.case, "pub fn a() {}")))
             })
             .unwrap()
-            .unwrap();
+            .obtained();
 
         let dir = store.entry_dir(&inputs, &key);
 
@@ -1953,10 +2427,10 @@ pub(crate) mod tests {
         // Non-vacuity first: with the store writable, this very call DOES produce an entry.
         let ok = store
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(produced(&f.case, "pub fn a() {}")))
+                Ok(Attempt::Produced(produced(&f.case, "pub fn a() {}")))
             })
             .expect("a writable store must store")
-            .expect("and must publish");
+            .obtained();
         assert!(!ok.replayed);
         assert_eq!(store.stats().unwrap().0, 1, "the fixture really can store");
 
@@ -1968,14 +2442,14 @@ pub(crate) mod tests {
         crate::artifact::set_read_only(&cache_root, Access::ReadOnly).unwrap();
 
         let out = store.obtain(&other_inputs, &test_cli(), &test_record(), || {
-            Ok(Some(produced(&f.case, "pub fn b() {}")))
+            Ok(Attempt::Produced(produced(&f.case, "pub fn b() {}")))
         });
 
         crate::artifact::set_read_only(&cache_root, Access::Writable).unwrap();
 
         let obtained = out
             .expect("a store failure must NOT propagate: the agent already ran and was paid for")
-            .expect("and the sealed artifact must still be handed back to be published");
+            .obtained();
         assert!(
             !obtained.replayed,
             "an unstored artifact is fresh, so the next run recomputes rather than expecting a hit"
@@ -2004,15 +2478,15 @@ pub(crate) mod tests {
 
         store
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(produced(&f.case, "pub fn a() {}")))
+                Ok(Attempt::Produced(produced(&f.case, "pub fn a() {}")))
             })
             .expect("a stale locked staging dir must not block the write")
-            .unwrap();
+            .obtained();
         assert!(
             store
                 .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || panic!("must hit"))
                 .unwrap()
-                .unwrap()
+                .obtained()
                 .replayed
         );
     }
@@ -2028,7 +2502,7 @@ pub(crate) mod tests {
         let key = inputs.key();
         store
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(produced(&f.case, "pub fn a() {}")))
+                Ok(Attempt::Produced(produced(&f.case, "pub fn a() {}")))
             })
             .unwrap();
 
@@ -2053,16 +2527,16 @@ pub(crate) mod tests {
         let inputs = owned.key_inputs();
         store
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(produced(&f.case, "pub fn a() {}")))
+                Ok(Attempt::Produced(produced(&f.case, "pub fn a() {}")))
             })
             .unwrap();
 
         let replay = store
             .obtain::<Verify>(&inputs, &test_cli(), &test_record(), || panic!("must hit"))
             .unwrap()
-            .unwrap();
+            .obtained();
         assert!(replay.replayed);
-        replay.sealed.publish(&f.case).unwrap();
+        replay.sealed.publish(&f.case).unwrap().finish().unwrap();
 
         let published = f.case.join(<Verify as Phase>::DIR);
         std::fs::write(
@@ -2081,7 +2555,7 @@ pub(crate) mod tests {
         let key = inputs.key();
         store
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(produced(&f.case, "pub fn a() {}")))
+                Ok(Attempt::Produced(produced(&f.case, "pub fn a() {}")))
             })
             .unwrap();
 
@@ -2098,10 +2572,13 @@ pub(crate) mod tests {
         let got = store
             .obtain(&inputs, &test_cli(), &test_record(), || {
                 ran = true;
-                Ok(Some(produced(&f.case, "pub fn a() { /* honest */ }")))
+                Ok(Attempt::Produced(produced(
+                    &f.case,
+                    "pub fn a() { /* honest */ }",
+                )))
             })
             .unwrap()
-            .unwrap();
+            .obtained();
         assert!(ran, "a corrupted entry must be recomputed, never served");
         assert!(!got.replayed);
         assert!(
@@ -2123,7 +2600,7 @@ pub(crate) mod tests {
         let inputs = owned.key_inputs();
         store
             .obtain(&inputs, &test_cli(), &test_record(), || {
-                Ok(Some(produced(&f.case, "pub fn a() {}")))
+                Ok(Attempt::Produced(produced(&f.case, "pub fn a() {}")))
             })
             .unwrap();
 
