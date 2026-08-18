@@ -66,15 +66,16 @@ fn main() -> Result<()> {
             let inner = Dataset::strip_prefix(target);
             let bench = benchmark::for_dataset(dataset);
 
-            bench.translate(&paths, inner, include_regex.as_deref(), parallel)?;
+            let translations =
+                bench.translate(&paths, inner, include_regex.as_deref(), parallel)?;
             if !no_verify && bench.verifies(agent) {
                 bench.verify(
-                    &repo_root,
                     &paths,
                     inner,
                     include_regex.as_deref(),
                     false,
                     parallel,
+                    &translations,
                 )?;
             }
             // `Update` covers enrichment and table regeneration; no separate steps.
@@ -138,13 +139,28 @@ fn main() -> Result<()> {
                  to verify. Its `translated/` result is what gets scored (`test`).",
                 format!("{agent:?}").to_lowercase(),
             );
-            bench.verify(
+            // Verify is seeded from a translation THIS RUN resolved, so translations are resolved first —
+            // through `cli::seeding`, a store that may only REPLAY. A command named `verify` must not pay
+            // the translate agent or replace what it checks, and `--force` reaches verify and nothing else.
+            let seeds = battery::Paths::new(
                 &repo_root,
+                agent,
+                dataset,
+                model,
+                cli::seeding(cache)?,
+                harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
+                    cli.allow_unsandboxed,
+                ),
+            )?;
+            let translations =
+                bench.translate(&seeds, inner, include_regex.as_deref(), parallel)?;
+            bench.verify(
                 &paths,
                 inner,
                 include_regex.as_deref(),
                 force,
                 parallel,
+                &translations,
             )?;
         }
         Command::Cache { action } => match action {
@@ -157,6 +173,20 @@ fn main() -> Result<()> {
                     bytes as f64 / 1_048_576.0,
                     repo_root.display()
                 );
+            }
+            cli::CacheAction::Failures => {
+                let store = cache::Store::open(&repo_root, cache::Mode::Bypass)?;
+                let failures = store.failures()?;
+                println!(
+                    "{} recorded failure(s) under {}/results/.cache/{}/{}",
+                    failures.len(),
+                    repo_root.display(),
+                    cache::SCHEMA,
+                    cache::FAILED
+                );
+                for (phase, agent, key, attempt) in &failures {
+                    println!("  {phase:<10} {agent:<12} {key}  attempt {attempt}");
+                }
             }
         },
         Command::Test {

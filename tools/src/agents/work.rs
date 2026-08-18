@@ -1,6 +1,6 @@
 //! The tree an agent is given to work in, and what it takes to get its output back out.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 /// One phase's working copy, expressed in terms of [`crate::artifact`].
@@ -51,12 +51,13 @@ impl IsolatedWorkDir<crate::artifact::Translate> {
     }
 }
 
-/// Seeding a verification from a sealed translation is the other transition this type
-/// materialises; [`crate::artifact::SeededBy`] is what stops any other pair compiling.
+/// Seeding a verification from a translation THIS RUN PUBLISHED is this type's other transition. A
+/// [`crate::artifact::Published`] value, never a `case_dir`: `Sealed::adopt` took a directory and
+/// no proof, so verify's input was whatever `translated/` held — five days old, measured.
 impl IsolatedWorkDir<crate::artifact::Verify> {
-    pub fn new(case_dir: &Path) -> Result<Self> {
-        let translated = crate::artifact::Sealed::<crate::artifact::Translate>::adopt(case_dir)
-            .context("adopting translated/ as a sealed artifact")?;
+    pub fn new(
+        translated: &crate::artifact::Published<crate::artifact::Translate>,
+    ) -> Result<Self> {
         let scratch = crate::artifact::Scratch::new("harvest-work-")?;
         let input = translated.digest().clone();
         let seed = translated.as_seed();

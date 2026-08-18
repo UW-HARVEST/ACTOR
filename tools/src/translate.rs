@@ -11,16 +11,45 @@ use crate::agents::session::{ClaudeRun, Session};
 use crate::agents::work::IsolatedWorkDir;
 use crate::agents::Semaphore;
 use crate::analyse::cargo_toml::{self, CargoToml};
-use crate::artifact::Translate;
+use crate::artifact::{Published, Publishing, Translate};
 use crate::battery::{self, Case, Paths};
-use crate::cache::{self, CliVersion, ModelId, Produced, Store};
+use crate::cache::{self, Attempt, CliVersion, ModelId, Produced, Store};
 use crate::cli::Agent;
 use crate::io::workdir::Roots;
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// What a translate sweep RESOLVED, by case dir — a case's only collision-free name. THE hand-off
+/// medium: a case absent from it had no translation resolved THIS RUN, a `None`, not a `stat`.
+pub type Translations = HashMap<PathBuf, Published<Translate>>;
+
+/// How many resolved translations under `prefix` no key names, so the phase that DERIVES A NUMBER from
+/// them can say so — nothing in a phase dir records the model or prompt behind it.
+pub fn unkeyed_seeds(translations: &Translations, prefix: &Path) -> usize {
+    translations
+        .iter()
+        .filter(|(dir, t)| {
+            dir.starts_with(prefix) && t.keying() == crate::artifact::Keying::Unkeyable
+        })
+        .count()
+}
+
+/// What one translate path produced: a [`Publishing`], since post-processing is per-case.
+struct Translated {
+    recorded: RecordedBy,
+    publishing: Publishing<Translate>,
+}
+
+/// What one translate path RESOLVED: `Recorded` ran and left its record, `Unavailable` never ran.
+enum Resolution {
+    Published(Translated),
+    Recorded,
+    Unavailable,
+}
 
 /// Wall-clock cap on one agentic session. Reaches the command through
 /// [`crate::agents::session::Session`], which is also what the cache key records.
@@ -35,8 +64,6 @@ fn opencode_model(paths: &Paths) -> Result<crate::agents::opencode::Model> {
     )?;
     crate::agents::opencode::parse_model(raw)
 }
-
-// ── Result type ────────────────────────────────────────────────────────
 
 struct CaseResult {
     name: String,
@@ -83,8 +110,6 @@ impl CaseResult {
     }
 }
 
-// ── Public entry point ─────────────────────────────────────────────────
-
 /// Zero discovered cases almost always means a case dir was passed where a battery
 /// was expected, so the message spells the layout out rather than reporting
 /// "0/0 translated".
@@ -112,7 +137,7 @@ pub fn run_test_corpus(
     battery_name: &str,
     filter: Option<&str>,
     parallel: usize,
-) -> Result<()> {
+) -> Result<Translations> {
     preflight_check(paths.agent)?;
     let skip = translate_skip_check(paths);
 
@@ -133,8 +158,8 @@ pub fn run_test_corpus(
         }
     }
 
-    // ── Parallel: independent cases ────────────────────────────────────
     let sem = Semaphore::new(parallel);
+    let mut resolved: Translations = HashMap::new();
     let ind_results: Vec<CaseResult> = std::thread::scope(|s| {
         let handles: Vec<(String, _)> = independent
             .iter()
@@ -153,8 +178,15 @@ pub fn run_test_corpus(
             .into_iter()
             .map(|(name, h)| {
                 let case_dir = output_dir.join(&name);
-                h.join()
-                    .unwrap_or_else(|e| CaseResult::panicked(name, &case_dir, &paths.agent_key, e))
+                match h.join() {
+                    Ok((r, published)) => {
+                        if let Some(p) = published {
+                            resolved.insert(case_dir, p);
+                        }
+                        r
+                    }
+                    Err(e) => CaseResult::panicked(name, &case_dir, &paths.agent_key, e),
+                }
             })
             .collect()
     });
@@ -181,10 +213,12 @@ pub fn run_test_corpus(
         }
     }
 
-    // ── Sequential: shared-source groups ───────────────────────────────
     for group in &shared {
         current += 1;
-        let r = translate_one_shared(paths, &output_dir, battery_name, group);
+        let (r, published) = translate_one_shared(paths, &output_dir, battery_name, group);
+        if let Some(p) = published {
+            resolved.insert(output_dir.join(&group.real_case), p);
+        }
 
         if r.skipped {
             translated += 1;
@@ -225,10 +259,68 @@ pub fn run_test_corpus(
 
     println!();
     println!("Done: {translated}/{total} translated, {failed} failed");
-    Ok(())
+    if let Some(line) = store.tally_line() {
+        println!("{line}");
+    }
+    Ok(resolved)
 }
 
-// ── Per-case translation (no shared state) ─────────────────────────────
+/// Can this sweep PAY for a translation? Not under [`cache::Mode::ReplayOnly`]. Decided once, here.
+fn resolvable(paths: &Paths, skip: SkipCheck) -> bool {
+    paths.cache_mode != cache::Mode::ReplayOnly || skip == SkipCheck::Keyed
+}
+
+fn unavailable(
+    name: &str,
+    case_dir: &Path,
+    agent: &crate::cache::AgentKey,
+) -> (CaseResult, Option<Published<Translate>>) {
+    run_and_record(
+        name,
+        case_dir,
+        agent,
+        || Ok(Resolution::Unavailable),
+        |_| Ok(()),
+    )
+}
+
+/// Already published, and taken as this run's translation because NO KEY EXISTS to ask for a better
+/// one — an unkeyed backend, or a group whose store is [`SHARED_SOURCE_CACHE`]. Reached only where
+/// [`SkipCheck::WhateverIsPublished`] is all that can be asked, so a keyed phase still resolves
+/// through the store or not at all.
+///
+/// Resolving NOTHING here left `--agent opencode` and every symlinked-config battery unable to
+/// verify at all: neither has an entry to replay, ever.
+fn from_published_tree(name: &str, case_dir: &Path) -> (CaseResult, Option<Published<Translate>>) {
+    let mut result = CaseResult {
+        name: name.to_owned(),
+        elapsed_secs: 0,
+        success: true,
+        error: None,
+        skipped: true,
+    };
+    match Published::<Translate>::unkeyed_from_phase_dir(case_dir) {
+        Ok(published) => {
+            // Per case, beside the other measurement caveats: nothing here names what produced it.
+            eprintln!(
+                "  ⚠️  {name}: seeded from the {} already published — no key names it, so the \
+                 freshness guarantee does not cover this case",
+                crate::battery::TRANSLATED
+            );
+            (result, Some(published))
+        }
+        // A skip reporting success while handing on nothing is what left verify with no seed.
+        Err(e) => {
+            result.success = false;
+            result.skipped = false;
+            result.error = Some(format!(
+                "the published {} cannot be digested, so no phase can be seeded from it: {e:#}",
+                crate::battery::TRANSLATED
+            ));
+            (result, None)
+        }
+    }
+}
 
 fn translate_one_independent(
     paths: &Paths,
@@ -237,37 +329,31 @@ fn translate_one_independent(
     case: &battery::IndependentCase,
     store: &Store,
     skip: SkipCheck,
-) -> CaseResult {
+) -> (CaseResult, Option<Published<Translate>>) {
+    let case_dir = output_dir.join(&case.name);
     if skip.already_done(|| {
         crate::battery::has_crate(&crate::battery::phase_dir(
-            &output_dir.join(&case.name),
+            &case_dir,
             crate::battery::TRANSLATED,
         ))
     }) {
-        return CaseResult {
-            name: case.name.clone(),
-            elapsed_secs: 0,
-            success: true,
-            error: None,
-            skipped: true,
-        };
+        return from_published_tree(&case.name, &case_dir);
+    }
+    if !resolvable(paths, skip) {
+        return unavailable(&case.name, &case_dir, &paths.agent_key);
     }
 
     run_and_record(
         &case.name,
-        &output_dir.join(&case.name),
+        &case_dir,
         &paths.agent_key,
         || dispatch_translate(paths, battery_name, &case.name, case.is_lib, store),
-        || {
+        |tree| {
             if paths.agent == Agent::ClaudeCrossPrompt {
                 // E4: the agent's lib-vs-bin choice IS the experiment, so it must not
                 // be overridden here; `[workspace]` is still needed so cargo does not
                 // absorb each case into a parent workspace.
-                let cargo_path = crate::battery::phase_dir(
-                    &paths.case_dir(battery_name, &case.name),
-                    crate::battery::TRANSLATED,
-                )
-                .join("Cargo.toml");
+                let cargo_path = tree.join("Cargo.toml");
                 if cargo_path.exists() {
                     if let Ok(mut cargo) = CargoToml::open(&cargo_path) {
                         cargo.add_workspace();
@@ -276,7 +362,7 @@ fn translate_one_independent(
                 }
                 Ok(())
             } else {
-                post_process_independent(paths, battery_name, &case.name, case.is_lib)
+                post_process_independent(paths, battery_name, &case.name, case.is_lib, tree)
             }
         },
     )
@@ -289,19 +375,19 @@ fn translate_one_shared(
     output_dir: &Path,
     battery_name: &str,
     group: &battery::SharedSourceGroup,
-) -> CaseResult {
+) -> (CaseResult, Option<Published<Translate>>) {
     let real_dir = output_dir.join(&group.real_case);
-    if crate::battery::has_crate(&crate::battery::phase_dir(
-        &real_dir,
-        crate::battery::TRANSLATED,
-    )) {
-        return CaseResult {
-            name: group.real_case.clone(),
-            elapsed_secs: 0,
-            success: true,
-            error: None,
-            skipped: true,
-        };
+    let skip = SkipCheck::Keyed.through(SHARED_SOURCE_CACHE);
+    if skip.already_done(|| {
+        crate::battery::has_crate(&crate::battery::phase_dir(
+            &real_dir,
+            crate::battery::TRANSLATED,
+        ))
+    }) {
+        return from_published_tree(&group.real_case, &real_dir);
+    }
+    if !resolvable(paths, skip) {
+        return unavailable(&group.real_case, &real_dir, &paths.agent_key);
     }
 
     println!(
@@ -314,11 +400,8 @@ fn translate_one_shared(
         &real_dir,
         &paths.agent_key,
         || dispatch_translate_shared(paths, battery_name, &group.real_case),
-        || {
-            if let Ok(mut cargo) = CargoToml::open(
-                &crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED)
-                    .join("Cargo.toml"),
-            ) {
+        |tree| {
+            if let Ok(mut cargo) = CargoToml::open(&tree.join("Cargo.toml")) {
                 cargo.add_workspace();
                 let features = battery::extract_features_from_path(
                     &paths
@@ -327,12 +410,8 @@ fn translate_one_shared(
                         .join("CMakePresets.json"),
                 )
                 .unwrap_or_default();
-                let resolved = battery::resolve_features(
-                    &crate::battery::phase_dir(&real_dir, crate::battery::TRANSLATED)
-                        .join("Cargo.toml"),
-                    &features,
-                )
-                .unwrap_or_default();
+                let resolved = battery::resolve_features(&tree.join("Cargo.toml"), &features)
+                    .unwrap_or_default();
                 if !resolved.is_empty() {
                     cargo.set_default_features(&resolved);
                 }
@@ -342,8 +421,6 @@ fn translate_one_shared(
         },
     )
 }
-
-// ── DRY dispatch helpers ───────────────────────────────────────────────
 
 /// Who wrote `translation.json`: [`run_cached`] does for the phase it drives, carrying the entry
 /// a replay served and the exit code the infra audit reads — a second write would blank both.
@@ -356,27 +433,75 @@ fn run_and_record(
     name: &str,
     case_dir: &Path,
     agent: &crate::cache::AgentKey,
-    translate_fn: impl FnOnce() -> Result<RecordedBy>,
-    post_process_fn: impl FnOnce() -> Result<()>,
-) -> CaseResult {
+    translate_fn: impl FnOnce() -> Result<Resolution>,
+    post_process_fn: impl FnOnce(&Path) -> Result<()>,
+) -> (CaseResult, Option<Published<Translate>>) {
     // A thread may be re-used across cases; without this, a non-CLI agent would
     // inherit the previous case's exit code.
     clear_agent_exit();
     let start = Instant::now();
     match translate_fn() {
-        Ok(recorded) => {
+        // The driver published nothing, having already displaced, recorded and written: repeating any of
+        // it overwrites that, and `merge_agent_exit` consumes the exit `exit_code` needs.
+        Ok(Resolution::Recorded) => (
+            CaseResult {
+                name: name.to_owned(),
+                elapsed_secs: start.elapsed().as_secs(),
+                success: false,
+                error: Some(format!(
+                    "no translation was published; the driver recorded why in {}",
+                    crate::artifact::phase_metrics::<Translate>(case_dir).display()
+                )),
+                skipped: false,
+            },
+            None,
+        ),
+        // Nothing to displace or record: no run happened, so the case is absent from the hand-off.
+        Ok(Resolution::Unavailable) => (
+            CaseResult {
+                name: name.to_owned(),
+                elapsed_secs: 0,
+                success: false,
+                error: Some(
+                    "no stored translation for this run's key, and this sweep may not pay for \
+                     one — `verify` resolves translations read-only. Translate it deliberately \
+                     (`harvest-tools translate <battery>`, or `run`) and verify after."
+                        .to_owned(),
+                ),
+                skipped: false,
+            },
+            None,
+        ),
+        Ok(Resolution::Published(Translated {
+            recorded,
+            publishing,
+        })) => {
             let elapsed = start.elapsed().as_secs();
             if matches!(recorded, RecordedBy::Caller) {
                 write_translation_metrics(case_dir, agent, elapsed, true);
             }
-            let _ = post_process_fn();
-            CaseResult {
-                name: name.to_owned(),
-                elapsed_secs: elapsed,
-                success: true,
-                error: None,
-                skipped: false,
-            }
+            let published = match publishing.edited(post_process_fn).finish() {
+                Ok(p) => Some(p),
+                // Published and staying published; what failed is HASHING it, which takes a symlink
+                // cycle — and nothing may be seeded from an undescribed tree.
+                Err(e) => {
+                    eprintln!(
+                        "  ⚠️  {name}: published, but could not be digested, so no phase can be \
+                         seeded from it: {e:#}"
+                    );
+                    None
+                }
+            };
+            (
+                CaseResult {
+                    name: name.to_owned(),
+                    elapsed_secs: elapsed,
+                    success: true,
+                    error: None,
+                    skipped: false,
+                },
+                published,
+            )
         }
         Err(e) => {
             let elapsed = start.elapsed().as_secs();
@@ -403,13 +528,16 @@ fn run_and_record(
                     crate::battery::TRANSLATED
                 ),
             };
-            CaseResult {
-                name: name.to_owned(),
-                elapsed_secs: elapsed,
-                success: false,
-                error: Some(error),
-                skipped: false,
-            }
+            (
+                CaseResult {
+                    name: name.to_owned(),
+                    elapsed_secs: elapsed,
+                    success: false,
+                    error: Some(error),
+                    skipped: false,
+                },
+                None,
+            )
         }
     }
 }
@@ -550,8 +678,13 @@ pub fn require_prompt(paths: &Paths, kind: PromptKind) -> Result<String> {
     })
 }
 
-fn uncached(r: Result<()>) -> Result<RecordedBy> {
-    r.map(|()| RecordedBy::Caller)
+fn uncached(r: Result<Publishing<Translate>>) -> Result<Resolution> {
+    r.map(|publishing| {
+        Resolution::Published(Translated {
+            recorded: RecordedBy::Caller,
+            publishing,
+        })
+    })
 }
 
 fn dispatch_translate(
@@ -560,7 +693,7 @@ fn dispatch_translate(
     name: &str,
     is_lib: bool,
     store: &Store,
-) -> Result<RecordedBy> {
+) -> Result<Resolution> {
     match paths.agent {
         Agent::Laertes => uncached(laertes_translate_case(paths, battery, name)),
         Agent::C2SaferRust => uncached(c2saferrust_translate_case(paths, battery, name, is_lib)),
@@ -585,7 +718,7 @@ fn dispatch_translate(
 const SHARED_SOURCE_CACHE: cache::Mode = cache::Mode::Bypass;
 
 /// Bypassed, with the store opened here so no caller can hand this path a keyed one.
-fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result<RecordedBy> {
+fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result<Resolution> {
     let store = Store::open(&paths.repo_root, SHARED_SOURCE_CACHE)?;
     match paths.agent {
         Agent::Laertes => uncached(laertes_translate_case(paths, battery, name)),
@@ -604,8 +737,6 @@ fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result
     }
 }
 
-// ── harvest-bench translation ──────────────────────────────────────────
-
 /// Translate every harvest-bench project's `test_case/` into a Rust crate that
 /// builds a cdylib with the same C ABI: the test phase builds it into a `.so` and
 /// runs the upstream gtest suite against it.
@@ -613,7 +744,7 @@ pub fn run_harvest_bench(
     paths: &Paths,
     projects: &[battery::HarvestBenchProject],
     parallel: usize,
-) -> Result<()> {
+) -> Result<Translations> {
     // Ahead of `preflight_check`, so an agent with no translate phase here refuses once
     // before a CLI it will never run is probed, rather than panicking once per project.
     anyhow::ensure!(
@@ -639,6 +770,7 @@ pub fn run_harvest_bench(
     let sem = Semaphore::new(parallel);
     let store = cache::Store::open(&paths.repo_root, paths.cache_mode)?;
 
+    let mut resolved: Translations = HashMap::new();
     let results: Vec<CaseResult> = std::thread::scope(|s| {
         let handles: Vec<(String, _)> = projects
             .iter()
@@ -660,8 +792,15 @@ pub fn run_harvest_bench(
             .into_iter()
             .map(|(name, h)| {
                 let case_dir = paths.output_dir(&name);
-                h.join()
-                    .unwrap_or_else(|e| CaseResult::panicked(name, &case_dir, &paths.agent_key, e))
+                match h.join() {
+                    Ok((r, published)) => {
+                        if let Some(p) = published {
+                            resolved.insert(case_dir, p);
+                        }
+                        r
+                    }
+                    Err(e) => CaseResult::panicked(name, &case_dir, &paths.agent_key, e),
+                }
             })
             .collect()
     });
@@ -684,7 +823,10 @@ pub fn run_harvest_bench(
     }
 
     println!("\nDone: {translated}/{total} translated, {failed} failed");
-    Ok(())
+    if let Some(line) = store.tally_line() {
+        println!("{line}");
+    }
+    Ok(resolved)
 }
 
 fn translate_one_harvest_bench(
@@ -693,7 +835,7 @@ fn translate_one_harvest_bench(
     prompt: &str,
     store: &Store,
     skip: SkipCheck,
-) -> CaseResult {
+) -> (CaseResult, Option<Published<Translate>>) {
     let name = project.name();
     let case_dir = paths.output_dir(name);
 
@@ -703,13 +845,10 @@ fn translate_one_harvest_bench(
             crate::battery::TRANSLATED,
         ))
     }) {
-        return CaseResult {
-            name: name.into(),
-            elapsed_secs: 0,
-            success: true,
-            error: None,
-            skipped: true,
-        };
+        return from_published_tree(name, &case_dir);
+    }
+    if !resolvable(paths, skip) {
+        return unavailable(name, &case_dir, &paths.agent_key);
     }
 
     run_and_record(
@@ -717,28 +856,22 @@ fn translate_one_harvest_bench(
         &case_dir,
         &paths.agent_key,
         || translate_case_at(paths, project.test_case(), &case_dir, prompt, store),
-        || {
+        |tree| {
             // The lib name must be the project name: the suite links `lib<name>.so`
             // by ABI, not by crate name.
-            let cargo_path =
-                crate::battery::phase_dir(&case_dir, crate::battery::TRANSLATED).join("Cargo.toml");
+            let cargo_path = tree.join("Cargo.toml");
             if cargo_path.exists() {
                 let mut cargo = CargoToml::open(&cargo_path)?;
                 cargo.add_workspace();
                 cargo.remove_bin();
                 cargo.set_lib(name);
                 cargo.save()?;
-                cargo_toml::strip_for_lib(&crate::battery::phase_dir(
-                    &case_dir,
-                    crate::battery::TRANSLATED,
-                ))?;
+                cargo_toml::strip_for_lib(tree)?;
             }
             Ok(())
         },
     )
 }
-
-// ── Preflight ──────────────────────────────────────────────────────────
 
 fn preflight_check(agent: Agent) -> Result<()> {
     let (cmd, version_args): (&str, &[&str]) = match agent {
@@ -828,8 +961,6 @@ fn preflight_check(agent: Agent) -> Result<()> {
     Ok(())
 }
 
-// ── Core translation ───────────────────────────────────────────────────
-
 /// Which CLI [`translate_case_at`] drives, resolved from `--agent` before anything runs.
 /// Codex's model and region travel with the arm that chose it, where a second
 /// `match paths.agent` picked them behind a `_ => unreachable!()` that was sound only because
@@ -895,7 +1026,7 @@ fn translate_case(
     name: &str,
     prompt: &str,
     store: &Store,
-) -> Result<RecordedBy> {
+) -> Result<Resolution> {
     let input_test_case = paths.input_dir(battery).join(name).join("test_case");
     let case_dir = paths.case_dir(battery, name);
     translate_case_at(paths, &input_test_case, &case_dir, prompt, store)
@@ -989,7 +1120,7 @@ fn translate_case_at(
     case_dir: &Path,
     prompt: &str,
     store: &Store,
-) -> Result<RecordedBy> {
+) -> Result<Resolution> {
     let backend =
         in_tool_translate(paths.agent).with_context(|| no_in_tool_translate(&paths.agent_key))?;
 
@@ -1026,9 +1157,19 @@ fn translate_case_at(
         // (see [`Launch`]), so routing them through the driver would refuse every healthy run
         // rather than cache one. The TREE they publish is the sealed path's, though, which is
         // what `publish_unsealed` is for.
+        //
+        // Repeated from the sweeps at the invocation itself: this arm reaches no store to refuse for it.
+        if !resolvable(paths, SkipCheck::WhateverIsPublished) {
+            return Ok(Resolution::Unavailable);
+        }
         run_translate_agent(paths, &launch, &work, &prompt, &log_path)?;
-        crate::artifact::publish_unsealed::<Translate>(&work.translated_rust(), case_dir)?;
-        return Ok(RecordedBy::Caller);
+        return Ok(Resolution::Published(Translated {
+            recorded: RecordedBy::Caller,
+            publishing: crate::artifact::publish_unsealed::<Translate>(
+                &work.translated_rust(),
+                case_dir,
+            )?,
+        }));
     };
 
     // Resolved once, so the digests below cannot disagree about what machine they were taken on.
@@ -1058,33 +1199,40 @@ fn translate_case_at(
         |work| {
             let start = Instant::now();
             run_translate_agent(paths, &launch, &work, &prompt, &log_path)?;
-            let sealed = work.finish(&completion_proof(paths, &log_path)?)?;
+            // `Attempt::Nothing`, not an `Err`: an incomplete agent is a run the driver must RECORD, with
+            // its transcript, and an error carries no reason it can file — this is where translate's
+            // `api_error` attempts used to become unexaminable.
+            let health = completion_proof(paths, &log_path);
+            let Some(proof) = health.completed() else {
+                return Ok(Attempt::Nothing(cache::NotProduced::DidNotComplete {
+                    health: format!("{health:?}"),
+                }));
+            };
+            let sealed = work.finish(&proof)?;
             // Once per invocation and inside `compute`: `agent_provenance` CONSUMES the observed
             // exit, so in the caller a replay would report the previous case's exit as this one's.
-            Ok(Some(Produced::new(
+            Ok(Attempt::Produced(Produced::new(
                 sealed,
                 log_path.clone(),
                 agent_provenance(&paths.agent_key, start.elapsed().as_secs()),
             )))
         },
     )?;
-    anyhow::ensure!(
-        matches!(outcome, Outcome::Published(_)),
-        "no translation was published, so the case has no result and must not be reported as \
-         one — the driver has already recorded why beside it"
-    );
-    Ok(RecordedBy::Driver)
+    Ok(match outcome {
+        Outcome::Published(publishing) => Resolution::Published(Translated {
+            recorded: RecordedBy::Driver,
+            publishing,
+        }),
+        // Not an error: see `Resolution::Recorded`'s arm in `run_and_record`.
+        Outcome::Nothing => Resolution::Recorded,
+        Outcome::Unavailable => Resolution::Unavailable,
+    })
 }
 
-/// The proof [`IsolatedWorkDir::finish`] demands, from the same discriminator the scoring gate
-/// uses: an infra failure is no measurement, so it must become neither `translated/` nor a cache
-/// entry — a transient outage memoised is a permanent, silent one.
-fn completion_proof(paths: &Paths, log_path: &Path) -> Result<crate::domain::health::Completed> {
-    let health =
-        crate::agent_health::classify_log(log_path, paths.agent.log_format(), observed_exit());
-    health
-        .completed()
-        .with_context(|| format!("the agent did not complete ({health:?})"))
+/// The classification [`IsolatedWorkDir::finish`]'s proof is minted from, by the same discriminator the
+/// scoring gate uses. Returned rather than an error: the caller records the reason.
+fn completion_proof(paths: &Paths, log_path: &Path) -> crate::domain::health::Health {
+    crate::agent_health::classify_log(log_path, paths.agent.log_format(), observed_exit())
 }
 
 /// Borrows the work tree rather than sealing it: the bypassed caller must leave the observed exit
@@ -1176,12 +1324,16 @@ fn run_translate_agent(
     Ok(())
 }
 
-// ── Post-processing ────────────────────────────────────────────────────
-
-fn post_process_independent(paths: &Paths, battery: &str, name: &str, is_lib: bool) -> Result<()> {
-    let cargo_path =
-        crate::battery::phase_dir(&paths.case_dir(battery, name), crate::battery::TRANSLATED)
-            .join("Cargo.toml");
+/// `tree` is handed in by [`crate::artifact::Publishing::edited`], not recomputed from `case_dir`:
+/// this body used to reopen the published `Cargo.toml` AFTER the seal (site 17).
+fn post_process_independent(
+    paths: &Paths,
+    battery: &str,
+    name: &str,
+    is_lib: bool,
+    tree: &Path,
+) -> Result<()> {
+    let cargo_path = tree.join("Cargo.toml");
     if !cargo_path.exists() {
         return Ok(());
     }
@@ -1193,10 +1345,7 @@ fn post_process_independent(paths: &Paths, battery: &str, name: &str, is_lib: bo
         let lib_name = battery::extract_lib_name(&paths.input_dir(battery), name);
         cargo.set_lib(lib_name.as_deref().unwrap_or(name));
         cargo.save()?;
-        cargo_toml::strip_for_lib(&crate::battery::phase_dir(
-            &paths.case_dir(battery, name),
-            crate::battery::TRANSLATED,
-        ))?;
+        cargo_toml::strip_for_lib(tree)?;
     } else {
         cargo.set_bin_driver();
         cargo.save()?;
@@ -1209,20 +1358,22 @@ fn post_process_independent(paths: &Paths, battery: &str, name: &str, is_lib: bo
 /// Verify re-propagates the `verified/` phase after fixing the real case, so each
 /// follower carries the same post-verify crate; without that, runtests scores only
 /// the real case as verified.
-pub fn propagate_config_phase(
+///
+/// The phase is a type parameter, not a `&str`: `only_the_pipeline_names_a_phase_directory` lexes the
+/// names, so a caller passing one would have a way past it.
+pub fn propagate_config_phase<P: crate::artifact::Phase>(
     paths: &Paths,
     battery: &str,
     real_case: &str,
     cfg: &battery::Config,
-    phase: &str,
 ) -> Result<()> {
-    let real_dir = crate::battery::phase_dir(&paths.case_dir(battery, real_case), phase);
+    let real_dir = crate::battery::phase_dir(&paths.case_dir(battery, real_case), P::DIR);
     // An agent with no verify phase produces no verified/ to copy.
     if !real_dir.is_dir() {
         return Ok(());
     }
     let cfg_dir = paths.case_dir(battery, &cfg.name);
-    let translated = crate::battery::phase_dir(&cfg_dir, phase);
+    let translated = crate::battery::phase_dir(&cfg_dir, P::DIR);
 
     std::fs::create_dir_all(&translated)?;
     std::fs::create_dir_all(translated.join("logs"))?;
@@ -1279,10 +1430,8 @@ pub fn propagate_config(
     real_case: &str,
     cfg: &battery::Config,
 ) -> Result<()> {
-    propagate_config_phase(paths, battery, real_case, cfg, crate::battery::TRANSLATED)
+    propagate_config_phase::<Translate>(paths, battery, real_case, cfg)
 }
-
-// ── Metrics ────────────────────────────────────────────────────────────
 
 /// For the paths that do NOT reach the store (see [`RecordedBy`]), so it is always fresh.
 fn write_translation_metrics(
@@ -1311,8 +1460,6 @@ fn count_cases(battery: &battery::Battery) -> usize {
         })
         .sum()
 }
-
-// ── Utilities ──────────────────────────────────────────────────────────
 
 pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
@@ -1505,7 +1652,12 @@ const BEDROCK_MODEL_ID: &str = "moonshotai.kimi-k2.5";
 const BEDROCK_REGION: &str = "us-east-1";
 const BEDROCK_MAX_TOKENS: u32 = 16384;
 
-fn kimi_translate_case(paths: &Paths, battery: &str, name: &str, is_lib_hint: bool) -> Result<()> {
+fn kimi_translate_case(
+    paths: &Paths,
+    battery: &str,
+    name: &str,
+    is_lib_hint: bool,
+) -> Result<Publishing<Translate>> {
     oneshot_llm_translate(paths, battery, name, is_lib_hint, None, bedrock_converse)
 }
 
@@ -1514,7 +1666,7 @@ fn oneshot_translate_case(
     battery: &str,
     name: &str,
     is_lib_hint: bool,
-) -> Result<()> {
+) -> Result<Publishing<Translate>> {
     // As in `opencode_model`: main rejects a missing --model, but this runs per case.
     let model = paths.model.as_deref().context(
         "--agent oneshot requires --model <provider>/<model-id> (should have been \
@@ -1537,7 +1689,7 @@ fn oneshot_llm_translate(
     is_lib_hint: bool,
     model: Option<&str>,
     invoke_llm: impl FnOnce(Conversation<'_>, &Path) -> Result<LlmResponse>,
-) -> Result<()> {
+) -> Result<Publishing<Translate>> {
     let case_dir = paths.case_dir(battery, name);
     let logs_dir = crate::artifact::phase_logs::<Translate>(&case_dir);
     std::fs::create_dir_all(&logs_dir)?;
@@ -1586,8 +1738,7 @@ fn oneshot_llm_translate(
         anyhow::bail!("no Cargo.toml in LLM response");
     }
 
-    crate::artifact::publish_unsealed::<Translate>(staged.path(), &case_dir)?;
-    Ok(())
+    crate::artifact::publish_unsealed::<Translate>(staged.path(), &case_dir)
 }
 
 /// Collect all files under `dir` as a JSON object: `{"files": [{"path": "...", "contents": "..."}]}`.
@@ -1893,7 +2044,11 @@ find rewrite-workspace/project -name '*.rs' | while read -r f; do
 done
 "#;
 
-fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()> {
+fn laertes_translate_case(
+    paths: &Paths,
+    battery: &str,
+    name: &str,
+) -> Result<Publishing<Translate>> {
     use std::io::Write;
 
     // c2rust never runs a verify phase, so its translated/ IS the crate to consume.
@@ -1979,8 +2134,7 @@ fn laertes_translate_case(paths: &Paths, battery: &str, name: &str) -> Result<()
         }
     )?;
 
-    crate::artifact::publish_unsealed::<Translate>(&work, &case_dir)?;
-    Ok(())
+    crate::artifact::publish_unsealed::<Translate>(&work, &case_dir)
 }
 
 // ── C2SaferRust (c2rust output -> LLM unsafe-reduction via Bedrock) ────────
@@ -2083,7 +2237,7 @@ fn c2saferrust_translate_case(
     battery: &str,
     name: &str,
     _is_lib: bool,
-) -> Result<()> {
+) -> Result<Publishing<Translate>> {
     use std::io::Write;
 
     // c2rust never runs a verify phase, so its translated/ IS the crate to consume.
@@ -2180,7 +2334,8 @@ fn c2saferrust_translate_case(
         )?;
         work_rust.clone()
     };
-    crate::artifact::publish_unsealed::<Translate>(&source_dir, &case_dir)?;
+    // Held rather than dropped: the tidying below edits the published tree before the digest.
+    let publishing = crate::artifact::publish_unsealed::<Translate>(&source_dir, &case_dir)?;
     for junk in [
         "callgraph.dot",
         "callgraph.pdf",
@@ -2213,7 +2368,7 @@ fn c2saferrust_translate_case(
         "\nc2saferrust translation collected into {}",
         translated.display()
     )?;
-    Ok(())
+    Ok(publishing)
 }
 
 /// Whatever `crate-type` c2rust emitted, replaced wholesale. `static`: as
@@ -2623,11 +2778,19 @@ mod tests {
             );
         }
 
-        // Non-vacuity: publishing DOES clear the first two, so the assertions above hold
-        // because the wipe moved to publish time, not because nothing ever clears.
-        crate::artifact::clear_phase::<Translate>(&case).unwrap();
-        assert!(
-            !translated.join("src/lib.rs").exists(),
+        // Non-vacuity: publishing a DIFFERENT translation does replace the first two, so the
+        // assertions above hold because the wipe moved to publish time, not because nothing clears.
+        let fresh = tmp.path().join("a-different-translation");
+        std::fs::create_dir_all(fresh.join("src")).unwrap();
+        std::fs::write(fresh.join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(fresh.join("src/lib.rs"), "pub fn b() {}").unwrap();
+        crate::artifact::publish_unsealed::<Translate>(&fresh, &case)
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(translated.join("src/lib.rs")).unwrap(),
+            "pub fn b() {}",
             "a publish must replace the old crate"
         );
         assert!(
@@ -2671,7 +2834,7 @@ mod tests {
     struct Site<'a> {
         what: &'a str,
         published: std::path::PathBuf,
-        run: &'a dyn Fn(SkipCheck) -> CaseResult,
+        run: &'a dyn Fn(SkipCheck) -> (CaseResult, Option<Published<Translate>>),
     }
 
     fn publish_a_crate(case_dir: &Path) -> std::path::PathBuf {
@@ -2731,11 +2894,16 @@ mod tests {
         for site in sites {
             let what = site.what;
             assert!(
-                (site.run)(SkipCheck::WhateverIsPublished).skipped,
+                (site.run)(SkipCheck::WhateverIsPublished).0.skipped,
                 "{what}: the fixture must be the tree the old check answered done on, or \
                  nothing here is being tested"
             );
-            let keyed = (site.run)(SkipCheck::Keyed);
+            let (keyed, resolved) = (site.run)(SkipCheck::Keyed);
+            assert!(
+                resolved.is_none(),
+                "{what}: and it resolved no artifact, so nothing downstream can be seeded from \
+                 this case at all"
+            );
             assert!(
                 !keyed.skipped,
                 "{what}: a `translated/` names no model, prompt, CLI or toolchain, so it \
@@ -2852,7 +3020,7 @@ mod tests {
         /// Only the LLM call is stood in for — as in
         /// `a_translation_that_fails_leaves_the_previous_result_standing`, it is the one
         /// injectable failure of the four, and the docker arm needs none.
-        fn fail(self, paths: &Paths) -> CaseResult {
+        fn fail(self, paths: &Paths) -> (CaseResult, Option<Published<Translate>>) {
             let (battery, name) = A_CASE;
             run_and_record(
                 name,
@@ -2875,7 +3043,7 @@ mod tests {
                         },
                     )),
                 },
-                || Ok(()),
+                |_| Ok(()),
             )
         }
     }
@@ -2891,12 +3059,17 @@ mod tests {
         let case = paths.case_dir(battery, name);
         a_previous_translation(&case);
 
-        let r = backend.fail(&paths);
+        let (r, resolved) = backend.fail(&paths);
         assert!(
             !r.success,
             "{}: the injected failure must fail the case: {:?}",
             backend.what(),
             r.error
+        );
+        assert!(
+            resolved.is_none(),
+            "{}: and an unkeyed path that failed resolves nothing either",
+            backend.what()
         );
         (paths, case)
     }
@@ -3017,13 +3190,13 @@ mod tests {
 
         a_previous_translation(&paths.case_dir(battery, name));
         assert!(
-            sweep().skipped,
+            sweep().0.skipped,
             "non-vacuity: a published crate IS read as done here — that is the whole of what \
              this path's skip check can ask"
         );
 
-        assert!(!backend.fail(&paths).success);
-        let next = sweep();
+        assert!(!backend.fail(&paths).0.success);
+        let (next, _) = sweep();
         assert!(
             !next.skipped,
             "a case whose last run failed must be translated again, not counted as translated"
@@ -3052,6 +3225,8 @@ mod tests {
         work.finish(&crate::domain::health::Completed::for_test())
             .unwrap()
             .publish(case_dir)
+            .unwrap()
+            .finish()
             .unwrap();
         write_phase_metrics::<Translate>(
             case_dir,
@@ -3078,14 +3253,24 @@ mod tests {
             let case = tmp.path().join(what);
             a_driver_published_translation(tmp.path(), &case);
 
-            let r = run_and_record(
+            let (r, resolved) = run_and_record(
                 A_CASE.1,
                 &case,
                 &test_agent_key(),
-                || Ok(recorded),
-                || Ok(()),
+                || {
+                    Ok(Resolution::Published(Translated {
+                        recorded,
+                        publishing: Publishing::for_test(&case),
+                    }))
+                },
+                |_| Ok(()),
             );
             assert!(r.success, "{what}: {:?}", r.error);
+            assert!(
+                resolved.is_some(),
+                "{what}: a published translation must be handed on, or verify has nothing to be \
+                 seeded from"
+            );
             assert_eq!(
                 std::fs::read_to_string(translated(&case).join("src/lib.rs")).unwrap_or_default(),
                 DRIVER_CRATE,
@@ -3119,16 +3304,48 @@ mod tests {
         // because the run succeeded and not because nothing here ever moves.
         let case = tmp.path().join("failed");
         a_driver_published_translation(tmp.path(), &case);
-        let r = run_and_record(
+        let (r, _) = run_and_record(
             A_CASE.1,
             &case,
             &test_agent_key(),
             || anyhow::bail!("the agent did not complete"),
-            || Ok(()),
+            |_| Ok(()),
         );
         assert!(!r.success);
         assert!(!crate::battery::has_crate(&translated(&case)));
         assert!(crate::battery::has_crate(&displaced(&translated(&case))));
+
+        // And the THIRD arm: the driver published nothing, having already displaced the crate, written
+        // its record and filed the failed run. Re-recording blanks the `cache_key` and drops `exit_code`.
+        let case = tmp.path().join("driver-published-nothing");
+        a_driver_published_translation(tmp.path(), &case);
+        let (r, resolved) = run_and_record(
+            A_CASE.1,
+            &case,
+            &test_agent_key(),
+            || Ok(Resolution::Recorded),
+            |_| Ok(()),
+        );
+        assert!(
+            !r.success,
+            "the case has no result and must not be reported as one"
+        );
+        assert!(
+            resolved.is_none(),
+            "and nothing downstream may be seeded from it"
+        );
+        assert!(
+            r.error
+                .as_deref()
+                .is_some_and(|e| e.contains("translation.json")),
+            "the operator is pointed at the record the driver wrote: {:?}",
+            r.error
+        );
+        assert_eq!(
+            entry_of("driver-published-nothing"),
+            serde_json::json!(DRIVER_ENTRY),
+            "which must still name the entry the driver recorded, not a second, blanker write"
+        );
     }
 
     /// The honest limit of a bypass: where no key can be asked about, "is something published here"
@@ -3149,7 +3366,7 @@ mod tests {
             is_lib: true,
         };
 
-        let r = translate_one_independent(
+        let (r, _) = translate_one_independent(
             &paths,
             &output_dir,
             battery,
@@ -3174,7 +3391,7 @@ mod tests {
             configs: Vec::new(),
         };
         let real = publish_a_crate(&output_dir.join(&group.real_case));
-        let g = translate_one_shared(&keyed_agent, &output_dir, battery, &group);
+        let (g, _) = translate_one_shared(&keyed_agent, &output_dir, battery, &group);
         assert!(
             g.skipped && g.success,
             "the group's store never loads, so there is no entry to replay and `translated/` \
@@ -3248,6 +3465,151 @@ mod tests {
                 !matches!(launch, Launch::Keyed(_)),
                 "{:?} is skipped on its published crate, so it must reach the store under no key",
                 skip_check(backend)
+            );
+        }
+    }
+
+    /// The two configurations no key can name could not complete a `verify` sweep AT ALL: `--agent
+    /// opencode`, and every battery of symlinked configs (B02_synthetic, P01_sphincs_plus, both
+    /// published). What is published is now the seed, recorded
+    /// [`crate::artifact::Keying::Unkeyable`]; what is NOT published is still refused, and so is
+    /// anything keyed — which is 014.
+    #[test]
+    fn a_sweep_that_may_not_pay_seeds_what_is_published_and_refuses_what_is_not() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let corpus = crate::cli::Dataset::TestCorpus;
+        // From the production mapping: a literal would pass while `cli::seeding` sent a sweep elsewhere.
+        let replay = crate::cli::seeding(cache::Mode::ReadWrite).unwrap();
+        let paths = paths_at(tmp.path(), Agent::Oneshot, corpus, replay);
+        let battery = "B01_organic";
+        let output_dir = paths.output_dir(battery);
+        let store = cache::Store::open(&paths.repo_root, paths.cache_mode).unwrap();
+        let one = |name: &str, skip| {
+            translate_one_independent(
+                &paths,
+                &output_dir,
+                battery,
+                &battery::IndependentCase {
+                    name: name.to_owned(),
+                    is_lib: true,
+                },
+                &store,
+                skip,
+            )
+        };
+
+        let translated = publish_a_crate(&output_dir.join("strcmp"));
+        let (r, resolved) = one("strcmp", translate_skip_check(&paths));
+        assert_eq!(
+            resolved.map(|p| p.keying()),
+            Some(crate::artifact::Keying::Unkeyable),
+            "a single API call has no entry to replay, so the tree already published is the only \
+             translation there is — and the sweep must say no key names it: {:?}",
+            r.error
+        );
+        assert!(r.skipped && r.success, "{:?}", r.error);
+        assert!(
+            crate::battery::has_crate(&translated)
+                && !crate::artifact::phase_metrics::<Translate>(&output_dir.join("strcmp"))
+                    .exists(),
+            "no agent ran, so the crate is untouched and no record claims an attempt"
+        );
+
+        // The same path with NOTHING published: still refused, or `refuse_absent` could not fire.
+        let (empty, resolved) = one("memcmp", translate_skip_check(&paths));
+        assert!(
+            resolved.is_none() && !empty.success && !empty.skipped,
+            "{:?}",
+            empty.error
+        );
+        assert!(
+            empty
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("read-only") && e.contains("translate")),
+            "and the operator is told what to run instead: {:?}",
+            empty.error
+        );
+
+        // A KEYED sweep (claude, kiro): `SkipCheck::Keyed` never answers from a phase dir, so with
+        // no entry the case resolves nothing — 014's shape. c2rust, to skip the CLI probe.
+        let unkeyed_launch = paths_at(tmp.path(), Agent::C2rust, corpus, replay);
+        std::fs::create_dir_all(unkeyed_launch.input_dir(battery).join("keyed/test_case")).unwrap();
+        std::fs::write(
+            unkeyed_launch
+                .input_dir(battery)
+                .join("keyed/test_case/lib.c"),
+            "int a(void){return 0;}",
+        )
+        .unwrap();
+        let keyed_crate = publish_a_crate(&output_dir.join("keyed"));
+        let (k, resolved) = translate_one_independent(
+            &unkeyed_launch,
+            &output_dir,
+            battery,
+            &battery::IndependentCase {
+                name: "keyed".to_owned(),
+                is_lib: true,
+            },
+            &store,
+            SkipCheck::Keyed,
+        );
+        assert!(
+            resolved.is_none() && !k.success && !k.skipped,
+            "a keyed check may not resolve a case from the crate sitting in its phase dir: {:?}",
+            k.error
+        );
+        assert!(crate::battery::has_crate(&keyed_crate));
+        assert_eq!(
+            translate_skip_check(&paths_at(tmp.path(), Agent::Claude, corpus, replay)),
+            SkipCheck::Keyed,
+            "and claude IS keyed under the mode `verify` seeds with, so that is the branch it takes"
+        );
+
+        // A group, with a KEYED agent: its own store is bypassed, so a published crate is all there is.
+        let group = battery::SharedSourceGroup {
+            real_case: "macrodepth_add_5".to_owned(),
+            configs: Vec::new(),
+        };
+        let real = publish_a_crate(&output_dir.join(&group.real_case));
+        let keyed = paths_at(tmp.path(), Agent::Claude, corpus, replay);
+        let (g, resolved) = translate_one_shared(&keyed, &output_dir, battery, &group);
+        assert_eq!(
+            resolved.map(|p| p.keying()),
+            Some(crate::artifact::Keying::Unkeyable),
+            "a group is never keyed, and refusing it left P01_sphincs_plus's 128 configs \
+             unverifiable: {:?}",
+            g.error
+        );
+        assert!(g.success && crate::battery::has_crate(&real));
+        let nothing_published = battery::SharedSourceGroup {
+            real_case: "macrodepth_add_9".to_owned(),
+            configs: Vec::new(),
+        };
+        let (n, resolved) = translate_one_shared(&keyed, &output_dir, battery, &nothing_published);
+        assert!(
+            resolved.is_none() && !n.success,
+            "and a group with nothing published is still refused: {:?}",
+            n.error
+        );
+
+        // THE mapping, over every mode a `Paths` can carry: only one refuses, and under it only a
+        // keyed check resolves — without both halves, a predicate answering alike would pass too.
+        for (mode, skip, expected) in [
+            (cache::Mode::ReplayOnly, SkipCheck::Keyed, true),
+            (
+                cache::Mode::ReplayOnly,
+                SkipCheck::WhateverIsPublished,
+                false,
+            ),
+            (cache::Mode::ReadWrite, SkipCheck::WhateverIsPublished, true),
+            (cache::Mode::Refresh, SkipCheck::WhateverIsPublished, true),
+            (cache::Mode::Bypass, SkipCheck::WhateverIsPublished, true),
+        ] {
+            assert_eq!(
+                resolvable(&paths_at(tmp.path(), Agent::Claude, corpus, mode), skip),
+                expected,
+                "--cache {mode:?} with {skip:?}"
             );
         }
     }

@@ -6,12 +6,14 @@ fn proof() -> &'static harvest_tools::domain::health::Completed {
     unreachable!()
 }
 
+fn published() -> harvest_tools::artifact::Published<harvest_tools::artifact::Translate> {
+    unreachable!()
+}
+
 fn main() {
-    let case = std::path::Path::new("/nonexistent");
-    let sealed = harvest_tools::artifact::Sealed::<harvest_tools::artifact::Translate>::adopt(case).unwrap();
     let scratch = harvest_tools::artifact::Scratch::new("t-").unwrap();
     let work: harvest_tools::artifact::WorkTree<harvest_tools::artifact::Verify> =
-        sealed.materialise_into(scratch).unwrap();
+        published().materialise_into(scratch).unwrap();
     let c_before = work.c().snapshot().unwrap();
     let scrubbed = work.scrub().unwrap();
     let _sealed = scrubbed.seal(proof(), &c_before).unwrap();

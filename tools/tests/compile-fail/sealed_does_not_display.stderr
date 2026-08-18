@@ -1,7 +1,7 @@
 error[E0277]: `Sealed<harvest_tools::artifact::Translate>` doesn't implement `std::fmt::Display`
- --> tests/compile-fail/sealed_does_not_display.rs:6:15
+ --> tests/compile-fail/sealed_does_not_display.rs:9:15
   |
-6 |     println!("{sealed}");
+9 |     println!("{sealed}");
   |               ^^^^^^^^ `Sealed<harvest_tools::artifact::Translate>` cannot be formatted with the default formatter
   |
   = help: the trait `std::fmt::Display` is not implemented for `Sealed<harvest_tools::artifact::Translate>`

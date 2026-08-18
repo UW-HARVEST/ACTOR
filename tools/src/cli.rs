@@ -260,6 +260,29 @@ pub fn honouring(mode: crate::cache::Mode, reuse: Reuse) -> crate::cache::Mode {
     }
 }
 
+/// The store mode for a phase this command does not run but is only SEEDED from — translate, under
+/// `verify`.
+///
+/// Always [`crate::cache::Mode::ReplayOnly`], whatever the operator asked for the phase under test:
+/// `--force` means "do not reuse a previous VERIFICATION", and reaching translate's store with it
+/// re-ran the translate agent for every case ($795.59 a harvest-bench sweep) and quarantined the
+/// entries as it went. Exhaustive, so a new mode decides here rather than defaulting into a store
+/// that can invoke.
+pub fn seeding(mode: crate::cache::Mode) -> anyhow::Result<crate::cache::Mode> {
+    match mode {
+        // Refused rather than silently served from a store the operator switched off.
+        crate::cache::Mode::Bypass => anyhow::bail!(
+            "--no-cache cannot be combined with `verify`: a verification is seeded from a \
+             translation resolved through the store, and a bypassed store can resolve none — while \
+             paying the translate agent is not what `verify` means. Use `verify --force` to re-run \
+             the verifications without reusing them, or `run` to translate."
+        ),
+        crate::cache::Mode::ReadWrite
+        | crate::cache::Mode::Refresh
+        | crate::cache::Mode::ReplayOnly => Ok(crate::cache::Mode::ReplayOnly),
+    }
+}
+
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// Translate + verify + test (full pipeline)
@@ -365,6 +388,9 @@ impl Cli {
 pub enum CacheAction {
     /// Entry count and size on disk.
     Stats,
+    /// Runs that produced nothing, per key. Recorded and never served, so a key can hold
+    /// several attempts and still be recomputed.
+    Failures,
 }
 
 impl Command {
@@ -421,5 +447,37 @@ mod tests {
         ] {
             assert_eq!(a.log_format(), LogFormat::Opaque, "{a:?}");
         }
+    }
+
+    /// `verify` gained a translate leg, and with it the ability to spend translate's money on the
+    /// one subcommand that carries `--force`: `honouring` turns that flag into `Refresh`, whose
+    /// store skips the load and re-runs every case. The mapping, over every mode a `Paths` can
+    /// carry, is what says no operator flag reaches a store that can invoke.
+    #[test]
+    fn the_phase_a_command_is_only_seeded_from_can_never_invoke_an_agent() {
+        for asked in [
+            crate::cache::Mode::ReadWrite,
+            crate::cache::Mode::Refresh,
+            crate::cache::Mode::ReplayOnly,
+        ] {
+            assert_eq!(
+                seeding(asked).unwrap(),
+                crate::cache::Mode::ReplayOnly,
+                "{asked:?}"
+            );
+            assert_eq!(
+                seeding(honouring(asked, Reuse::Refused)).unwrap(),
+                crate::cache::Mode::ReplayOnly,
+                "--force must not reach it either, whatever it does to {asked:?}"
+            );
+        }
+        // Non-vacuity: one mode really is refused, so the equalities above are a decision and not
+        // a function that answers the same thing to everything.
+        let err = format!(
+            "{:#}",
+            seeding(crate::cache::Mode::Bypass)
+                .expect_err("a bypassed store can resolve no translation to be seeded from")
+        );
+        assert!(err.contains("--no-cache"), "{err}");
     }
 }

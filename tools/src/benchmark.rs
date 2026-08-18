@@ -7,6 +7,7 @@ use crate::agents::invocation::has_verify_phase;
 use crate::battery::{self, Paths};
 use crate::cli::{Agent, Dataset};
 use crate::oracle::{self, TestMode, TestOutcome};
+use crate::translate::Translations;
 use crate::{translate, verify};
 use anyhow::Result;
 use std::path::Path;
@@ -22,24 +23,27 @@ pub trait Benchmark {
     /// Does a separate C-as-oracle verify phase run for this agent?
     fn verifies(&self, agent: Agent) -> bool;
 
+    /// Returns what it RESOLVED, per case: a value this run produced, not a phase dir to be asked.
     fn translate(
         &self,
         paths: &Paths,
         target: &str,
         filter: Option<&str>,
         parallel: usize,
-    ) -> Result<()>;
+    ) -> Result<Translations>;
 
     /// Reached from `Run` only when [`Self::verifies`] is true, but also invoked directly by
     /// the `verify` subcommand, so an impl cannot assume that gate ran.
+    ///
+    /// `translations` is the hand-off: a case absent from it is refused, not seeded from disk.
     fn verify(
         &self,
-        _repo_root: &Path,
         _paths: &Paths,
         _target: &str,
         _filter: Option<&str>,
         _force: bool,
         _parallel: usize,
+        _translations: &Translations,
     ) -> Result<()> {
         Ok(())
     }
@@ -137,8 +141,9 @@ impl Benchmark for TestCorpus {
         target: &str,
         filter_flag: Option<&str>,
         parallel: usize,
-    ) -> Result<()> {
+    ) -> Result<Translations> {
         let batteries = resolve_batteries(&paths.corpus_dir, target)?;
+        let mut resolved = Translations::new();
 
         // Shared-source batteries must run single-threaded: their follower configs are
         // propagated from one real translation. Independent batteries split the rest of
@@ -151,38 +156,40 @@ impl Benchmark for TestCorpus {
 
             let indie_parallel = parallel.saturating_sub(shared_bats.len()).max(1);
 
-            let errors: Vec<anyhow::Error> = std::thread::scope(|s| {
+            let mut errors: Vec<anyhow::Error> = Vec::new();
+            // Merged as each thread joins; case dirs are disjoint, so no merge drops one.
+            std::thread::scope(|s| {
                 let mut handles = Vec::new();
                 for bat in &shared_bats {
-                    handles.push(s.spawn(move || -> Result<()> {
+                    handles.push(s.spawn(move || -> Result<Translations> {
                         let (name, filter) = parse_target(bat);
                         let filter = one_filter(filter, filter_flag)?;
                         translate::run_test_corpus(paths, &name, filter.as_deref(), 1)
                     }));
                 }
                 if !indie_bats.is_empty() {
-                    handles.push(s.spawn(|| -> Result<()> {
+                    handles.push(s.spawn(|| -> Result<Translations> {
+                        let mut mine = Translations::new();
                         for bat in &indie_bats {
                             let (name, filter) = parse_target(bat);
                             let filter = one_filter(filter, filter_flag)?;
-                            translate::run_test_corpus(
+                            mine.extend(translate::run_test_corpus(
                                 paths,
                                 &name,
                                 filter.as_deref(),
                                 indie_parallel,
-                            )?;
+                            )?);
                         }
-                        Ok(())
+                        Ok(mine)
                     }));
                 }
-                handles
-                    .into_iter()
-                    .filter_map(|h| match h.join() {
-                        Ok(Ok(())) => None,
-                        Ok(Err(e)) => Some(e),
-                        Err(_) => Some(anyhow::anyhow!("translate thread panicked")),
-                    })
-                    .collect()
+                for h in handles {
+                    match h.join() {
+                        Ok(Ok(t)) => resolved.extend(t),
+                        Ok(Err(e)) => errors.push(e),
+                        Err(_) => errors.push(anyhow::anyhow!("translate thread panicked")),
+                    }
+                }
             });
             if let Some(first) = errors.into_iter().next() {
                 return Err(first);
@@ -191,31 +198,41 @@ impl Benchmark for TestCorpus {
             for bat in &batteries {
                 let (name, filter) = parse_target(bat);
                 let filter = one_filter(filter, filter_flag)?;
-                translate::run_test_corpus(paths, &name, filter.as_deref(), parallel)?;
+                resolved.extend(translate::run_test_corpus(
+                    paths,
+                    &name,
+                    filter.as_deref(),
+                    parallel,
+                )?);
             }
         }
-        Ok(())
+        Ok(resolved)
     }
 
-    // `_repo_root` is unused in every impl: the real repo root travels on `Paths` (see
-    // crate::io::sandbox), so the trait parameter could be dropped as a follow-up.
     fn verify(
         &self,
-        _repo_root: &Path,
         paths: &Paths,
         target: &str,
         filter_flag: Option<&str>,
         force: bool,
         parallel: usize,
+        translations: &Translations,
     ) -> Result<()> {
         let batteries = resolve_batteries(&paths.corpus_dir, target)?;
         if batteries.len() > 1 {
-            verify::run_all(paths, &batteries, force, parallel)
+            verify::run_all(paths, &batteries, force, parallel, translations)
         } else {
             for bat in &batteries {
                 let (name, filter) = parse_target(bat);
                 let filter = one_filter(filter, filter_flag)?;
-                verify::run(paths, &name, filter.as_deref(), force, parallel)?;
+                verify::run(
+                    paths,
+                    &name,
+                    filter.as_deref(),
+                    force,
+                    parallel,
+                    translations,
+                )?;
             }
             Ok(())
         }
@@ -261,7 +278,7 @@ impl Benchmark for HarvestBench {
         target: &str,
         filter_flag: Option<&str>,
         parallel: usize,
-    ) -> Result<()> {
+    ) -> Result<Translations> {
         no_filter_here(filter_flag)?;
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
         translate::run_harvest_bench(paths, &projects, parallel)
@@ -269,16 +286,16 @@ impl Benchmark for HarvestBench {
 
     fn verify(
         &self,
-        _repo_root: &Path,
         paths: &Paths,
         target: &str,
         filter_flag: Option<&str>,
         force: bool,
         parallel: usize,
+        translations: &Translations,
     ) -> Result<()> {
         no_filter_here(filter_flag)?;
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
-        verify::run_harvest_bench(paths, &projects, parallel, force)
+        verify::run_harvest_bench(paths, &projects, parallel, force, translations)
     }
 
     fn test(&self, paths: &Paths, target: &str, mode: TestMode) -> Result<TestOutcome> {

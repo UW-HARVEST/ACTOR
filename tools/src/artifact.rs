@@ -1,6 +1,6 @@
 //! Typed phase artifacts: what an agent produced, and what may be done with it.
 //!
-//! Three invariants are enforced by the compiler, not by convention:
+//! Four invariants are enforced by the compiler, not by convention:
 //! * Nothing runs in a published artifact: `Command::current_dir` and `--target-dir`
 //!   both take `impl AsRef<Path>`, so "can obtain a path" *is* "can execute here", and
 //!   [`Sealed`] yields no path in any form. (`oracle/` still builds inside the tree it
@@ -8,11 +8,12 @@
 //!   crate at `<case>/translated_rust` and pins its build output to
 //!   `<that>/target` with an explicit `--target-dir`, and its `cando2` runner bakes
 //!   `CARGO_MANIFEST_DIR`. The build has to leave the tree, which is what
-//!   [`Scratch::subdir`] + [`Sealed::materialise_at`] exist for.)
+//!   [`Scratch::subdir`] + [`Published::materialise_at`] exist for.)
 //! * An infra-failed run cannot be sealed: [`Scrubbed::seal`] demands a
 //!   [`crate::domain::health::Completed`], mintable only from a completed run.
 //! * A tree cannot be hashed before it is scrubbed: agent output embeds the random
 //!   scratch directory name, so a digest of raw output changes every run.
+//! * A published tree is digested AFTER its phase edited it: [`Publishing::finish`] is its only exit.
 
 use crate::domain::contents::{classify, Carry, Disposition, C_ORACLE_DIR};
 use crate::domain::health::Completed;
@@ -39,8 +40,8 @@ pub trait Phase: sealed_trait::Sealed + Copy + 'static {
     /// the case ROOT, so an infra failure on those backends was scored as a result and
     /// `exit_code`/`timed_out` (the 124 a wall-clock kill leaves) were read by nothing.
     const METRICS: &'static str;
-    /// Phase dirs a fresh result of this phase makes stale, which `clear_phase` removes
-    /// whole. A translation invalidates `verified/`: [`crate::battery::crate_dir`] prefers
+    /// Phase dirs a CHANGED result of this phase makes stale, which [`Publishing::finish`] removes
+    /// whole. A *different* translation invalidates `verified/`: [`crate::battery::crate_dir`] prefers
     /// `verified/` when it holds a crate, so it would score the last sweep's verification
     /// against this one's translation — and the "already verified" skip keys on
     /// `verified/logs/verify.log`, so keeping just its logs makes verify skip the case.
@@ -68,6 +69,10 @@ impl Phase for Verify {
     const INVALIDATES: &'static [&'static str] = &[];
 }
 
+/// An invalidation fires from [`Publishing::finish`], which `verify::verify_case` never reaches
+/// (it drops its [`Publishing`]), so an entry here could never fire: finish that publish first.
+const _: () = assert!(Verify::INVALIDATES.is_empty());
+
 /// Inside the phase's own dir, which is what lets [`clear_phase`] keep the transcript while
 /// replacing the artifact around it.
 pub(crate) fn phase_logs<P: Phase>(case_dir: &Path) -> PathBuf {
@@ -83,8 +88,8 @@ pub(crate) fn phase_metrics<P: Phase>(case_dir: &Path) -> PathBuf {
     crate::battery::phase_dir(case_dir, P::DIR).join(P::METRICS)
 }
 
-/// Make room for a fresh result of this phase. THE definition of "clear a phase dir";
-/// [`Sealed::publish`] is its other caller.
+/// Make room for a fresh result of this phase — THIS phase's dir only. `INVALIDATES` is
+/// [`Publishing::finish`]'s: whether a dependent went stale is unknown until the tree is digested.
 ///
 /// Call it immediately before the new output is written, never before the agent starts: the
 /// four translate paths used to `remove_dir_all` the whole case up front, so a crash, an API
@@ -96,13 +101,6 @@ pub(crate) fn phase_metrics<P: Phase>(case_dir: &Path) -> PathBuf {
 /// is not crate-external API, and `no_public_path_escapes_the_artifact_modules` reads only
 /// impls and structs, so nothing would have caught it escaping.
 pub(crate) fn clear_phase<P: Phase>(case_dir: &Path) -> Result<()> {
-    for stale in P::INVALIDATES {
-        let dir = crate::battery::phase_dir(case_dir, stale);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)
-                .with_context(|| format!("removing the stale {}", dir.display()))?;
-        }
-    }
     for entry in artifact_children::<P>(case_dir)? {
         let p = entry.path();
         if entry.file_type()?.is_dir() {
@@ -113,6 +111,32 @@ pub(crate) fn clear_phase<P: Phase>(case_dir: &Path) -> Result<()> {
         .with_context(|| format!("clearing {}", p.display()))?;
     }
     Ok(())
+}
+
+/// Remove what a CHANGED result of this phase makes stale. Deferred out of [`clear_phase`] to
+/// [`Publishing::finish`]: `verify` seeds itself by REPUBLISHING each case's stored translation, so
+/// invalidating on every publish deleted the verification the command was asked to check — crate,
+/// `logs/` and `verification.json`, 248 in the shipped tree — for a translation that had not moved.
+fn invalidate_dependents<P: Phase>(case_dir: &Path) -> Result<()> {
+    for stale in P::INVALIDATES {
+        let dir = crate::battery::phase_dir(case_dir, stale);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("removing the stale {}", dir.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// What the phase dir holds NOW, measured as the phase seeded from it keys it — verify's `input_tree`
+/// IS [`Published::digest`] of the translation — so "the tree changed" and "the key moved" are one
+/// comparison, post-seal edits on both sides. `None` (no dir, or unhashable) keeps the invalidation.
+fn phase_dir_digest<P: Phase>(case_dir: &Path) -> Option<TreeDigest> {
+    let dir = crate::battery::phase_dir(case_dir, P::DIR);
+    if !dir.is_dir() {
+        return None;
+    }
+    digest_tree(&dir).ok()
 }
 
 /// What a fresh result of this phase replaces: everything in the phase dir but `logs/`, which holds
@@ -207,8 +231,9 @@ impl SeededBy<Corpus> for Translate {
     const AT: SeedAt = SeedAt::COracle;
 }
 
-/// Only from a *translation*: re-verifying a verification does not compile.
-impl SeededBy<Sealed<Translate>> for Verify {
+/// Only from a *published translation*: re-verifying a verification does not compile, and neither
+/// does seeding from a [`Sealed`] — [`Publishing::edited`] rewrites `Cargo.toml` in between.
+impl SeededBy<Published<Translate>> for Verify {
     const AT: SeedAt = SeedAt::CrateRoot;
 }
 
@@ -544,7 +569,7 @@ impl Scratch {
         })
     }
 
-    /// Room for ONE case inside a root shared by many. [`Sealed::materialise_into`]
+    /// Room for ONE case inside a root shared by many. [`Published::materialise_into`]
     /// cannot serve a whole battery: it consumes the `Scratch` and roots the work tree
     /// at the tempdir itself, so N cases would need N roots.
     pub fn subdir(&self, name: impl AsRef<Path>) -> Result<ScratchPath> {
@@ -560,7 +585,7 @@ impl Scratch {
 }
 
 /// Where a case may be materialised. Hands out no path of its own, so the only thing a
-/// caller can do with one is pass it to [`Sealed::materialise_at`] — which is what stops
+/// caller can do with one is pass it to [`Published::materialise_at`] — which is what stops
 /// that destination from being the results-tree phase dir being measured.
 #[must_use]
 pub struct ScratchPath {
@@ -968,23 +993,6 @@ impl<P: Phase> fmt::Debug for Sealed<P> {
 }
 
 impl<P: Phase> Sealed<P> {
-    pub fn adopt(case_dir: &Path) -> Result<Self> {
-        let root = crate::battery::phase_dir(case_dir, P::DIR);
-        anyhow::ensure!(
-            root.is_dir(),
-            "no {} phase dir at {}",
-            P::DIR,
-            root.display()
-        );
-        let digest = digest_tree(&root)?;
-        Ok(Self {
-            root,
-            _scratch: None,
-            digest,
-            _phase: PhantomData,
-        })
-    }
-
     /// Re-adopt a tree the cache stored earlier. Kept `pub(crate)`: widening it would be
     /// a way to manufacture a `Sealed` without a `Completed` proof.
     pub(crate) fn from_cache(code_dir: &Path) -> Result<Self> {
@@ -1009,15 +1017,147 @@ impl<P: Phase> Sealed<P> {
     /// Takes a destination and returns nothing, so there is still no expression that
     /// yields a path *to* a sealed artifact. Uses the same [`Carry`] variant as the
     /// results-tree overlay, so a replay cannot differ from a fresh run.
-    /// Where this artifact lives, so a work dir seeded from it can tell the store what its key
-    /// named. Returns a [`Seed`], not a path, so `Sealed` still yields no `Path` and
-    /// `sealed_has_no_path` keeps holding.
-    pub fn as_seed(&self) -> Seed {
-        Seed::FromArtifact(self.root.clone())
-    }
-
     pub fn export_into(&self, dest: &Path) -> Result<()> {
         copy_carrying(&self.root, dest, Carry::FromArtifact)
+    }
+
+    /// Consumes `self`: [`Publishing::edited`] changes the tree, so a `Sealed` usable afterwards would
+    /// be one whose digest describes a tree that no longer exists.
+    pub fn publish(self, case_dir: &Path) -> Result<Publishing<P>> {
+        let replaced = phase_dir_digest::<P>(case_dir);
+        clear_phase::<P>(case_dir)?;
+        let dst = crate::battery::phase_dir(case_dir, P::DIR);
+        self.assemble_into(case_dir, &dst)?;
+        Ok(Publishing {
+            root: dst,
+            case_dir: case_dir.to_path_buf(),
+            replaced,
+            keying: Keying::Keyed,
+            _phase: PhantomData,
+        })
+    }
+
+    /// Factored out of [`Self::publish`]: "what this phase's tree contains" has one answer.
+    pub fn assemble_into(&self, case_dir: &Path, dst: &Path) -> Result<()> {
+        assemble::<P>(&self.root, case_dir, dst)
+    }
+}
+
+/// A phase dir this run has just written, whose only exit is [`Self::finish`] — which digests the tree AS
+/// IT THEN STANDS. Post-processing edited `translated/Cargo.toml` after `publish` wrote it, so what was
+/// scored was not what was sealed: for every case, always.
+#[must_use = "a published phase dir that is never finished has no digest, so nothing can name it"]
+pub struct Publishing<P: Phase> {
+    root: PathBuf,
+    case_dir: PathBuf,
+    /// What the phase dir held before, so [`Self::finish`] can tell a republish from a new tree.
+    replaced: Option<TreeDigest>,
+    keying: Keying,
+    _phase: PhantomData<P>,
+}
+
+/// Whether a cache key names this artifact, so "its inputs are this run's inputs" is a guarantee and
+/// not a hope about bytes on disk. Only a [`Sealed`] — which needs a [`Completed`] — can be `Keyed`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Keying {
+    Keyed,
+    Unkeyable,
+}
+
+impl<P: Phase> fmt::Debug for Publishing<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Publishing<{}>", P::DIR)
+    }
+}
+
+impl<P: Phase> Publishing<P> {
+    #[cfg(test)]
+    pub(crate) fn for_test(case_dir: &Path) -> Self {
+        Self {
+            root: crate::battery::phase_dir(case_dir, P::DIR),
+            case_dir: case_dir.to_path_buf(),
+            replaced: None,
+            keying: Keying::Keyed,
+            _phase: PhantomData,
+        }
+    }
+
+    /// The edits this phase makes to its OWN published tree, before anything digests it. Handed the tree
+    /// and not a case dir, so the destination cannot be another phase's, and consuming `self` makes an
+    /// edit provably precede [`Self::finish`]. Best-effort, as it has always been.
+    pub fn edited(self, edit: impl FnOnce(&Path) -> Result<()>) -> Self {
+        if let Err(e) = edit(&self.root) {
+            eprintln!(
+                "  ⚠️  post-processing {} failed; published unedited: {e:#}",
+                self.root.display()
+            );
+        }
+        self
+    }
+
+    pub fn finish(self) -> Result<Published<P>> {
+        let digest = digest_tree(&self.root);
+        // Only a republish PROVEN identical skips the invalidation: a tree that cannot be digested, or
+        // a phase dir that was not there to compare with, may not keep a dependent phase alive.
+        if !matches!((&self.replaced, &digest), (Some(before), Ok(after)) if before == after) {
+            invalidate_dependents::<P>(&self.case_dir)?;
+        }
+        Ok(Published {
+            root: self.root,
+            digest: digest?,
+            keying: self.keying,
+            _phase: PhantomData,
+        })
+    }
+}
+
+/// A phase's artifact as this run published it: a stable path, a digest of it, and no scratch
+/// lifetime, so a battery's translations can be held while verify runs over them. THE hand-off
+/// medium, taken BY VALUE: "seeded from a translation this run did not produce" does not compile.
+pub struct Published<P: Phase> {
+    root: PathBuf,
+    digest: TreeDigest,
+    keying: Keying,
+    _phase: PhantomData<P>,
+}
+
+impl<P: Phase> fmt::Debug for Published<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Published<{}>({:?})", P::DIR, self.digest)
+    }
+}
+
+impl<P: Phase> Published<P> {
+    /// The tree already in the phase dir, taken as this run's artifact because NO KEY EXISTS to ask
+    /// for a better one: an unkeyed backend, or a phase whose store is bypassed — refusing those
+    /// left `--agent opencode` and every battery of symlinked configs unable to verify under any
+    /// flag. `Sealed::adopt`'s shape without its power: it mints no [`Sealed`], so nothing here
+    /// becomes a cache entry or stands in for a [`Completed`], and [`Keying::Unkeyable`] is
+    /// recorded rather than a guarantee implied.
+    pub(crate) fn unkeyed_from_phase_dir(case_dir: &Path) -> Result<Self> {
+        let root = crate::battery::phase_dir(case_dir, P::DIR);
+        anyhow::ensure!(root.is_dir(), "no {} at {}", P::DIR, root.display());
+        Ok(Self {
+            digest: digest_tree(&root)?,
+            root,
+            keying: Keying::Unkeyable,
+            _phase: PhantomData,
+        })
+    }
+
+    pub fn digest(&self) -> &TreeDigest {
+        &self.digest
+    }
+
+    /// Printed per case by the sweeps: a number derived from an unkeyed artifact is a weaker claim.
+    pub(crate) fn keying(&self) -> Keying {
+        self.keying
+    }
+
+    /// Where this artifact lives, so a work dir seeded from it can tell the store what its key
+    /// named. A [`Seed`], not a path: `sealed_has_no_path`'s property holds for this type too.
+    pub fn as_seed(&self) -> Seed {
+        Seed::FromArtifact(self.root.clone())
     }
 
     /// The only way to obtain something runnable: a writable copy elsewhere.
@@ -1041,16 +1181,28 @@ impl<P: Phase> Sealed<P> {
         let ScratchPath { root, keep } = at;
         seed(&self.root, root, Scratch { dir: keep }, Q::AT)
     }
+}
 
-    pub fn publish(&self, case_dir: &Path) -> Result<()> {
-        clear_phase::<P>(case_dir)?;
-        self.assemble_into(case_dir, &crate::battery::phase_dir(case_dir, P::DIR))
+/// A published tree, MEASURED, and nothing else. `Sealed::adopt` served this — the golden
+/// fingerprint pins `digest_tree` over 40 shipped `translated/` dirs — and served a whole artifact
+/// with it: a `Sealed<P>` with no [`Completed`], which then seeded verify. A `String` mints
+/// nothing.
+pub struct Fingerprint(String);
+
+impl Fingerprint {
+    pub fn of_phase_dir<P: Phase>(case_dir: &Path) -> Result<Self> {
+        let root = crate::battery::phase_dir(case_dir, P::DIR);
+        anyhow::ensure!(
+            root.is_dir(),
+            "no {} phase dir at {}",
+            P::DIR,
+            root.display()
+        );
+        Ok(Self(digest_tree(&root)?.0))
     }
 
-    /// Factored out of [`Self::publish`] so that "what this phase's tree contains" —
-    /// published, or copied to compile-check — has exactly one answer.
-    pub fn assemble_into(&self, case_dir: &Path, dst: &Path) -> Result<()> {
-        assemble::<P>(&self.root, case_dir, dst)
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -1091,9 +1243,22 @@ fn assemble<P: Phase>(from: &Path, case_dir: &Path, dst: &Path) -> Result<()> {
 /// It cannot be fixed by calling `drop_build_products` here, because that step takes an
 /// [`Oracle`] and an unkeyed path has no `Completed` with which to obtain one. Closing it means
 /// giving the unkeyed backends a completion proof -- backlog #38 -- not widening this function.
-pub(crate) fn publish_unsealed<P: Phase>(from: &Path, case_dir: &Path) -> Result<()> {
+///
+/// It yields a [`Publishing`] and therefore a [`Published`], since it can digest what it just
+/// wrote; what it cannot mint is a [`Sealed`], having no [`Completed`] — so STALENESS holds for all
+/// seven translate arms while CACHING covers only the keyed two.
+pub(crate) fn publish_unsealed<P: Phase>(from: &Path, case_dir: &Path) -> Result<Publishing<P>> {
+    let replaced = phase_dir_digest::<P>(case_dir);
     clear_phase::<P>(case_dir)?;
-    assemble::<P>(from, case_dir, &crate::battery::phase_dir(case_dir, P::DIR))
+    let dst = crate::battery::phase_dir(case_dir, P::DIR);
+    assemble::<P>(from, case_dir, &dst)?;
+    Ok(Publishing {
+        root: dst,
+        case_dir: case_dir.to_path_buf(),
+        replaced,
+        keying: Keying::Unkeyable,
+        _phase: PhantomData,
+    })
 }
 
 #[cfg(test)]
@@ -1315,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn a_corpus_seeds_the_oracle_and_a_sealed_artifact_seeds_the_crate_root() {
+    fn a_corpus_seeds_the_oracle_and_a_published_translation_seeds_the_crate_root() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         let src = tmp.path().join("corpus");
         tree(&src, &[("src/lib.c", "int f(void){return 1;}")]);
@@ -1334,7 +1499,7 @@ mod tests {
         );
         assert_eq!(<Translate as SeededBy<Corpus>>::AT, SeedAt::COracle);
         assert_eq!(
-            <Verify as SeededBy<Sealed<Translate>>>::AT,
+            <Verify as SeededBy<Published<Translate>>>::AT,
             SeedAt::CrateRoot
         );
     }
@@ -1498,10 +1663,11 @@ mod tests {
             ],
         );
 
-        let sealed = Sealed::<Translate>::adopt(case.path()).expect("adopt");
+        let published =
+            Published::<Translate>::unkeyed_from_phase_dir(case.path()).expect("the fixture tree");
 
         let scratch = Scratch::new("test-work-").unwrap();
-        let work: WorkTree<Verify> = sealed.materialise_into(scratch).expect("materialise");
+        let work: WorkTree<Verify> = published.materialise_into(scratch).expect("materialise");
         let crate_dir = work.crate_dir();
         assert!(
             crate_dir.join("src/lib.rs").is_file(),
@@ -1545,7 +1711,11 @@ mod tests {
         let verified = scrubbed
             .seal(&crate::domain::health::Completed::for_test(), &c_before)
             .expect("seal");
-        verified.publish(case.path()).expect("publish");
+        verified
+            .publish(case.path())
+            .expect("publish")
+            .finish()
+            .expect("digest the published tree");
 
         let out = case.path().join(crate::battery::VERIFIED);
         assert_eq!(
@@ -1568,6 +1738,58 @@ mod tests {
         );
     }
 
+    /// SITE 17, and the probe that no key moved when it closed: post-processing edited the tree after
+    /// the seal, so the recorded `output_tree` described 0 of 84 published trees. The edits now run on
+    /// the way to [`Published`], so WHERE the digest is taken moves and not what it covers.
+    #[test]
+    fn a_published_translation_is_digested_after_its_post_processing() {
+        let case = crate::io::workdir::test_tempdir().unwrap();
+        let (work, c_before, _) = seeded_oracle();
+        let sealed = work
+            .scrub()
+            .unwrap()
+            .seal(&crate::domain::health::Completed::for_test(), &c_before)
+            .unwrap();
+        let sealed_digest = sealed.digest().clone();
+
+        // `add_workspace`'s effect in one line: the ORDER is what is under test, not the rewrite.
+        let published = sealed
+            .publish(case.path())
+            .unwrap()
+            .edited(|tree| {
+                let manifest = tree.join("Cargo.toml");
+                let mut text = std::fs::read_to_string(&manifest)?;
+                text.push_str("\n[workspace]\n");
+                std::fs::write(&manifest, text)?;
+                Ok(())
+            })
+            .finish()
+            .unwrap();
+
+        let manifest =
+            crate::battery::phase_dir(case.path(), crate::battery::TRANSLATED).join("Cargo.toml");
+        assert!(
+            std::fs::read_to_string(&manifest)
+                .unwrap()
+                .contains("[workspace]"),
+            "the edit must reach the published tree, or the ordering below is about nothing"
+        );
+        assert_ne!(
+            &sealed_digest,
+            published.digest(),
+            "non-vacuity: the edit really does move the digest, which is why taking it at the \
+             seal described a tree that no longer existed by the time anything read it"
+        );
+        assert_eq!(
+            published.digest().as_str(),
+            Fingerprint::of_phase_dir::<Translate>(case.path())
+                .unwrap()
+                .as_str(),
+            "and what `Published` states is the digest OF THE PUBLISHED TREE — the same function \
+             the 40 golden fingerprints pin, so verify's `input_tree` is unchanged"
+        );
+    }
+
     /// One root, many cases — the shape `materialise_into` cannot express, and the
     /// prerequisite for scoring a battery outside the tree it scores.
     #[test]
@@ -1577,13 +1799,13 @@ mod tests {
             &case.path().join(crate::battery::TRANSLATED),
             &[("Cargo.toml", "[package]"), ("src/lib.rs", "pub fn a() {}")],
         );
-        let sealed = Sealed::<Translate>::adopt(case.path()).unwrap();
+        let published = Published::<Translate>::unkeyed_from_phase_dir(case.path()).unwrap();
 
         let root = Scratch::new("test-battery-").unwrap();
-        let a: WorkTree<Verify> = sealed
+        let a: WorkTree<Verify> = published
             .materialise_at(root.subdir("case-a").unwrap())
             .unwrap();
-        let b: WorkTree<Verify> = sealed
+        let b: WorkTree<Verify> = published
             .materialise_at(root.subdir("case-b").unwrap())
             .unwrap();
 
@@ -1628,8 +1850,8 @@ mod tests {
                 ("c_src/src/lib.c", "int a(void){return 0;}"),
             ],
         );
-        let sealed = Sealed::<Translate>::adopt(case.path()).unwrap();
-        let work: WorkTree<Verify> = sealed
+        let published = Published::<Translate>::unkeyed_from_phase_dir(case.path()).unwrap();
+        let work: WorkTree<Verify> = published
             .materialise_into(Scratch::new("t-").unwrap())
             .unwrap();
         let c_before = work.c().snapshot().unwrap();
@@ -1983,10 +2205,11 @@ mod tests {
                 &case.path().join(crate::battery::TRANSLATED),
                 &[("Cargo.toml", "[package]"), ("src/lib.rs", "pub fn a() {}")],
             );
-            let work: WorkTree<Verify> = Sealed::<Translate>::adopt(case.path())
-                .unwrap()
-                .materialise_into(Scratch::new("t-").unwrap())
-                .unwrap();
+            let work: WorkTree<Verify> =
+                Published::<Translate>::unkeyed_from_phase_dir(case.path())
+                    .unwrap()
+                    .materialise_into(Scratch::new("t-").unwrap())
+                    .unwrap();
             let c_before = work.c().snapshot().unwrap();
             assert!(
                 matches!(c_before.0, Reference::Ungraded),
@@ -2083,15 +2306,22 @@ mod tests {
         );
         non_regular_entries(&produced);
 
-        type Publish = fn(&Path, &Path) -> Result<()>;
+        // Both FINISHED here: the file sets below catch a difference the digest cannot see.
+        type Publish = fn(&Path, &Path) -> Result<Published<Translate>>;
         let mut shapes = Vec::new();
-        let sealed: Publish = |from, case| Sealed::<Translate>::from_cache(from)?.publish(case);
-        for (what, publish) in [
-            ("sealed", sealed),
-            ("copied", publish_unsealed::<Translate>),
-        ] {
+        let mut digests = Vec::new();
+        let sealed: Publish = |from, case| {
+            Sealed::<Translate>::from_cache(from)?
+                .publish(case)?
+                .finish()
+        };
+        let copied: Publish = |from, case| publish_unsealed::<Translate>(from, case)?.finish();
+        let mut keyings = Vec::new();
+        for (what, publish) in [("sealed", sealed), ("copied", copied)] {
             let case = tmp.path().join(what);
-            publish(&produced, &case).unwrap();
+            let published = publish(&produced, &case).unwrap();
+            keyings.push(published.keying());
+            digests.push(published.digest().clone());
             let dst = crate::battery::phase_dir(&case, crate::battery::TRANSLATED);
             for admitted in [
                 "Cargo.toml",
@@ -2134,6 +2364,25 @@ mod tests {
             shapes[0], shapes[1],
             "the two publishes must agree file for file, or `translated/` means one thing for \
              a keyed backend and another for an unkeyed one"
+        );
+        assert_eq!(
+            digests[0], digests[1],
+            "and they must digest alike, because that digest is what the next phase's key names"
+        );
+        // Every way a `Published` is minted: identical trees, and a KEYING that differs, because
+        // reporting the unkeyed two as covered claims a guarantee nothing has.
+        assert_eq!(
+            (keyings[0], keyings[1]),
+            (Keying::Keyed, Keying::Unkeyable),
+            "only a `Sealed`, which needs a `Completed`, is what the store can key"
+        );
+        assert_eq!(
+            Published::<Translate>::unkeyed_from_phase_dir(&tmp.path().join("sealed"))
+                .unwrap()
+                .keying(),
+            Keying::Unkeyable,
+            "and a tree re-adopted from its phase dir is unkeyable however it was first published: \
+             the adoption asks no key, so nothing there names the model, prompt or toolchain"
         );
     }
 
