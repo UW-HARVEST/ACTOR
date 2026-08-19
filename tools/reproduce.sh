@@ -15,12 +15,20 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 unset RUSTUP_TOOLCHAIN
 export PATH="$HOME/.cargo/bin:$PATH"
 
+# `CliVersion::probe` runs `claude --version` PER CASE, which failed 85/85 in CI. Sound to state: `cli`
+# left the key in #109, a replay stores nothing, and `assert_pins_honoured` runs inside `compute`.
+export HARVEST_CLI_VERSION="${HARVEST_CLI_VERSION:-replay-only: no agent CLI was invoked}"
+
 BIN=tools/target/release/harvest-tools
 die() { echo "❌ $*" >&2; exit 1; }
 
 echo "=== reproduce: $AGENT / $BATTERY ==="
 rustc --version
 [ -x "$BIN" ] || die "$BIN not built: cargo build --release --locked --manifest-path tools/Cargo.toml"
+
+python3 - <<'VER' || die "python3 is $(python3 -V 2>&1), but MIT runtests needs >= 3.10"
+import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)
+VER
 [ -d results/.cache ] || die "results/.cache absent — run: git submodule update --init results test-corpus"
 
 log=$(mktemp -t reproduce.XXXXXX) || die "mktemp failed"
