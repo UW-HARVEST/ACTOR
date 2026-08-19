@@ -340,6 +340,9 @@ fn run_with_semaphore(
         panicked.join(", ")
     );
     refuse_absent(&absent, &format!("harvest-tools translate {battery_name}"))?;
+    paths
+        .cache_mode
+        .require_every_case_resolved(failed, total)?;
     Ok(resolved)
 }
 

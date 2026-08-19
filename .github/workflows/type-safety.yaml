@@ -96,7 +96,7 @@ jobs:
         #
         # TWO ceilings, because each is blind to exactly what the other catches.
         #
-        # --max-comments 3100 is primary: an absolute comment-line ceiling since PR 13,
+        # --max-comments 3150 is primary: an absolute comment-line ceiling since PR 13,
         # not the `--max 14` whole-tree ratio before it. The ratio was green on a false
         # measurement -- the raw-string masker matched any `r` before a quote, so 95 of
         # its 149 matches over tools/src/**.rs were ordinary words like `"a valid
@@ -136,12 +136,22 @@ jobs:
         # docs/HANDOFF.md's remaining-work table so it cannot be forgotten. Never raise it
         # again without the same explicit reasoning in this comment.
         #
+        # RAISED 3100 -> 3150 by PR 23, and here is the reasoning the line above demands.
+        # origin/main measured EXACTLY 3100 of 3100: PR 22 spent the whole budget, leaving a
+        # PR that adds a file no way to document it. PR 23 adds two -- tools/reproduce.sh
+        # (the reproducibility procedure, which must not live only in a workflow) and a
+        # rewritten validate.yaml -- plus two documented functions, and measures 3138 after
+        # trimming its own comments 46 lines. Fitting under 3100 would mean deleting
+        # PRE-EXISTING documentation to make room, which is what PR 21 did to this very
+        # block and what "never work around your own gate" forbids. 3150 is 3138 plus 12,
+        # not a round number: the next PR prunes or raises deliberately, as this one did.
+        #
         # .py is in neither HASH nor SLASH, so the budget does not count itself: this
         # script's own docstring and all 250 lines of tools/test_comment_budget.py cost
         # ZERO against both ceilings. Deriving 3100 from the tree needs that fact.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 3100 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 3150 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is

@@ -138,7 +138,7 @@ pub fn run_test_corpus(
     filter: Option<&str>,
     parallel: usize,
 ) -> Result<Translations> {
-    preflight_check(paths.agent)?;
+    preflight_check(paths.agent, paths.cache_mode)?;
     let skip = translate_skip_check(paths);
 
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
@@ -259,6 +259,9 @@ pub fn run_test_corpus(
     if let Some(line) = store.tally_line() {
         println!("{line}");
     }
+    paths
+        .cache_mode
+        .require_every_case_resolved(failed, total)?;
     Ok(resolved)
 }
 
@@ -460,9 +463,10 @@ fn run_and_record(
                 elapsed_secs: 0,
                 success: false,
                 error: Some(
-                    "no stored translation for this run's key, and this sweep may not pay for \
-                     one — `verify` resolves translations read-only. Translate it deliberately \
-                     (`harvest-tools translate <battery>`, or `run`) and verify after."
+                    "no stored translation for this run's key, and this sweep may not pay for one \
+                     — either `verify`, which resolves translations read-only, or `--replay-only`. \
+                     Translate it deliberately (`harvest-tools translate <battery>`, or `run`) and \
+                     verify after."
                         .to_owned(),
                 ),
                 skipped: false,
@@ -749,7 +753,7 @@ pub fn run_harvest_bench(
         "{}",
         no_in_tool_translate(&paths.agent_key)
     );
-    preflight_check(paths.agent)?;
+    preflight_check(paths.agent, paths.cache_mode)?;
     let skip = translate_skip_check(paths);
 
     // A harvest-bench test_case/ is always a C library the suite links by ABI, so the
@@ -823,6 +827,9 @@ pub fn run_harvest_bench(
     if let Some(line) = store.tally_line() {
         println!("{line}");
     }
+    paths
+        .cache_mode
+        .require_every_case_resolved(failed, total)?;
     Ok(resolved)
 }
 
@@ -870,7 +877,20 @@ fn translate_one_harvest_bench(
     )
 }
 
-fn preflight_check(agent: Agent) -> Result<()> {
+/// Whether this sweep can launch an agent, so whether its CLI must be on PATH. A pure mapping so a
+/// test can assert it exhaustively: `ReplayOnly` refuses above `compute`, so demanding a CLI only
+/// stops a runner that was never going to run it. `cli` is not a key component (#109) either.
+fn probes_the_agent_cli(mode: cache::Mode) -> bool {
+    match mode {
+        cache::Mode::ReadWrite | cache::Mode::Bypass | cache::Mode::Refresh => true,
+        cache::Mode::ReplayOnly => false,
+    }
+}
+
+fn preflight_check(agent: Agent, mode: cache::Mode) -> Result<()> {
+    if !probes_the_agent_cli(mode) {
+        return Ok(());
+    }
     let (cmd, version_args): (&str, &[&str]) = match agent {
         Agent::Kiro => ("kiro-cli", &["--version"]),
         Agent::Claude
@@ -2679,6 +2699,31 @@ fn invoke_opencode_with_retry(
 
 #[cfg(test)]
 mod tests {
+    /// A runner replaying a stored battery has no `claude` on PATH and needs none. Asserted over
+    /// every mode so a new one decides here rather than defaulting into probing a CLI it never runs.
+    #[test]
+    fn only_a_sweep_that_can_launch_an_agent_demands_its_cli() {
+        for mode in [
+            crate::cache::Mode::ReadWrite,
+            crate::cache::Mode::Bypass,
+            crate::cache::Mode::Refresh,
+        ] {
+            assert!(
+                probes_the_agent_cli(mode),
+                "{mode:?} can reach compute, so the CLI must exist"
+            );
+        }
+        assert!(
+            !probes_the_agent_cli(crate::cache::Mode::ReplayOnly),
+            "a replay cannot launch an agent, so requiring its CLI only breaks the runner"
+        );
+
+        // Non-vacuity: the skip is what makes the check reachable with nothing on PATH at all.
+        // `Agent::Claude` names a `claude` binary this test does not provide.
+        preflight_check(Agent::Claude, crate::cache::Mode::ReplayOnly)
+            .expect("a replay must not probe a CLI it will never invoke");
+    }
+
     use super::*;
     use std::process::Command;
 
