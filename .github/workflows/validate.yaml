@@ -3,123 +3,100 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
-  setup:
+  # Attached to PRs because it CAN pass: no agent, no credentials, and `--replay-only` makes a miss
+  # a refusal. The 7-arm `test all --check` matrix that was here had not passed once in 100 runs back
+  # past 2026-07-05, so every PR merged on `type safety` alone; it is now `archive`, run on demand.
+  reproduce:
+    name: Reproduce Test-Corpus claude B01_synthetic from the cache
     runs-on: ubuntu-24.04
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
         with:
           token: ${{ secrets.SUBMODULE_PAT }}
 
-      - name: Check out submodules
+      # NO --depth=1: a shallow fetch produces only the tip, so a submodule pinned elsewhere cannot
+      # be checked out and the runner holds a different results tree than the pin names.
+      - name: Check out submodules at their pinned commits
         run: |
           git config --global url."https://x-access-token:${{ secrets.SUBMODULE_PAT }}@github.com/".insteadOf "https://github.com/"
-          git submodule update --init --depth=1 results test-corpus
+          git submodule update --init results test-corpus
+
+      - name: Assert the submodules are at their pins
+        run: |
+          fail=0
+          for m in results test-corpus; do
+            want=$(git ls-tree HEAD "$m" | awk '{print $3}')
+            have=$(git -C "$m" rev-parse HEAD)
+            echo "$m: pinned $want / checked out $have"
+            [ "$want" = "$have" ] || { echo "::error::$m is not at its pin"; fail=1; }
+          done
+          test -d results/.cache || { echo "::error::results/.cache is absent — the pin predates the commit that ships the cache"; fail=1; }
+          exit $fail
 
       - name: Set up Rust
         run: |
           rustup toolchain install 1.94.0 --profile default
-          rustup toolchain install nightly --profile default
           rustup default 1.94.0
-
-      - name: Build harvest-tools
-        run: cargo build --release --locked --manifest-path tools/Cargo.toml
-
-      - name: Cache workspace
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            .
-            !.git
-          key: workspace-${{ github.sha }}
-
-  validate:
-    needs: setup
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Test-Corpus kiro
-            guard: results/Test-Corpus/kiro
-            cmd: ./tools/target/release/harvest-tools --agent kiro test all --check
-            needs_openssl: false
-          - name: Test-Corpus c2rust
-            guard: results/Test-Corpus/c2rust
-            cmd: ./tools/target/release/harvest-tools --agent c2rust test all --check
-            needs_openssl: false
-          - name: Test-Corpus claude
-            guard: results/Test-Corpus/claude
-            cmd: ./tools/target/release/harvest-tools --agent claude test all --check
-            needs_openssl: false
-          - name: Test-Corpus laertes
-            guard: results/Test-Corpus/laertes
-            cmd: ./tools/target/release/harvest-tools --agent laertes test all --check
-            needs_openssl: false
-          - name: Test-Corpus kimi
-            guard: results/Test-Corpus/kimi
-            cmd: ./tools/target/release/harvest-tools --agent kimi test all --check
-            needs_openssl: false
-          - name: Test-Corpus gpt-5.4
-            guard: results/Test-Corpus/gpt-5.4
-            cmd: ./tools/target/release/harvest-tools --agent oneshot --model openai/gpt-5.4 test all --check
-            needs_openssl: false
-          - name: Test-Corpus gemini-3.1-pro-preview
-            guard: results/Test-Corpus/gemini-3.1-pro-preview
-            cmd: ./tools/target/release/harvest-tools --agent oneshot --model google/gemini-3.1-pro-preview test all --check
-            needs_openssl: false
-    name: ${{ matrix.name }}
-    steps:
-      - name: Restore workspace
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            .
-            !.git
-          key: workspace-${{ github.sha }}
-
-      - name: Set up Rust
-        run: |
-          rustup toolchain install 1.94.0 --profile default
-          rustup toolchain install nightly --profile default
-          rustup default 1.94.0
-
-      - name: Install system dependencies
-        if: matrix.needs_openssl
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev cmake pkg-config
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+      - name: Build harvest-tools
+        run: cargo build --release --locked --manifest-path tools/Cargo.toml
+
+      - name: Reproduce
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: ./tools/reproduce.sh B01_synthetic
+
+  # Not on push/PR: it scores translations whose transcripts include dead runs, so the infra gate
+  # refuses and it cannot pass. Kept because it refuted spec-20's claimed c2rust regression.
+  archive:
+    if: github.event_name == 'workflow_dispatch'
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Archive Test-Corpus kiro
+            cmd: ./tools/target/release/harvest-tools --agent kiro test all --check
+          - name: Archive Test-Corpus c2rust
+            cmd: ./tools/target/release/harvest-tools --agent c2rust test all --check
+          - name: Archive Test-Corpus claude
+            cmd: ./tools/target/release/harvest-tools --agent claude test all --check
+          - name: Archive Test-Corpus laertes
+            cmd: ./tools/target/release/harvest-tools --agent laertes test all --check
+          - name: Archive Test-Corpus kimi
+            cmd: ./tools/target/release/harvest-tools --agent kimi test all --check
+          - name: Archive Test-Corpus gpt-5.4
+            cmd: ./tools/target/release/harvest-tools --agent oneshot --model openai/gpt-5.4 test all --check
+          - name: Archive Test-Corpus gemini-3.1-pro-preview
+            cmd: ./tools/target/release/harvest-tools --agent oneshot --model google/gemini-3.1-pro-preview test all --check
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.SUBMODULE_PAT }}
+      - name: Check out submodules at their pinned commits
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.SUBMODULE_PAT }}@github.com/".insteadOf "https://github.com/"
+          git submodule update --init results test-corpus
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.94.0 --profile default
+          rustup default 1.94.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build harvest-tools
+        run: cargo build --release --locked --manifest-path tools/Cargo.toml
+      # No --allow-infra-failures: that would publish numbers nobody measured.
       - name: Validate
         env:
           CARGO_BUILD_JOBS: "2"
-        run: |
-          echo "::group::Environment diagnostics"
-          echo "Guard path: ${{ matrix.guard }}"
-          ls -la "${{ matrix.guard }}" 2>/dev/null | head -5 || echo "Guard path does not exist"
-          echo "pkg-config openssl:"
-          pkg-config --modversion openssl 2>&1 || echo "pkg-config not available"
-          echo "openssl version:"
-          openssl version 2>&1 || echo "openssl not found"
-          echo "::endgroup::"
-          if [ -d "${{ matrix.guard }}" ]; then
-            for attempt in 1 2 3; do
-              echo "::group::Attempt $attempt/3"
-              if ${{ matrix.cmd }}; then
-                echo "::endgroup::"
-                exit 0
-              fi
-              echo "::endgroup::"
-              if [ "$attempt" -lt 3 ]; then
-                echo "⚠️ Attempt $attempt failed, retrying (flaky floating-point tests)..."
-                find results -name target -type d -exec rm -rf {} + 2>/dev/null || true
-              fi
-            done
-            echo "❌ Failed after 3 attempts"
-            exit 1
-          fi
+        run: ${{ matrix.cmd }}

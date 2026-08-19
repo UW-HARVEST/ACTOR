@@ -526,6 +526,24 @@ pub enum Mode {
     ReplayOnly,
 }
 
+impl Mode {
+    /// THE refusal for a sweep that may not pay, called from every sweep so the three cannot
+    /// disagree. Other modes print failures and exit 0 — there a failure is a property of the moment
+    /// — but a `--replay-only` sweep that resolved fewer cases than it was asked about has
+    /// reproduced NOTHING, which is `spec-22.md`'s vacuous pass one command over.
+    pub fn require_every_case_resolved(self, failed: usize, total: usize) -> Result<()> {
+        anyhow::ensure!(
+            self != Mode::ReplayOnly || failed == 0,
+            "--replay-only: {failed} of {total} case(s) had no stored entry for this run's key, so \
+             nothing was reproduced and no number here is measured. The store does not cover this \
+             battery at these inputs — most often because a prompt, the model or the toolchain \
+             moved, and each is a key component, so the stored results no longer answer the \
+             question being asked. Earn them with a paid sweep, or drop --replay-only."
+        );
+        Ok(())
+    }
+}
+
 /// Constructible only from a [`Sealed`], hence only with a `Completed` proof.
 pub struct Produced<P: Phase> {
     pub sealed: Sealed<P>,
@@ -1175,6 +1193,30 @@ pub(crate) fn fake_program(dir: &Path, name: &str, body: &str) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// Asserted over every mode, so a mode added later decides here rather than defaulting into
+    /// "failures are fine".
+    #[test]
+    fn only_a_replay_only_sweep_refuses_to_report_a_partial_result() {
+        for mode in [Mode::ReadWrite, Mode::Bypass, Mode::Refresh] {
+            assert!(
+                mode.require_every_case_resolved(3, 85).is_ok(),
+                "{mode:?}: a failure is a property of the moment and the next run retries it"
+            );
+        }
+        assert!(
+            Mode::ReplayOnly.require_every_case_resolved(0, 85).is_ok(),
+            "a replay that resolved every case is exactly what this mode is for"
+        );
+        let refused = Mode::ReplayOnly
+            .require_every_case_resolved(3, 85)
+            .expect_err("3 of 85 unresolved reproduced nothing, so it may not report a number");
+        let msg = format!("{refused:#}");
+        assert!(
+            msg.contains("3 of 85"),
+            "the refusal must name how much was missing, not just that something was: {msg}"
+        );
+    }
+
     use super::*;
 
     fn recipe(session: &Session, policy: Option<&str>) -> RecipeDigest {

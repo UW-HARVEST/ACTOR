@@ -194,6 +194,20 @@ pub struct Cli {
     #[arg(long)]
     pub refresh_cache: bool,
 
+    /// Replay stored results and refuse to invoke an agent: a cache miss is an error, not a run.
+    ///
+    /// What a reproducibility check needs. `tools/reproduce.sh` re-derives a battery's numbers from
+    /// the store and must be incapable of spending money, so a miss stops the sweep by name instead
+    /// of quietly paying for the case and reporting a figure nobody stored. A prompt, model or
+    /// toolchain change moves the key and therefore misses -- deliberately, because the stored
+    /// translations no longer answer the question being asked.
+    ///
+    /// `conflicts_with` the pair above: "replay only" and "ignore the cache" are opposite
+    /// instructions, and the CLI is the edge where that gets parsed away rather than resolved by
+    /// precedence.
+    #[arg(long, conflicts_with_all = ["no_cache", "refresh_cache"])]
+    pub replay_only: bool,
+
     /// Produce artifacts even though the code cannot be identified — an
     /// uncommitted tree, or a binary built from a different commit.
     ///
@@ -224,9 +238,10 @@ impl Cli {
     /// THE mapping from what the operator typed to what the store does. `clap` has already
     /// rejected the illegal pair, so this is total without a fallback arm.
     pub fn cache_mode(&self) -> crate::cache::Mode {
-        match (self.no_cache, self.refresh_cache) {
-            (true, _) => crate::cache::Mode::Bypass,
-            (_, true) => crate::cache::Mode::Refresh,
+        match (self.no_cache, self.refresh_cache, self.replay_only) {
+            (true, _, _) => crate::cache::Mode::Bypass,
+            (_, true, _) => crate::cache::Mode::Refresh,
+            (_, _, true) => crate::cache::Mode::ReplayOnly,
             _ => crate::cache::Mode::ReadWrite,
         }
     }
@@ -423,6 +438,42 @@ impl Command {
 mod tests {
     use super::*;
     use crate::domain::health::LogFormat;
+
+    /// `--replay-only` is the flag `tools/reproduce.sh` relies on to be unable to spend money, so the
+    /// thing under test is the MAPPING from typed flags to store mode — not a hand-built `Mode`.
+    /// Parsed through `clap`, because the mutual exclusion is enforced there and a hand-built `Cli`
+    /// would report an illegal combination as reachable.
+    #[test]
+    fn replay_only_reaches_the_store_as_the_mode_that_cannot_invoke() {
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from([&["harvest-tools"], args, &["report"]].concat())
+                .map(|c| c.cache_mode())
+        };
+
+        assert_eq!(
+            parse(&["--replay-only"]).unwrap(),
+            crate::cache::Mode::ReplayOnly
+        );
+        assert_eq!(parse(&[]).unwrap(), crate::cache::Mode::ReadWrite);
+        assert_eq!(parse(&["--no-cache"]).unwrap(), crate::cache::Mode::Bypass);
+        assert_eq!(
+            parse(&["--refresh-cache"]).unwrap(),
+            crate::cache::Mode::Refresh
+        );
+
+        // "Replay only" and "ignore the cache" are opposite instructions, so the pair is rejected at
+        // parse time rather than resolved by a precedence nobody can see.
+        for illegal in [
+            vec!["--replay-only", "--no-cache"],
+            vec!["--replay-only", "--refresh-cache"],
+        ] {
+            assert!(
+                parse(&illegal).is_err(),
+                "{illegal:?} must not parse: it asks the store for two opposite things"
+            );
+        }
+    }
 
     #[test]
     fn every_agent_declares_a_log_format_and_the_prose_ones_are_opaque() {
