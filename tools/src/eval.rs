@@ -42,9 +42,10 @@ impl Provenance {
             Self::ThisRun => println!(
                 "  scoring artifacts this run resolved, materialised into a tree created empty"
             ),
+            // What it read, not a verdict: `test` cannot see a pipeline that just published these.
             Self::Archive => println!(
-                "  ⚠️  ARCHIVAL SCORE: these bytes come from results/, not from this run's work, \
-                 so this number carries NO FRESHNESS GUARANTEE"
+                "  scoring bytes read from results/: this command did not produce them, so their \
+                 provenance is whatever put them there"
             ),
         }
     }
