@@ -1022,11 +1022,10 @@ mod tests {
         ] {
             std::fs::write(verified.join(rel), body).unwrap();
         }
-        assert_eq!(
-            crate::battery::crate_dir(case),
-            verified,
-            "the fixture must be a tree the scorer reads verified/ from, or there is no \
-             corruption to leave and nothing to lose"
+        assert!(
+            has_crate(&verified),
+            "the fixture must hold a complete verified/ crate, or there is no corruption to \
+             leave and nothing to lose"
         );
 
         let log = verified.join("logs/verify.log");
@@ -1071,11 +1070,10 @@ mod tests {
             !verified.join("result.json").exists(),
             "nor its score, which is what the enrichers rewrite in place"
         );
-        assert_eq!(
-            crate::battery::crate_dir(&case),
-            phase_dir(&case, TRANSLATED),
-            "so the scorer falls back to translated/, which is what verify already claims it \
-             will when it declines to publish"
+        assert!(
+            !has_crate(&phase_dir(&case, VERIFIED)),
+            "so this run resolved no verified artifact at all, and a score can only cover the \
+             artifacts it resolved (see `crate::eval`)"
         );
         assert_eq!(
             std::fs::read_to_string(crate::artifact::phase_log::<Verify>(&case)).unwrap(),

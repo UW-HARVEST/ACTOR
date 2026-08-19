@@ -3,6 +3,7 @@ use anyhow::Result;
 use harvest_tools::agents::opencode;
 use harvest_tools::analyse::report;
 use harvest_tools::cli::{Cli, Command, Dataset};
+use harvest_tools::eval;
 use harvest_tools::{agent_health, battery, benchmark, cache, cli, oracle, provenance};
 
 fn main() -> Result<()> {
@@ -68,7 +69,7 @@ fn main() -> Result<()> {
 
             let translations =
                 bench.translate(&paths, inner, include_regex.as_deref(), parallel)?;
-            if !no_verify && bench.verifies(agent) {
+            let verifications = if !no_verify && bench.verifies(agent) {
                 bench.verify(
                     &paths,
                     inner,
@@ -76,17 +77,27 @@ fn main() -> Result<()> {
                     false,
                     parallel,
                     &translations,
-                )?;
-            }
+                )?
+            } else {
+                harvest_tools::verify::Verifications::new()
+            };
             // `Update` covers enrichment and table regeneration; no separate steps.
-            run_test(
+            report_test_outcome(run_test(
                 &repo_root,
                 bench.as_ref(),
                 &paths,
                 inner,
-                oracle::TestMode::Update,
-                false,
-            )?;
+                Score {
+                    mode: oracle::TestMode::Update,
+                    on_failure: agent_health::OnInfraFailure::Refuse,
+                    keep: eval::Keep::from_keep_eval_tree_flag(cli.keep_eval_tree),
+                    source: eval::Source::Run {
+                        translate: &translations,
+                        verify: &verifications,
+                    },
+                    covers: oracle::Covers::from_include_regex(include_regex.as_deref()),
+                },
+            )?);
         }
         Command::Translate {
             ref target,
@@ -215,14 +226,21 @@ fn main() -> Result<()> {
                 oracle::TestMode::Run
             };
 
-            run_test(
+            report_test_outcome(run_test(
                 &repo_root,
                 benchmark::for_dataset(dataset).as_ref(),
                 &paths,
                 inner,
-                mode,
-                allow_infra_failures,
-            )?;
+                Score {
+                    mode,
+                    on_failure: agent_health::OnInfraFailure::from_allow_infra_failures_flag(
+                        allow_infra_failures,
+                    ),
+                    keep: eval::Keep::from_keep_eval_tree_flag(cli.keep_eval_tree),
+                    source: eval::Source::Archive,
+                    covers: oracle::Covers::WholeBattery,
+                },
+            )?);
         }
         Command::Enrich { ref target } => {
             let dataset = Dataset::detect(target);
@@ -246,39 +264,48 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// The only path into scoring and table regeneration, so the health gate below can
-/// live here rather than in each dataset's scorer.
+struct Score<'a> {
+    mode: oracle::TestMode,
+    on_failure: agent_health::OnInfraFailure,
+    keep: eval::Keep,
+    source: eval::Source<'a>,
+    covers: oracle::Covers<'a>,
+}
+
+/// The only path into scoring and table regeneration, so the tree and the gate are built once here. It
+/// RETURNS the outcome rather than reporting it: [`report_test_outcome`] ends in `process::exit`, which
+/// runs no destructor, and the [`eval::Tree`] whose `Drop` removes the tree is live in this frame.
 fn run_test(
     repo_root: &std::path::Path,
     bench: &dyn benchmark::Benchmark,
     paths: &battery::Paths,
     target: &str,
-    mode: oracle::TestMode,
-    allow_infra_failures: bool,
-) -> Result<()> {
-    // Must precede scoring: `bench.test` writes result.json and `report::generate`
-    // rewrites all of tables/, so a warning afterwards comes too late to help.
-    let audit = agent_health::audit(&paths.results_dir, paths.agent.log_format())?;
-    if let Some(report) = agent_health::describe_infra_failures(&audit) {
-        agent_health::record_infra_failures(&paths.results_dir, &audit)?;
-        if !allow_infra_failures {
-            anyhow::bail!(
-                "{report}\n\
-                 Refusing to score. An infrastructure failure is not a result.\n\
-                 Re-run those cases after fixing the cause: a dead run stores no cache entry, \
-                 so `verify <target>` re-runs it, and `--force` is needed only under \
-                 `--cache off`. Or pass --allow-infra-failures to score anyway.\n\
-                 Details written to {}/INFRA_FAILURES.json",
-                paths.results_dir.display()
-            );
-        }
-        eprintln!(
-            "⚠️  --allow-infra-failures: scoring despite dead agent runs.\n{report}\
-             These cases have no measurement; treat any number derived from them as unsupported."
-        );
-    }
-
-    let outcome = bench.test(paths, target, mode)?;
+    score: Score<'_>,
+) -> Result<oracle::TestOutcome> {
+    let Score {
+        mode,
+        on_failure,
+        keep,
+        source,
+        covers,
+    } = score;
+    let gate = agent_health::Gate {
+        format: paths.agent.log_format(),
+        on_failure,
+        results_dir: &paths.results_dir,
+    };
+    let tree = eval::Tree::create_empty(paths, keep)?;
+    let outcome = bench.test(
+        paths,
+        target,
+        &oracle::Scoring {
+            mode,
+            source,
+            tree: &tree,
+            gate: &gate,
+            covers,
+        },
+    )?;
     if matches!(mode, oracle::TestMode::Update) {
         // Best-effort: the tables are a whole-corpus roll-up, so `report::generate`
         // legitimately fails on a partial tree and must not fail the score run.
@@ -290,8 +317,7 @@ fn run_test(
             ),
         }
     }
-    report_test_outcome(outcome);
-    Ok(())
+    Ok(outcome)
 }
 
 fn report_test_outcome(outcome: oracle::TestOutcome) {
@@ -313,5 +339,102 @@ fn find_repo_root() -> Result<std::path::PathBuf> {
         if !dir.pop() {
             anyhow::bail!("Could not find repo root (looking for test-corpus/ and results/)");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eval_root(paths: &battery::Paths) -> std::path::PathBuf {
+        paths
+            .repo_root
+            .join(eval::EVAL_DIR)
+            .join(paths.agent_key.as_str())
+    }
+
+    struct Mismatching;
+
+    impl benchmark::Benchmark for Mismatching {
+        fn name(&self) -> &'static str {
+            "mismatching"
+        }
+        fn verifies(&self, _agent: cli::Agent) -> bool {
+            false
+        }
+        fn translate(
+            &self,
+            _paths: &battery::Paths,
+            _target: &str,
+            _filter: Option<&str>,
+            _parallel: usize,
+        ) -> Result<harvest_tools::translate::Translations> {
+            unreachable!("scoring only")
+        }
+        fn test(
+            &self,
+            paths: &battery::Paths,
+            target: &str,
+            scoring: &oracle::Scoring<'_>,
+        ) -> Result<oracle::TestOutcome> {
+            scoring.tree.scope(target)?;
+            assert!(
+                eval_root(paths).join(target).is_dir(),
+                "the tree must be standing while the score runs, or its removal proves nothing"
+            );
+            Ok(oracle::TestOutcome::Failed(vec![oracle::BatteryMismatch {
+                battery: target.to_string(),
+                diffs: vec!["vectors_passed: 393 → 0".to_string()],
+            }]))
+        }
+        fn enrich(&self, _paths: &battery::Paths, _target: &str) -> Result<()> {
+            unreachable!("scoring only")
+        }
+    }
+
+    /// `process::exit` runs no destructor, so reporting the mismatch from inside `run_test` left the
+    /// whole tree standing on the one path a `--check` failure takes, unasked for `--keep-eval-tree`.
+    #[test]
+    fn a_mismatch_reported_to_the_operator_still_removes_the_evaluation_tree() {
+        let tmp = harvest_tools::io::workdir::test_tempdir().unwrap();
+        let paths = battery::Paths::new(
+            tmp.path(),
+            cli::Agent::C2rust,
+            Dataset::TestCorpus,
+            None,
+            cache::Mode::Bypass,
+            harvest_tools::io::sandbox::Enforcement::AllowUnsandboxed,
+        )
+        .unwrap();
+        let translations = harvest_tools::translate::Translations::new();
+        let verifications = harvest_tools::verify::Verifications::new();
+
+        let outcome = run_test(
+            tmp.path(),
+            &Mismatching,
+            &paths,
+            "B01",
+            Score {
+                mode: oracle::TestMode::Check,
+                on_failure: agent_health::OnInfraFailure::Refuse,
+                keep: eval::Keep::Discard,
+                source: eval::Source::Run {
+                    translate: &translations,
+                    verify: &verifications,
+                },
+                covers: oracle::Covers::WholeBattery,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(outcome, oracle::TestOutcome::Failed(_)),
+            "the mismatch must come back to `main` to be exited on, not be exited on in here"
+        );
+        assert!(
+            !eval_root(&paths).exists(),
+            "and the tree must be gone by then: {}",
+            eval_root(&paths).display()
+        );
     }
 }

@@ -234,24 +234,21 @@ pub fn run_test_corpus(
             continue;
         }
 
+        // Propagated every run: a crate already there is a PREVIOUS run's derivation of this one.
         for cfg in &group.configs {
             current += 1;
-            if crate::battery::has_crate(&crate::battery::phase_dir(
-                &output_dir.join(&cfg.name),
-                crate::battery::TRANSLATED,
-            )) {
-                translated += 1;
-                println!("[{current}/{total}] ⏭️  {} (already done)", cfg.name);
-                continue;
-            }
-            match propagate_config(paths, battery_name, &group.real_case, cfg) {
-                Ok(()) => {
+            let cfg_dir = output_dir.join(&cfg.name);
+            let derived = propagate_config(paths, battery_name, &group.real_case, cfg)
+                .and_then(|()| Published::<Translate>::unkeyed_from_phase_dir(&cfg_dir));
+            match derived {
+                Ok(published) => {
                     translated += 1;
+                    resolved.insert(cfg_dir, published);
                     println!("[{current}/{total}] 🔗 {} → {}", cfg.name, group.real_case);
                 }
                 Err(e) => {
                     failed += 1;
-                    println!("[{current}/{total}] ❌ {} — {e}", cfg.name);
+                    println!("[{current}/{total}] ❌ {} — {e:#}", cfg.name);
                 }
             }
         }
@@ -2961,10 +2958,9 @@ mod tests {
         let log = crate::artifact::phase_log::<Translate>(case_dir);
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         std::fs::write(&log, RUN_A_LOG).unwrap();
-        assert_eq!(
-            crate::battery::crate_dir(case_dir),
-            dir,
-            "the fixture must be the crate the scorer reads, or there is no wrong number to leave"
+        assert!(
+            crate::battery::has_crate(&dir),
+            "the fixture must hold a complete crate, or there is no wrong number to leave"
         );
     }
 
@@ -3074,11 +3070,9 @@ mod tests {
         (paths, case)
     }
 
-    /// INVARIANT 1 on the five unkeyed paths. `run_and_record`'s `Err` arm writes
-    /// `translation.json` into the phase dir, and every reader of `Phase::METRICS` resolves it
-    /// from there — so with run A's crate still standing, `battery::crate_dir` hands that crate to
-    /// the scorer and the enrichers stamp run B's agent, model, cost and timestamp onto its
-    /// `result.json`.
+    /// INVARIANT 1 on the five unkeyed paths. `run_and_record`'s `Err` arm writes `translation.json`
+    /// into the phase dir, so with run A's crate still standing the enrichers would stamp run B's
+    /// agent, model, cost and timestamp onto its `result.json`.
     #[test]
     fn a_failed_unkeyed_translation_does_not_leave_its_metrics_beside_an_earlier_crate() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
@@ -3107,8 +3101,12 @@ mod tests {
                 "{what}: nor its score, which is what the enrichers rewrite in place"
             );
             assert!(
-                !crate::battery::has_crate(&crate::battery::crate_dir(&case)),
-                "{what}: so the scorer finds no crate for this case rather than the wrong one"
+                !crate::battery::has_crate(&crate::battery::phase_dir(
+                    &case,
+                    crate::battery::VERIFIED
+                )),
+                "{what}: and no other phase dir holds one either, so this run resolved nothing \
+                 for this case rather than the wrong thing"
             );
             assert_eq!(
                 std::fs::read_to_string(crate::artifact::phase_log::<Translate>(&case)).unwrap(),

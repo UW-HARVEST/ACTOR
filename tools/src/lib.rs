@@ -12,6 +12,7 @@ pub mod benchmark;
 pub mod cache;
 pub mod cli;
 pub mod domain;
+pub mod eval;
 pub mod io;
 pub mod oracle;
 pub mod provenance;

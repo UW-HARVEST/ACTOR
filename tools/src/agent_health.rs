@@ -81,52 +81,83 @@ pub struct CaseHealth {
     pub log: PathBuf,
 }
 
-/// Classify every case under `results_dir` that has a verify or translate log,
-/// preferring the verify log when both exist, since verify is the later phase.
-///
-/// One `format` for the whole tree because `results_dir` is agent-scoped —
-/// `results/<Dataset>/<agent_key>`, see [`crate::battery::Paths::new`] — so every transcript
-/// beneath it came from the one backend the caller named.
-pub fn audit(results_dir: &Path, format: LogFormat) -> Result<Vec<CaseHealth>> {
-    let mut out = Vec::new();
-    collect(results_dir, results_dir, format, &mut out)
-        .with_context(|| format!("auditing agent health under {}", results_dir.display()))?;
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
+pub struct Run {
+    pub name: String,
+    pub case_dir: PathBuf,
 }
 
-fn collect(root: &Path, dir: &Path, format: LogFormat, out: &mut Vec<CaseHealth>) -> Result<()> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Ok(());
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if !p.is_dir() {
-            continue;
-        }
-        let verify = p.join("verified/logs/verify.log");
-        let translate = p.join("translated/logs/translation.log");
+/// Classify each run in the ROSTER, preferring the verify log where both exist. A roster and not a root
+/// to recurse from: `audit(paths.results_dir, ..)` refused B01_synthetic with all 85 cases fresh, for
+/// 27 dead runs in other batteries. One `format`, because a roster is agent-scoped.
+pub fn audit(runs: &[Run], format: LogFormat) -> Vec<CaseHealth> {
+    let mut out = Vec::new();
+    for run in runs {
+        let verify = run.case_dir.join("verified/logs/verify.log");
+        let translate = run.case_dir.join("translated/logs/translation.log");
         let (log, metrics) = if verify.is_file() {
-            (verify, p.join("verified/verification.json"))
+            (verify, run.case_dir.join("verified/verification.json"))
         } else if translate.is_file() {
-            (translate, p.join("translated/translation.json"))
+            (translate, run.case_dir.join("translated/translation.json"))
         } else {
-            collect(root, &p, format, out)?;
             continue;
         };
-        let name = p
-            .strip_prefix(root)
-            .unwrap_or(&p)
-            .to_string_lossy()
-            .into_owned();
         out.push(CaseHealth {
-            name,
+            name: run.name.clone(),
             health: classify_log(&log, format, recorded_exit(&metrics)),
             exit_code: exit_code(&metrics),
             log,
         });
     }
-    Ok(())
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OnInfraFailure {
+    Refuse,
+    ScoreAnyway,
+}
+
+impl OnInfraFailure {
+    pub fn from_allow_infra_failures_flag(flag: bool) -> Self {
+        if flag {
+            Self::ScoreAnyway
+        } else {
+            Self::Refuse
+        }
+    }
+}
+
+/// The refusal itself is kept: an infrastructure failure is not a result. Only its scope changed.
+pub struct Gate<'a> {
+    pub format: LogFormat,
+    pub on_failure: OnInfraFailure,
+    pub results_dir: &'a Path,
+}
+
+impl Gate<'_> {
+    pub fn grade(&self, runs: &[Run]) -> Result<()> {
+        let audit = audit(runs, self.format);
+        let Some(report) = describe_infra_failures(&audit) else {
+            return Ok(());
+        };
+        record_infra_failures(self.results_dir, &audit)?;
+        anyhow::ensure!(
+            self.on_failure == OnInfraFailure::ScoreAnyway,
+            "{report}\n\
+             Refusing to score. An infrastructure failure is not a result.\n\
+             Re-run those cases after fixing the cause: a dead run stores no cache entry, \
+             so `verify <target>` re-runs it, and `--force` is needed only under \
+             `--cache off`. Or pass --allow-infra-failures to score anyway.\n\
+             Details written to {}/INFRA_FAILURES.json",
+            self.results_dir.display()
+        );
+        eprintln!(
+            "⚠️  --allow-infra-failures: scoring despite dead agent runs.\n{report}\
+             These cases have no measurement; treat any number derived from them as unsupported."
+        );
+        Ok(())
+    }
 }
 
 pub fn describe_infra_failures(audit: &[CaseHealth]) -> Option<String> {
@@ -233,13 +264,23 @@ mod tests {
         p
     }
 
+    fn roster(root: &Path, names: &[&str]) -> Vec<Run> {
+        names
+            .iter()
+            .map(|n| Run {
+                name: (*n).to_string(),
+                case_dir: root.join(n),
+            })
+            .collect()
+    }
+
     #[test]
     fn audit_prefers_the_verify_log_over_the_translate_log() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         let case = tmp.path().join("B01/case_x");
         write(&case, "translated/logs/translation.log", CLEAN);
         write(&case, "verified/logs/verify.log", DEAD);
-        let a = audit(tmp.path(), LogFormat::StreamJson).unwrap();
+        let a = audit(&roster(tmp.path(), &["B01/case_x"]), LogFormat::StreamJson);
         assert_eq!(a.len(), 1, "one case, not one per phase");
         assert_eq!(a[0].name, "B01/case_x");
         assert!(
@@ -258,7 +299,7 @@ mod tests {
             r#"{"exit_code":1,"success":true,"duration_secs":4569}"#,
         )
         .unwrap();
-        let a = audit(tmp.path(), LogFormat::StreamJson).unwrap();
+        let a = audit(&roster(tmp.path(), &["hb/jansson"]), LogFormat::StreamJson);
         assert_eq!(a[0].exit_code, Some(1));
         // `success:true` here is the cargo-check gate, NOT agent health.
         assert!(a[0].health.is_infra());
@@ -279,7 +320,7 @@ mod tests {
         )
         .unwrap();
 
-        let a = audit(tmp.path(), LogFormat::Opaque).unwrap();
+        let a = audit(&roster(tmp.path(), &["B01/case_x"]), LogFormat::Opaque);
         assert_eq!(
             a.len(),
             1,
@@ -292,7 +333,7 @@ mod tests {
         );
         assert!(describe_infra_failures(&a).is_none());
 
-        let as_stream_json = audit(tmp.path(), LogFormat::StreamJson).unwrap();
+        let as_stream_json = audit(&roster(tmp.path(), &["B01/case_x"]), LogFormat::StreamJson);
         assert!(
             as_stream_json[0].health.is_infra(),
             "fixture must trip the hardcoded classifier, or this proves nothing"
@@ -336,7 +377,10 @@ mod tests {
             .unwrap();
         }
 
-        let a = audit(tmp.path(), LogFormat::Opaque).unwrap();
+        let a = audit(
+            &roster(tmp.path(), &["HB/jansson", "HB/mujs", "HB/zlib"]),
+            LogFormat::Opaque,
+        );
         let health = |name: &str| {
             a.iter()
                 .find(|c| c.name == name)
@@ -377,7 +421,10 @@ mod tests {
         // The fixture is the transcript the hardcoded stream-json reading called
         // `Infra { "truncated" }`: the killed run is still blocked — now on the evidence rather
         // than on a misread — and its two healthy neighbours no longer with it.
-        let as_stream_json = audit(tmp.path(), LogFormat::StreamJson).unwrap();
+        let as_stream_json = audit(
+            &roster(tmp.path(), &["HB/jansson", "HB/mujs", "HB/zlib"]),
+            LogFormat::StreamJson,
+        );
         assert!(
             as_stream_json.iter().all(|c| c.health.is_infra()),
             "fixture must trip the hardcoded classifier, or this proves nothing: {as_stream_json:?}"
@@ -385,10 +432,40 @@ mod tests {
     }
 
     #[test]
+    fn a_dead_run_in_a_battery_nobody_is_scoring_does_not_block_the_one_being_scored() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        write(
+            &tmp.path().join("B01/fresh"),
+            "verified/logs/verify.log",
+            CLEAN,
+        );
+        write(
+            &tmp.path().join("B02/dead"),
+            "verified/logs/verify.log",
+            DEAD,
+        );
+        let gate = Gate {
+            format: LogFormat::StreamJson,
+            on_failure: OnInfraFailure::Refuse,
+            results_dir: tmp.path(),
+        };
+
+        gate.grade(&roster(tmp.path(), &["B01/fresh"]))
+            .expect("a clean battery must score even with a dead run elsewhere under the root");
+
+        let err = gate
+            .grade(&roster(tmp.path(), &["B01/fresh", "B02/dead"]))
+            .expect_err("the refusal must still fire when the dead run IS in the roster");
+        let text = format!("{err:#}");
+        assert!(text.contains("B02/dead"), "and must name it: {text}");
+        assert!(text.contains("1 of 2"), "counting only the roster: {text}");
+    }
+
+    #[test]
     fn describe_is_none_when_everything_completed() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         write(&tmp.path().join("b/c1"), "verified/logs/verify.log", CLEAN);
-        let a = audit(tmp.path(), LogFormat::StreamJson).unwrap();
+        let a = audit(&roster(tmp.path(), &["b/c1"]), LogFormat::StreamJson);
         assert!(describe_infra_failures(&a).is_none());
     }
 
@@ -401,7 +478,10 @@ mod tests {
             CLEAN,
         );
         write(&tmp.path().join("b/bad"), "verified/logs/verify.log", DEAD);
-        let a = audit(tmp.path(), LogFormat::StreamJson).unwrap();
+        let a = audit(
+            &roster(tmp.path(), &["b/good", "b/bad"]),
+            LogFormat::StreamJson,
+        );
         let msg = describe_infra_failures(&a).expect("one failure");
         assert!(msg.contains("1 of 2"), "counts: {msg}");
         assert!(msg.contains("b/bad"), "names the case: {msg}");

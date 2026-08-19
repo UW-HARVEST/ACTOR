@@ -6,7 +6,7 @@ pub mod score;
 
 pub use gtest::run_harvest_bench_test;
 pub use runtests::run_test_corpus;
-pub use score::{BatteryMismatch, Summary, TestMode, TestOutcome};
+pub use score::{BatteryMismatch, Covers, Scoring, Summary, TestMode, TestOutcome};
 
 use crate::battery::Paths;
 use anyhow::Result;
@@ -19,7 +19,6 @@ fn openssl_dir() -> String {
 }
 
 // ── Enrichment: the ONE definition of result.json metadata ─────────────
-//
 // INVARIANT: every writer of result.json metadata goes through `merge_into`,
 // and [`check_enrichment`] stays a pure inverse of it. Duplicating either side
 // is how a stored result.json drifts from what `test --check` recomputes.
@@ -254,12 +253,8 @@ mod tests {
         assert!(stored["loc"]["code"].as_u64().unwrap() >= 2);
     }
 
-    /// Moving the scorer's build out of `results/` is measurement-neutral only if every
-    /// file the scorer writes back into a scored crate is outside the digest and outside
-    /// every [`crate::domain::contents::Carry`]. Enumerated beside the writers: `write_results`
-    /// and `run_harvest_bench_test` (result.json, logs/test.log),
-    /// `score_harvest_bench_suite` (harvest_bench_report.json, gtest_build/) and
-    /// `build_harvest_bench_lib` (target/).
+    /// `result.json` is still written back INTO the artifact directory, so it must stay outside the
+    /// digest and every [`crate::domain::contents::Carry`]; the rest lands in [`crate::eval`]'s tree.
     #[test]
     fn every_file_the_scorer_writes_back_is_excluded_from_the_artifact() {
         use crate::domain::contents::{classify, Disposition};

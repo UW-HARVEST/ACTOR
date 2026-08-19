@@ -3,7 +3,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
 struct Summary {
@@ -605,6 +605,17 @@ fn generate_manual_tex(repo_root: &Path) -> String {
     out
 }
 
+/// THE archival resolver, and the only one left: `tables/` is regenerated from the shipped submodule
+/// with no run in flight, so the `result.json` the run left is the only record of what was scored.
+fn archived_score(case_dir: &Path) -> PathBuf {
+    let verified = crate::battery::phase_dir(case_dir, crate::battery::VERIFIED);
+    if verified.join("result.json").is_file() {
+        verified
+    } else {
+        crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED)
+    }
+}
+
 /// Keyed `"battery/case"`; the value is the runner's own build result.
 fn case_builds(repo_root: &Path, agent: &str) -> std::collections::BTreeMap<String, bool> {
     let mut out = std::collections::BTreeMap::new();
@@ -625,7 +636,7 @@ fn case_builds(repo_root: &Path, agent: &str) -> std::collections::BTreeMap<Stri
                 continue;
             }
             let case = ce.file_name().to_string_lossy().to_string();
-            let rp = crate::battery::crate_dir(&ce.path()).join("result.json");
+            let rp = archived_score(&ce.path()).join("result.json");
             let Some(r) = read_json::<CaseResult>(&rp) else {
                 continue;
             };
@@ -696,7 +707,7 @@ fn kiro_cost(base: &Path) -> KiroCost {
         // A case dir is one with a translated/ phase. Do NOT also descend into
         // its phase dirs — each carries a result.json and would double-count.
         if crate::battery::phase_dir(&p, crate::battery::TRANSLATED).is_dir() {
-            let rp = crate::battery::crate_dir(&p).join("result.json");
+            let rp = archived_score(&p).join("result.json");
             if let Some(r) = read_json::<serde_json::Value>(&rp) {
                 for ph in ["translate", "verify"] {
                     let c = r
@@ -1066,9 +1077,7 @@ fn aggregate_cases(bat_dir: &Path, corpus_bat_dir: &Path) -> CaseTotals {
     aggregate_cases_phase(bat_dir, corpus_bat_dir, None)
 }
 
-/// `phase` selects which phase dir's result.json to read: `Some("translated")`
-/// for the pre-verify (no-validate) numbers, `None` for the headline phase under
-/// the reader rule (verified/ if present, else translated/).
+/// `phase`: `Some("translated")` for the pre-verify (no-validate) numbers, `None` for [`archived_score`].
 fn aggregate_cases_phase(bat_dir: &Path, corpus_bat_dir: &Path, phase: Option<&str>) -> CaseTotals {
     let corpus_present = corpus_bat_dir.is_dir();
     let (mut total_loc, mut total_unsafe, mut built) = (0u32, 0u32, 0u32);
@@ -1085,7 +1094,7 @@ fn aggregate_cases_phase(bat_dir: &Path, corpus_bat_dir: &Path, phase: Option<&s
         }
         let phase_dir = match phase {
             Some(p) => crate::battery::phase_dir(&entry.path(), p),
-            None => crate::battery::crate_dir(&entry.path()),
+            None => archived_score(&entry.path()),
         };
         let result_path = phase_dir.join("result.json");
         let cr: CaseResult = match read_json(&result_path) {
