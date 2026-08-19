@@ -149,10 +149,9 @@ impl AgentKey {
 
 /// The agent CLI build that will run, from `<program> --version`.
 ///
-/// Keyed because the CLIs auto-update through a shim: two claude builds (2.1.231.653
-/// and 2.1.232.657) are installed under `~/.toolbox/tools/claude-code/` on this
-/// machine, so without this one entry spans two binaries. It cannot be read from the
-/// transcript, which reports it only after the money is spent.
+/// RECORDED, not keyed — #109 took it out of the key because the CLIs auto-update through a shim
+/// and keying them stranded every entry on each vendor release. It is absent from
+/// `KeyInputs::VALIDATED` for that reason, so a replay does not depend on it.
 ///
 /// Probed per case rather than memoised, so an upgrade part-way through a sweep is
 /// caught before the next case is attributed to the old build.
@@ -701,6 +700,8 @@ pub struct Store {
     mode: Mode,
     /// So "two hits per case" is OBSERVABLE: on the `Store`, not a process global.
     tally: std::sync::Mutex<std::collections::BTreeMap<&'static str, Counts>>,
+    /// One miss diagnostic, not 85: repeats bury the field that differs.
+    explained: std::sync::atomic::AtomicBool,
 }
 
 use crate::artifact::set_read_only;
@@ -719,6 +720,7 @@ impl Store {
             root,
             mode,
             tally: Default::default(),
+            explained: Default::default(),
         })
     }
 
@@ -813,6 +815,7 @@ impl Store {
 
         // Above `compute`, which is where the money is: refusing instead is the whole mode.
         if self.mode == Mode::ReplayOnly {
+            self.explain_miss(inputs, cli, &key, &dir);
             return Ok(Resolved::Unavailable);
         }
 
@@ -928,6 +931,19 @@ impl Store {
         }
         out.sort();
         Ok(out)
+    }
+
+    fn explain_miss(&self, inputs: &KeyInputs<'_>, cli: &CliVersion, key: &CacheKey, dir: &Path) {
+        use std::sync::atomic::Ordering;
+        if self.explained.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        eprintln!(
+            "  cache: --replay-only found no entry for {}\n  looked in {}\n  derived from {}",
+            key.as_str(),
+            dir.display(),
+            serde_json::to_string_pretty(&inputs.meta(key, cli)).unwrap_or_default()
+        );
     }
 
     /// Move a suspect entry aside, keeping it readable for a post-mortem. Reports failure
