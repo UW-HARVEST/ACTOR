@@ -11,9 +11,13 @@ use crate::cli::Agent;
 use crate::io::workdir::Roots;
 use crate::translate::Translations;
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+
+/// What a verify sweep RESOLVED, by case dir. A case absent from it is absent from the verified score.
+pub type Verifications = HashMap<PathBuf, Published<Verify>>;
 
 /// Wall-clock cap on one verify session. Reaches the command through
 /// [`Session`], which is also what the cache key records, so the two cannot diverge.
@@ -28,7 +32,7 @@ pub fn run(
     force: bool,
     parallel: usize,
     translations: &Translations,
-) -> Result<()> {
+) -> Result<Verifications> {
     let sem = Arc::new(Semaphore::new(parallel));
     run_with_semaphore(paths, battery_name, filter, force, &sem, translations)
 }
@@ -39,15 +43,16 @@ pub fn run_all(
     force: bool,
     parallel: usize,
     translations: &Translations,
-) -> Result<()> {
+) -> Result<Verifications> {
     let sem = Arc::new(Semaphore::new(parallel));
+    let mut resolved = Verifications::new();
 
     let errors: Vec<anyhow::Error> = std::thread::scope(|s| {
         let handles: Vec<_> = batteries
             .iter()
             .map(|bat| {
                 let sem = sem.clone();
-                s.spawn(move || -> Result<()> {
+                s.spawn(move || -> Result<Verifications> {
                     run_with_semaphore(paths, bat, None, force, &sem, translations)
                 })
             })
@@ -56,7 +61,10 @@ pub fn run_all(
         handles
             .into_iter()
             .filter_map(|h| match h.join() {
-                Ok(Ok(())) => None,
+                Ok(Ok(v)) => {
+                    resolved.extend(v);
+                    None
+                }
                 Ok(Err(e)) => Some(e),
                 Err(_) => Some(anyhow::anyhow!("verify thread panicked")),
             })
@@ -66,21 +74,21 @@ pub fn run_all(
     if let Some(first) = errors.into_iter().next() {
         return Err(first);
     }
-    Ok(())
+    Ok(resolved)
 }
 
 /// `Absent` and `AlreadyVerified` were one "skipped" line, which is how a sweep that verified NOTHING
 /// read like one that verified everything. Only the first is refused.
 enum Verdict {
     Absent,
-    AlreadyVerified,
-    Verified,
+    AlreadyVerified(Option<Published<Verify>>),
+    Verified(Published<Verify>),
     Failed,
 }
 
 /// Names, capped: one shared-source group is 127 followers, and the list would bury the sentence.
-fn first_few(names: &[&str]) -> String {
-    let shown: Vec<&str> = names.iter().take(8).copied().collect();
+fn first_few(names: &[String]) -> String {
+    let shown: Vec<&str> = names.iter().take(8).map(String::as_str).collect();
     if names.len() > shown.len() {
         return format!(
             "{} … and {} more",
@@ -101,9 +109,8 @@ fn report_unkeyed_seeds(unkeyed: usize) {
     }
 }
 
-/// A sweep that verified nothing must not exit 0: `§B.2`'s evaluation tree is not in this PR, so
-/// the scorer still reads whatever `verified/` is on disk.
-fn refuse_absent(absent: &[&str], how_to_translate: &str) -> Result<()> {
+/// A sweep that verified nothing must not exit 0: the eval tree makes those cases absent, this loud.
+fn refuse_absent(absent: &[String], how_to_translate: &str) -> Result<()> {
     anyhow::ensure!(
         absent.is_empty(),
         "{} case(s) went unverified: this run resolved no translation for {}. A verification is \
@@ -124,7 +131,8 @@ fn run_with_semaphore(
     force: bool,
     sem: &Arc<Semaphore>,
     translations: &Translations,
-) -> Result<()> {
+) -> Result<Verifications> {
+    let mut resolved = Verifications::new();
     let battery = battery::discover(&paths.corpus_dir, battery_name, filter)?;
     let output_dir = paths.output_dir(battery_name);
     let skip = verify_skip_check(paths);
@@ -158,10 +166,13 @@ fn run_with_semaphore(
                             crate::artifact::phase_log::<Verify>(&case_dir).exists()
                         })
                     {
-                        return (c.name.clone(), Verdict::AlreadyVerified);
+                        return (
+                            c.name.clone(),
+                            Verdict::AlreadyVerified(already(&c.name, &case_dir)),
+                        );
                     }
                     let cmake_flags = get_cmake_flags(paths, battery_name, &c.name);
-                    let outcome = verify_case(
+                    let verdict = match verify_case(
                         &case_dir,
                         translated,
                         &prompt_template,
@@ -169,11 +180,13 @@ fn run_with_semaphore(
                         "",
                         paths,
                         &store,
-                    );
-                    let verdict = if crate::refusal::record(&c.name, outcome) {
-                        Verdict::Verified
-                    } else {
-                        Verdict::Failed
+                    ) {
+                        Ok(Some(published)) => Verdict::Verified(published),
+                        Ok(None) => Verdict::Failed,
+                        Err(e) => {
+                            crate::refusal::record(&c.name, Err(e));
+                            Verdict::Failed
+                        }
                     };
                     (c.name.clone(), verdict)
                 });
@@ -194,28 +207,33 @@ fn run_with_semaphore(
             })
             .collect()
     });
-    let panicked: Vec<&str> = ind_results
+    let panicked: Vec<String> = ind_results
         .iter()
         .filter(|(_, _, p)| *p)
-        .map(|(n, _, _)| n.as_str())
+        .map(|(n, _, _)| n.clone())
         .collect();
 
     let mut verified = 0usize;
     let mut failed = 0usize;
     let mut current = 0usize;
-    let mut absent: Vec<&str> = Vec::new();
-    for (name, result, _) in &ind_results {
+    let mut absent: Vec<String> = Vec::new();
+    for (name, result, _) in ind_results {
         current += 1;
+        let case_dir = output_dir.join(&name);
         match result {
             Verdict::Absent => {
-                absent.push(name);
                 println!("[{current}/{total}] ⏭️  {name} (no translation resolved this run)");
+                absent.push(name);
             }
-            Verdict::AlreadyVerified => {
+            Verdict::AlreadyVerified(published) => {
+                if let Some(p) = published {
+                    resolved.insert(case_dir, p);
+                }
                 println!("[{current}/{total}] ⏭️  {name} (already verified)")
             }
-            Verdict::Verified => {
+            Verdict::Verified(published) => {
                 verified += 1;
+                resolved.insert(case_dir, published);
                 println!("[{current}/{total}] ✅ {name}");
             }
             Verdict::Failed => {
@@ -232,7 +250,7 @@ fn run_with_semaphore(
         // The propagation below derives every follower's `verified/` from this one, so an unresolved
         // group is refused rather than propagated from what it left last time.
         let Some(translated) = translations.get(&real_dir) else {
-            absent.push(&group.real_case);
+            absent.push(group.real_case.clone());
             println!(
                 "[{current}/{total}] ⏭️  {} (no translation resolved this run)",
                 group.real_case
@@ -240,12 +258,14 @@ fn run_with_semaphore(
             continue;
         };
 
-        if !force && skip.already_done(|| crate::artifact::phase_log::<Verify>(&real_dir).exists())
+        let real = if !force
+            && skip.already_done(|| crate::artifact::phase_log::<Verify>(&real_dir).exists())
         {
             println!(
                 "[{current}/{total}] ⏭️  {} (already verified)",
                 group.real_case
             );
+            already(&group.real_case, &real_dir)
         } else {
             println!(
                 "[{current}/{total}] 🔬 {} (shared-source, {} configs)",
@@ -254,7 +274,7 @@ fn run_with_semaphore(
             );
             let cmake_flags = get_cmake_flags(paths, battery_name, &group.real_case);
             let configs_text = build_configs_text(paths, battery_name, group);
-            let ok = verify_case(
+            let published = verify_case(
                 &real_dir,
                 translated,
                 &prompt_template,
@@ -264,7 +284,7 @@ fn run_with_semaphore(
                 &store,
             )?;
 
-            if ok {
+            if published.is_some() {
                 verified += 1;
                 println!("[{current}/{total}] ✅ {} — verified", group.real_case);
             } else {
@@ -274,10 +294,12 @@ fn run_with_semaphore(
                     group.real_case
                 );
             }
-        }
+            published
+        };
 
-        // Unconditional: without it runtests scores only the real case as verified,
-        // never the config followers.
+        // A follower's crate is DERIVED, so it is resolved only where the real case was.
+        let Some(real) = real else { continue };
+        resolved.insert(real_dir, real);
         println!(
             "Re-propagating verified fixes from {} to {} configs...",
             group.real_case,
@@ -290,6 +312,11 @@ fn run_with_semaphore(
                 &group.real_case,
                 cfg,
             )?;
+            let cfg_dir = paths.case_dir(battery_name, &cfg.name);
+            resolved.insert(
+                cfg_dir.clone(),
+                Published::<Verify>::unkeyed_from_phase_dir(&cfg_dir)?,
+            );
         }
         println!("Propagated to {} cases", group.configs.len());
     }
@@ -312,7 +339,24 @@ fn run_with_semaphore(
         panicked.len(),
         panicked.join(", ")
     );
-    refuse_absent(&absent, &format!("harvest-tools translate {battery_name}"))
+    refuse_absent(&absent, &format!("harvest-tools translate {battery_name}"))?;
+    Ok(resolved)
+}
+
+/// A case the skip check passed over: no key names what is in `verified/`, and it says so. That check
+/// is the LOG, so `verified/` can hold a transcript and no crate — what the run below leaves when its
+/// verification does not compile. `None` then: absent from the score, not a build failure.
+fn already(name: &str, case_dir: &Path) -> Option<Published<Verify>> {
+    match Published::<Verify>::unkeyed_from_phase_dir(case_dir) {
+        Ok(published) => Some(published),
+        Err(e) => {
+            eprintln!(
+                "  ⚠️  {name}: nothing published in verified/ can be taken as this run's \
+                 verification, so the case is absent from the verified score: {e:#}"
+            );
+            None
+        }
+    }
 }
 
 /// Deliberately shares `verify.md` and `verify_case` with Test-Corpus so both
@@ -324,7 +368,8 @@ pub fn run_harvest_bench(
     parallel: usize,
     force: bool,
     translations: &Translations,
-) -> Result<()> {
+) -> Result<Verifications> {
+    let mut resolved = Verifications::new();
     let sem = Arc::new(Semaphore::new(parallel));
     let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))
         .context("reading verify.md")?;
@@ -355,20 +400,20 @@ pub fn run_harvest_bench(
                                 crate::artifact::phase_log::<Verify>(&case_dir).exists()
                             })
                         {
-                            return (name, Verdict::AlreadyVerified);
+                            let published = already(&name, &case_dir);
+                            return (name, Verdict::AlreadyVerified(published));
                         }
-                        let ok = crate::refusal::record(
-                            &name,
-                            verify_case(&case_dir, translated, prompt, "", "", paths, store),
-                        );
-                        (
-                            name,
-                            if ok {
-                                Verdict::Verified
-                            } else {
+                        let verdict = match verify_case(
+                            &case_dir, translated, prompt, "", "", paths, store,
+                        ) {
+                            Ok(Some(published)) => Verdict::Verified(published),
+                            Ok(None) => Verdict::Failed,
+                            Err(e) => {
+                                crate::refusal::record(&name, Err(e));
                                 Verdict::Failed
-                            },
-                        )
+                            }
+                        };
+                        (name, verdict)
                     }
                 });
                 (name, handle)
@@ -387,24 +432,31 @@ pub fn run_harvest_bench(
             })
             .collect()
     });
-    let panicked: Vec<&str> = results
+    let panicked: Vec<String> = results
         .iter()
         .filter(|(_, _, p)| *p)
-        .map(|(n, _, _)| n.as_str())
+        .map(|(n, _, _)| n.clone())
         .collect();
 
     let (mut verified, mut failed) = (0usize, 0usize);
-    let mut absent: Vec<&str> = Vec::new();
-    for (i, (name, result, _)) in results.iter().enumerate() {
+    let mut absent: Vec<String> = Vec::new();
+    for (i, (name, result, _)) in results.into_iter().enumerate() {
         let n = i + 1;
+        let case_dir = paths.output_dir(&name);
         match result {
             Verdict::Absent => {
-                absent.push(name);
                 println!("[{n}/{total}] ⏭️  {name} (no translation resolved this run)");
+                absent.push(name);
             }
-            Verdict::AlreadyVerified => println!("[{n}/{total}] ⏭️  {name} (already verified)"),
-            Verdict::Verified => {
+            Verdict::AlreadyVerified(published) => {
+                if let Some(p) = published {
+                    resolved.insert(case_dir, p);
+                }
+                println!("[{n}/{total}] ⏭️  {name} (already verified)")
+            }
+            Verdict::Verified(published) => {
                 verified += 1;
+                resolved.insert(case_dir, published);
                 println!("[{n}/{total}] ✅ {name}");
             }
             Verdict::Failed => {
@@ -429,7 +481,8 @@ pub fn run_harvest_bench(
         panicked.len(),
         panicked.join(", ")
     );
-    refuse_absent(&absent, "harvest-tools translate HB")
+    refuse_absent(&absent, "harvest-tools translate HB")?;
+    Ok(resolved)
 }
 
 /// Resolves the backend a verify phase will use; `None` means no verify phase. Consulted
@@ -526,9 +579,10 @@ fn verify_case(
     configs_text: &str,
     paths: &Paths,
     store: &cache::Store,
-) -> Result<bool> {
+) -> Result<Option<Published<Verify>>> {
+    // Unreachable: `has_verify_phase` gates every caller. `None`, not a claimed success.
     let Some(inv) = verify_invocation(paths)? else {
-        return Ok(true);
+        return Ok(None);
     };
 
     // Verify never mutates `translated/`, so no snapshot/restore is needed.
@@ -581,9 +635,11 @@ fn verify_case(
         store,
         |work| run_verify_agent(case_dir, &inv, work, &prompt, &log_path, paths),
     )?;
-    // An artifact exists only if it compiled (see `run_verify_agent`), so a replay does
-    // not re-prove it.
-    Ok(matches!(outcome, Outcome::Published(_)))
+    // An artifact exists only if it compiled (`run_verify_agent`), and `finish` digests what it hands on.
+    match outcome {
+        Outcome::Published(publishing) => Ok(Some(publishing.finish()?)),
+        Outcome::Nothing | Outcome::Unavailable => Ok(None),
+    }
 }
 
 /// [`cache::Attempt::Nothing`] is "nothing worth keeping" — API error, abort, or a crate that does not
@@ -695,9 +751,10 @@ fn run_verify_agent(
         .current_dir(gate.path())
         .output();
     if !check.is_ok_and(|o| o.status.success()) {
-        // The second clause holds because `run_cached` moves a stale `verified/` crate aside when
-        // it publishes nothing; left standing, `battery::crate_dir` keeps preferring the old one.
-        eprintln!("  ⚠️  verify produced a non-compiling crate — not publishing; scorer will use translated/");
+        eprintln!(
+            "  ⚠️  verify produced a non-compiling crate — not publishing, so this case has no \
+             verification this run and is absent from the verified score"
+        );
         return Ok(cache::Attempt::Nothing(cache::NotProduced::DoesNotCompile));
     }
     println!("  verified artifact {:?}", sealed.digest());

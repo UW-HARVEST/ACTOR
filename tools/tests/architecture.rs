@@ -155,10 +155,10 @@ fn is_public(vis: &syn::Visibility) -> bool {
 /// all of them, `sealed_implements_only_debug` included, and each would still report green.
 #[test]
 fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
-    // Measured 35 today: 33 module files plus lib.rs and main.rs. The floor is that count
+    // Measured 36 today: 34 module files plus lib.rs and main.rs. The floor is that count
     // minus 2, so a merge landing a file needs no edit here while deleting three fails
     // instead of quietly narrowing what every rule below inspects. Add files, raise it.
-    const MIN_FILES: usize = 33;
+    const MIN_FILES: usize = 34;
     const REQUIRED: &[&str] = &[
         "Sealed",
         "Publishing",
@@ -216,7 +216,7 @@ fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
         (found.len(), nested),
         count_rust_files(&dir, 1),
         "rust_sources() and an independent walk of src/ disagree on (total, nested). \
-         agents/, analyse/, domain/, io/ and oracle/ make the nested half live: 23 of 35 \
+         agents/, analyse/, domain/, io/ and oracle/ make the nested half live: 23 of 36 \
          today, so a traversal that stopped at the top level of src/ would fail here \
          instead of reporting green."
     );
@@ -1114,19 +1114,13 @@ fn the_digest_path_is_lossless() {
 /// `results/` is written and never read: a phase directory is an OUTPUT, so naming one is the pipeline's
 /// business and nobody else's. Shrink-only over the SET OF MODULES, both directions, exactly as
 /// [`CYCLE_BASELINE`] is: one that STARTS naming a phase dir fails, which is what stops a twentieth
-/// site. It does not cap the count INSIDE a listed module — `oracle` and `analyse` still resolve a
-/// crate from disk, which is §B.2.
-const PHASE_DIR_READERS: &[&str] = &[
-    "analyse::report",
-    "artifact",
-    "oracle",
-    "oracle::gtest",
-    "oracle::runtests",
-    "translate",
-];
+/// site. It does not cap the count INSIDE a listed module. The two scorers came off it when scoring
+/// moved to `crate::eval`: both take the artifact as a VALUE, so neither can resolve one from a path.
+const PHASE_DIR_READERS: &[&str] = &["analyse::report", "artifact", "oracle", "translate"];
 
-/// Every spelling `battery` exports for a case's layout: the three resolvers AND the two phase names,
-/// since `case_dir(b, c).join(battery::VERIFIED)` resolves one while naming no resolver.
+/// Every spelling `battery` exports (or exported) for a case's layout, including the two phase names,
+/// since `case_dir(b, c).join(battery::VERIFIED)` resolves one while naming no resolver. `crate_dir`
+/// stays listed after its deletion so re-adding it lands a module on the list rather than passing.
 const PHASE_DIR_VOCABULARY: &[&str] = &[
     "phase_dir",
     "crate_dir",
@@ -1205,7 +1199,7 @@ fn only_the_pipeline_names_a_phase_directory() {
         "{gone:?} no longer name a phase directory, so PHASE_DIR_READERS is stale and this\n\
          rule is looser than the code. Strike them off — the list ratchets DOWN."
     );
-    // Anti-vacuity: a lexer returning nothing passes every assertion above. 20 sites, 6 modules.
+    // Anti-vacuity: a lexer returning nothing passes every assertion above. 13 sites, 4 modules.
     assert!(
         sites >= 6 && naming.len() == baseline.len(),
         "found {sites} site(s) across {naming:?}, which is too few to be inspecting anything"

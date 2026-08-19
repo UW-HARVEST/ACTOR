@@ -3,12 +3,7 @@
 //! Four invariants are enforced by the compiler, not by convention:
 //! * Nothing runs in a published artifact: `Command::current_dir` and `--target-dir`
 //!   both take `impl AsRef<Path>`, so "can obtain a path" *is* "can execute here", and
-//!   [`Sealed`] yields no path in any form. (`oracle/` still builds inside the tree it
-//!   scores. No layout *inside* `results/` fixes that: MIT `runtests` resolves each
-//!   crate at `<case>/translated_rust` and pins its build output to
-//!   `<that>/target` with an explicit `--target-dir`, and its `cando2` runner bakes
-//!   `CARGO_MANIFEST_DIR`. The build has to leave the tree, which is what
-//!   [`Scratch::subdir`] + [`Published::materialise_at`] exist for.)
+//!   [`Sealed`] yields no path in any form; the scorers build in [`crate::eval`]'s tree, not in one.
 //! * An infra-failed run cannot be sealed: [`Scrubbed::seal`] demands a
 //!   [`crate::domain::health::Completed`], mintable only from a completed run.
 //! * A tree cannot be hashed before it is scrubbed: agent output embeds the random
@@ -41,9 +36,8 @@ pub trait Phase: sealed_trait::Sealed + Copy + 'static {
     /// `exit_code`/`timed_out` (the 124 a wall-clock kill leaves) were read by nothing.
     const METRICS: &'static str;
     /// Phase dirs a CHANGED result of this phase makes stale, which [`Publishing::finish`] removes
-    /// whole. A *different* translation invalidates `verified/`: [`crate::battery::crate_dir`] prefers
-    /// `verified/` when it holds a crate, so it would score the last sweep's verification
-    /// against this one's translation — and the "already verified" skip keys on
+    /// whole. A *different* translation invalidates `verified/`: the verification it holds was
+    /// performed on the previous one, and the "already verified" skip keys on
     /// `verified/logs/verify.log`, so keeping just its logs makes verify skip the case.
     const INVALIDATES: &'static [&'static str];
 }
@@ -69,8 +63,7 @@ impl Phase for Verify {
     const INVALIDATES: &'static [&'static str] = &[];
 }
 
-/// An invalidation fires from [`Publishing::finish`], which `verify::verify_case` never reaches
-/// (it drops its [`Publishing`]), so an entry here could never fire: finish that publish first.
+/// Verify has no dependent to invalidate; asserted rather than assumed, since [`Publishing::finish`] acts.
 const _: () = assert!(Verify::INVALIDATES.is_empty());
 
 /// Inside the phase's own dir, which is what lets [`clear_phase`] keep the transcript while
@@ -173,9 +166,9 @@ fn children_but_logs(
 /// [`clear_phase`]'s counterpart for a run that published nothing. It may not delete: an artifact
 /// from a `--cache off` sweep, or from before the store existed, is replayable from nowhere, so a
 /// delete makes a transient failure permanent. It may not leave it either — the failed run's
-/// transcript and metrics are in that phase dir already, so [`crate::battery::crate_dir`] and the
-/// enrichers would score the earlier crate as this run's. A sibling is in no digest, no reader's
-/// path and no `INVALIDATES` list.
+/// transcript and metrics are in that phase dir already, so the enrichers and any archival reader
+/// would take the earlier crate for this run's. A sibling is in no digest, no reader's path and no
+/// `INVALIDATES` list.
 pub(crate) fn displace_phase<P: Phase>(case_dir: &Path) -> Result<Option<PathBuf>> {
     // The crate, because that is what a reader scores; a metrics file is not an artifact, and moving
     // one aside would overwrite what an earlier displacement left here.
@@ -1133,10 +1126,16 @@ impl<P: Phase> Published<P> {
     /// left `--agent opencode` and every battery of symlinked configs unable to verify under any
     /// flag. `Sealed::adopt`'s shape without its power: it mints no [`Sealed`], so nothing here
     /// becomes a cache entry or stands in for a [`Completed`], and [`Keying::Unkeyable`] is
-    /// recorded rather than a guarantee implied.
+    /// recorded rather than a guarantee implied. A CRATE, not merely a directory: [`displace_phase`] keeps `logs/` when a run publishes nothing, so
+    /// a transcript alone would be adopted as this run's artifact and scored a BUILD FAILURE, not absent.
     pub(crate) fn unkeyed_from_phase_dir(case_dir: &Path) -> Result<Self> {
         let root = crate::battery::phase_dir(case_dir, P::DIR);
-        anyhow::ensure!(root.is_dir(), "no {} at {}", P::DIR, root.display());
+        anyhow::ensure!(
+            crate::battery::has_crate(&root),
+            "no {} crate at {}",
+            P::DIR,
+            root.display()
+        );
         Ok(Self {
             digest: digest_tree(&root)?,
             root,
@@ -1181,6 +1180,27 @@ impl<P: Phase> Published<P> {
         let ScratchPath { root, keep } = at;
         seed(&self.root, root, Scratch { dir: keep }, Q::AT)
     }
+}
+
+/// Every crate the ARCHIVE holds for one phase, by case dir — not this run's work, so [`Keying::Unkeyable`].
+pub(crate) fn archived_artifacts<P: Phase>(
+    battery_dir: &Path,
+) -> Result<std::collections::HashMap<PathBuf, Published<P>>> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir(battery_dir) else {
+        return Ok(out);
+    };
+    for entry in entries.flatten() {
+        let case_dir = entry.path();
+        if !case_dir.is_dir()
+            || !crate::battery::has_crate(&crate::battery::phase_dir(&case_dir, P::DIR))
+        {
+            continue;
+        }
+        let artifact = Published::<P>::unkeyed_from_phase_dir(&case_dir)?;
+        out.insert(case_dir, artifact);
+    }
+    Ok(out)
 }
 
 /// A published tree, MEASURED, and nothing else. `Sealed::adopt` served this — the golden
@@ -2384,6 +2404,30 @@ mod tests {
             "and a tree re-adopted from its phase dir is unkeyable however it was first published: \
              the adoption asks no key, so nothing there names the model, prompt or toolchain"
         );
+    }
+
+    /// The pcre2 shape, and what verify leaves when its crate fails `cargo check`: nothing published,
+    /// the crate displaced, `verified/` a transcript alone — scored as a build failure, not absent.
+    #[test]
+    fn a_phase_dir_holding_only_a_transcript_is_not_an_artifact() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let case = tmp.path().join("pcre2");
+        let verified = crate::battery::phase_dir(&case, crate::battery::VERIFIED);
+        std::fs::create_dir_all(verified.join("logs")).unwrap();
+        std::fs::write(phase_log::<Verify>(&case), "the run that published nothing").unwrap();
+        std::fs::write(verified.join(Verify::METRICS), "{}").unwrap();
+
+        let err = Published::<Verify>::unkeyed_from_phase_dir(&case)
+            .expect_err("a transcript is not a verification");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("no verified crate"),
+            "naming what is missing: {text}"
+        );
+
+        std::fs::write(verified.join("Cargo.toml"), "[package]\n").unwrap();
+        Published::<Verify>::unkeyed_from_phase_dir(&case)
+            .expect("a real crate in the same dir is still adopted, or this pins nothing");
     }
 
     /// A symlink CYCLE is the input that separates "skip what cannot be resolved" from "swallow

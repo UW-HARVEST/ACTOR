@@ -211,6 +211,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub allow_unsandboxed: bool,
 
+    /// Leave `.eval/` on disk after scoring, for a post-mortem of a build failure. It is otherwise
+    /// removed: a tree left standing is one a later run could read instead of materialising its own.
+    #[arg(long, global = true)]
+    pub keep_eval_tree: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }

@@ -31,21 +31,9 @@ pub fn has_crate(phase_dir: &Path) -> bool {
     phase_dir.join("Cargo.toml").is_file()
 }
 
-/// THE READER RULE: every reader wanting a case's current state (score, LOC,
-/// unsafe, crate source) must come through here, so pre- and post-verify cases
-/// resolve uniformly.
-pub fn crate_dir(case_dir: &Path) -> PathBuf {
-    let verified = phase_dir(case_dir, VERIFIED);
-    if has_crate(&verified) {
-        verified
-    } else {
-        phase_dir(case_dir, TRANSLATED)
-    }
-}
-
-/// The crate-dir name MIT `runtests` hardcodes (test-corpus/.../discovery/
-/// rust.py), also used for the agent's temp workspace. NOT a storage phase dir:
-/// for scoring, it is staged as a symlink to [`TRANSLATED`]/[`VERIFIED`].
+/// The crate-dir name MIT `runtests` hardcodes (test-corpus/.../discovery/rust.py), also used for the
+/// agent's temp workspace and for the crate [`crate::eval`] materialises. NOT a storage phase dir, and
+/// no longer a symlink to one — see [`crate::eval`] for what `.resolve()` did with the last symlink.
 pub const TRANSLATED_RUST: &str = "translated_rust";
 
 #[derive(Debug, Clone)]
@@ -768,9 +756,8 @@ mod tests {
         assert_eq!(shared_count, 1, "should have 1 shared-source group");
     }
 
-    /// Regression, pcre2: a `verified/` holding only logs used to shadow the crate.
     #[test]
-    fn a_verified_dir_holding_only_logs_resolves_to_translated() {
+    fn a_verified_dir_holding_only_logs_is_not_a_crate() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         let case = tmp.path().join("pcre2");
         fs::create_dir_all(case.join("verified/logs")).unwrap();
@@ -784,26 +771,7 @@ mod tests {
             "fixture must retain the trap"
         );
         assert!(!has_crate(&case.join("verified")));
-        assert_eq!(
-            crate_dir(&case),
-            case.join("translated"),
-            "a phase that produced no crate must not shadow the one that did"
-        );
-        assert!(
-            has_crate(&crate_dir(&case)),
-            "the resolved dir must be scoreable"
-        );
-    }
-
-    #[test]
-    fn a_verified_crate_still_wins() {
-        let tmp = crate::io::workdir::test_tempdir().unwrap();
-        let case = tmp.path().join("zstd");
-        for phase in [TRANSLATED, VERIFIED] {
-            fs::create_dir_all(case.join(phase)).unwrap();
-            fs::write(case.join(phase).join("Cargo.toml"), "[package]").unwrap();
-        }
-        assert_eq!(crate_dir(&case), case.join(VERIFIED));
+        assert!(has_crate(&case.join("translated")));
     }
 
     #[test]

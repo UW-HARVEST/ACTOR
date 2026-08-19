@@ -1,5 +1,7 @@
-use super::{openssl_dir, BatteryMismatch, Enrichment, TestMode, TestOutcome};
+use super::{openssl_dir, BatteryMismatch, Enrichment, Scoring, TestMode, TestOutcome};
+use crate::artifact::{Phase, Translate, Verify};
 use crate::battery::Paths;
+use crate::eval::Source;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -175,23 +177,17 @@ fn score_harvest_bench_suite(
     Ok(res)
 }
 
-/// Load stored harvest-bench result.json files as a baseline for --check.
 fn load_harvest_bench_stored(
-    paths: &Paths,
+    covered: &[crate::eval::Case],
 ) -> std::collections::BTreeMap<String, HarvestBenchResult> {
     let mut map = std::collections::BTreeMap::new();
-    let Ok(entries) = std::fs::read_dir(&paths.results_dir) else {
-        return map;
-    };
-    for entry in entries.filter_map(|e| e.ok()) {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        // Single-phase: score lives in translated/result.json (reader rule).
-        let rj = crate::battery::crate_dir(&entry.path()).join("result.json");
-        if let Ok(data) = std::fs::read_to_string(&rj) {
+    for crate::eval::Case {
+        name, record_into, ..
+    } in covered
+    {
+        if let Ok(data) = std::fs::read_to_string(record_into.join("result.json")) {
             if let Ok(r) = serde_json::from_str::<HarvestBenchResult>(&data) {
-                map.insert(entry.file_name().to_string_lossy().into_owned(), r);
+                map.insert(name.clone(), r);
             }
         }
     }
@@ -201,46 +197,79 @@ fn load_harvest_bench_stored(
 pub fn run_harvest_bench_test(
     paths: &Paths,
     projects: &[crate::battery::HarvestBenchProject],
-    mode: TestMode,
+    scoring: &Scoring<'_>,
 ) -> Result<TestOutcome> {
     let runner = harvest_bench_runner(&paths.corpus_dir)?;
-    let stored = load_harvest_bench_stored(paths);
+
+    // Verify's artifact where the run resolved one, else translate's — from the values, not a stat.
+    let (archive_t, archive_v);
+    let (translate, verify) = match &scoring.source {
+        Source::Run { translate, verify } => (*translate, *verify),
+        Source::Archive => {
+            archive_t = crate::artifact::archived_artifacts::<Translate>(&paths.results_dir)?;
+            archive_v = crate::artifact::archived_artifacts::<Verify>(&paths.results_dir)?;
+            (&archive_t, &archive_v)
+        }
+    };
+
+    // Every project REQUESTED, not only those that resolved a crate: a run that died on `api_error`
+    // publishes nothing, so grading the resolved set grades the one set with no infra failure in it.
+    scoring.gate.grade(
+        &projects
+            .iter()
+            .map(|p| crate::agent_health::Run {
+                name: p.name().to_string(),
+                case_dir: paths.output_dir(p.name()),
+            })
+            .collect::<Vec<_>>(),
+    )?;
+
+    let mut scope = scoring.tree.scope("")?;
+    let mut absent: Vec<&str> = Vec::new();
+    for project in projects {
+        let case_dir = paths.output_dir(project.name());
+        if let Some(v) = verify.get(&case_dir) {
+            scope.materialise(project.name(), v, &case_dir)?;
+        } else if let Some(t) = translate.get(&case_dir) {
+            scope.materialise(project.name(), t, &case_dir)?;
+        } else {
+            absent.push(project.name());
+        }
+    }
+    let materialised = scope.finish()?;
+    scoring.source.provenance().announce();
+
+    let stored = load_harvest_bench_stored(materialised.cases());
+    let mode = scoring.mode;
 
     let mut results: std::collections::BTreeMap<String, HarvestBenchResult> = Default::default();
     let mut passed = 0usize;
     let mut build_failed = 0usize;
     let mut recorded = 0usize;
 
+    // A project the harness got no crate out of is a FAILED project, not an absent one:
+    // `continue`ing shrank the denominator, publishing `N/6` for 7 projects.
+    for name in &absent {
+        build_failed += 1;
+        println!("  ❌ {name}: no crate this run resolved — counted as a build failure");
+        results.insert(
+            (*name).to_string(),
+            HarvestBenchResult {
+                tests_ok: 0,
+                tests_failed: 0,
+                tests_skipped: 0,
+                build_ok: false,
+            },
+        );
+    }
+
     for project in projects {
         let name = project.name();
-        let case_dir = paths.output_dir(name);
-        // Reader rule: verified/ if verify produced a valid crate, else
-        // translated/ — which also covers verify breaking the crate, since the
-        // compile gate then discards verified/ entirely.
-        let crate_dir = crate::battery::crate_dir(&case_dir);
-
-        // A project the harness got no crate out of is a FAILED project, not an absent
-        // one: `continue`ing shrank the denominator, publishing `N/6` for 7 projects.
-        // There is no phase dir to hold a result.json, so the failure lives in the count
-        // and `--check` reports the missing stored result rather than passing vacuously.
-        if !crate::battery::has_crate(&crate_dir) {
-            build_failed += 1;
-            println!(
-                "  ❌ {name}: no crate in translated/ or verified/ — counted as a build failure"
-            );
-            results.insert(
-                name.to_string(),
-                HarvestBenchResult {
-                    tests_ok: 0,
-                    tests_failed: 0,
-                    tests_skipped: 0,
-                    build_ok: false,
-                },
-            );
+        let Some(case) = materialised.cases().iter().find(|c| c.name == name) else {
             continue;
-        }
-
-        let logs_dir = crate_dir.join("logs");
+        };
+        let crate_dir = materialised.crate_root(name);
+        let logs_dir = case.record_into.join("logs");
         std::fs::create_dir_all(&logs_dir)?;
 
         let (so, build_log) = build_harvest_bench_lib(&crate_dir, name);
@@ -280,11 +309,11 @@ pub fn run_harvest_bench_test(
 
         if matches!(mode, TestMode::Update) {
             let mut json = serde_json::to_value(&r)?;
-            let tlog = logs_dir.join("translation.log");
+            let tlog = crate_dir.join("logs").join(Translate::LOG);
             Enrichment::compute(&crate_dir.join("src"), &[("translate", &tlog)])
                 .merge_into(&mut json);
             std::fs::write(
-                crate_dir.join("result.json"),
+                case.record_into.join("result.json"),
                 serde_json::to_string_pretty(&json)? + "\n",
             )?;
             recorded += 1;

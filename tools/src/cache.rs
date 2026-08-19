@@ -2592,8 +2592,8 @@ pub(crate) mod tests {
 
     #[test]
     fn the_store_sits_outside_every_tree_walker() {
-        // `discover_batteries` treats each child of `results/<dataset>/<agent>` as a
-        // battery, so a store living under it could be graded as if it were a case.
+        // Every walker of `results/<dataset>/<agent>` — the archival artifact scan, the report —
+        // treats a child as a case, so a store living under it could be graded as one.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let owned = Inputs::new();

@@ -6,8 +6,9 @@
 use crate::agents::invocation::has_verify_phase;
 use crate::battery::{self, Paths};
 use crate::cli::{Agent, Dataset};
-use crate::oracle::{self, TestMode, TestOutcome};
+use crate::oracle::{self, Scoring, TestOutcome};
 use crate::translate::Translations;
+use crate::verify::Verifications;
 use crate::{translate, verify};
 use anyhow::Result;
 use std::path::Path;
@@ -44,11 +45,11 @@ pub trait Benchmark {
         _force: bool,
         _parallel: usize,
         _translations: &Translations,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<Verifications> {
+        Ok(Verifications::new())
     }
 
-    fn test(&self, paths: &Paths, target: &str, mode: TestMode) -> Result<TestOutcome>;
+    fn test(&self, paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<TestOutcome>;
 
     /// Backfills result.json (unsafe/loc/credits); already folded into `test --update`,
     /// so the `enrich` subcommand only re-runs this step.
@@ -217,40 +218,30 @@ impl Benchmark for TestCorpus {
         force: bool,
         parallel: usize,
         translations: &Translations,
-    ) -> Result<()> {
+    ) -> Result<Verifications> {
         let batteries = resolve_batteries(&paths.corpus_dir, target)?;
         if batteries.len() > 1 {
             verify::run_all(paths, &batteries, force, parallel, translations)
         } else {
+            let mut resolved = Verifications::new();
             for bat in &batteries {
                 let (name, filter) = parse_target(bat);
                 let filter = one_filter(filter, filter_flag)?;
-                verify::run(
+                resolved.extend(verify::run(
                     paths,
                     &name,
                     filter.as_deref(),
                     force,
                     parallel,
                     translations,
-                )?;
+                )?);
             }
-            Ok(())
+            Ok(resolved)
         }
     }
 
-    fn test(&self, paths: &Paths, target: &str, mode: TestMode) -> Result<TestOutcome> {
-        let batteries = resolve_batteries(&paths.corpus_dir, target)?;
-        let mut all_mismatches = Vec::new();
-        for bat in &batteries {
-            if let TestOutcome::Failed(m) = oracle::run_test_corpus(paths, bat, mode)? {
-                all_mismatches.extend(m);
-            }
-        }
-        Ok(if all_mismatches.is_empty() {
-            TestOutcome::Passed
-        } else {
-            TestOutcome::Failed(all_mismatches)
-        })
+    fn test(&self, paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<TestOutcome> {
+        oracle::run_test_corpus(paths, target, scoring)
     }
 
     fn enrich(&self, paths: &Paths, target: &str) -> Result<()> {
@@ -292,15 +283,15 @@ impl Benchmark for HarvestBench {
         force: bool,
         parallel: usize,
         translations: &Translations,
-    ) -> Result<()> {
+    ) -> Result<Verifications> {
         no_filter_here(filter_flag)?;
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
         verify::run_harvest_bench(paths, &projects, parallel, force, translations)
     }
 
-    fn test(&self, paths: &Paths, target: &str, mode: TestMode) -> Result<TestOutcome> {
+    fn test(&self, paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<TestOutcome> {
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
-        oracle::run_harvest_bench_test(paths, &projects, mode)
+        oracle::run_harvest_bench_test(paths, &projects, scoring)
     }
 
     fn enrich(&self, paths: &Paths, _target: &str) -> Result<()> {
