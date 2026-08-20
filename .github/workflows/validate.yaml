@@ -10,8 +10,18 @@ jobs:
   # a refusal. The 7-arm `test all --check` matrix that was here had not passed once in 100 runs back
   # past 2026-07-05, so every PR merged on `type safety` alone; it is now `archive`, run on demand.
   reproduce:
-    name: Reproduce Test-Corpus claude B01_synthetic from the cache
+    name: Reproduce ${{ matrix.battery }}
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      # Both absentees are shared-source groups: opening at Mode::Bypass they mint no key, so P01 is
+      # wholly absent from the store and B02_synthetic's group leaves its followers' enrichment stale.
+      matrix:
+        battery:
+          - B01_synthetic
+          - B01_organic
+          - B02_organic
+          - P00_perlin_noise
     steps:
       - uses: actions/checkout@v5
         with:
@@ -52,7 +62,7 @@ jobs:
       - name: Reproduce
         env:
           CARGO_BUILD_JOBS: "2"
-        run: ./tools/reproduce.sh B01_synthetic
+        run: ./tools/reproduce.sh ${{ matrix.battery }}
 
   # Not on push/PR: it scores translations whose transcripts include dead runs, so the infra gate
   # refuses and it cannot pass. Kept because it refuted spec-20's claimed c2rust regression.

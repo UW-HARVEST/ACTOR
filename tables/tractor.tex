@@ -2,7 +2,7 @@
 % Builds = crate compiles (result.json error != "build failed").
 % Tests = cases passing all vectors. Every system is scored over all cases.
 B01-syn & ACTOR (Kiro) & 85/85 & \textbf{85/85} & 5k & 15\% \\
- & ACTOR (Claude Code) & 85/85 & \textbf{85/85} & 6k & 18\% \\
+ & ACTOR (Claude Code) & 85/85 & \textbf{85/85} & 10k & 22\% \\
  & ACTOR (Codex) & 85/85 & 84/85 & 4k & 30\% \\
  & \makebox[\knvLength][l]{ACTOR (Kiro, no validate)} & 85/85 & 83/85 & 3k & 17\% \\
  & C2Rust & 85/85 & \textbf{85/85} & 5k & 57\% \\
@@ -14,7 +14,7 @@ B01-syn & ACTOR (Kiro) & 85/85 & \textbf{85/85} & 5k & 15\% \\
  & Gemini 3.1 Pro (query) & 82/85 & 75/85 & 2k & 5\% \\
 \hline
 B01-org & ACTOR (Kiro) & 38/38 & \textbf{38/38} & 3k & 38\% \\
- & ACTOR (Claude Code) & 38/38 & \textbf{38/38} & 3k & 44\% \\
+ & ACTOR (Claude Code) & 38/38 & \textbf{38/38} & 4k & 61\% \\
  & ACTOR (Codex) & 38/38 & \textbf{38/38} & 2k & 61\% \\
  & \makebox[\knvLength][l]{ACTOR (Kiro, no validate)} & 38/38 & \textbf{38/38} & 3k & 38\% \\
  & C2Rust & 38/38 & \textbf{38/38} & 9k & 33\% \\
@@ -26,8 +26,8 @@ B01-org & ACTOR (Kiro) & 38/38 & \textbf{38/38} & 3k & 38\% \\
  & Gemini 3.1 Pro (query) & 37/38 & 35/38 & 2k & 23\% \\
 \hline
 B02-syn & ACTOR (Kiro) & 42/42 & 31/42 & 12k & 31\% \\
- & ACTOR (Claude Code) & 42/42 & \textbf{36/42} & 15k & 41\% \\
- & ACTOR (Codex) & 42/42 & \textbf{36/42} & 11k & 32\% \\
+ & ACTOR (Claude Code) & 42/42 & \textbf{40/42} & 18k & 50\% \\
+ & ACTOR (Codex) & 42/42 & 36/42 & 11k & 32\% \\
  & \makebox[\knvLength][l]{ACTOR (Kiro, no validate)} & 42/42 & 31/42 & 8k & 24\% \\
  & C2Rust & 39/42 & 38/42 & 21k & 76\% \\
  & Laertes & 40/42 & 39/42 & 21k & 73\% \\
@@ -38,7 +38,7 @@ B02-syn & ACTOR (Kiro) & 42/42 & 31/42 & 12k & 31\% \\
  & Gemini 3.1 Pro (query) & 37/42 & 24/42 & 8k & 5\% \\
 \hline
 B02-org & ACTOR (Kiro) & 44/44 & 42/44 & 22k & 67\% \\
- & ACTOR (Claude Code) & 44/44 & \textbf{43/44} & 24k & 78\% \\
+ & ACTOR (Claude Code) & 44/44 & \textbf{43/44} & 31k & 84\% \\
  & ACTOR (Codex) & 43/44 & 41/44 & 16k & 48\% \\
  & \makebox[\knvLength][l]{ACTOR (Kiro, no validate)} & 43/44 & 41/44 & 18k & 66\% \\
  & C2Rust & 42/44 & 42/44 & 45k & 76\% \\
@@ -50,7 +50,7 @@ B02-org & ACTOR (Kiro) & 44/44 & 42/44 & 22k & 67\% \\
  & Gemini 3.1 Pro (query) & 29/44 & 22/44 & 10k & 26\% \\
 \hline
 P00 & ACTOR (Kiro) & 1/1 & \textbf{1/1} & 556 & 0\% \\
-(Perlin) & ACTOR (Claude Code) & 1/1 & \textbf{1/1} & 450 & 1\% \\
+(Perlin) & ACTOR (Claude Code) & 1/1 & \textbf{1/1} & 1.4k & 1\% \\
  & ACTOR (Codex) & 1/1 & \textbf{1/1} & 394 & 5\% \\
  & \makebox[\knvLength][l]{ACTOR (Kiro, no validate)} & 1/1 & \textbf{1/1} & 315 & 0\% \\
  & C2Rust & 1/1 & \textbf{1/1} & 1.6k & 31\% \\
@@ -74,7 +74,7 @@ P01 & ACTOR (Kiro) & 128/128 & \textbf{128/128} & 5k & 64\% \\
  & Gemini 3.1 Pro (query) & 0/128 & 0/128 & 1.2k & 3\% \\
 \hline\hline
 Total & ACTOR (Kiro) & 338/338 & \textbf{325/338} & 47k & 50\% \\
- & ACTOR (Claude Code) & 338/338 & 319/338 & 53k & 53\% \\
+ & ACTOR (Claude Code) & 338/338 & 323/338 & 70k & 59\% \\
  & ACTOR (Codex) & 337/338 & 244/338 & 36k & 39\% \\
  & \makebox[\knvLength][l]{ACTOR (Kiro, no validate)} & 337/338 & 230/338 & 37k & 50\% \\
  & C2Rust & 205/338 & 204/338 & 87k & 70\% \\
