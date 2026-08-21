@@ -33,7 +33,6 @@ pub fn run_test_corpus(paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Re
         unresolved |= resolved.is_empty();
         passes.extend(resolved);
     }
-    scoring.source.provenance().announce();
 
     if let Some(battery) = named.filter(|_| unresolved) {
         return nothing_to_score(paths, battery, scoring.mode);
@@ -80,33 +79,15 @@ struct CheckRow {
 struct Pass {
     battery: String,
     phase: &'static str,
-    record: Record,
+    record: &'static str,
     tree: Materialised,
 }
 
-/// The convention the shipped archive and [`crate::analyse::report`] share: `summary.json` is a battery's HEADLINE record —
-/// where a verify-less agent files its translate score — and `summary_translated.json` the translate record beside a verified
-/// headline, so picking the wrong one compares against another phase's number rather than against a stale file.
+/// The convention [`crate::analyse::report`] reads: `summary.json` is a battery's HEADLINE record — where a verify-less agent
+/// files its translate score — and `summary_translated.json` the translate record beside a verified headline. Pick the wrong
+/// one and the comparison is against another phase's number.
 const HEADLINE_SUMMARY: &str = "summary.json";
 const TRANSLATE_BESIDE_HEADLINE: &str = "summary_translated.json";
-
-/// Which record a pass may be compared against — the ARCHIVE's answer, not `has_verify_phase`'s. Measured at `results` HEAD,
-/// not a working tree local `--update`s littered: 7 of 100 pairs hold both phases' crates under a lone `summary.json` (all six
-/// `claude/*` plus `claude-cross-prompt/B01_synthetic`; only `kiro/*` files the other), so demanding it keeps the FLAGSHIP red
-/// on every battery. Base compared that same one record, so this checks no less. `--update` may not file it. Needs SOME filed.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Record {
-    Compare(&'static str),
-    Unfiled(&'static str),
-}
-
-impl Record {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Compare(name) | Self::Unfiled(name) => name,
-        }
-    }
-}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Headline {
@@ -158,16 +139,7 @@ fn covered_runs(paths: &Paths, batteries: &[String], covers: Covers<'_>) -> Resu
 }
 
 fn materialise_battery(paths: &Paths, battery: &str, scoring: &Scoring<'_>) -> Result<Vec<Pass>> {
-    let output_dir = paths.output_dir(battery);
-    let (archive_t, archive_v);
-    let (translate, verify) = match &scoring.source {
-        Source::Run { translate, verify } => (*translate, *verify),
-        Source::Archive => {
-            archive_t = crate::artifact::archived_artifacts::<Translate>(&output_dir)?;
-            archive_v = crate::artifact::archived_artifacts::<Verify>(&output_dir)?;
-            (&archive_t, &archive_v)
-        }
-    };
+    let Source { translate, verify } = scoring.source;
     let translated = materialise_phase::<Translate>(paths, battery, scoring, translate)?;
     let verified = materialise_phase::<Verify>(paths, battery, scoring, verify)?;
 
@@ -180,19 +152,12 @@ fn materialise_battery(paths: &Paths, battery: &str, scoring: &Scoring<'_>) -> R
         wanted.push((Verify::DIR, HEADLINE_SUMMARY, tree));
     }
 
-    let filed = |name: &str| output_dir.join(name).is_file();
-    let archived =
-        matches!(scoring.source, Source::Archive) && wanted.iter().any(|(_, n, _)| filed(n));
     Ok(wanted
         .into_iter()
-        .map(|(phase, name, tree)| Pass {
+        .map(|(phase, record, tree)| Pass {
             battery: battery.to_string(),
             phase,
-            record: if archived && !filed(name) {
-                Record::Unfiled(name)
-            } else {
-                Record::Compare(name)
-            },
+            record,
             tree,
         })
         .collect())
@@ -275,8 +240,8 @@ fn stored_summary(path: &Path) -> Result<Summary, String> {
 }
 
 /// A battery NAMED on the command line that materialised nothing is refused in every mode, as
-/// [`crate::oracle::gtest`] already refuses a project it resolved no crate for: nothing was scored, so
-/// `Passed` here is the archival `--check` reporting OK over an empty archive or an absent corpus.
+/// [`crate::oracle::gtest`] refuses a project it resolved no crate for: `Passed` over nothing scored is
+/// a check reporting OK having seen nothing.
 fn nothing_to_score(paths: &Paths, battery: &str, mode: TestMode) -> Result<TestOutcome> {
     let input_dir = paths.input_dir(battery);
     let why = if input_dir.is_dir() {
@@ -323,29 +288,19 @@ fn check(
     check_rows: &mut Vec<CheckRow>,
 ) -> TestOutcome {
     let mut diffs = Vec::new();
-    let expected = match pass.record {
-        Record::Compare(name) => {
-            let stored = paths.output_dir(&pass.battery).join(name);
-            Some(match stored_summary(&stored) {
-                Ok(expected) => {
-                    diffs.extend(diff_summaries(&expected, summary));
-                    expected
-                }
-                Err(why) => {
-                    diffs.push(why);
-                    Summary::default()
-                }
-            })
+    // Always compared, never skipped: a run PRODUCED this number, so a record it cannot find is
+    // missing, not merely unfiled.
+    let stored = paths.output_dir(&pass.battery).join(pass.record);
+    let expected = Some(match stored_summary(&stored) {
+        Ok(expected) => {
+            diffs.extend(diff_summaries(&expected, summary));
+            expected
         }
-        Record::Unfiled(name) => {
-            println!(
-                "   ⏭️  {} [{}]: the archive files no {name}, so this number is reported and not \
-                 compared against one",
-                pass.battery, pass.phase
-            );
-            None
+        Err(why) => {
+            diffs.push(why);
+            Summary::default()
         }
-    };
+    });
     for case in pass.tree.cases() {
         if !per_case.contains_key(&case.name) {
             continue;
@@ -656,26 +611,19 @@ fn write_results(
         let json = serde_json::to_string_pretty(&val)?;
         std::fs::write(case.record_into.join("result.json"), format!("{json}\n"))?;
     }
-    match (covers, pass.record) {
-        (Covers::WholeBattery, Record::Compare(name)) => {
+    match covers {
+        Covers::WholeBattery => {
             let json = serde_json::to_string_pretty(summary)?;
             std::fs::write(
-                paths.output_dir(&pass.battery).join(name),
+                paths.output_dir(&pass.battery).join(pass.record),
                 format!("{json}\n"),
             )?;
         }
-        (Covers::WholeBattery, Record::Unfiled(name)) => println!(
-            "   ⏭️  {} [{}]: the archive files no {name}, so this run reports its number and does \
-             not invent one",
-            pass.battery, pass.phase
-        ),
         // `analyse::report` rebuilds `tables/` from this file, and a subset's count is not the battery's.
-        (Covers::Subset(regex), record) => println!(
+        Covers::Subset(regex) => println!(
             "   ⏭️  {} [{}]: --include-regex {regex} covered part of the battery, so {} keeps the \
              whole battery's number and is not rewritten",
-            pass.battery,
-            pass.phase,
-            record.name()
+            pass.battery, pass.phase, pass.record
         ),
     }
     Ok(())
@@ -813,7 +761,7 @@ mod tests {
         let gate = gate_at(&paths);
         let scoring = Scoring {
             mode: TestMode::Run,
-            source: Source::Run {
+            source: Source {
                 translate: &translations,
                 verify: &verifications,
             },
@@ -830,8 +778,7 @@ mod tests {
             "a battery that verified nothing must not get a verified pass from one leftover dir"
         );
         assert_eq!(
-            passes[0].record,
-            Record::Compare(TRANSLATE_BESIDE_HEADLINE),
+            passes[0].record, TRANSLATE_BESIDE_HEADLINE,
             "and claude's headline stays the verified record it declares a phase for, so a \
              --no-verify sweep cannot file a translate number over it"
         );
@@ -865,7 +812,7 @@ mod tests {
             "B01",
             &Scoring {
                 mode: TestMode::Check,
-                source: Source::Run {
+                source: Source {
                     translate: translations,
                     verify: &verifications,
                 },
@@ -901,8 +848,7 @@ mod tests {
             "an agent with no verify phase gets exactly the translate pass"
         );
         assert_eq!(
-            passes[0].record,
-            Record::Compare(HEADLINE_SUMMARY),
+            passes[0].record, HEADLINE_SUMMARY,
             "and its translate score IS the battery headline, which is where the archive files it \
              and where analyse::report reads it"
         );
@@ -971,14 +917,27 @@ mod tests {
         );
     }
 
-    fn archival(paths: &Paths, target: &str, tree: &Tree, mode: TestMode) -> Result<TestOutcome> {
+    /// A run that RESOLVED NOTHING — the shape a battery takes when every case missed.
+    fn resolved_nothing(
+        paths: &Paths,
+        target: &str,
+        tree: &Tree,
+        mode: TestMode,
+    ) -> Result<TestOutcome> {
         let gate = gate_at(paths);
+        let (t, v) = (
+            crate::translate::Translations::new(),
+            crate::verify::Verifications::new(),
+        );
         run_test_corpus(
             paths,
             target,
             &Scoring {
                 mode,
-                source: Source::Archive,
+                source: Source {
+                    translate: &t,
+                    verify: &v,
+                },
                 tree,
                 gate: &gate,
                 covers: Covers::WholeBattery,
@@ -986,8 +945,8 @@ mod tests {
         )
     }
 
-    /// The archival `--check` refuted `spec-20.md`, and both shapes below made it exit 0 having compared
-    /// nothing: no crate for the battery in the archive, and no corpus battery dir (a fresh worktree).
+    /// Refuting `spec-20.md`: both shapes below once exited 0 having compared nothing — no crate
+    /// resolved for the battery, and no corpus battery dir at all (a fresh worktree).
     #[test]
     fn a_named_battery_that_materialised_nothing_is_never_a_pass() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
@@ -1002,7 +961,7 @@ mod tests {
         );
 
         let tree = Tree::create_empty(&paths, Keep::ForPostMortem).unwrap();
-        let outcome = archival(&paths, "B01", &tree, TestMode::Check).unwrap();
+        let outcome = resolved_nothing(&paths, "B01", &tree, TestMode::Check).unwrap();
         let TestOutcome::Failed(mismatches) = outcome else {
             panic!("a --check that materialised nothing must not report a pass: {outcome:?}")
         };
@@ -1014,9 +973,9 @@ mod tests {
             "naming the record it wanted to compare against: {:?}",
             mismatches[0].diffs
         );
-        archival(&paths, "B01", &tree, TestMode::Update)
+        resolved_nothing(&paths, "B01", &tree, TestMode::Update)
             .expect_err("and --update must refuse rather than silently write nothing");
-        archival(&paths, "all", &tree, TestMode::Check)
+        resolved_nothing(&paths, "all", &tree, TestMode::Check)
             .expect_err("nor may the fan-out report a pass when it skipped EVERY battery");
 
         let tmp = crate::io::workdir::test_tempdir().unwrap();
@@ -1028,7 +987,7 @@ mod tests {
             "the second fixture holds a complete crate and NO corpus battery"
         );
         let tree = Tree::create_empty(&paths, Keep::ForPostMortem).unwrap();
-        let outcome = archival(&paths, "B01", &tree, TestMode::Check).unwrap();
+        let outcome = resolved_nothing(&paths, "B01", &tree, TestMode::Check).unwrap();
         let TestOutcome::Failed(mismatches) = outcome else {
             panic!("an absent corpus is not an agreeing score either: {outcome:?}")
         };
@@ -1050,130 +1009,6 @@ mod tests {
             executed_cases(log).unwrap(),
             vec!["001_helloworld", "014_dead_code_lib"],
             "the two indented lines are the cases; the header names none"
-        );
-    }
-
-    fn archival_passes(paths: &Paths, battery: &str, tree: &Tree) -> Vec<Pass> {
-        let gate = gate_at(paths);
-        materialise_battery(
-            paths,
-            battery,
-            &Scoring {
-                mode: TestMode::Check,
-                source: Source::Archive,
-                tree,
-                gate: &gate,
-                covers: Covers::WholeBattery,
-            },
-        )
-        .unwrap()
-    }
-
-    /// `claude-cross-prompt/B01_synthetic` holds crates for both phases under a lone `summary.json`, and
-    /// `has_verify_phase` excludes that agent — so a record derived from it demanded one never archived.
-    #[test]
-    fn a_phase_the_archive_files_no_number_for_is_reported_and_the_one_it_files_is_still_compared()
-    {
-        const CASES: usize = 85;
-        let tmp = crate::io::workdir::test_tempdir().unwrap();
-        let names: Vec<String> = (1..=CASES).map(|i| format!("{i:03}_case")).collect();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        corpus_battery(tmp.path(), "B01_synthetic", &refs);
-        let paths = paths_at(tmp.path(), crate::cli::Agent::ClaudeCrossPrompt);
-        let both_crates = |name: &String| {
-            let case = paths.case_dir("B01_synthetic", name);
-            crate::battery::has_crate(&case.join(Translate::DIR))
-                && crate::battery::has_crate(&case.join(Verify::DIR))
-        };
-        for name in &names {
-            let case = paths.case_dir("B01_synthetic", name);
-            crate_at(&case.join(Translate::DIR));
-            crate_at(&case.join(Verify::DIR));
-        }
-
-        let output_dir = paths.output_dir("B01_synthetic");
-        let stored = Summary {
-            cases_tested: CASES,
-            cases_passed: 44,
-            vectors_failed: 185,
-            vectors_skipped: 11,
-            ..Default::default()
-        };
-        fs::write(
-            output_dir.join(HEADLINE_SUMMARY),
-            serde_json::to_string(&stored).unwrap(),
-        )
-        .unwrap();
-        assert!(
-            names.iter().all(both_crates)
-                && stored_summary(&output_dir.join(TRANSLATE_BESIDE_HEADLINE)).is_err(),
-            "the fixture must hold {CASES} crates for BOTH phases and no {TRANSLATE_BESIDE_HEADLINE}, \
-             or there is no phase for the archive to file no number for"
-        );
-
-        let tree = Tree::create_empty(&paths, Keep::ForPostMortem).unwrap();
-        let passes = archival_passes(&paths, "B01_synthetic", &tree);
-        assert_eq!(
-            passes
-                .iter()
-                .map(|p| (p.phase, p.record))
-                .collect::<Vec<_>>(),
-            vec![
-                (Translate::DIR, Record::Unfiled(TRANSLATE_BESIDE_HEADLINE)),
-                (Verify::DIR, Record::Compare(HEADLINE_SUMMARY)),
-            ],
-            "the archive files exactly one number, and it is the verified one base compared"
-        );
-
-        let mut rows = Vec::new();
-        for pass in &passes {
-            let outcome = check(&paths, pass, &stored, &HashMap::new(), &mut rows);
-            assert!(
-                !matches!(outcome, TestOutcome::Failed(_)),
-                "a shipped battery must not go red for a record the archive never filed: {outcome:?}"
-            );
-        }
-        assert_eq!(
-            rows.len(),
-            1,
-            "and only the compared pass may claim a line in the Check Summary table"
-        );
-
-        let drifted = Summary {
-            vectors_passed: 1,
-            ..stored.clone()
-        };
-        rows.clear();
-        let outcome = check(&paths, &passes[1], &drifted, &HashMap::new(), &mut rows);
-        assert!(
-            matches!(outcome, TestOutcome::Failed(_)),
-            "while one vector of drift against the record it DOES file is still caught: {outcome:?}"
-        );
-
-        write_results(
-            &paths,
-            &passes[0],
-            &stored,
-            &HashMap::new(),
-            Covers::WholeBattery,
-        )
-        .unwrap();
-        assert!(
-            !output_dir.join(TRANSLATE_BESIDE_HEADLINE).exists(),
-            "and --update writes no record into an archive that never held one"
-        );
-
-        fs::remove_file(output_dir.join(HEADLINE_SUMMARY)).unwrap();
-        rows.clear();
-        let bare = archival_passes(&paths, "B01_synthetic", &tree);
-        assert!(
-            bare.iter().all(|p| matches!(p.record, Record::Compare(_))
-                && matches!(
-                    check(&paths, p, &stored, &HashMap::new(), &mut rows),
-                    TestOutcome::Failed(_)
-                )),
-            "while a battery that files NO number is granted nothing: that is the vacuous --check \
-             pass, not a phase the archive declined to score"
         );
     }
 

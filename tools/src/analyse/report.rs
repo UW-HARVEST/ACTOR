@@ -48,7 +48,34 @@ struct BatteryRow {
     unsafe_lines: u32,
 }
 
-pub fn generate(repo_root: &Path) -> Result<()> {
+/// The (agent, battery) pairs a run RESOLVED, and so the only ones a table may report: `report` used
+/// to walk `results/` and publish whatever it found, which by [`crate::eval::Source`]'s measurement
+/// was ~95% unattested. A set built BY the run cannot name a pair the run did not resolve.
+#[derive(Debug, Default)]
+pub struct Attested(std::collections::BTreeSet<(String, String)>);
+
+impl Attested {
+    pub fn insert(&mut self, agent: &str, battery: &str) {
+        self.0.insert((agent.to_owned(), battery.to_owned()));
+    }
+
+    fn covers(&self, agent: &str, battery: &str) -> bool {
+        // `kiro-translate` is a synthetic row off kiro's pre-verify numbers: attested iff kiro is.
+        let agent = agent.strip_suffix("-translate").unwrap_or(agent);
+        self.0.contains(&(agent.to_owned(), battery.to_owned()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+pub fn generate(repo_root: &Path, attested: &Attested) -> Result<()> {
+    anyhow::ensure!(
+        !attested.is_empty(),
+        "refusing to write tables/: this run resolved nothing, so every row would come from \
+         artifacts it did not produce"
+    );
     let results_dir = repo_root.join("results/Test-Corpus");
     let test_corpus_dir = repo_root.join("test-corpus/Public-Tests");
     let tables_dir = repo_root.join("tables");
@@ -78,7 +105,11 @@ pub fn generate(repo_root: &Path) -> Result<()> {
                 continue;
             }
 
-            // Headline row: the verified phase.
+            if !attested.covers(&agent, &battery) {
+                println!("   \u{23ed}\u{fe0f}  {agent}/{battery}: not resolved by this run, so it is not reported");
+                continue;
+            }
+
             let summary_path = bat_dir.join("summary.json");
             let summary: Summary = match read_json(&summary_path) {
                 Some(s) => s,
@@ -229,13 +260,11 @@ pub fn generate(repo_root: &Path) -> Result<()> {
     std::fs::write(&numbers_path, &numbers)?;
     println!("✅ Wrote {}", numbers_path.display());
 
-    // tab:datasets body.
     let datasets = generate_datasets_tex(repo_root);
     let datasets_path = tables_dir.join("datasets.tex");
     std::fs::write(&datasets_path, &datasets)?;
     println!("✅ Wrote {}", datasets_path.display());
 
-    // tab:prompt-sensitivity body.
     let promptsens = generate_prompt_sensitivity_tex(repo_root, &rows);
     let promptsens_path = tables_dir.join("prompt-sensitivity.tex");
     std::fs::write(&promptsens_path, &promptsens)?;
@@ -250,16 +279,23 @@ pub fn generate(repo_root: &Path) -> Result<()> {
     //    from, not over compile-time constants: a renamed/missing input dir or a
     //    lost symlink must fail generation, not silently change a number. ──
 
-    // (1) 338 cases. Max-over-agents works because the ACTOR harnesses run
-    //     every case.
+    // (1) Every case of every battery IN SCOPE. A constant 338 could not tell a partial tree from a
+    //     deliberately narrower published set; scoped, it still fires on a battery losing cases.
     let mut per_agent_total: BTreeMap<&str, u32> = BTreeMap::new();
     for r in &rows {
         *per_agent_total.entry(r.agent.as_str()).or_insert(0) += r.cases_tested;
     }
     let tractor_total = per_agent_total.values().copied().max().unwrap_or(0);
+    let in_scope: std::collections::BTreeSet<&str> =
+        rows.iter().map(|r| r.battery.as_str()).collect();
+    let expected: u32 = EXPECTED_BATTERY_SIZES
+        .iter()
+        .filter(|(bat, _)| in_scope.contains(bat))
+        .map(|(_, n)| n)
+        .sum();
     anyhow::ensure!(
-        tractor_total == 338,
-        "TRACTOR invariant failed: max agent case total is {tractor_total}, expected 338"
+        tractor_total == expected,
+        "TRACTOR invariant failed: max agent case total is {tractor_total}, expected {expected}"
     );
 
     // (1b) Also pin each battery, so compensating errors cannot inflate one
@@ -354,7 +390,6 @@ pub fn generate(repo_root: &Path) -> Result<()> {
             if name.is_empty() || name.starts_with('#') {
                 continue;
             }
-            // match `\newcommand{\Name}` in the emitted files
             if !emitted.contains(&format!("{{\\{name}}}")) {
                 missing.push(name.to_string());
             }
@@ -605,9 +640,8 @@ fn generate_manual_tex(repo_root: &Path) -> String {
     out
 }
 
-/// THE archival resolver, and the only one left: `tables/` is regenerated from the shipped submodule
-/// with no run in flight, so the `result.json` the run left is the only record of what was scored.
-fn archived_score(case_dir: &Path) -> PathBuf {
+/// The phase whose `result.json` records what was scored: verify if it ran, else translate.
+fn scored_phase_dir(case_dir: &Path) -> PathBuf {
     let verified = crate::battery::phase_dir(case_dir, crate::battery::VERIFIED);
     if verified.join("result.json").is_file() {
         verified
@@ -636,7 +670,7 @@ fn case_builds(repo_root: &Path, agent: &str) -> std::collections::BTreeMap<Stri
                 continue;
             }
             let case = ce.file_name().to_string_lossy().to_string();
-            let rp = archived_score(&ce.path()).join("result.json");
+            let rp = scored_phase_dir(&ce.path()).join("result.json");
             let Some(r) = read_json::<CaseResult>(&rp) else {
                 continue;
             };
@@ -707,7 +741,7 @@ fn kiro_cost(base: &Path) -> KiroCost {
         // A case dir is one with a translated/ phase. Do NOT also descend into
         // its phase dirs — each carries a result.json and would double-count.
         if crate::battery::phase_dir(&p, crate::battery::TRANSLATED).is_dir() {
-            let rp = archived_score(&p).join("result.json");
+            let rp = scored_phase_dir(&p).join("result.json");
             if let Some(r) = read_json::<serde_json::Value>(&rp) {
                 for ph in ["translate", "verify"] {
                     let c = r
@@ -1012,14 +1046,22 @@ fn generate_tractor_tex(rows: &[BatteryRow]) -> String {
             .map(|(_, a, _)| cell(a, bat_dir).tests_pass)
             .max()
             .unwrap_or(0);
-        for (ri, (label, agent, _)) in TRACTOR_TABLE_ROWS.iter().enumerate() {
+        // The label goes on the first row EMITTED: rows are skipped, so index 0 left blocks bare.
+        let mut emitted = 0usize;
+        for (label, agent, _) in TRACTOR_TABLE_ROWS {
             let c = cell(agent, bat_dir);
+            // A system this run did not resolve is ABSENT, never zeroed: `0/85` reads as "scored
+            // zero", which is a claim. Invariant (1c) names that hazard for a missing agent dir.
+            if !c.present {
+                continue;
+            }
             let denom = c.denom;
-            let first_col = match ri {
+            let first_col = match emitted {
                 0 => *bat_line1,
                 1 => *bat_line2,
                 _ => "",
             };
+            emitted += 1;
             let tests = if c.tests_pass == best && best > 0 {
                 format!("\\textbf{{{}/{}}}", c.tests_pass, denom)
             } else {
@@ -1043,7 +1085,10 @@ fn generate_tractor_tex(rows: &[BatteryRow]) -> String {
                 first_col, label, c.built, denom, tests, loc, un
             ));
         }
-        // hline between batteries; double before Total.
+        // An out-of-scope battery would otherwise leave a doubled \hline where its rows were.
+        if emitted == 0 {
+            continue;
+        }
         if bi + 2 == TRACTOR_BATTERIES.len() {
             out.push_str("\\hline\\hline\n");
         } else if bi + 1 < TRACTOR_BATTERIES.len() {
@@ -1077,7 +1122,7 @@ fn aggregate_cases(bat_dir: &Path, corpus_bat_dir: &Path) -> CaseTotals {
     aggregate_cases_phase(bat_dir, corpus_bat_dir, None)
 }
 
-/// `phase`: `Some("translated")` for the pre-verify (no-validate) numbers, `None` for [`archived_score`].
+/// `phase`: `Some("translated")` for the pre-verify (no-validate) numbers, `None` for the phase [`scored_phase_dir`] picks.
 fn aggregate_cases_phase(bat_dir: &Path, corpus_bat_dir: &Path, phase: Option<&str>) -> CaseTotals {
     let corpus_present = corpus_bat_dir.is_dir();
     let (mut total_loc, mut total_unsafe, mut built) = (0u32, 0u32, 0u32);
@@ -1094,7 +1139,7 @@ fn aggregate_cases_phase(bat_dir: &Path, corpus_bat_dir: &Path, phase: Option<&s
         }
         let phase_dir = match phase {
             Some(p) => crate::battery::phase_dir(&entry.path(), p),
-            None => archived_score(&entry.path()),
+            None => scored_phase_dir(&entry.path()),
         };
         let result_path = phase_dir.join("result.json");
         let cr: CaseResult = match read_json(&result_path) {

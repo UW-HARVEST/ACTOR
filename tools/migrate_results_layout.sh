@@ -122,8 +122,7 @@ done
 
 say ""
 say "Migration complete. Next:"
-say "  1. Verify:  harvest-tools report   (tables/*.tex must match committed numbers)"
-say "  2. Verify:  harvest-tools --agent <a> test <dataset> --check   (per agent)"
+say "  1. Verify:  tools/reproduce.sh all   (replays from the cache and diffs tables/)"
 say "     (the no-validate summary was migrated to kiro/<bat>/summary_translated.json"
 say "      from the old kiro-translate pseudo-agent; no re-run needed)."
-say "  3. Commit inside results/ submodule, then bump the pointer in ACTOR."
+say "  2. Commit inside results/ submodule, then bump the pointer in ACTOR."

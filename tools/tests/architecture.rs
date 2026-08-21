@@ -408,6 +408,11 @@ fn compile_fail_cases_still_assert_what_they_were_written_for() {
         ("phase_cannot_be_implemented_downstream", vec!["E0277"]), // sealed supertrait
         ("sealed_does_not_display", vec!["E0277"]), // no Display impl
         ("materialise_at_refuses_a_results_tree_path", vec!["E0308"]), // not a ScratchPath
+        // The two ways a score could once name a phase dir instead of taking the run's own output.
+        (
+            "a_score_cannot_come_from_a_phase_dir",
+            vec!["E0599", "E0425"],
+        ),
         // Both doors that once minted from a directory: E0599 is `Sealed::adopt`, gone; E0624 is
         // `Published::unkeyed_from_phase_dir`, gone the moment that `pub(crate)` widens.
         (

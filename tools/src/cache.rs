@@ -2650,8 +2650,8 @@ pub(crate) mod tests {
 
     #[test]
     fn the_store_sits_outside_every_tree_walker() {
-        // Every walker of `results/<dataset>/<agent>` — the archival artifact scan, the report —
-        // treats a child as a case, so a store living under it could be graded as one.
+        // The report walks `results/<dataset>/<agent>` treating each child as a case, so a store
+        // living under it could be graded as one.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
         let owned = Inputs::new();

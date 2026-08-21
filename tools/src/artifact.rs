@@ -166,9 +166,8 @@ fn children_but_logs(
 /// [`clear_phase`]'s counterpart for a run that published nothing. It may not delete: an artifact
 /// from a `--cache off` sweep, or from before the store existed, is replayable from nowhere, so a
 /// delete makes a transient failure permanent. It may not leave it either — the failed run's
-/// transcript and metrics are in that phase dir already, so the enrichers and any archival reader
-/// would take the earlier crate for this run's. A sibling is in no digest, no reader's path and no
-/// `INVALIDATES` list.
+/// transcript and metrics are in that phase dir already, so the enrichers would take the earlier
+/// crate for this run's. A sibling is in no digest, no reader's path and no `INVALIDATES` list.
 pub(crate) fn displace_phase<P: Phase>(case_dir: &Path) -> Result<Option<PathBuf>> {
     // The crate, because that is what a reader scores; a metrics file is not an artifact, and moving
     // one aside would overwrite what an earlier displacement left here.
@@ -1180,27 +1179,6 @@ impl<P: Phase> Published<P> {
         let ScratchPath { root, keep } = at;
         seed(&self.root, root, Scratch { dir: keep }, Q::AT)
     }
-}
-
-/// Every crate the ARCHIVE holds for one phase, by case dir — not this run's work, so [`Keying::Unkeyable`].
-pub(crate) fn archived_artifacts<P: Phase>(
-    battery_dir: &Path,
-) -> Result<std::collections::HashMap<PathBuf, Published<P>>> {
-    let mut out = std::collections::HashMap::new();
-    let Ok(entries) = std::fs::read_dir(battery_dir) else {
-        return Ok(out);
-    };
-    for entry in entries.flatten() {
-        let case_dir = entry.path();
-        if !case_dir.is_dir()
-            || !crate::battery::has_crate(&crate::battery::phase_dir(&case_dir, P::DIR))
-        {
-            continue;
-        }
-        let artifact = Published::<P>::unkeyed_from_phase_dir(&case_dir)?;
-        out.insert(case_dir, artifact);
-    }
-    Ok(out)
 }
 
 /// A published tree, MEASURED, and nothing else. `Sealed::adopt` served this — the golden

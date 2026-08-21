@@ -124,26 +124,68 @@ PR does not revisit it. Historic artifacts stay on disk and out of the tables.
 - Answer, for every check the diff touches: **after my change, what input still makes this check
   fail?** Name it.
 
-## Acceptance criteria
+## Acceptance criteria, measured
 
-The eleven gates, plus:
+The eleven gates, all green (`fmt`, lib+bin 251 tests, architecture, `compile_fail`, both clippys,
+`doc`, release build, `test_comment_budget.py`, `comment_budget.py --max-comments 3150 --max-ratio 20`
+at **3150/3150** — pruned to the ceiling, not raised — and `check_paths.py`). Plus:
 
-1. **Scoring something the pipeline did not produce does not compile.** `Source::Archive` and
-   `archived_artifacts` are gone; show the compile-fail case or the deleted API, and name what an
-   external caller can still reach.
-2. **One command produces everything**, demonstrated end to end: artifacts resolved, `.eval/` created
-   empty and removed, scores printed, `tables/` written — with `0 agent invocation(s)` on every tally
-   line under `--replay-only`.
-3. **The scope is derived, shown by earning and losing one.** Move one battery's entries aside: it
-   must drop out of scope and out of `tables/`, loudly. Restore them: it returns. No file edited
-   either way.
-4. **A partial run does not write `tables/`**, shown by running one battery and diffing `tables/`
-   to empty.
-5. **`tables/` contains exactly the derived scope** — measured today that is `claude` × five
-   batteries, and the 16 other agents are absent. Quote the row count before and after.
-6. **The 40 golden digests unchanged**, fingerprint passing and not skipping; both keys and `SCHEMA`
-   unchanged with the probe output.
-7. **CI is one job, not a hand-listed matrix**, and its scope comes from the store.
+1. **Scoring something the pipeline did not produce does not compile.**
+   `tests/compile-fail/a_score_cannot_come_from_a_phase_dir.rs` pins both doors: `Source::Archive` is
+   E0599 and `artifact::archived_artifacts` is E0425. Proven non-vacuous — re-adding a
+   `pub fn archived_artifacts` stub turns the case red (`mismatch`, 1 failed), and removing it green
+   again. What an external caller can still reach: nothing. `Published`'s only path-taking mint,
+   `unkeyed_from_phase_dir`, is `pub(crate)` (already pinned as E0624 by the PR-21 case), and
+   `publish_unsealed` and `from_published_tree` are `pub(crate)`/private too.
+2. **One command produces everything.** `tools/reproduce.sh all` exits 0: 5 translate + 4 verify
+   tally lines, every one `N hit / 0 run (0 agent invocation(s))` — the operator's two cache hits per
+   case — `.eval/` created empty and empty again afterwards, scores printed, all six `tables/` files
+   written, and `git diff --exit-code -- tables/` clean.
+3. **The scope is derived, shown by earning and losing one.** P00's two entries renamed aside in the
+   store (no file edited): the run refuses, exit 1 —
+   *"--replay-only: 1 of 1 case(s) had no stored entry for this run's key, so nothing was reproduced
+   and no number here is measured"* — and `tables/` does not move. Renamed back: P00 returns, exit 0,
+   `tables/` byte-identical, `git -C results status -- .cache` clean.
+
+   **This is not what this spec predicted, and the difference is worth stating.** It said the battery
+   would drop out of scope. It does not, and should not: a case that *can* have a key but whose entry
+   is absent is earnable by a paid run, so refusing is right — CI must not publish a narrower table
+   because the store lost an entry. Scope narrowing is for cases that can never be keyed at all:
+   `B02_synthetic` (3 of 42) and `P01_sphincs_plus` (128 of 128) are shared-source followers, opened at
+   `SHARED_SOURCE_CACHE = Mode::Bypass`, so they mint no key and no sweep at any price changes that
+   until `spec-7c`. Both are announced by name with their counts and excluded from `tables/`.
+4. **A partial run does not write `tables/`.** `--replay-only run B01_organic`: 38 translate hits, 38
+   verify hits, exit 0, `git diff --exit-code -- tables/` clean.
+5. **`tables/` contains exactly the derived scope.** `results.md` **119 → 13** data rows;
+   `tractor.tex` **77 → 5**. Agents present: **17 → 1** (`claude`; the other 16 are absent, each
+   announced as "not resolved by this run, so it is not reported" — 97 pairs). Batteries present:
+   **5 → 4**. So the measured scope is `claude` × four batteries, not five as drafted above:
+   `B02_synthetic` drops for the reason in (3).
+6. **The 40 golden digests unchanged**, `tests/integration.rs` 10 passed / **0 ignored** — nothing
+   skipped, and the fixture's own `pins nothing` guard held. `SCHEMA` still **4**, `KeyInputs` still
+   the same seven components (`phase, agent, model, toolchain, prompt, recipe, input_tree`).
+7. **CI is one job.** `validate.yaml` is `reproduce` alone, running `./tools/reproduce.sh all`; its
+   scope comes from the store, so no battery is named anywhere in it. The `archive` matrix is deleted
+   rather than left on `workflow_dispatch` — its command *was* `test all --check`, which no longer
+   exists.
+
+## Measured side effects, stated rather than left to be found
+
+- **An out-of-scope battery loses its `result.json` files in the `results/` working tree.** Translate
+  republishes on a hit, `clear_phase` empties the phase dir immediately before, and `result.json` is
+  written by the score — which an out-of-scope battery never reaches. Measured: 78 files under
+  `Test-Corpus/claude/B02_synthetic` (39 cases × 2 phases). Nothing commits them, `report` does not
+  read them (the battery is out of scope), and `tables/` is byte-identical either way — but they were
+  restored with `git checkout` rather than left staged for someone to commit. This PR opens the window
+  by creating out-of-scope batteries at all; the durable fix belongs with `spec-7c`, which removes the
+  category.
+- **A replay leaves exactly one `Test-Corpus` record modified**, and it is noise, not drift:
+  `B02_organic/underhanded-c-nuke_lib/verified/result.json` embeds the runner's PID in a panic
+  message (`thread 'main' (2761648)` → `(3734255)`). The counts are identical, so no table input moves.
+  This is why "`results/` is clean after a replay" is not added as a gate: it would fire on a PID.
+- **`TestMode::Check` now has no production caller** — `main.rs` uses `Update`, and `Check` is reached
+  only from tests. It is left in place rather than deleted in the same PR as the archival path, and is
+  the obvious next cleanup: the comparison it performs is what `git diff -- tables/` does one level out.
 
 ## Commit message
 

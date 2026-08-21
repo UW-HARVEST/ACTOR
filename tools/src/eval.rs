@@ -29,44 +29,13 @@ impl Keep {
     }
 }
 
-/// Printed on every invocation: scoring an archive is not the same operation as scoring a run.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Provenance {
-    ThisRun,
-    Archive,
-}
-
-impl Provenance {
-    pub fn announce(self) {
-        match self {
-            Self::ThisRun => println!(
-                "  scoring artifacts this run resolved, materialised into a tree created empty"
-            ),
-            // What it read, not a verdict: `test` cannot see a pipeline that just published these.
-            Self::Archive => println!(
-                "  scoring bytes read from results/: this command did not produce them, so their \
-                 provenance is whatever put them there"
-            ),
-        }
-    }
-}
-
-/// `Archive` is not a fallback for an empty `Run`: an absent case is absent from the score.
-pub enum Source<'a> {
-    Run {
-        translate: &'a crate::translate::Translations,
-        verify: &'a crate::verify::Verifications,
-    },
-    Archive,
-}
-
-impl Source<'_> {
-    pub fn provenance(&self) -> Provenance {
-        match self {
-            Self::Run { .. } => Provenance::ThisRun,
-            Self::Archive => Provenance::Archive,
-        }
-    }
+/// What a score is taken from: the artifacts THIS RUN resolved, and nothing else. It was an enum whose
+/// `Archive` variant read a phase dir with no key; measured when that went, 16 of 17 published agents
+/// had no cached agent call at all, so ~95% of the numbers rested on artifacts nothing could attest.
+#[derive(Copy, Clone)]
+pub struct Source<'a> {
+    pub translate: &'a crate::translate::Translations,
+    pub verify: &'a crate::verify::Verifications,
 }
 
 pub fn artifact_root<P: Phase>(artifact: &Published<P>) -> PathBuf {

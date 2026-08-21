@@ -50,17 +50,11 @@ harvest-tools --agent c2rust translate B02_organic
 # One-shot LLM translation
 harvest-tools --agent oneshot --model openai/gpt-5.4 translate B01_organic
 
-# Test and update stored results
-harvest-tools --agent kiro test all --update
-
-# CI validation (exact-match against stored summary.json)
-harvest-tools --agent kiro test all --check
+# Reproduce the published numbers from the cache: a miss refuses, so this cannot spend money
+harvest-tools --agent claude --replay-only run all
 
 # Single case
 harvest-tools --agent kiro run B01_synthetic/001_helloworld
-
-# Generate result tables
-harvest-tools report
 ```
 
 ## License
