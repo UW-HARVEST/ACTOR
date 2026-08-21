@@ -802,7 +802,7 @@ impl OracleFiles {
     /// Only `Reference::Ungraded` reaches it: judging additions against nothing IS "invent none".
     const NONE: Self = Self(std::collections::BTreeMap::new());
 
-    /// Gone, edited, or no longer in the artifact is tampering; so is an unexplained addition.
+    /// Gone, edited or no longer carried is tampering; so is an addition where the reference stood.
     fn judge(&self, artifact: &Path) -> Result<OracleVerdict> {
         use crate::refusal::{OracleChange, Refusal};
         let tampered = |change, rel: &RelPath| {
@@ -830,12 +830,22 @@ impl OracleFiles {
             if self.0.contains_key(&rel) {
                 continue;
             }
-            if !is_build_product(&rel, &head(&abs)?) {
+            if !is_build_product(&rel, &head(&abs)?) && self.occupied_dir_of(&rel) {
                 return tampered(OracleChange::Added, &rel);
             }
             built.push(abs);
         }
         Ok(OracleVerdict::BuiltInPlace(built))
+    }
+
+    /// Did the reference we were handed occupy this path's directory? One it never occupied is one the
+    /// build created, so nothing inside it can be a change to the reference — the question `BUILD_DIRS`
+    /// approximated by NAME, one project at a time, until SPHINCS+'s plain-Makefile `build-<variant>/`
+    /// would have made it twelve (`docs/prs/spec-25.md`). Empty is [`Reference::Ungraded`]: a run that
+    /// was handed no reference may not invent one, so nothing there is a build's either.
+    fn occupied_dir_of(&self, rel: &RelPath) -> bool {
+        let dir = rel.as_path().parent().unwrap_or(Path::new(""));
+        self.0.is_empty() || self.0.keys().any(|k| k.as_path().starts_with(dir))
     }
 }
 
@@ -2000,20 +2010,58 @@ mod tests {
         assert!(format!("{err:#}").contains("was removed"), "{err:#}");
     }
 
-    /// The shadowing hazard: a new `.h` pre-empts an include, a new `.c` is swept up by a glob.
+    /// Which additions under `c_src` are the build's own and which are a changed reference. Refusing is
+    /// the shadowing hazard: a new `.h` pre-empts an include, a new `.c` is swept up by a glob. Accepting
+    /// is why no name list is needed, and cost a verify ~3h of paid work when it refused
+    /// (`docs/prs/spec-25.md`). Accepted rows compare digests, because `Sealed` exposes no path.
     #[test]
-    fn an_added_header_is_still_refused() {
-        let (work, c_before, _) = seeded_oracle();
-        tree(&work.c().0, &[("include/shim.h", "#define a() 1")]);
-        let err = seal_as_completed(work, &c_before).expect_err("an added header must refuse");
-        assert_eq!(
-            crate::refusal::Refusal::in_chain(&err),
-            Some(&crate::refusal::Refusal::OracleModified {
-                change: crate::refusal::OracleChange::Added,
-                file: "include/shim.h".into(),
-            }),
-            "{err:#}"
-        );
+    fn an_addition_is_the_builds_own_only_where_the_reference_was_never_present() {
+        let sealed = |work: WorkTree<Translate>, c: &Oracle| -> Result<TreeDigest> {
+            work.scrub()?
+                .seal(&crate::domain::health::Completed::for_test(), c)
+                .map(|s| s.digest().clone())
+        };
+        let (clean, reference, _) = seeded_oracle();
+        let untouched = sealed(clean, &reference).expect("the fixture itself seals");
+
+        for (added, refused) in [
+            // The reference occupies `.`, `src/`, `include/` and `doc/`; the build made the rest.
+            ("evil.c", true),
+            ("src/extra.c", true),
+            ("include/shim.h", true),
+            ("doc/note.bak", true),
+            ("build-blake-robust-128f/build.log", false),
+            ("obj/notes.txt", false),
+        ] {
+            let (work, reference, _) = seeded_oracle();
+            tree(
+                &work.c().0,
+                &[(added, "the build's own, or a changed reference")],
+            );
+            match sealed(work, &reference) {
+                Err(err) => {
+                    assert!(
+                        refused,
+                        "{added} is the build's own, not tampering: {err:#}"
+                    );
+                    assert_eq!(
+                        crate::refusal::Refusal::in_chain(&err),
+                        Some(&crate::refusal::Refusal::OracleModified {
+                            change: crate::refusal::OracleChange::Added,
+                            file: added.into(),
+                        }),
+                        "{added}: {err:#}"
+                    );
+                }
+                Ok(digest) => {
+                    assert!(
+                        !refused,
+                        "{added} changes what gets built, so it must refuse"
+                    );
+                    assert_eq!(digest, untouched, "{added} must be dropped, not sealed in");
+                }
+            }
+        }
     }
 
     /// `is_cmake_build_dir` is an OR, and either leg blinds the walk that hashes and publishes:

@@ -2202,8 +2202,6 @@ pub(crate) mod tests {
         // which makes it the evidence: deleting it destroys the only copy of the thing
         // being disputed.
         let f = fixture();
-        // Ported onto this branch's `Inputs` builder, which replaced the free
-        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
         let held = Inputs::new();
         let inputs = held.key_inputs();
         let key = inputs.key();
@@ -2271,8 +2269,6 @@ pub(crate) mod tests {
     #[test]
     fn a_quarantined_entry_is_read_only_and_uncounted() {
         let f = fixture();
-        // Ported onto this branch's `Inputs` builder, which replaced the free
-        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
         let held = Inputs::new();
         let inputs = held.key_inputs();
         let key = inputs.key();
@@ -2316,8 +2312,6 @@ pub(crate) mod tests {
         // the results tree and then failed EACCES on the next replay of the same case.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        // Ported onto this branch's `Inputs` builder, which replaced the free
-        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
         let held = Inputs::new();
         let inputs = held.key_inputs();
         let key = inputs.key();
@@ -2353,8 +2347,6 @@ pub(crate) mod tests {
         // no cost, which reads as an agent invocation that cost nothing.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        // Ported onto this branch's `Inputs` builder, which replaced the free
-        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
         let held = Inputs::new();
         let inputs = held.key_inputs();
         let key = inputs.key();
@@ -2520,8 +2512,6 @@ pub(crate) mod tests {
         // orphan, and entries inside a 0o555 directory cannot be removed.
         let f = fixture();
         let store = Store::open(&f.repo, Mode::ReadWrite).unwrap();
-        // Ported onto this branch's `Inputs` builder, which replaced the free
-        // fixtures()/key_inputs() helpers; `held` must outlive `inputs`, which borrows it.
         let held = Inputs::new();
         let inputs = held.key_inputs();
         let key = inputs.key();
