@@ -394,6 +394,9 @@ fn run_runtests(
 ) -> Result<(Summary, HashMap<String, serde_json::Value>)> {
     let battery = &pass.battery;
     let root = pass.tree.root().to_string_lossy().to_string();
+    // Inside the evaluation tree, so it is removed with it and no run can read another's.
+    let report = pass.tree.root().join("junit.xml");
+    let report_arg = report.to_string_lossy().to_string();
     let scripts_dir = paths.corpus_dir.join("deployment/scripts/github-actions");
 
     let mut pythonpath = scripts_dir.to_string_lossy().to_string();
@@ -411,6 +414,8 @@ fn run_runtests(
             &root,
             "--keep-going",
             "--verbose",
+            "--junit-xml",
+            &report_arg,
         ])
         .env("PYTHONPATH", &pythonpath)
         .env("OPENSSL_DIR", openssl_dir())
@@ -578,7 +583,14 @@ fn run_runtests(
     }
 
     // Executed and not already recorded as failed ⇒ passed.
-    for name in executed_cases(&text)? {
+    let ran = cases_in_report(&std::fs::read_to_string(&report).with_context(|| {
+        format!(
+            "reading the runtests report at {} -- without it there is no authoritative record of \
+             which cases ran",
+            report.display()
+        )
+    })?)?;
+    for name in ran {
         per_case.entry(name.clone()).or_insert_with(|| {
             serde_json::json!({
                 "case": name, "battery": battery,
@@ -603,13 +615,14 @@ fn run_runtests(
     ))
 }
 
-/// ANCHORED: `runtests` prints a bare "Executing test cases..." header too, which files a case `test`.
-fn executed_cases(text: &str) -> Result<Vec<String>> {
-    let re = Regex::new(r"^\s+Executing (\S+)$")?;
-    Ok(text
-        .lines()
-        .filter_map(|line| re.captures(line).map(|c| c[1].to_string()))
-        .collect())
+/// The cases `runtests` RAN, read from the report it writes rather than from its console output. That
+/// output is the interleaved stdout of parallel jobs, and a single mangled `Executing NAME` line drops
+/// the case from the set [`crate::eval::Materialised::reconcile`] compares -- which refuses the whole
+/// battery. Observed on `tfm_lib` and, two runs later, on `confusion_lib`. A report written once, at
+/// the end, cannot interleave. `<testsuite\s` also excludes the `<testsuites>` root element.
+fn cases_in_report(xml: &str) -> Result<Vec<String>> {
+    let re = Regex::new(r#"<testsuite\s[^>]*name="([^"]+)""#)?;
+    Ok(re.captures_iter(xml).map(|c| c[1].to_string()).collect())
 }
 
 fn write_results(
@@ -1047,14 +1060,25 @@ mod tests {
         );
     }
 
-    /// That header was scored as a case named `test`, so `reconcile` refused every battery before comparing.
+    /// The `<testsuites>` root carries a `name` too, and counting it files a case called `Tests` — the
+    /// same shape as the console header once scored as a case named `test`, which made `reconcile` refuse
+    /// every battery. A case that FAILED TO BUILD still gets a suite, with no vectors in it.
     #[test]
-    fn the_oracles_own_header_is_not_scored_as_a_case_no_tree_materialised() {
-        let log = "Executing test cases...\n   Executing 001_helloworld\n   Executing 014_dead_code_lib\n";
+    fn the_reports_own_root_element_is_not_scored_as_a_case() {
+        let xml = concat!(
+            r#"<?xml version="1.0"?><testsuites name="Tests" tests="3" failures="1">"#,
+            r#"<testsuite name="001_helloworld" tests="2" failures="0">"#,
+            r#"<testcase name="test0" classname="001_helloworld" />"#,
+            r#"<testcase name="test1" classname="001_helloworld" /></testsuite>"#,
+            r#"<testsuite name="014_dead_code_lib" tests="1" failures="1">"#,
+            r#"<testcase name="test0" classname="014_dead_code_lib">"#,
+            r#"<failure message="stdout mismatch" /></testcase></testsuite>"#,
+            r#"<testsuite name="confusion_lib" tests="0" failures="0" /></testsuites>"#,
+        );
         assert_eq!(
-            executed_cases(log).unwrap(),
-            vec!["001_helloworld", "014_dead_code_lib"],
-            "the two indented lines are the cases; the header names none"
+            cases_in_report(xml).unwrap(),
+            vec!["001_helloworld", "014_dead_code_lib", "confusion_lib"],
+            "every suite is a case and the root element is not one"
         );
     }
 
