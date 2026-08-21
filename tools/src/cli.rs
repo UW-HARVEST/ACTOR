@@ -346,30 +346,8 @@ pub enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
-    /// Run MIT runtests
-    Test {
-        target: String,
-        /// Update stored expected results
-        #[arg(long)]
-        update: bool,
-        /// CI mode: compare against stored summary.json, exit 1 on mismatch
-        #[arg(long, conflicts_with = "update")]
-        check: bool,
-        /// Score even though some agent runs died on infrastructure (expired
-        /// credentials, rate limiting, a truncated log).
-        ///
-        /// Scoring refuses by default, because a case whose agent never ran has
-        /// no measurement and reporting one is how 7 harvest-bench projects
-        /// became "3/5 pass" on 2026-08-14. Pass this only when you know why the
-        /// runs died and want the numbers anyway; the affected cases are listed
-        /// and written to `INFRA_FAILURES.json` beside the results.
-        #[arg(long)]
-        allow_infra_failures: bool,
-    },
     /// Backfill result.json with credits + unsafe counts (no tests, no LLM calls)
     Enrich { target: String },
-    /// Generate markdown report tables from validated results into tables/
-    Report,
 }
 
 // Execution is now driven by the `Benchmark` trait (see `benchmark.rs`): one
@@ -425,9 +403,7 @@ impl Command {
             Command::Run { .. }
             | Command::Translate { .. }
             | Command::Verify { .. }
-            | Command::Test { .. }
-            | Command::Enrich { .. }
-            | Command::Report => true,
+            | Command::Enrich { .. } => true,
             // Read-only introspection.
             Command::Cache { .. } => false,
         }
@@ -447,7 +423,7 @@ mod tests {
     fn replay_only_reaches_the_store_as_the_mode_that_cannot_invoke() {
         use clap::Parser;
         let parse = |args: &[&str]| {
-            Cli::try_parse_from([&["harvest-tools"], args, &["report"]].concat())
+            Cli::try_parse_from([&["harvest-tools"], args, &["run", "B01"]].concat())
                 .map(|c| c.cache_mode())
         };
 

@@ -69,35 +69,74 @@ fn main() -> Result<()> {
 
             let translations =
                 bench.translate(&paths, inner, include_regex.as_deref(), parallel)?;
-            let verifications = if !no_verify && bench.verifies(agent) {
-                bench.verify(
+
+            // THE SCOPE, derived from what the store served rather than from any list -- see
+            // `Benchmark::attests`. Today B02_synthetic and P01_sphincs_plus drop out because a
+            // shared-source group opens at `SHARED_SOURCE_CACHE = Mode::Bypass` and mints no key, so
+            // `spec-7c` is what returns them, not an edit here.
+            let mut attested = report::Attested::default();
+            let mut in_scope: Vec<String> = Vec::new();
+            for battery in bench.batteries(&paths, inner)? {
+                match bench.attests(&paths, &battery, &translations) {
+                    Ok(()) => {
+                        attested.insert(paths.agent_key.as_str(), &battery);
+                        in_scope.push(battery);
+                    }
+                    Err(why) => println!("⏭️  {battery}: out of scope — {why}"),
+                }
+            }
+            anyhow::ensure!(
+                !in_scope.is_empty(),
+                "the store serves no battery of {inner} in full, so this run can publish nothing"
+            );
+
+            let mut outcome = oracle::TestOutcome::Ok;
+            for battery in &in_scope {
+                let verifications = if !no_verify && bench.verifies(agent) {
+                    bench.verify(
+                        &paths,
+                        battery,
+                        include_regex.as_deref(),
+                        false,
+                        parallel,
+                        &translations,
+                    )?
+                } else {
+                    harvest_tools::verify::Verifications::new()
+                };
+                let scored = run_test(
+                    bench.as_ref(),
                     &paths,
-                    inner,
-                    include_regex.as_deref(),
-                    false,
-                    parallel,
-                    &translations,
-                )?
-            } else {
-                harvest_tools::verify::Verifications::new()
-            };
-            // `Update` covers enrichment and table regeneration; no separate steps.
-            report_test_outcome(run_test(
-                &repo_root,
-                bench.as_ref(),
-                &paths,
-                inner,
-                Score {
-                    mode: oracle::TestMode::Update,
-                    on_failure: agent_health::OnInfraFailure::Refuse,
-                    keep: eval::Keep::from_keep_eval_tree_flag(cli.keep_eval_tree),
-                    source: eval::Source::Run {
-                        translate: &translations,
-                        verify: &verifications,
+                    battery,
+                    Score {
+                        mode: oracle::TestMode::Update,
+                        on_failure: agent_health::OnInfraFailure::Refuse,
+                        keep: eval::Keep::from_keep_eval_tree_flag(cli.keep_eval_tree),
+                        source: eval::Source {
+                            translate: &translations,
+                            verify: &verifications,
+                        },
+                        covers: oracle::Covers::from_include_regex(include_regex.as_deref()),
                     },
-                    covers: oracle::Covers::from_include_regex(include_regex.as_deref()),
-                },
-            )?);
+                )?;
+                if let oracle::TestOutcome::Failed(mm) = scored {
+                    outcome = match outcome {
+                        oracle::TestOutcome::Failed(mut had) => {
+                            had.extend(mm);
+                            oracle::TestOutcome::Failed(had)
+                        }
+                        _ => oracle::TestOutcome::Failed(mm),
+                    };
+                }
+            }
+
+            // Written ONCE from the whole scope: per battery it would erase every other battery's
+            // rows, which is `Covers::Subset`'s rule one level up. A partial target writes none.
+            if inner == "all" && include_regex.is_none() {
+                report::generate(&repo_root, &attested)?;
+                println!("📊 Tables regenerated (tables/)");
+            }
+            report_test_outcome(outcome);
         }
         Command::Translate {
             ref target,
@@ -200,48 +239,6 @@ fn main() -> Result<()> {
                 }
             }
         },
-        Command::Test {
-            ref target,
-            update,
-            check,
-            allow_infra_failures,
-        } => {
-            let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(
-                &repo_root,
-                agent,
-                dataset,
-                model,
-                cache,
-                harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
-                    cli.allow_unsandboxed,
-                ),
-            )?;
-            let inner = Dataset::strip_prefix(target);
-            let mode = if update {
-                oracle::TestMode::Update
-            } else if check {
-                oracle::TestMode::Check
-            } else {
-                oracle::TestMode::Run
-            };
-
-            report_test_outcome(run_test(
-                &repo_root,
-                benchmark::for_dataset(dataset).as_ref(),
-                &paths,
-                inner,
-                Score {
-                    mode,
-                    on_failure: agent_health::OnInfraFailure::from_allow_infra_failures_flag(
-                        allow_infra_failures,
-                    ),
-                    keep: eval::Keep::from_keep_eval_tree_flag(cli.keep_eval_tree),
-                    source: eval::Source::Archive,
-                    covers: oracle::Covers::WholeBattery,
-                },
-            )?);
-        }
         Command::Enrich { ref target } => {
             let dataset = Dataset::detect(target);
             let paths = battery::Paths::new(
@@ -257,9 +254,6 @@ fn main() -> Result<()> {
             let inner = Dataset::strip_prefix(target);
             benchmark::for_dataset(dataset).enrich(&paths, inner)?;
         }
-        Command::Report => {
-            report::generate(&repo_root)?;
-        }
     }
     Ok(())
 }
@@ -272,11 +266,9 @@ struct Score<'a> {
     covers: oracle::Covers<'a>,
 }
 
-/// The only path into scoring and table regeneration, so the tree and the gate are built once here. It
 /// RETURNS the outcome rather than reporting it: [`report_test_outcome`] ends in `process::exit`, which
 /// runs no destructor, and the [`eval::Tree`] whose `Drop` removes the tree is live in this frame.
 fn run_test(
-    repo_root: &std::path::Path,
     bench: &dyn benchmark::Benchmark,
     paths: &battery::Paths,
     target: &str,
@@ -306,17 +298,6 @@ fn run_test(
             covers,
         },
     )?;
-    if matches!(mode, oracle::TestMode::Update) {
-        // Best-effort: the tables are a whole-corpus roll-up, so `report::generate`
-        // legitimately fails on a partial tree and must not fail the score run.
-        match report::generate(repo_root) {
-            Ok(()) => println!("📊 Tables regenerated (tables/)"),
-            Err(e) => eprintln!(
-                "⚠️  Skipped table regeneration (results tree not complete enough): {e}\n   \
-                 Run `harvest-tools report` once all agents/datasets are populated."
-            ),
-        }
-    }
     Ok(outcome)
 }
 
@@ -390,6 +371,17 @@ mod tests {
         fn enrich(&self, _paths: &battery::Paths, _target: &str) -> Result<()> {
             unreachable!("scoring only")
         }
+        fn batteries(&self, _paths: &battery::Paths, target: &str) -> Result<Vec<String>> {
+            Ok(vec![target.to_string()])
+        }
+        fn attests(
+            &self,
+            _paths: &battery::Paths,
+            _battery: &str,
+            _resolved: &harvest_tools::translate::Translations,
+        ) -> Result<()> {
+            Ok(())
+        }
     }
 
     /// `process::exit` runs no destructor, so reporting the mismatch from inside `run_test` left the
@@ -410,7 +402,6 @@ mod tests {
         let verifications = harvest_tools::verify::Verifications::new();
 
         let outcome = run_test(
-            tmp.path(),
             &Mismatching,
             &paths,
             "B01",
@@ -418,7 +409,7 @@ mod tests {
                 mode: oracle::TestMode::Check,
                 on_failure: agent_health::OnInfraFailure::Refuse,
                 keep: eval::Keep::Discard,
-                source: eval::Source::Run {
+                source: eval::Source {
                     translate: &translations,
                     verify: &verifications,
                 },

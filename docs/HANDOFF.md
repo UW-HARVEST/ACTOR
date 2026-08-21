@@ -176,9 +176,8 @@ sequence, merged on `type safety` alone. The cause is not a broken gate: every C
 `terminal_reason=max_turns` and the infra gate correctly refuses ("An infrastructure failure is not
 a result"). Agent invocations do not work on the runner, so nothing is scorable. The consequence is
 that a red matrix arm carries no information and a real translation regression would not be caught.
-**It does NOT indicate a harness regression.** c2rust's arm went red at `80b9475` (#48), but
-`harvest-tools --agent c2rust test <battery> --check` reproduces every stored value exactly on this
-machine — B01_synthetic 85/85 (393v), B02_synthetic 38/42 (988v), P00_perlin_noise 1/1 (30v) — against
+**It does NOT indicate a harness regression.** c2rust's arm went red at `80b9475` (#48), and the
+archival scoring that PR 24 deletes reproduced every stored value exactly on this machine — B01_synthetic 85/85 (393v), B02_synthetic 38/42 (988v), P00_perlin_noise 1/1 (30v) — against
 CI's claimed 160/28/0. The harness is correct and the published numbers are unaffected; the failure
 is environmental to the runner. See `docs/prs/spec-20.md`, withdrawn. **So do not read a green `tests` as "CI validated this."** `docs/prs/spec-19.md` moves the matrix to
 a deliberate trigger so a red check means something again. Never make it green with

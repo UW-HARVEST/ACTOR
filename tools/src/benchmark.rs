@@ -21,8 +21,14 @@ pub trait Benchmark {
     )]
     fn name(&self) -> &'static str;
 
-    /// Does a separate C-as-oracle verify phase run for this agent?
     fn verifies(&self, agent: Agent) -> bool;
+
+    fn batteries(&self, paths: &Paths, target: &str) -> Result<Vec<String>>;
+
+    /// May this unit's number be PUBLISHED? Only if EVERY case came from a keyed replay: one case the
+    /// store cannot name leaves the number resting on an artifact nothing attests, and counting the
+    /// attested subset would be a smaller denominator nobody asked for.
+    fn attests(&self, paths: &Paths, battery: &str, resolved: &Translations) -> Result<()>;
 
     /// Returns what it RESOLVED, per case: a value this run produced, not a phase dir to be asked.
     fn translate(
@@ -128,6 +134,26 @@ fn parse_target(target: &str) -> (String, Option<String>) {
 struct TestCorpus;
 
 impl Benchmark for TestCorpus {
+    fn batteries(&self, paths: &Paths, target: &str) -> Result<Vec<String>> {
+        resolve_batteries(&paths.corpus_dir, target)
+    }
+
+    fn attests(&self, paths: &Paths, battery: &str, resolved: &Translations) -> Result<()> {
+        let output_dir = paths.output_dir(battery);
+        let cases = battery::all_case_names(&battery::discover(&paths.corpus_dir, battery, None)?);
+        let missing = cases
+            .iter()
+            .filter(|n| !resolved.contains_key(&output_dir.join(n)))
+            .count();
+        let unkeyed = crate::translate::unkeyed_seeds(resolved, &output_dir);
+        anyhow::ensure!(
+            missing == 0 && unkeyed == 0,
+            "the store serves {} of its {} case(s) ({missing} unresolved, {unkeyed} with no key)",
+            cases.len() - missing - unkeyed,
+            cases.len()
+        );
+        Ok(())
+    }
     fn name(&self) -> &'static str {
         "test-corpus"
     }
@@ -255,6 +281,21 @@ impl Benchmark for TestCorpus {
 struct HarvestBench;
 
 impl Benchmark for HarvestBench {
+    fn batteries(&self, paths: &Paths, target: &str) -> Result<Vec<String>> {
+        Ok(resolve_harvest_bench_projects(&paths.corpus_dir, target)?
+            .iter()
+            .map(|p| p.name().to_string())
+            .collect())
+    }
+
+    fn attests(&self, paths: &Paths, project: &str, resolved: &Translations) -> Result<()> {
+        let dir = paths.results_dir.join(project);
+        anyhow::ensure!(
+            resolved.contains_key(&dir) && crate::translate::unkeyed_seeds(resolved, &dir) == 0,
+            "the store does not serve {project} with a key"
+        );
+        Ok(())
+    }
     fn name(&self) -> &'static str {
         "harvest-bench"
     }
@@ -305,9 +346,8 @@ impl Benchmark for HarvestBench {
 mod tests {
     use super::*;
 
-    /// `--include-regex` was accepted, documented, threaded into this trait and then discarded by
-    /// every impl as `_filter`, so asking for one case ran the whole battery. Nothing tested the
-    /// flag, which is why it survived — so these pin the mapping itself rather than any one caller.
+    /// Pinning the mapping itself, not any one caller: nothing tested `--include-regex`, which is how
+    /// every impl came to discard it as `_filter`.
     #[test]
     fn a_case_named_in_the_target_becomes_the_filter() {
         assert_eq!(

@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# Re-derive a battery's published numbers from the cache. Must be incapable of spending money:
-# every phase runs `--replay-only`, so a miss refuses instead of invoking. Lives here, not in a
-# workflow, so a reader with the repo runs exactly what CI runs.
+# Reproduce the published numbers in ONE shot: resolve every phase from the cache, score, and emit
+# tables/ -- then check nothing moved. Must be incapable of spending money: `--replay-only` makes a
+# cache miss a refusal, never an invocation.
 #
-# Usage: tools/reproduce.sh [battery]        (default: B01_synthetic)
+# There is no separate score or report step to point at a tree. `run` produces every output from what
+# it resolved, so `git diff` IS the check: if what it regenerated matches the committed files, the run
+# reproduced them. No row parsing, and nothing a stale file can satisfy.
+#
+# Usage: tools/reproduce.sh [target]        (default: all)
 set -uo pipefail
 
-BATTERY="${1:-B01_synthetic}"
+TARGET="${1:-all}"
 AGENT=claude
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Exported as 1.97.1 in the operator's login shell, silently overriding rust-toolchain.toml's
-# 1.94.0 -- and the toolchain is a cache key component, so this alone makes all 175 entries miss.
+# 1.94.0 -- and the toolchain is a cache key component, so this alone makes every entry miss.
 unset RUSTUP_TOOLCHAIN
 export PATH="$HOME/.cargo/bin:$PATH"
 
@@ -22,7 +26,7 @@ export HARVEST_CLI_VERSION="${HARVEST_CLI_VERSION:-replay-only: no agent CLI was
 BIN=tools/target/release/harvest-tools
 die() { echo "❌ $*" >&2; exit 1; }
 
-echo "=== reproduce: $AGENT / $BATTERY ==="
+echo "=== reproduce: $AGENT / $TARGET ==="
 rustc --version
 [ -x "$BIN" ] || die "$BIN not built: cargo build --release --locked --manifest-path tools/Cargo.toml"
 
@@ -32,19 +36,14 @@ VER
 [ -d results/.cache ] || die "results/.cache absent — run: git submodule update --init results test-corpus"
 
 log=$(mktemp -t reproduce.XXXXXX) || die "mktemp failed"
-scored=$(mktemp -t scored.XXXXXX) || die "mktemp failed"
-published=$(mktemp -t published.XXXXXX) || die "mktemp failed"
-trap 'rm -f "$log" "$scored" "$published"' EXIT
+trap 'rm -f "$log"' EXIT
 
-for phase in translate verify; do
-  echo
-  echo "--- $phase $BATTERY (--replay-only) ---"
-  if ! "$BIN" --agent "$AGENT" --replay-only "$phase" "$BATTERY" 2>&1 | tee -a "$log"; then
-    die "$phase failed — the error above says why. Usually either 'built from X but HEAD is Y'
-   (rebuild), or no stored entry for the key (a prompt, model or toolchain moved, so the stored
-   results no longer answer this question)."
-  fi
-done
+echo
+echo "--- run $TARGET (--replay-only) ---"
+"$BIN" --agent "$AGENT" --replay-only run "$TARGET" 2>&1 | tee "$log"
+[ "${PIPESTATUS[0]}" -eq 0 ] || die "the run failed — the error above says why. Usually either 'built
+   from X but HEAD is Y' (rebuild), or no stored entry for a key (a prompt, model or toolchain moved,
+   so the stored results no longer answer this question)."
 
 # Belt to `--replay-only`'s braces: trusting exit 0 alone would let a paid run pass as a replay.
 tallies=$(grep -c 'agent invocation(s)' "$log" || true)
@@ -60,59 +59,17 @@ fi
 echo
 echo "✅ every phase replayed: $tallies tally line(s), all '0 run', all '0 agent invocation(s)'"
 
-echo
-echo "--- test $BATTERY --check ---"
-"$BIN" --agent "$AGENT" test "$BATTERY" --check 2>&1 | tee "$scored"
-[ "${PIPESTATUS[0]}" -eq 0 ] || die "the scored numbers disagree with the stored record"
-
 # PR #116 removes the tree even when the score exits 1; one left standing is one the next run reads.
 [ -z "$(find .eval -mindepth 1 2>/dev/null | head -1)" ] || die ".eval/ still holds files"
 echo "✅ .eval/ is empty"
 
 echo
-echo "--- report (regenerating tables/) ---"
-"$BIN" report || die "report failed"
-
-# The COMMITTED table (a planted wrong row still exited 0, because report overwrites it), and
-# results.md not tractor.tex, whose columns are Builds and Tests of the HEADLINE phase only.
-git show HEAD:tables/results.md > "$published" 2>/dev/null \
-  || die "tables/results.md is not committed at HEAD, so there is no published number to check"
-
-python3 - "$BATTERY" "$AGENT" "$scored" "$published" <<'PY' || die "the replayed numbers do not match the published table"
-import re, sys
-battery, agent, scored, table = sys.argv[1:5]
-text = open(scored).read()
-
-# Both phases must have been SCORED, so one cannot silently vanish. Only the headline is compared:
-# the published tables carry no separate translated cases-passed figure to compare against.
-for phase in ("translated", "verified"):
-    if not re.search(rf"{re.escape(battery)} \[{phase}\]: \d+/\d+ cases", text):
-        sys.exit(f"the run reported no [{phase}] score for {battery}, so a phase went unscored")
-
-m = re.search(rf"{re.escape(battery)} \[verified\]: (\d+/\d+) cases, (\d+/\d+) vectors", text)
-measured = (m[1], m[2])
-
-section, row = False, None
-for line in open(table):
-    if line.startswith("## "):
-        section = line.strip() == f"## {battery}"
-    elif section and line.startswith(f"| {agent} |"):
-        row = [c.strip() for c in line.strip().strip("|").split("|")]
-        break
-if row is None:
-    sys.exit(f"the committed results.md has no `{agent}` row under `## {battery}`")
-published = (row[1], row[2])
-
-print(f"   replayed  {measured[0]} cases, {measured[1]} vectors")
-print(f"   published {published[0]} cases, {published[1]} vectors  (committed tables/results.md)")
-if measured != published:
-    sys.exit(f"MISMATCH: replayed {measured} but the committed table publishes {published}")
-print(f"✅ {battery} [{agent}] reproduces the published headline exactly")
-PY
-
-git diff --quiet -- tables/ \
-  && echo "   tables/ regenerated byte-identical to committed" \
-  || echo "   ⚠️  tables/ moved (other agents/batteries are stale; this run reproduces $BATTERY only)"
+echo "--- did anything move? ---"
+git diff --stat -- tables/
+git diff --exit-code -- tables/ >/dev/null \
+  || die "tables/ moved: the replayed numbers differ from the committed ones. Inspect the diff above,
+   then commit it deliberately if the new numbers are the ones you mean to publish."
+echo "✅ tables/ byte-identical to committed"
 
 echo
-echo "=== reproduced $AGENT / $BATTERY from the cache, no agent invoked ==="
+echo "=== reproduced $AGENT / $TARGET from the cache, no agent invoked ==="

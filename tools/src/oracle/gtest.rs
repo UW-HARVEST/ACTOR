@@ -1,5 +1,5 @@
 use super::{openssl_dir, BatteryMismatch, Enrichment, Scoring, TestMode, TestOutcome};
-use crate::artifact::{Phase, Translate, Verify};
+use crate::artifact::{Phase, Translate};
 use crate::battery::Paths;
 use crate::eval::Source;
 use anyhow::{Context, Result};
@@ -202,15 +202,7 @@ pub fn run_harvest_bench_test(
     let runner = harvest_bench_runner(&paths.corpus_dir)?;
 
     // Verify's artifact where the run resolved one, else translate's — from the values, not a stat.
-    let (archive_t, archive_v);
-    let (translate, verify) = match &scoring.source {
-        Source::Run { translate, verify } => (*translate, *verify),
-        Source::Archive => {
-            archive_t = crate::artifact::archived_artifacts::<Translate>(&paths.results_dir)?;
-            archive_v = crate::artifact::archived_artifacts::<Verify>(&paths.results_dir)?;
-            (&archive_t, &archive_v)
-        }
-    };
+    let Source { translate, verify } = scoring.source;
 
     // Every project REQUESTED, not only those that resolved a crate: a run that died on `api_error`
     // publishes nothing, so grading the resolved set grades the one set with no infra failure in it.
@@ -237,7 +229,6 @@ pub fn run_harvest_bench_test(
         }
     }
     let materialised = scope.finish()?;
-    scoring.source.provenance().announce();
 
     let stored = load_harvest_bench_stored(materialised.cases());
     let mode = scoring.mode;

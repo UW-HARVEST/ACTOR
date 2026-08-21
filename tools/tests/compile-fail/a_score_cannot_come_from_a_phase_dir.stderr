@@ -1,0 +1,11 @@
+error[E0425]: cannot find function `archived_artifacts` in module `harvest_tools::artifact`
+ --> tests/compile-fail/a_score_cannot_come_from_a_phase_dir.rs:5:43
+  |
+5 |     let _found = harvest_tools::artifact::archived_artifacts(dir);
+  |                                           ^^^^^^^^^^^^^^^^^^ not found in `harvest_tools::artifact`
+
+error[E0599]: no associated item named `Archive` found for struct `Source<'a>` in the current scope
+ --> tests/compile-fail/a_score_cannot_come_from_a_phase_dir.rs:4:48
+  |
+4 |     let _source = harvest_tools::eval::Source::Archive(dir);
+  |                                                ^^^^^^^ associated item not found in `Source<'_>`
