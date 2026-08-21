@@ -1,4 +1,4 @@
-# PR 25 — `build-<variant>/` is build output. The oracle guard is right; the classifier is wrong.
+# PR 25 — An addition is the build's own where the reference never stood. No name list.
 
 ## The failure, measured
 
@@ -10,103 +10,148 @@ and is not a compiled build product. The C side is the reference the translation
 against; a run that changes it has not been verified against the original program.
 ```
 
-That is PR 14's oracle guard (`OracleChange::Added`) doing exactly its job. The defect is one level
-down, in `domain/contents.rs`:
+PR 14's oracle guard is right. What refused is one level down, and **not** where the first draft of
+this spec said it was.
+
+## Where it actually refuses, probed rather than reasoned
+
+The refusal comes from `OracleFiles::judge`, whose addition loop asks a magic-byte-and-extension
+question:
 
 ```rust
-BUILD_DIRS.iter().any(|d| d.as_bytes() == s) || s.starts_with(b"cbuild")
+if !is_build_product(&rel, &head(&abs)?) {
+    return tampered(OracleChange::Added, &rel);
+}
 ```
 
-`BUILD_DIRS` is `["target", "build", "c_build", "build_c", "artifacts", "gtest_build", "CMakeFiles",
-"e2e_out", "build_ffi", "fuzz_scripts"]`, matched **exactly** per path component, plus a `cbuild`
-prefix. `build-blake-robust-128f` is neither, so everything under it is `StoreAndHash` — and since
-nothing under `c_src/` is ever `Ignore` (deliberately: 26 real `c_src/doc/footer.html.bak` files once
-sat in that blind spot), the build log reads as an added reference file.
+A build log is not ELF, and `log` is not in `BUILD_PRODUCT_EXTS`. That is the whole bug.
 
-SPHINCS+ builds one directory per variant — `build-<hash>-<robust|simple>-<size>` — so this is not one
-stray file. Any project that emits `build-<variant>/` hits it, and the run is refused **after** the
-agent has been paid: the run that found this cost ~3 hours.
+**The first draft proposed adding a `build-` arm to `classify`'s build-directory check. That would not
+have fixed it.** `classify` is never asked. Probed directly:
 
-## Why the obvious fix is wrong
+```
+classify("build-blake-robust-128f/build.log")  =>  Ignore      ← the oracle walk's actual input
+classify("build/x.log")                        =>  Ignore
+classify("build/CMakeCache.txt")               =>  BuildOutput
+```
 
-Adding `s.starts_with(b"build-")` beside the `cbuild` clause misclassifies a **file**. The predicate
-runs over *every* component including the last, so a source file named `build-config.c` would become
-`BuildOutput` — neither hashed nor carried — and would vanish from the digest and from every published
-artifact **silently**. That is the "check that can pass while seeing nothing" shape, one layer down: a
-digest that no longer covers a source file.
+`is_ignored` runs first and returns `Ignore` for anything ending `.log`, and `oracle_admits` is
+`d != Disposition::BuildOutput` — it *admits* `Ignore` deliberately, because the oracle walk roots at
+`c_src` itself where root-anchored rules cannot see the prefix, and narrowing it loses 26 stored cases'
+`doc/footer.html.bak`. So the log is admitted, reaches `judge`, and is refused there.
 
-`cbuild` already carries that latent trap. Leave it: its only occurrence in the tree is
-`HarvestBench/claude/jansson/verified/logs/cbuild.log`, already `Ignore` under `logs/`, so touching it
-risks moving a digest for no gain. Fix the new rule properly and note the old one.
+Two further claims in the first draft were wrong, and are retracted here rather than quietly dropped:
+
+- **"`c_src/build/x.log` refuses too."** It does not. `OracleDir::walk` classifies each *directory*
+  before descending, so a directory whose name is in `BUILD_DIRS` is rejected and never opened. The bug
+  needs a build directory whose name is unlisted **and** which holds no CMake evidence — SPHINCS+ uses
+  plain Makefiles, so `is_cmake_build_dir` (`CMakeCache.txt` or a `CMakeFiles/` child) misses it too.
+- **"108 stored files are hashed into `OracleDir::digest`."** They are not. Probing a real stored tree —
+  `Test-Corpus/kiro/B02_synthetic/macrodepth_add_5` — `OracleDir::contents()` admits **4 files, zero
+  `.log`, zero under `build_*/`**: each `build_*` directory holds a `CMakeFiles/` child, so the cmake
+  sniff excludes it. Measuring filesystem paths against a predicate is not measuring what the walker
+  admits.
 
 ## The rule
 
-**A path component that starts with `build-` is build output when it is a DIRECTORY — that is, when it
-is not the last component of the path.** `classify` already receives the whole `RelPath`, so this is
-decidable without touching the walker: check `components()` excluding the final one.
+`BUILD_DIRS` is a name list grown once per project — `target`, `build`, `c_build`, `build_c`,
+`artifacts`, `gtest_build`, `CMakeFiles`, `e2e_out`, `build_ffi`, `fuzz_scripts`, plus a `cbuild`
+prefix. `build-<variant>/` would be the twelfth entry. The guard has something better available to it:
+**the reference snapshot itself.**
 
-Prefer expressing it so the distinction is visible in the type or the name rather than as an index
-arithmetic detail — `is_build_dir_component(..)` over `if i < n - 1`.
+> An addition is the build's own iff it is a build product by sniff, **or the reference recorded nothing
+> anywhere in the directory that holds it.**
 
-## Measured: this moves no digest
+A directory the reference never occupied is a directory the build created. Nothing about SPHINCS+, no
+names, no prefixes, and it covers every future project's convention at once.
 
-The whole point of checking before touching `classify`, which feeds `hash_tree` and therefore every
-tree digest and every cache key's `input_tree`:
+```rust
+fn occupied_dir_of(&self, rel: &RelPath) -> bool {
+    let dir = rel.as_path().parent().unwrap_or(Path::new(""));
+    self.0.is_empty() || self.0.keys().any(|k| k.as_path().starts_with(dir))
+}
+```
 
-| where | components starting with `build-` | currently hashed? |
+`parent()` is the safety property: it drops the final component, so the rule is about the *directory*
+and a reference file named `build-config.c` can never be waved through. `is_empty()` is
+`Reference::Ungraded` — a run handed no reference may not invent one, so nothing there is a build's
+either. That branch is not decoration: without it the existing test
+`a_tree_that_never_had_an_oracle_seals_but_may_not_invent_one` goes red, which is how it was found.
+
+## After this change, what input still makes the guard refuse?
+
+Named, because a guard whose failing input you cannot produce is not a guard:
+
+| input | verdict | why |
 |---|---|---|
-| `test-corpus/Public-Tests` (the corpus) | **0** | — |
-| cached trees (`code/`, `input/`) | 3, all `logs/build-*.log` | **no** — `logs` is in `ROOT_ONLY_IGNORED_DIRS` |
-| `results/` | 1116, all under `target/` | **no** — already `BuildOutput` |
-| any FILE named `build-*` outside `target/`/`logs/` | **0** | — |
+| `evil.c` added at the `c_src` root | **refuses** | the reference occupies `.` |
+| `src/extra.c`, where a glob would sweep it up | **refuses** | occupies `src/` |
+| `include/shim.h`, pre-empting an include | **refuses** | occupies `include/` |
+| `doc/note.bak`, beside the 26 real `footer.html.bak` | **refuses** | occupies `doc/` |
+| any recorded file edited, removed or hidden | **refuses** | the first loop, untouched |
+| an invented `c_src` where none was handed over | **refuses** | `Reference::Ungraded` |
+| `build-blake-robust-128f/build.log` | the build's; dropped | unoccupied directory |
+| `obj/notes.txt` — an unlisted name, no cmake evidence | the build's; dropped | same rule, no name needed |
+| `src/foo.o`, `test_runner` (bare ELF), `src/lib.gcda` | the build's; dropped | `is_build_product`, unchanged |
 
-So no currently-hashed path is reclassified, and the 415 stored entries keep validating. **Re-measure
-all four rows before relying on them** — the tree moves — and if any row is nonzero, stop: a digest
-change invalidates the store and is a `SCHEMA` question, not a classification tweak.
+**The residual widening, stated:** an agent could add a *source* file inside a brand-new directory and
+have the C build pick it up, where today that refuses. It is narrow — the file is deleted by
+`drop_build_products` before anything is hashed or published, and *moving* a reference file there still
+trips `Removed` — but it is real. The knob that closes it is to require the new directory to hold at
+least one sniff-detected build product; not taken, because a C build that emitted only a log would then
+refuse for the wrong reason.
+
+## Blast radius: none, by construction
+
+`is_build_product` and `occupied_dir_of` are reachable only from `OracleFiles::judge`. Neither is in
+`classify`, `hash_tree`, `digest_tree` or any cache key. So:
+
+- **No digest can move.** The 40 golden digests are unchanged and the fixture's own "pins nothing"
+  guard held (`integration`: 10 passed, 0 ignored).
+- **`SCHEMA` is still 4** and `KeyInputs` still names the same seven components.
+- **All 415 stored entries still validate**, shown by `tools/reproduce.sh all` replaying every phase
+  with `0 run` and `0 agent invocation(s)` and `tables/` byte-identical.
+- **`classify` is untouched.** The first draft's `classify` edit is dropped: measured, there are **0**
+  `build-`-prefixed components anywhere in the tree, so it protected against a hypothetical while
+  putting every tree digest at risk.
 
 ## Acceptance criteria
 
 The eleven gates, plus:
 
-1. **The 40 golden digests unchanged**, fingerprint passing and not skipping. This is the load-bearing
-   gate for this PR.
-2. **All 415 cache entries still validate**, shown by a replay of one earned battery reporting all
-   hits and `0 agent invocation(s)`. A reclassification that moved a digest would quarantine entries
-   instead — that is the failure mode to demonstrate the absence of.
-3. **A directory is reclassified, a file is not**, asserted exhaustively over the pairs that matter:
-   `c_src/build-blake-robust-128f/build.log` → `BuildOutput`;
-   `c_src/build-config.c` → `StoreAndHash`;
-   `build-x/y/z.o` → `BuildOutput`;
-   `src/build-helper.rs` → `StoreAndHash`.
-   The file cases are the ones that make this rule safe, so they are not optional.
-4. **The oracle guard still refuses a real modification.** Plant an edit to a recorded `c_src` file and
-   an added `c_src/doc/note.bak`, and show `OracleChange::Edited` and `Added` still fire — this PR must
-   narrow nothing but the build-directory case. Name the input that still makes the guard refuse.
-5. **Mutate**: drop the directory-only restriction so the rule also matches the final component, and
-   show criterion 3's file cases go red.
-6. Both keys unchanged and `SCHEMA` still 4, with the probe output quoted.
+1. **The nine rows above, pinned exhaustively** in one table-driven test. The four refusals are what
+   make the widening safe, so they are not optional.
+2. **Two mutations, both red.** Make `occupied_dir_of` return `true` (the old behaviour): the accepted
+   rows fail with the *exact* production message, `build-blake-robust-128f/build.log was added, and is
+   not a compiled build product`. Drop the `parent()` restriction so the rule reads the file's own path:
+   red again.
+3. **Golden digests, `SCHEMA` and both keys unchanged**, with the probe output quoted.
+4. **A replay of the earned scope reports all hits**, proving no entry was quarantined.
+5. **Comment budget pruned, not raised** — the ceiling is 3150 and was already at it, so the five
+   verbatim copies of a note in `cache.rs` that restated a `KeyInputs<'_>` borrow the compiler enforces
+   are deduped instead.
 
 ## What this does and does not unblock
 
-**Does:** any project emitting `build-<variant>/` can be verified at all. P01's verify was refused for
-this and nothing else.
+**Does:** any project that builds into a directory the corpus did not ship can be verified at all,
+whatever it names it.
 
-**Does not:** make P01 cacheable, publishable, or CI-validated. P01 is one shared-source group, groups
-open at `SHARED_SOURCE_CACHE = Mode::Bypass`, so it mints no key and stores no entry — see
-`spec-7c.md`, and `spec-24.md` for why an unattributable number should not be published at all. After
-this PR, re-verifying P01 costs a fresh ~3-hour paid run and yields a number that still nothing can
-attest. **So do not sequence a P01 re-run off this PR as though it fixed the publishing problem.** It
-fixes the execution bug; `spec-24` and `#38`/`spec-7c` decide whether the number may be published.
+**Does not:** make P01 publishable. P01 is one shared-source group, groups open at
+`SHARED_SOURCE_CACHE = Mode::Bypass`, so it mints no key and stores no entry — exactly what `spec-24`
+now prints out loud (`P01_sphincs_plus: out of scope — the store serves 0 of its 128 case(s), 128 with
+no key`). After this PR a P01 re-verify costs a fresh ~3-hour paid run and still yields a number nothing
+can attest. **Do not sequence a P01 re-run off this PR as though it fixed publishing.** `#38`/`spec-7c`
+decides that.
 
 ## Commit message
 
-That the oracle guard was right and the classifier wrong: `BUILD_DIRS` matches components exactly plus
-a `cbuild` prefix, so SPHINCS+'s per-variant `build-<hash>-<robust|simple>-<size>/` directories were
-not recognised and a build log inside one read as an added reference file — refusing P01's verify after
-~3 hours of paid work. That the rule applies to DIRECTORY components only, because the predicate also
-sees the final component and a source file named `build-config.c` would otherwise be dropped from the
-digest silently, which is the same shape one layer down; and that `cbuild` keeps its latent version of
-that trap deliberately, since its only occurrence is already `Ignore` under `logs/` and touching it
-would risk a digest for no gain. The four measurements showing no currently-hashed path is
-reclassified, the 40 golden digests unchanged, and 415 entries still validating. And that this unblocks
-execution only — P01 remains uncacheable and unpublishable until `#38`/`spec-7c`.
+That the oracle guard was right and the refusal came from `is_build_product`'s magic-and-extension
+sniff, not from `classify` — which is never asked, because `is_ignored` returns `Ignore` for a `.log`
+first and `oracle_admits` admits `Ignore` deliberately. That the fix is to ask the reference instead of
+a name list: an addition is the build's own where the reference recorded nothing in its directory, which
+retires the reason `BUILD_DIRS` grew once per project. That `parent()` is the safety property and
+`is_empty()` is `Reference::Ungraded`, found by an existing test going red. The nine pinned rows and
+both mutations, including the one that reproduces the production message verbatim. That nothing can move
+a digest because neither function is in `classify` or any key — 40 goldens unchanged, `SCHEMA` still 4,
+415 entries still validating. The three claims retracted from the first draft, measured rather than
+reasoned. And that this unblocks execution only: P01 stays out of `tables/` until `#38`/`spec-7c`.
