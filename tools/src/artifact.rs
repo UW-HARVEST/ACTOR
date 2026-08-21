@@ -1063,7 +1063,20 @@ pub struct Publishing<P: Phase> {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Keying {
     Keyed,
+    /// A deterministic function of a keyed artifact of the same phase — a shared-source follower,
+    /// derived by `propagate_config` — so the group's key attests it without an entry of its own.
+    Derived,
     Unkeyable,
+}
+
+impl Keying {
+    /// Deriving from something nothing attests attests nothing.
+    fn derived(self) -> Self {
+        match self {
+            Self::Keyed | Self::Derived => Self::Derived,
+            Self::Unkeyable => Self::Unkeyable,
+        }
+    }
 }
 
 impl<P: Phase> fmt::Debug for Publishing<P> {
@@ -1255,6 +1268,18 @@ fn assemble<P: Phase>(from: &Path, case_dir: &Path, dst: &Path) -> Result<()> {
 /// It yields a [`Publishing`] and therefore a [`Published`], since it can digest what it just
 /// wrote; what it cannot mint is a [`Sealed`], having no [`Completed`] — so STALENESS holds for all
 /// seven translate arms while CACHING covers only the keyed two.
+/// A follower's phase dir, DERIVED from `source` rather than replayed from an entry of its own.
+/// `source` is the proof: `Derived` cannot be minted without the artifact it came from.
+pub(crate) fn publish_derived<P: Phase>(
+    from: &Path,
+    case_dir: &Path,
+    source: &Published<P>,
+) -> Result<Publishing<P>> {
+    let mut publishing = publish_unsealed::<P>(from, case_dir)?;
+    publishing.keying = source.keying().derived();
+    Ok(publishing)
+}
+
 pub(crate) fn publish_unsealed<P: Phase>(from: &Path, case_dir: &Path) -> Result<Publishing<P>> {
     let replaced = phase_dir_digest::<P>(case_dir);
     clear_phase::<P>(case_dir)?;
@@ -2481,6 +2506,18 @@ mod tests {
             text.contains("resolving") || text.contains("a.rs") || text.contains("b.rs"),
             "and must name what it could not resolve: {text}"
         );
+    }
+
+    /// Exhaustive over `Keying`: a mapping collapsed to a constant is this repo's commonest defect.
+    #[test]
+    fn a_derivation_inherits_attribution_only_where_there_was_some() {
+        for (from, want) in [
+            (Keying::Keyed, Keying::Derived),
+            (Keying::Derived, Keying::Derived),
+            (Keying::Unkeyable, Keying::Unkeyable),
+        ] {
+            assert_eq!(from.derived(), want, "{from:?}");
+        }
     }
 
     #[test]

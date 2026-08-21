@@ -71,9 +71,7 @@ fn main() -> Result<()> {
                 bench.translate(&paths, inner, include_regex.as_deref(), parallel)?;
 
             // THE SCOPE, derived from what the store served rather than from any list -- see
-            // `Benchmark::attests`. Today B02_synthetic and P01_sphincs_plus drop out because a
-            // shared-source group opens at `SHARED_SOURCE_CACHE = Mode::Bypass` and mints no key, so
-            // `spec-7c` is what returns them, not an edit here.
+            // `Benchmark::attests`. A battery drops out until the store covers every case of it.
             let mut attested = report::Attested::default();
             let mut in_scope: Vec<String> = Vec::new();
             for battery in bench.batteries(&paths, inner)? {

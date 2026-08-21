@@ -380,6 +380,13 @@ fn print_check_summary(rows: &[CheckRow]) {
     println!("========================================");
 }
 
+/// Cases discovered but not one vector judged: the oracle measured nothing, whatever it printed. All
+/// 128 of P01's crates once failed to build on a runner whose registry lacked their dependency, and the
+/// pass reported `0/128` and regenerated `tables/` from it -- caught only by `git diff`.
+fn measured_nothing(cases_discovered: usize, vectors_passed: usize, vectors_failed: usize) -> bool {
+    cases_discovered > 0 && vectors_passed + vectors_failed == 0
+}
+
 fn run_runtests(
     paths: &Paths,
     pass: &Pass,
@@ -387,6 +394,9 @@ fn run_runtests(
 ) -> Result<(Summary, HashMap<String, serde_json::Value>)> {
     let battery = &pass.battery;
     let root = pass.tree.root().to_string_lossy().to_string();
+    // Inside the evaluation tree, so it is removed with it and no run can read another's.
+    let report = pass.tree.root().join("junit.xml");
+    let report_arg = report.to_string_lossy().to_string();
     let scripts_dir = paths.corpus_dir.join("deployment/scripts/github-actions");
 
     let mut pythonpath = scripts_dir.to_string_lossy().to_string();
@@ -404,9 +414,18 @@ fn run_runtests(
             &root,
             "--keep-going",
             "--verbose",
+            "--junit-xml",
+            &report_arg,
         ])
         .env("PYTHONPATH", &pythonpath)
         .env("OPENSSL_DIR", openssl_dir())
+        // The agent translates in a sandbox with no network and leaves `[net] offline = true` in the
+        // crate's `.cargo/config.toml`, which the artifact carries because `.cargo/` is a real build
+        // input in 16 corpus cases. That is the AGENT's sandbox policy, not the scorer's: P01's crate
+        // declares `aes = "=0.8.4"`, so on any machine without it already in the registry all 128
+        // builds failed at once -- and the version is pinned exactly and checksum-verified, so
+        // resolving it changes nothing about what is measured.
+        .env("CARGO_NET_OFFLINE", "false")
         .current_dir(&paths.corpus_dir)
         .output()
         .context("running MIT runtests")?;
@@ -434,6 +453,15 @@ fn run_runtests(
     let vectors_passed = extract(r"Test Vectors Passed:\s+(\d+)");
     let vectors_failed = extract(r"Test Vectors Failed:\s+(\d+)");
     let vectors_skipped = extract(r"Test Vectors Skipped:\s+(\d+)");
+
+    anyhow::ensure!(
+        !measured_nothing(cases_discovered, vectors_passed, vectors_failed),
+        "{battery} [{}] discovered {cases_discovered} case(s) and ran NO test vector, so this is not a \
+         score of zero -- nothing was measured. Every crate failing to build looks exactly like this. \
+         The build output is in {}.",
+        pass.phase,
+        paths.output_dir(battery).join("test.log").display(),
+    );
 
     // runtests' grammar: "- NAME: Build failed …", or "- NAME: Test failed (testN: REASON" — ONE
     // vector, opening a block of diff lines, then "expected rc=A, actual rc=B", then ")" — and
@@ -555,7 +583,14 @@ fn run_runtests(
     }
 
     // Executed and not already recorded as failed ⇒ passed.
-    for name in executed_cases(&text)? {
+    let ran = cases_in_report(&std::fs::read_to_string(&report).with_context(|| {
+        format!(
+            "reading the runtests report at {} -- without it there is no authoritative record of \
+             which cases ran",
+            report.display()
+        )
+    })?)?;
+    for name in ran {
         per_case.entry(name.clone()).or_insert_with(|| {
             serde_json::json!({
                 "case": name, "battery": battery,
@@ -580,13 +615,14 @@ fn run_runtests(
     ))
 }
 
-/// ANCHORED: `runtests` prints a bare "Executing test cases..." header too, which files a case `test`.
-fn executed_cases(text: &str) -> Result<Vec<String>> {
-    let re = Regex::new(r"^\s+Executing (\S+)$")?;
-    Ok(text
-        .lines()
-        .filter_map(|line| re.captures(line).map(|c| c[1].to_string()))
-        .collect())
+/// The cases `runtests` RAN, read from the report it writes rather than from its console output. That
+/// output is the interleaved stdout of parallel jobs, and a single mangled `Executing NAME` line drops
+/// the case from the set [`crate::eval::Materialised::reconcile`] compares -- which refuses the whole
+/// battery. Observed on `tfm_lib` and, two runs later, on `confusion_lib`. A report written once, at
+/// the end, cannot interleave. `<testsuite\s` also excludes the `<testsuites>` root element.
+fn cases_in_report(xml: &str) -> Result<Vec<String>> {
+    let re = Regex::new(r#"<testsuite\s[^>]*name="([^"]+)""#)?;
+    Ok(re.captures_iter(xml).map(|c| c[1].to_string()).collect())
 }
 
 fn write_results(
@@ -917,6 +953,29 @@ mod tests {
         );
     }
 
+    /// Exhaustive over the shapes the parsed counts can take, because the one that matters is
+    /// indistinguishable from a real zero in the printed output: `0/128 cases, 0/0 vectors`.
+    #[test]
+    fn a_battery_that_judged_no_vector_measured_nothing_however_many_cases_it_found() {
+        for (found, passed, failed, nothing) in [
+            // Every crate failed to build: the CI shape this exists for.
+            (128, 0, 0, true),
+            (1, 0, 0, true),
+            // A genuine zero SCORE still judged vectors, so it is a measurement.
+            (128, 0, 128, false),
+            (42, 1001, 24, false),
+            (1, 30, 0, false),
+            // Nothing discovered is `nothing_to_score`'s business, not this guard's.
+            (0, 0, 0, false),
+        ] {
+            assert_eq!(
+                measured_nothing(found, passed, failed),
+                nothing,
+                "{found} case(s), {passed} passed, {failed} failed"
+            );
+        }
+    }
+
     /// A run that RESOLVED NOTHING — the shape a battery takes when every case missed.
     fn resolved_nothing(
         paths: &Paths,
@@ -1001,14 +1060,25 @@ mod tests {
         );
     }
 
-    /// That header was scored as a case named `test`, so `reconcile` refused every battery before comparing.
+    /// The `<testsuites>` root carries a `name` too, and counting it files a case called `Tests` — the
+    /// same shape as the console header once scored as a case named `test`, which made `reconcile` refuse
+    /// every battery. A case that FAILED TO BUILD still gets a suite, with no vectors in it.
     #[test]
-    fn the_oracles_own_header_is_not_scored_as_a_case_no_tree_materialised() {
-        let log = "Executing test cases...\n   Executing 001_helloworld\n   Executing 014_dead_code_lib\n";
+    fn the_reports_own_root_element_is_not_scored_as_a_case() {
+        let xml = concat!(
+            r#"<?xml version="1.0"?><testsuites name="Tests" tests="3" failures="1">"#,
+            r#"<testsuite name="001_helloworld" tests="2" failures="0">"#,
+            r#"<testcase name="test0" classname="001_helloworld" />"#,
+            r#"<testcase name="test1" classname="001_helloworld" /></testsuite>"#,
+            r#"<testsuite name="014_dead_code_lib" tests="1" failures="1">"#,
+            r#"<testcase name="test0" classname="014_dead_code_lib">"#,
+            r#"<failure message="stdout mismatch" /></testcase></testsuite>"#,
+            r#"<testsuite name="confusion_lib" tests="0" failures="0" /></testsuites>"#,
+        );
         assert_eq!(
-            executed_cases(log).unwrap(),
-            vec!["001_helloworld", "014_dead_code_lib"],
-            "the two indented lines are the cases; the header names none"
+            cases_in_report(xml).unwrap(),
+            vec!["001_helloworld", "014_dead_code_lib", "confusion_lib"],
+            "every suite is a case and the root element is not one"
         );
     }
 

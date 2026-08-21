@@ -23,6 +23,26 @@ pub type Verifications = HashMap<PathBuf, Published<Verify>>;
 /// [`Session`], which is also what the cache key records, so the two cannot diverge.
 pub(crate) const VERIFY_TIMEOUT_SECS: u64 = 10800;
 
+/// A group's one session covers every config it has, so its wall clock is a different unit of work.
+/// Scoped rather than raised globally because `timeout=` is in the verify key and the 208 stored
+/// entries measure 126.6 h with a 2.50 h maximum — see `spec-7c.md`.
+const GROUP_VERIFY_TIMEOUT_SECS: u64 = 43200;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Budget {
+    OneCase,
+    WholeGroup,
+}
+
+impl Budget {
+    fn secs(self, one_case: u64) -> u64 {
+        match self {
+            Self::OneCase => one_case,
+            Self::WholeGroup => GROUP_VERIFY_TIMEOUT_SECS,
+        }
+    }
+}
+
 const KIRO_VERIFY_TIMEOUT_SECS: u64 = 2700;
 
 pub fn run(
@@ -175,11 +195,14 @@ fn run_with_semaphore(
                     let verdict = match verify_case(
                         &case_dir,
                         translated,
-                        &prompt_template,
-                        &cmake_flags,
-                        "",
+                        Rendering {
+                            template: &prompt_template,
+                            cmake_flags: &cmake_flags,
+                            configs: "",
+                        },
                         paths,
                         &store,
+                        Budget::OneCase,
                     ) {
                         Ok(Some(published)) => Verdict::Verified(published),
                         Ok(None) => Verdict::Failed,
@@ -277,11 +300,14 @@ fn run_with_semaphore(
             let published = verify_case(
                 &real_dir,
                 translated,
-                &prompt_template,
-                &cmake_flags,
-                &configs_text,
+                Rendering {
+                    template: &prompt_template,
+                    cmake_flags: &cmake_flags,
+                    configs: &configs_text,
+                },
                 paths,
                 &store,
+                Budget::WholeGroup,
             )?;
 
             if published.is_some() {
@@ -299,24 +325,27 @@ fn run_with_semaphore(
 
         // A follower's crate is DERIVED, so it is resolved only where the real case was.
         let Some(real) = real else { continue };
-        resolved.insert(real_dir, real);
+        resolved.insert(real_dir.clone(), real);
         println!(
             "Re-propagating verified fixes from {} to {} configs...",
             group.real_case,
             group.configs.len()
         );
         for cfg in &group.configs {
-            crate::translate::propagate_config_phase::<Verify>(
-                paths,
-                battery_name,
-                &group.real_case,
-                cfg,
-            )?;
-            let cfg_dir = paths.case_dir(battery_name, &cfg.name);
-            resolved.insert(
-                cfg_dir.clone(),
-                Published::<Verify>::unkeyed_from_phase_dir(&cfg_dir)?,
-            );
+            // The borrow ends before the insert: a follower's provenance is the group's key.
+            let derived = match resolved.get(&real_dir) {
+                Some(source) => crate::translate::propagate_config_phase::<Verify>(
+                    paths,
+                    battery_name,
+                    &group.real_case,
+                    cfg,
+                    source,
+                )?,
+                None => None,
+            };
+            if let Some(published) = derived {
+                resolved.insert(paths.case_dir(battery_name, &cfg.name), published);
+            }
         }
         println!("Propagated to {} cases", group.configs.len());
     }
@@ -407,7 +436,16 @@ pub fn run_harvest_bench(
                             return (name, Verdict::AlreadyVerified(published));
                         }
                         let verdict = match verify_case(
-                            &case_dir, translated, prompt, "", "", paths, store,
+                            &case_dir,
+                            translated,
+                            Rendering {
+                                template: prompt,
+                                cmake_flags: "",
+                                configs: "",
+                            },
+                            paths,
+                            store,
+                            Budget::OneCase,
                         ) {
                             Ok(Some(published)) => Verdict::Verified(published),
                             Ok(None) => Verdict::Failed,
@@ -495,19 +533,19 @@ pub fn run_harvest_bench(
 /// the two are one decision split across two files.
 /// `a_verify_backend_resolves_exactly_where_a_verify_phase_is_declared` is what holds them
 /// together; adjacency used to be all there was, and it was never a guard.
-fn verify_invocation(paths: &Paths) -> Result<Option<Invocation>> {
+fn verify_invocation(paths: &Paths, budget: Budget) -> Result<Option<Invocation>> {
     let inv = match paths.agent {
         Agent::Kiro => Invocation {
             backend: Backend::Kiro,
             model: ModelId::new(KIRO_UNPINNED_MODEL)?,
             cli: CliVersion::probe("kiro-cli")?,
-            session: Session::kiro(KIRO_VERIFY_TIMEOUT_SECS),
+            session: Session::kiro(budget.secs(KIRO_VERIFY_TIMEOUT_SECS)),
         },
         Agent::Claude => Invocation {
             backend: Backend::Claude,
             model: crate::agents::invocation::claude_model()?,
             cli: CliVersion::probe("claude")?,
-            session: Session::claude(VERIFY_TIMEOUT_SECS),
+            session: Session::claude(budget.secs(VERIFY_TIMEOUT_SECS)),
         },
         Agent::OpenCode => {
             let model =
@@ -518,7 +556,7 @@ fn verify_invocation(paths: &Paths) -> Result<Option<Invocation>> {
                 cli: CliVersion::probe("opencode")?,
                 session: Session::opencode(
                     crate::agents::opencode::Phase::Verify,
-                    VERIFY_TIMEOUT_SECS,
+                    budget.secs(VERIFY_TIMEOUT_SECS),
                 ),
             }
         }
@@ -572,19 +610,25 @@ fn verify_skip_check(paths: &Paths) -> SkipCheck {
     .through(paths.cache_mode)
 }
 
+/// The template plus the two substitutions a group needs and an independent case leaves empty.
+struct Rendering<'a> {
+    template: &'a str,
+    cmake_flags: &'a str,
+    configs: &'a str,
+}
+
 /// Resolve what will run, then hand it to [`run_cached`] — the one execution path for an
 /// agent phase, where the store, the publish and the metrics live for both phases.
 fn verify_case(
     case_dir: &Path,
     translated: &Published<crate::artifact::Translate>,
-    prompt_template: &str,
-    cmake_flags: &str,
-    configs_text: &str,
+    rendering: Rendering<'_>,
     paths: &Paths,
     store: &cache::Store,
+    budget: Budget,
 ) -> Result<Option<Published<Verify>>> {
     // Unreachable: `has_verify_phase` gates every caller. `None`, not a claimed success.
-    let Some(inv) = verify_invocation(paths)? else {
+    let Some(inv) = verify_invocation(paths, budget)? else {
         return Ok(None);
     };
 
@@ -600,10 +644,11 @@ fn verify_case(
     // agent are provably the same string.
     let work = IsolatedWorkDir::new(translated)?;
 
-    let mut prompt = prompt_template
+    let mut prompt = rendering
+        .template
         .replace("CASE_DIR_PLACEHOLDER", &work.root().to_string_lossy())
-        .replace("CMAKE_BUILD_FLAGS", cmake_flags)
-        .replace("ALL_CONFIGURATIONS", configs_text);
+        .replace("CMAKE_BUILD_FLAGS", rendering.cmake_flags)
+        .replace("ALL_CONFIGURATIONS", rendering.configs);
 
     if matches!(inv.backend, Backend::OpenCode(_)) {
         prompt.push_str(&crate::agents::opencode::prompt_suffix(work.root()));
@@ -847,6 +892,37 @@ mod tests {
     /// written in two files. Nothing else connects them: `translate.rs` pins
     /// `has_verify_phase` against the verify-prompt table, not against this match, and the
     /// only other test to call `verify_invocation` calls it for one agent with no phase.
+    /// The group's longer session must reach its key, and an independent case's must not move: the
+    /// 208 stored verify entries depend on the second half.
+    #[test]
+    fn a_group_gets_the_longer_verify_session_and_a_single_case_keeps_its_own() {
+        assert_eq!(
+            Budget::OneCase.secs(7),
+            7,
+            "one case takes the caller's own ceiling"
+        );
+        assert_eq!(
+            Budget::WholeGroup.secs(7),
+            GROUP_VERIFY_TIMEOUT_SECS,
+            "a group takes the group ceiling whatever the caller's is"
+        );
+        assert_eq!(
+            (VERIFY_TIMEOUT_SECS, GROUP_VERIFY_TIMEOUT_SECS),
+            (10_800, 43_200),
+            "raising the FIRST of these moves all 208 stored verify keys"
+        );
+        let one = Session::claude(Budget::OneCase.secs(VERIFY_TIMEOUT_SECS)).shape();
+        let group = Session::claude(Budget::WholeGroup.secs(VERIFY_TIMEOUT_SECS)).shape();
+        assert!(
+            one.contains("timeout=10800") && group.contains("timeout=43200"),
+            "{one} / {group}"
+        );
+        assert_ne!(
+            one, group,
+            "or the longer session never reaches the group's key"
+        );
+    }
+
     #[test]
     fn a_verify_backend_resolves_exactly_where_a_verify_phase_is_declared() {
         use crate::agents::invocation::has_verify_phase;
@@ -873,7 +949,7 @@ mod tests {
             // verify-less arm returns it before touching the environment, so an `Err` is a
             // backend that resolved and then failed to probe a CLI this machine lacks —
             // a phase, not the absence of one.
-            let resolves = match verify_invocation(&paths) {
+            let resolves = match verify_invocation(&paths, Budget::OneCase) {
                 Ok(inv) => inv.is_some(),
                 Err(_) => true,
             };
@@ -974,7 +1050,7 @@ mod tests {
                 std::fs::create_dir_all(paths.input_dir(bat).join(name).join(dir)).unwrap();
             }
         }
-        // The symlinked `test_case` IS what makes a group, and why its store is bypassed.
+        // The symlinked `test_case` IS what makes a group.
         std::fs::create_dir_all(paths.input_dir(bat).join(follower).join("test_vectors")).unwrap();
         std::os::unix::fs::symlink(
             format!("../{group}/test_case"),
@@ -1074,6 +1150,8 @@ mod tests {
             crate::io::sandbox::Enforcement::AllowUnsandboxed,
         )
         .unwrap();
-        assert!(verify_invocation(&paths).unwrap().is_none());
+        assert!(verify_invocation(&paths, Budget::OneCase)
+            .unwrap()
+            .is_none());
     }
 }
