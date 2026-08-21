@@ -215,9 +215,11 @@ pub fn run_test_corpus(
 
     for group in &shared {
         current += 1;
-        let (r, published) = translate_one_shared(paths, &output_dir, battery_name, group);
+        let real_dir = output_dir.join(&group.real_case);
+        let (r, published) =
+            translate_one_shared(paths, &output_dir, battery_name, group, &store, skip);
         if let Some(p) = published {
-            resolved.insert(output_dir.join(&group.real_case), p);
+            resolved.insert(real_dir.clone(), p);
         }
 
         if r.skipped {
@@ -238,8 +240,17 @@ pub fn run_test_corpus(
         for cfg in &group.configs {
             current += 1;
             let cfg_dir = output_dir.join(&cfg.name);
-            let derived = propagate_config(paths, battery_name, &group.real_case, cfg)
-                .and_then(|()| Published::<Translate>::unkeyed_from_phase_dir(&cfg_dir));
+            // The borrow ends before the insert below; a follower is derived from the real case's
+            // artifact, so the group's key is what attests it.
+            let derived = match resolved.get(&real_dir) {
+                Some(source) => {
+                    propagate_config(paths, battery_name, &group.real_case, cfg, source)
+                }
+                None => Err(anyhow::anyhow!(
+                    "no published translation for {} to derive from",
+                    group.real_case
+                )),
+            };
             match derived {
                 Ok(published) => {
                     translated += 1;
@@ -285,9 +296,8 @@ fn unavailable(
 }
 
 /// Already published, and taken as this run's translation because NO KEY EXISTS to ask for a better
-/// one — an unkeyed backend, or a group whose store is [`SHARED_SOURCE_CACHE`]. Reached only where
-/// [`SkipCheck::WhateverIsPublished`] is all that can be asked, so a keyed phase still resolves
-/// through the store or not at all.
+/// one: an unkeyed backend. Reached only where [`SkipCheck::WhateverIsPublished`] is all that can be
+/// asked, so a keyed phase still resolves through the store or not at all.
 ///
 /// Resolving NOTHING here left `--agent opencode` and every symlinked-config battery unable to
 /// verify at all: neither has an entry to replay, ever.
@@ -368,16 +378,17 @@ fn translate_one_independent(
     )
 }
 
-/// A group's store is [`SHARED_SOURCE_CACHE`], i.e. bypassed, and a follower's crate is DERIVED
-/// rather than keyed — so a published crate is all either skip here can ask, as the test pins.
+/// Keyed like any other case: one entry names the shared source and every follower is `Derived` from
+/// it. Bypassing the store here kept `B02_synthetic` and `P01_sphincs_plus` out of `tables/`.
 fn translate_one_shared(
     paths: &Paths,
     output_dir: &Path,
     battery_name: &str,
     group: &battery::SharedSourceGroup,
+    store: &Store,
+    skip: SkipCheck,
 ) -> (CaseResult, Option<Published<Translate>>) {
     let real_dir = output_dir.join(&group.real_case);
-    let skip = SkipCheck::Keyed.through(SHARED_SOURCE_CACHE);
     if skip.already_done(|| {
         crate::battery::has_crate(&crate::battery::phase_dir(
             &real_dir,
@@ -399,7 +410,7 @@ fn translate_one_shared(
         &group.real_case,
         &real_dir,
         &paths.agent_key,
-        || dispatch_translate_shared(paths, battery_name, &group.real_case),
+        || dispatch_translate_shared(paths, battery_name, &group.real_case, store),
         |tree| {
             if let Ok(mut cargo) = CargoToml::open(&tree.join("Cargo.toml")) {
                 cargo.add_workspace();
@@ -713,27 +724,26 @@ fn dispatch_translate(
     }
 }
 
-/// The shared-source path's store: one invocation serves N configs `propagate_config` DERIVES
-/// from the published real case, and spec-7c exists to show a replay derives identical ones.
-/// Named because it is also what justifies [`translate_one_shared`] reading a published crate.
-const SHARED_SOURCE_CACHE: cache::Mode = cache::Mode::Bypass;
-
-/// Bypassed, with the store opened here so no caller can hand this path a keyed one.
-fn dispatch_translate_shared(paths: &Paths, battery: &str, name: &str) -> Result<Resolution> {
-    let store = Store::open(&paths.repo_root, SHARED_SOURCE_CACHE)?;
+/// One invocation serves N configs derived from it, so the group holds ONE entry.
+fn dispatch_translate_shared(
+    paths: &Paths,
+    battery: &str,
+    name: &str,
+    store: &Store,
+) -> Result<Resolution> {
     match paths.agent {
         Agent::Laertes => uncached(laertes_translate_case(paths, battery, name)),
         Agent::C2SaferRust => uncached(c2saferrust_translate_case(paths, battery, name, true)),
         Agent::SmartC2Rust => anyhow::bail!("smartc2rust is translated via the external fixture pipeline (docs), not in-tool; harvest-tools only scores its results"),
         Agent::Kimi => uncached(kimi_translate_case(paths, battery, name, true)),
         Agent::Oneshot => uncached(oneshot_translate_case(paths, battery, name, true)),
-        Agent::C2rust => translate_case(paths, battery, name, "", &store),
+        Agent::C2rust => translate_case(paths, battery, name, "", store),
         Agent::Kiro | Agent::Claude | Agent::OpenCode | Agent::ClaudeCombined
         | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures
         | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
         | Agent::CodexGpt55 | Agent::CodexGpt54 => {
             let prompt = require_prompt(paths, PromptKind::Shared)?;
-            translate_case(paths, battery, name, &prompt, &store)
+            translate_case(paths, battery, name, &prompt, store)
         }
     }
 }
@@ -1383,41 +1393,20 @@ pub fn propagate_config_phase<P: crate::artifact::Phase>(
     battery: &str,
     real_case: &str,
     cfg: &battery::Config,
-) -> Result<()> {
+    source: &Published<P>,
+) -> Result<Option<Published<P>>> {
     let real_dir = crate::battery::phase_dir(&paths.case_dir(battery, real_case), P::DIR);
     // An agent with no verify phase produces no verified/ to copy.
     if !real_dir.is_dir() {
-        return Ok(());
+        return Ok(None);
     }
     let cfg_dir = paths.case_dir(battery, &cfg.name);
+
+    // Published, not written file by file: that is what clears the destination and what invalidates
+    // the follower's dependent phases only when the derived tree actually moved.
+    let publishing = crate::artifact::publish_derived::<P>(&real_dir, &cfg_dir, source)?;
     let translated = crate::battery::phase_dir(&cfg_dir, P::DIR);
-
-    std::fs::create_dir_all(&translated)?;
     std::fs::create_dir_all(translated.join("logs"))?;
-
-    let src_dst = translated.join("src");
-    if src_dst.exists() {
-        std::fs::remove_dir_all(&src_dst)?;
-    }
-    copy_dir_all(&real_dir.join("src"), &src_dst)?;
-
-    std::fs::copy(real_dir.join("Cargo.toml"), translated.join("Cargo.toml"))?;
-
-    for entry in std::fs::read_dir(&real_dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() && entry.file_name() != "Cargo.toml" {
-            std::fs::copy(entry.path(), translated.join(entry.file_name()))?;
-        }
-    }
-
-    let c_src_src = real_dir.join("c_src");
-    if c_src_src.is_dir() {
-        let c_src_dst = translated.join("c_src");
-        if c_src_dst.exists() {
-            std::fs::remove_dir_all(&c_src_dst)?;
-        }
-        copy_dir_all(&c_src_src, &c_src_dst)?;
-    }
 
     let cargo_path = translated.join("Cargo.toml");
     let mut cargo = CargoToml::open(&cargo_path)?;
@@ -1438,7 +1427,7 @@ pub fn propagate_config_phase<P: crate::artifact::Phase>(
         cargo.save()?;
     }
 
-    Ok(())
+    Ok(Some(publishing.finish()?))
 }
 
 pub fn propagate_config(
@@ -1446,8 +1435,14 @@ pub fn propagate_config(
     battery: &str,
     real_case: &str,
     cfg: &battery::Config,
-) -> Result<()> {
-    propagate_config_phase::<Translate>(paths, battery, real_case, cfg)
+    source: &Published<Translate>,
+) -> Result<Published<Translate>> {
+    propagate_config_phase::<Translate>(paths, battery, real_case, cfg, source)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{real_case} published no {}, so nothing can be derived from it",
+            crate::battery::TRANSLATED
+        )
+    })
 }
 
 /// For the paths that do NOT reach the store (see [`RecordedBy`]), so it is always fresh.
@@ -2886,6 +2881,113 @@ mod tests {
         dir
     }
 
+    /// A follower's number rests on the group's key PLUS a deterministic derivation, so both halves are
+    /// pinned here, and a re-derivation must clear what it does not produce (`spec-7c.md`).
+    #[test]
+    fn a_follower_is_derived_from_the_group_and_derives_the_same_tree_every_time() {
+        let (_tmp, paths, battery, real, real_dir, published) = group_fixture();
+        let source = crate::artifact::Publishing::<Translate>::for_test(&real_dir)
+            .finish()
+            .unwrap();
+        assert_eq!(
+            source.keying(),
+            crate::artifact::Keying::Keyed,
+            "fixture: the group is what holds the key"
+        );
+        let _ = published;
+
+        let cfg = battery::Config {
+            name: "macrodepth_add_0".to_owned(),
+            features: Vec::new(),
+            is_lib: false,
+            lib_name: None,
+        };
+        let first = propagate_config(&paths, battery, real, &cfg, &source).unwrap();
+        assert_eq!(
+            first.keying(),
+            crate::artifact::Keying::Derived,
+            "a follower is attributable through the group's key, so it is not Unkeyable"
+        );
+
+        let follower = crate::battery::phase_dir(
+            &paths.case_dir(battery, &cfg.name),
+            crate::battery::TRANSLATED,
+        );
+        std::fs::write(follower.join("stale.rs"), "left by an earlier derivation").unwrap();
+        let again = propagate_config(&paths, battery, real, &cfg, &source).unwrap();
+        assert!(
+            !follower.join("stale.rs").is_file(),
+            "a derivation must clear what it does not produce"
+        );
+        assert_eq!(
+            first.digest(),
+            again.digest(),
+            "and derive the identical tree, or the group's key names nothing about its followers"
+        );
+    }
+
+    /// PR 21's rule one level down, and the defect that shelved `spec-7c`: without BOTH directions the
+    /// group straddles two phases and the battery's headline silently loses a case.
+    #[test]
+    fn a_follower_keeps_its_verification_only_while_its_derivation_does_not_move() {
+        let (_tmp, paths, battery, real, real_dir, published) = group_fixture();
+        let cfg = battery::Config {
+            name: "macrodepth_add_0".to_owned(),
+            features: Vec::new(),
+            is_lib: false,
+            lib_name: None,
+        };
+        let keyed = || {
+            crate::artifact::Publishing::<Translate>::for_test(&real_dir)
+                .finish()
+                .unwrap()
+        };
+        propagate_config(&paths, battery, real, &cfg, &keyed()).unwrap();
+
+        let verified = crate::battery::phase_dir(
+            &paths.case_dir(battery, &cfg.name),
+            crate::battery::VERIFIED,
+        );
+        std::fs::create_dir_all(&verified).unwrap();
+        std::fs::write(verified.join("Cargo.toml"), "[package]").unwrap();
+
+        propagate_config(&paths, battery, real, &cfg, &keyed()).unwrap();
+        assert!(
+            verified.join("Cargo.toml").is_file(),
+            "an identical re-derivation must not delete the follower's verification"
+        );
+
+        std::fs::write(published.join("src/lib.rs"), "pub fn a() { /* fixed */ }").unwrap();
+        propagate_config(&paths, battery, real, &cfg, &keyed()).unwrap();
+        assert!(
+            !verified.exists(),
+            "and a derivation that MOVED must invalidate it, or the group straddles two phases"
+        );
+    }
+
+    fn group_fixture() -> (
+        tempfile::TempDir,
+        Paths,
+        &'static str,
+        &'static str,
+        PathBuf,
+        PathBuf,
+    ) {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let paths = paths_at(
+            tmp.path(),
+            Agent::Claude,
+            crate::cli::Dataset::TestCorpus,
+            cache::Mode::ReadWrite,
+        );
+        let (battery, real) = ("B02_synthetic", "macrodepth_add_5");
+        let real_dir = paths.case_dir(battery, real);
+        let published = publish_a_crate(&real_dir);
+        std::fs::create_dir_all(published.join("src")).unwrap();
+        std::fs::write(published.join("src/lib.rs"), "pub fn a() {}").unwrap();
+        (tmp, paths, battery, real, real_dir, published)
+    }
+
     /// A published `translated/` records nothing about the invocation that wrote it, so a skip check
     /// reading one accepts another model's crate as this model's, and publishes numbers. Both values
     /// go to BOTH keyed sites: a site that stops consulting the one it was given is the same bug.
@@ -3391,9 +3493,9 @@ mod tests {
         );
     }
 
-    /// The honest limit of a bypass: where no key can be asked about, "is something published here"
-    /// is all there is to ask, and it stays — both for a keyless backend and for a store that never
-    /// reads. Keyed either way, the case is re-run and re-billed on every sweep.
+    /// The honest limit of a keyless BACKEND: where no key can be asked about, "is something published
+    /// here" is all there is to ask, and it stays. A shared-source group used to be the other half of
+    /// this and no longer is — it is keyed like any other case, so it may not adopt what it finds.
     #[test]
     fn a_bypassed_backend_still_skips_on_a_published_crate() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
@@ -3427,26 +3529,38 @@ mod tests {
             "and the crate it answered from is untouched"
         );
 
-        // The other half, every agent's shared-source group: a bypassed store, keyed agent.
-        let keyed_agent = paths_at(tmp.path(), Agent::Claude, corpus, cache::Mode::ReadWrite);
+        // A group takes no such licence any more: keyed, it must ask the store, and a store that may
+        // only replay and holds no entry refuses rather than adopting the crate already there.
+        let replay = paths_at(tmp.path(), Agent::Claude, corpus, cache::Mode::ReplayOnly);
         let group = battery::SharedSourceGroup {
             real_case: "macrodepth_add_5".to_owned(),
             configs: Vec::new(),
         };
         let real = publish_a_crate(&output_dir.join(&group.real_case));
-        let (g, _) = translate_one_shared(&keyed_agent, &output_dir, battery, &group);
+        let group_store = cache::Store::open(&replay.repo_root, replay.cache_mode).unwrap();
+        let (g, resolved) = translate_one_shared(
+            &replay,
+            &output_dir,
+            battery,
+            &group,
+            &group_store,
+            translate_skip_check(&replay),
+        );
         assert!(
-            g.skipped && g.success,
-            "the group's store never loads, so there is no entry to replay and `translated/` \
-             is all there is to read: {:?}",
+            !g.skipped,
+            "a keyed group may not adopt the crate already published: {:?}",
             g.error
         );
-        assert!(crate::battery::has_crate(&real));
-        assert_eq!(
-            SkipCheck::Keyed.through(SHARED_SOURCE_CACHE),
-            SkipCheck::WhateverIsPublished,
-            "which is exactly what the group's mode answers, and the only thing that licenses \
-             those two sites to read a published crate without asking"
+        assert!(resolved.is_none() && !g.success, "and it resolves nothing");
+        assert!(
+            !crate::battery::has_crate(&real)
+                && output_dir
+                    .join(&group.real_case)
+                    .join(format!("{}.displaced", crate::battery::TRANSLATED))
+                    .join("Cargo.toml")
+                    .is_file(),
+            "the crate it would once have adopted is DISPLACED, not deleted and not left in place \
+             for the next run to read"
         );
 
         // THE WHOLE DECISION, both halves, as a sweep resolves it — here, because a sweep needs a CLI
@@ -3609,32 +3723,32 @@ mod tests {
             "and claude IS keyed under the mode `verify` seeds with, so that is the branch it takes"
         );
 
-        // A group, with a KEYED agent: its own store is bypassed, so a published crate is all there is.
-        let group = battery::SharedSourceGroup {
-            real_case: "macrodepth_add_5".to_owned(),
-            configs: Vec::new(),
-        };
-        let real = publish_a_crate(&output_dir.join(&group.real_case));
+        // A group, with a KEYED agent: keyed like any other case now, so a sweep that may not pay and
+        // has no entry refuses it — whether or not a crate is already published there.
         let keyed = paths_at(tmp.path(), Agent::Claude, corpus, replay);
-        let (g, resolved) = translate_one_shared(&keyed, &output_dir, battery, &group);
-        assert_eq!(
-            resolved.map(|p| p.keying()),
-            Some(crate::artifact::Keying::Unkeyable),
-            "a group is never keyed, and refusing it left P01_sphincs_plus's 128 configs \
-             unverifiable: {:?}",
-            g.error
-        );
-        assert!(g.success && crate::battery::has_crate(&real));
-        let nothing_published = battery::SharedSourceGroup {
-            real_case: "macrodepth_add_9".to_owned(),
-            configs: Vec::new(),
-        };
-        let (n, resolved) = translate_one_shared(&keyed, &output_dir, battery, &nothing_published);
-        assert!(
-            resolved.is_none() && !n.success,
-            "and a group with nothing published is still refused: {:?}",
-            n.error
-        );
+        let keyed_store = cache::Store::open(&keyed.repo_root, keyed.cache_mode).unwrap();
+        for real_case in ["macrodepth_add_5", "macrodepth_add_9"] {
+            let group = battery::SharedSourceGroup {
+                real_case: real_case.to_owned(),
+                configs: Vec::new(),
+            };
+            if real_case.ends_with('5') {
+                publish_a_crate(&output_dir.join(real_case));
+            }
+            let (g, resolved) = translate_one_shared(
+                &keyed,
+                &output_dir,
+                battery,
+                &group,
+                &keyed_store,
+                translate_skip_check(&keyed),
+            );
+            assert!(
+                resolved.is_none() && !g.success,
+                "{real_case}: a group with no entry must refuse, published crate or not: {:?}",
+                g.error
+            );
+        }
 
         // THE mapping, over every mode a `Paths` can carry: only one refuses, and under it only a
         // keyed check resolves — without both halves, a predicate answering alike would pass too.

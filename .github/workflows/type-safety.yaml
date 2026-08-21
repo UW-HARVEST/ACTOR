@@ -96,7 +96,7 @@ jobs:
         #
         # TWO ceilings, because each is blind to exactly what the other catches.
         #
-        # --max-comments 3150 is primary: an absolute comment-line ceiling since PR 13,
+        # --max-comments 3200 is primary: an absolute comment-line ceiling since PR 13,
         # not the `--max 14` whole-tree ratio before it. The ratio was green on a false
         # measurement -- the raw-string masker matched any `r` before a quote, so 95 of
         # its 149 matches over tools/src/**.rs were ordinary words like `"a valid
@@ -146,12 +146,23 @@ jobs:
         # block and what "never work around your own gate" forbids. 3150 is 3138 plus 12,
         # not a round number: the next PR prunes or raises deliberately, as this one did.
         #
+        # RAISED 3150 -> 3200 by PR 7c, with the reasoning the line above demands. `main` measured
+        # EXACTLY 3150 of 3150 for the third time running: PR 24 pruned itself to the ceiling and PR 25
+        # deduped five verbatim copies of a `cache.rs` note to fit, so each spent its budget deleting
+        # PRE-EXISTING documentation rather than writing its own -- the thing this block already calls
+        # forbidden. PR 7c adds 224 counted lines and 34 comment lines, 15% against a 13.82% tree, after
+        # compressing its own docs ~45% and deleting the ones removing `SHARED_SOURCE_CACHE` made false.
+        # The operator chose this over deleting the WHY on `Keying::Derived`, on why `publish_derived`
+        # takes its source as proof, and on four mutation-tested invariants. 3200 is 3174 -- the tree
+        # with this PR and these nine lines in it -- plus 26. Same rule as before: prune or raise
+        # deliberately, never quietly, and `--max-ratio 20` remains what actually stops sprawl.
+        #
         # .py is in neither HASH nor SLASH, so the budget does not count itself: this
         # script's own docstring and all 250 lines of tools/test_comment_budget.py cost
         # ZERO against both ceilings. Deriving 3100 from the tree needs that fact.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 3150 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 3200 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is
