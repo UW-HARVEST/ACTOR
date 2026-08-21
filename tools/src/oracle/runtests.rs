@@ -380,6 +380,13 @@ fn print_check_summary(rows: &[CheckRow]) {
     println!("========================================");
 }
 
+/// Cases discovered but not one vector judged: the oracle measured nothing, whatever it printed. All
+/// 128 of P01's crates once failed to build on a runner whose registry lacked their dependency, and the
+/// pass reported `0/128` and regenerated `tables/` from it -- caught only by `git diff`.
+fn measured_nothing(cases_discovered: usize, vectors_passed: usize, vectors_failed: usize) -> bool {
+    cases_discovered > 0 && vectors_passed + vectors_failed == 0
+}
+
 fn run_runtests(
     paths: &Paths,
     pass: &Pass,
@@ -407,6 +414,13 @@ fn run_runtests(
         ])
         .env("PYTHONPATH", &pythonpath)
         .env("OPENSSL_DIR", openssl_dir())
+        // The agent translates in a sandbox with no network and leaves `[net] offline = true` in the
+        // crate's `.cargo/config.toml`, which the artifact carries because `.cargo/` is a real build
+        // input in 16 corpus cases. That is the AGENT's sandbox policy, not the scorer's: P01's crate
+        // declares `aes = "=0.8.4"`, so on any machine without it already in the registry all 128
+        // builds failed at once -- and the version is pinned exactly and checksum-verified, so
+        // resolving it changes nothing about what is measured.
+        .env("CARGO_NET_OFFLINE", "false")
         .current_dir(&paths.corpus_dir)
         .output()
         .context("running MIT runtests")?;
@@ -434,6 +448,15 @@ fn run_runtests(
     let vectors_passed = extract(r"Test Vectors Passed:\s+(\d+)");
     let vectors_failed = extract(r"Test Vectors Failed:\s+(\d+)");
     let vectors_skipped = extract(r"Test Vectors Skipped:\s+(\d+)");
+
+    anyhow::ensure!(
+        !measured_nothing(cases_discovered, vectors_passed, vectors_failed),
+        "{battery} [{}] discovered {cases_discovered} case(s) and ran NO test vector, so this is not a \
+         score of zero -- nothing was measured. Every crate failing to build looks exactly like this. \
+         The build output is in {}.",
+        pass.phase,
+        paths.output_dir(battery).join("test.log").display(),
+    );
 
     // runtests' grammar: "- NAME: Build failed …", or "- NAME: Test failed (testN: REASON" — ONE
     // vector, opening a block of diff lines, then "expected rc=A, actual rc=B", then ")" — and
@@ -915,6 +938,29 @@ mod tests {
             7,
             "the fixture must hold the record whose never being read is the defect"
         );
+    }
+
+    /// Exhaustive over the shapes the parsed counts can take, because the one that matters is
+    /// indistinguishable from a real zero in the printed output: `0/128 cases, 0/0 vectors`.
+    #[test]
+    fn a_battery_that_judged_no_vector_measured_nothing_however_many_cases_it_found() {
+        for (found, passed, failed, nothing) in [
+            // Every crate failed to build: the CI shape this exists for.
+            (128, 0, 0, true),
+            (1, 0, 0, true),
+            // A genuine zero SCORE still judged vectors, so it is a measurement.
+            (128, 0, 128, false),
+            (42, 1001, 24, false),
+            (1, 30, 0, false),
+            // Nothing discovered is `nothing_to_score`'s business, not this guard's.
+            (0, 0, 0, false),
+        ] {
+            assert_eq!(
+                measured_nothing(found, passed, failed),
+                nothing,
+                "{found} case(s), {passed} passed, {failed} failed"
+            );
+        }
     }
 
     /// A run that RESOLVED NOTHING — the shape a battery takes when every case missed.
