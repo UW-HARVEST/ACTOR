@@ -166,8 +166,37 @@ fn materialise_phase<P: Phase>(
     Ok(Some(scope.finish()?))
 }
 
+/// Case by case, so nothing must finish before a case is graded (`spec-27.md`).
 fn score_pass(paths: &Paths, pass: &Pass, scoring: &Scoring<'_>) -> Result<()> {
-    let (summary, per_case) = run_runtests(paths, pass)?;
+    let mut summary = Summary::default();
+    let mut per_case: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut transcript = String::new();
+    for case in pass.tree.cases() {
+        let (one, records, text) = run_runtests(paths, pass, &case.name)?;
+        summary.absorb(one);
+        per_case.extend(records);
+        transcript.push_str(&text);
+    }
+    let _ = std::fs::write(
+        paths.output_dir(&pass.battery).join("test.log"),
+        &transcript,
+    );
+
+    anyhow::ensure!(
+        !measured_nothing(
+            summary.cases_tested,
+            summary.vectors_passed,
+            summary.vectors_failed
+        ),
+        "{} [{}] discovered {} case(s) and ran NO test vector, so this is not a score of zero -- \
+         nothing was measured. EVERY crate failing to build looks exactly like this. The build output \
+         is in {}.",
+        pass.battery,
+        pass.phase,
+        summary.cases_tested,
+        paths.output_dir(&pass.battery).join("test.log").display(),
+    );
+
     let scored: BTreeSet<String> = per_case.keys().cloned().collect();
     pass.tree.reconcile(summary.cases_tested, &scored)?;
 
@@ -245,18 +274,22 @@ fn transcripts(crate_root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 /// Cases discovered but not one vector judged: the oracle measured nothing, whatever it printed. All
 /// 128 of P01's crates once failed to build on a runner whose registry lacked their dependency, and the
 /// pass reported `0/128` and regenerated `tables/` from it -- caught only by `git diff`.
+/// Over the BATTERY's sum: one crate failing to build judges no vector either, and that IS a result.
 fn measured_nothing(cases_discovered: usize, vectors_passed: usize, vectors_failed: usize) -> bool {
     cases_discovered > 0 && vectors_passed + vectors_failed == 0
 }
 
+/// Scores ONE case, returning its transcript: a per-case write would leave `test.log` holding the last.
 fn run_runtests(
     paths: &Paths,
     pass: &Pass,
-) -> Result<(Summary, HashMap<String, serde_json::Value>)> {
+    case: &str,
+) -> Result<(Summary, HashMap<String, serde_json::Value>, String)> {
     let battery = &pass.battery;
     let root = pass.tree.root().to_string_lossy().to_string();
-    // Inside the evaluation tree, so it is removed with it and no run can read another's.
-    let report = pass.tree.root().join("junit.xml");
+    let subset = pass.tree.root().join(case).to_string_lossy().to_string();
+    // In the evaluation tree, so it goes with it; per case, or each would overwrite the last.
+    let report = pass.tree.root().join(format!("junit-{case}.xml"));
     let report_arg = report.to_string_lossy().to_string();
     let scripts_dir = paths.corpus_dir.join("deployment/scripts/github-actions");
 
@@ -272,7 +305,7 @@ fn run_runtests(
             "--root",
             &root,
             "--subset",
-            &root,
+            &subset,
             "--keep-going",
             "--verbose",
             "--junit-xml",
@@ -297,7 +330,6 @@ fn run_runtests(
         String::from_utf8_lossy(&output.stderr)
     );
     print!("{text}");
-    let _ = std::fs::write(paths.output_dir(battery).join("test.log"), &text);
 
     let extract = |pattern: &str| -> usize {
         Regex::new(pattern)
@@ -312,15 +344,6 @@ fn run_runtests(
     let vectors_passed = extract(r"Test Vectors Passed:\s+(\d+)");
     let vectors_failed = extract(r"Test Vectors Failed:\s+(\d+)");
     let vectors_skipped = extract(r"Test Vectors Skipped:\s+(\d+)");
-
-    anyhow::ensure!(
-        !measured_nothing(cases_discovered, vectors_passed, vectors_failed),
-        "{battery} [{}] discovered {cases_discovered} case(s) and ran NO test vector, so this is not a \
-         score of zero -- nothing was measured. Every crate failing to build looks exactly like this. \
-         The build output is in {}.",
-        pass.phase,
-        paths.output_dir(battery).join("test.log").display(),
-    );
 
     // runtests' grammar: "- NAME: Build failed …", or "- NAME: Test failed (testN: REASON" — ONE
     // vector, opening a block of diff lines, then "expected rc=A, actual rc=B", then ")" — and
@@ -471,6 +494,7 @@ fn run_runtests(
             failed_cases,
         },
         per_case,
+        text,
     ))
 }
 
