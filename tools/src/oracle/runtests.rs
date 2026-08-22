@@ -184,6 +184,21 @@ fn score_pass(paths: &Paths, pass: &Pass, scoring: &Scoring<'_>) -> Result<()> {
         &transcript,
     );
 
+    anyhow::ensure!(
+        !measured_nothing(
+            summary.cases_tested,
+            summary.vectors_passed,
+            summary.vectors_failed
+        ),
+        "{} [{}] discovered {} case(s) and ran NO test vector, so this is not a score of zero -- \
+         nothing was measured. EVERY crate failing to build looks exactly like this. The build output \
+         is in {}.",
+        pass.battery,
+        pass.phase,
+        summary.cases_tested,
+        paths.output_dir(&pass.battery).join("test.log").display(),
+    );
+
     let scored: BTreeSet<String> = per_case.keys().cloned().collect();
     pass.tree.reconcile(summary.cases_tested, &scored)?;
 
@@ -261,6 +276,10 @@ fn transcripts(crate_root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 /// Cases discovered but not one vector judged: the oracle measured nothing, whatever it printed. All
 /// 128 of P01's crates once failed to build on a runner whose registry lacked their dependency, and the
 /// pass reported `0/128` and regenerated `tables/` from it -- caught only by `git diff`.
+///
+/// Over the BATTERY's summed record, never one case's: a single crate that fails to build has no vector
+/// to judge either, and that is a measurement -- `B02_organic/underhanded-c-nuke_lib` is exactly that,
+/// 43/44 for real. What is not a measurement is a battery where EVERY case looks like it.
 fn measured_nothing(cases_discovered: usize, vectors_passed: usize, vectors_failed: usize) -> bool {
     cases_discovered > 0 && vectors_passed + vectors_failed == 0
 }
@@ -332,15 +351,6 @@ fn run_runtests(
     let vectors_passed = extract(r"Test Vectors Passed:\s+(\d+)");
     let vectors_failed = extract(r"Test Vectors Failed:\s+(\d+)");
     let vectors_skipped = extract(r"Test Vectors Skipped:\s+(\d+)");
-
-    anyhow::ensure!(
-        !measured_nothing(cases_discovered, vectors_passed, vectors_failed),
-        "{battery} [{}] discovered {cases_discovered} case(s) and ran NO test vector, so this is not a \
-         score of zero -- nothing was measured. Every crate failing to build looks exactly like this. \
-         The build output is in {}.",
-        pass.phase,
-        paths.output_dir(battery).join("test.log").display(),
-    );
 
     // runtests' grammar: "- NAME: Build failed …", or "- NAME: Test failed (testN: REASON" — ONE
     // vector, opening a block of diff lines, then "expected rc=A, actual rc=B", then ")" — and
