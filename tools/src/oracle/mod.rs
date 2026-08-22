@@ -6,7 +6,7 @@ pub mod score;
 
 pub use gtest::run_harvest_bench_test;
 pub use runtests::run_test_corpus;
-pub use score::{BatteryMismatch, Covers, Scoring, Summary, TestMode, TestOutcome};
+pub use score::{Covers, Scoring, Summary};
 
 use crate::battery::Paths;
 use anyhow::Result;
@@ -85,101 +85,6 @@ impl Enrichment {
 
 /// Pure inverse of [`Enrichment::merge_into`]; returns mismatch descriptions.
 /// `agent` gates the "missing meta" check to kiro, the only agent that records
-/// credits.
-fn check_enrichment(
-    result_json: &Path,
-    src_dir: &Path,
-    log_paths: &[(&str, &Path)],
-    agent: crate::cli::Agent,
-) -> Vec<String> {
-    let mut diffs = Vec::new();
-    let Ok(data) = std::fs::read_to_string(result_json) else {
-        return diffs;
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
-        return diffs;
-    };
-
-    let live = Enrichment::compute(src_dir, log_paths);
-
-    match json.get("unsafe") {
-        Some(stored) => {
-            let sb = stored.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let sf = stored.get("fns").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let si = stored.get("impls").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            if sb != live.unsafe_.blocks {
-                diffs.push(format!(
-                    "unsafe.blocks expected={sb} actual={}",
-                    live.unsafe_.blocks
-                ));
-            }
-            if sf != live.unsafe_.fns {
-                diffs.push(format!(
-                    "unsafe.fns expected={sf} actual={}",
-                    live.unsafe_.fns
-                ));
-            }
-            if si != live.unsafe_.impls {
-                diffs.push(format!(
-                    "unsafe.impls expected={si} actual={}",
-                    live.unsafe_.impls
-                ));
-            }
-            let sl = stored.get("lines").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            if sl != live.unsafe_.lines {
-                diffs.push(format!(
-                    "unsafe.lines expected={sl} actual={}",
-                    live.unsafe_.lines
-                ));
-            }
-        }
-        None => diffs.push("missing unsafe field".into()),
-    }
-
-    match json.get("loc") {
-        Some(stored) => {
-            let sc = stored.get("code").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            if sc != live.loc.code {
-                diffs.push(format!("loc.code expected={sc} actual={}", live.loc.code));
-            }
-        }
-        None => diffs.push("missing loc field".into()),
-    }
-
-    // `live.meta` is filtered and keyed exactly as merge_into's, so a phase whose
-    // log is absent is simply not compared.
-    let require_credits = matches!(agent, crate::cli::Agent::Kiro);
-    for (key, live) in &live.meta {
-        match json.get(key) {
-            Some(stored) => {
-                let sc = stored
-                    .get("credits")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                let sw = stored
-                    .get("wall_secs")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if (sc - live.credits.as_f64()).abs() > 0.001 {
-                    diffs.push(format!(
-                        "{key}.credits expected={sc} actual={}",
-                        live.credits.as_f64()
-                    ));
-                }
-                if sw != live.wall_secs {
-                    diffs.push(format!(
-                        "{key}.wall_secs expected={sw} actual={}",
-                        live.wall_secs
-                    ));
-                }
-            }
-            None if require_credits => diffs.push(format!("missing {key} field")),
-            None => {}
-        }
-    }
-    diffs
-}
-
 pub fn enrich_test_corpus(paths: &Paths, battery: &str) -> Result<()> {
     let output_dir = paths.results_dir.join(battery);
     if !output_dir.is_dir() {
@@ -216,9 +121,10 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// Guards the `merge_into` / `check_enrichment` inverse invariant.
+    /// What `merge_into` actually records into a scored `result.json`. Its inverse,
+    /// `check_enrichment`, went with the `--check` mode that was its only caller.
     #[test]
-    fn merge_into_then_check_has_no_diffs() {
+    fn merge_into_records_the_unsafe_blocks_and_loc_it_measured() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         let src = tmp.path().join("src");
         fs::create_dir_all(&src).unwrap();
@@ -235,22 +141,16 @@ mod tests {
         Enrichment::compute(&src, &[("translate", &missing)]).merge_into(&mut json);
         fs::write(&rj, serde_json::to_string_pretty(&json).unwrap()).unwrap();
 
-        let diffs = check_enrichment(
-            &rj,
-            &src,
-            &[("translate", &missing)],
-            crate::cli::Agent::Claude,
-        );
-        assert!(
-            diffs.is_empty(),
-            "merge_into output should pass its own check: {diffs:?}"
-        );
-
-        // And it actually recorded the unsafe block + loc (not a vacuous pass).
         let stored: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&rj).unwrap()).unwrap();
-        assert_eq!(stored["unsafe"]["blocks"], 1);
-        assert!(stored["loc"]["code"].as_u64().unwrap() >= 2);
+        assert_eq!(
+            stored["unsafe"]["blocks"], 1,
+            "the one unsafe block is counted"
+        );
+        assert!(
+            stored["loc"]["code"].as_u64().unwrap() >= 2,
+            "and the code it measured is not zero"
+        );
     }
 
     /// `result.json` is still written back INTO the artifact directory, so it must stay outside the
@@ -275,31 +175,5 @@ mod tests {
         // The one write a scored build makes that IS hashed — hence why the build has to
         // move out of the tree, and not merely its reports.
         assert_eq!(of("Cargo.lock"), Disposition::StoreAndHash);
-    }
-
-    /// Proves the check above is not vacuously empty.
-    #[test]
-    fn check_detects_tampered_unsafe_count() {
-        let tmp = crate::io::workdir::test_tempdir().unwrap();
-        let src = tmp.path().join("src");
-        fs::create_dir_all(&src).unwrap();
-        fs::write(
-            src.join("lib.rs"),
-            "pub fn f() { unsafe { let _x = 0; } }\n",
-        )
-        .unwrap();
-
-        let rj = tmp.path().join("result.json");
-        let mut json = serde_json::json!({});
-        let _missing = tmp.path().join("nope.log");
-        Enrichment::compute(&src, &[]).merge_into(&mut json);
-        json["unsafe"]["blocks"] = serde_json::json!(99); // tamper
-        fs::write(&rj, serde_json::to_string_pretty(&json).unwrap()).unwrap();
-
-        let diffs = check_enrichment(&rj, &src, &[], crate::cli::Agent::Claude);
-        assert!(
-            diffs.iter().any(|d| d.contains("unsafe.blocks")),
-            "tamper should be caught: {diffs:?}"
-        );
     }
 }

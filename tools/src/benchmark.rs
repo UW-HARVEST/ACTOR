@@ -6,7 +6,7 @@
 use crate::agents::invocation::has_verify_phase;
 use crate::battery::{self, Paths};
 use crate::cli::{Agent, Dataset};
-use crate::oracle::{self, Scoring, TestOutcome};
+use crate::oracle::{self, Scoring};
 use crate::translate::Translations;
 use crate::verify::Verifications;
 use crate::{translate, verify};
@@ -55,7 +55,7 @@ pub trait Benchmark {
         Ok(Verifications::new())
     }
 
-    fn test(&self, paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<TestOutcome>;
+    fn test(&self, paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<()>;
 
     /// Backfills result.json (unsafe/loc/credits); already folded into `test --update`,
     /// so the `enrich` subcommand only re-runs this step.
@@ -266,7 +266,7 @@ impl Benchmark for TestCorpus {
         }
     }
 
-    fn test(&self, paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<TestOutcome> {
+    fn test(&self, paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<()> {
         oracle::run_test_corpus(paths, target, scoring)
     }
 
@@ -330,7 +330,7 @@ impl Benchmark for HarvestBench {
         verify::run_harvest_bench(paths, &projects, parallel, force, translations)
     }
 
-    fn test(&self, paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<TestOutcome> {
+    fn test(&self, paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<()> {
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
         oracle::run_harvest_bench_test(paths, &projects, scoring)
     }

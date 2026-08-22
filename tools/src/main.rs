@@ -88,7 +88,6 @@ fn main() -> Result<()> {
                 "the store serves no battery of {inner} in full, so this run can publish nothing"
             );
 
-            let mut outcome = oracle::TestOutcome::Ok;
             for battery in &in_scope {
                 let verifications = if !no_verify && bench.verifies(agent) {
                     bench.verify(
@@ -102,12 +101,11 @@ fn main() -> Result<()> {
                 } else {
                     harvest_tools::verify::Verifications::new()
                 };
-                let scored = run_test(
+                run_test(
                     bench.as_ref(),
                     &paths,
                     battery,
                     Score {
-                        mode: oracle::TestMode::Update,
                         on_failure: agent_health::OnInfraFailure::Refuse,
                         keep: eval::Keep::from_keep_eval_tree_flag(cli.keep_eval_tree),
                         source: eval::Source {
@@ -117,15 +115,6 @@ fn main() -> Result<()> {
                         covers: oracle::Covers::from_include_regex(include_regex.as_deref()),
                     },
                 )?;
-                if let oracle::TestOutcome::Failed(mm) = scored {
-                    outcome = match outcome {
-                        oracle::TestOutcome::Failed(mut had) => {
-                            had.extend(mm);
-                            oracle::TestOutcome::Failed(had)
-                        }
-                        _ => oracle::TestOutcome::Failed(mm),
-                    };
-                }
             }
 
             // Written ONCE from the whole scope: per battery it would erase every other battery's
@@ -134,7 +123,6 @@ fn main() -> Result<()> {
                 report::generate(&repo_root, &attested)?;
                 println!("📊 Tables regenerated (tables/)");
             }
-            report_test_outcome(outcome);
         }
         Command::Translate {
             ref target,
@@ -257,23 +245,22 @@ fn main() -> Result<()> {
 }
 
 struct Score<'a> {
-    mode: oracle::TestMode,
     on_failure: agent_health::OnInfraFailure,
     keep: eval::Keep,
     source: eval::Source<'a>,
     covers: oracle::Covers<'a>,
 }
 
-/// RETURNS the outcome rather than reporting it: [`report_test_outcome`] ends in `process::exit`, which
-/// runs no destructor, and the [`eval::Tree`] whose `Drop` removes the tree is live in this frame.
+/// A score REFUSES rather than reporting a verdict, so the only way out is `?` — which unwinds, running
+/// the [`eval::Tree`] `Drop` that removes the tree. The `--check` mode this replaced ended in
+/// `process::exit`, which runs no destructor and once left the whole tree standing.
 fn run_test(
     bench: &dyn benchmark::Benchmark,
     paths: &battery::Paths,
     target: &str,
     score: Score<'_>,
-) -> Result<oracle::TestOutcome> {
+) -> Result<()> {
     let Score {
-        mode,
         on_failure,
         keep,
         source,
@@ -285,28 +272,16 @@ fn run_test(
         results_dir: &paths.results_dir,
     };
     let tree = eval::Tree::create_empty(paths, keep)?;
-    let outcome = bench.test(
+    bench.test(
         paths,
         target,
         &oracle::Scoring {
-            mode,
             source,
             tree: &tree,
             gate: &gate,
             covers,
         },
-    )?;
-    Ok(outcome)
-}
-
-fn report_test_outcome(outcome: oracle::TestOutcome) {
-    if let oracle::TestOutcome::Failed(ref mismatches) = outcome {
-        eprintln!("\n❌ {} battery(ies) mismatched:", mismatches.len());
-        for m in mismatches {
-            eprintln!("  {}: {}", m.battery, m.diffs.join("; "));
-        }
-        std::process::exit(1);
-    }
+    )
 }
 
 fn find_repo_root() -> Result<std::path::PathBuf> {
@@ -332,11 +307,11 @@ mod tests {
             .join(paths.agent_key.as_str())
     }
 
-    struct Mismatching;
+    struct Refusing;
 
-    impl benchmark::Benchmark for Mismatching {
+    impl benchmark::Benchmark for Refusing {
         fn name(&self) -> &'static str {
-            "mismatching"
+            "refusing"
         }
         fn verifies(&self, _agent: cli::Agent) -> bool {
             false
@@ -355,16 +330,13 @@ mod tests {
             paths: &battery::Paths,
             target: &str,
             scoring: &oracle::Scoring<'_>,
-        ) -> Result<oracle::TestOutcome> {
+        ) -> Result<()> {
             scoring.tree.scope(target)?;
             assert!(
                 eval_root(paths).join(target).is_dir(),
                 "the tree must be standing while the score runs, or its removal proves nothing"
             );
-            Ok(oracle::TestOutcome::Failed(vec![oracle::BatteryMismatch {
-                battery: target.to_string(),
-                diffs: vec!["vectors_passed: 393 → 0".to_string()],
-            }]))
+            anyhow::bail!("{target}: vectors_passed 393 → 0")
         }
         fn enrich(&self, _paths: &battery::Paths, _target: &str) -> Result<()> {
             unreachable!("scoring only")
@@ -382,10 +354,11 @@ mod tests {
         }
     }
 
-    /// `process::exit` runs no destructor, so reporting the mismatch from inside `run_test` left the
-    /// whole tree standing on the one path a `--check` failure takes, unasked for `--keep-eval-tree`.
+    /// A score that REFUSES leaves by `?`, which unwinds and runs the tree's `Drop`. The `--check`
+    /// mode this replaced left by `process::exit`, which runs no destructor and once left the whole tree
+    /// standing on the one path a failure takes, unasked for `--keep-eval-tree`.
     #[test]
-    fn a_mismatch_reported_to_the_operator_still_removes_the_evaluation_tree() {
+    fn a_score_that_refuses_still_removes_the_evaluation_tree() {
         let tmp = harvest_tools::io::workdir::test_tempdir().unwrap();
         let paths = battery::Paths::new(
             tmp.path(),
@@ -399,12 +372,11 @@ mod tests {
         let translations = harvest_tools::translate::Translations::new();
         let verifications = harvest_tools::verify::Verifications::new();
 
-        let outcome = run_test(
-            &Mismatching,
+        let refused = run_test(
+            &Refusing,
             &paths,
             "B01",
             Score {
-                mode: oracle::TestMode::Check,
                 on_failure: agent_health::OnInfraFailure::Refuse,
                 keep: eval::Keep::Discard,
                 source: eval::Source {
@@ -413,12 +385,12 @@ mod tests {
                 },
                 covers: oracle::Covers::WholeBattery,
             },
-        )
-        .unwrap();
+        );
 
+        let err = refused.expect_err("the fixture refuses, so this must carry the refusal out");
         assert!(
-            matches!(outcome, oracle::TestOutcome::Failed(_)),
-            "the mismatch must come back to `main` to be exited on, not be exited on in here"
+            format!("{err:#}").contains("393"),
+            "carrying the reason to `main` rather than exiting in here: {err:#}"
         );
         assert!(
             !eval_root(&paths).exists(),
