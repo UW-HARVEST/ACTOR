@@ -43,9 +43,7 @@ pub struct Summary {
 }
 
 impl Summary {
-    /// A battery's record is the SUM of its cases', because each case is scored on its own. Measured
-    /// against the battery-wide invocation this replaces, on `B02_organic` (a real failure and 11
-    /// skips): 44 discovered / 261 passed / 2 failed / 11 skipped, identical either way.
+    /// A battery's record is the SUM of its cases': `B02_organic` 44/261/2/11 either way (`spec-27.md`).
     pub fn absorb(&mut self, case: Summary) {
         self.cases_tested += case.cases_tested;
         self.cases_passed += case.cases_passed;
@@ -60,9 +58,7 @@ impl Summary {
 mod tests {
     use super::*;
 
-    /// Every field, because a battery's published record is now this sum: one field left out of
-    /// `absorb` is a number that silently reads low for the whole battery. Measured against the
-    /// battery-wide invocation it replaces, `B02_organic` sums to exactly 44/261/2/11 either way.
+    /// Every field: one left out of the sum reads low for the whole battery.
     #[test]
     fn absorbing_a_case_adds_every_field_of_it() {
         let case = |t, p, vp, vf, vs, failed: &[&str]| Summary {

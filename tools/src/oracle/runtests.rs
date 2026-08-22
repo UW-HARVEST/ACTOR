@@ -166,9 +166,7 @@ fn materialise_phase<P: Phase>(
     Ok(Some(scope.finish()?))
 }
 
-/// Case by case, not battery-wide: a case is scored on its own and the battery's record is the sum, so
-/// nothing has to finish before a case can be graded. The oracle is asked about ONE case per
-/// invocation -- `--subset` narrows the same materialised tree -- and `Summary::absorb` adds them up.
+/// Case by case, so nothing must finish before a case is graded (`spec-27.md`).
 fn score_pass(paths: &Paths, pass: &Pass, scoring: &Scoring<'_>) -> Result<()> {
     let mut summary = Summary::default();
     let mut per_case: HashMap<String, serde_json::Value> = HashMap::new();
@@ -276,16 +274,12 @@ fn transcripts(crate_root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 /// Cases discovered but not one vector judged: the oracle measured nothing, whatever it printed. All
 /// 128 of P01's crates once failed to build on a runner whose registry lacked their dependency, and the
 /// pass reported `0/128` and regenerated `tables/` from it -- caught only by `git diff`.
-///
-/// Over the BATTERY's summed record, never one case's: a single crate that fails to build has no vector
-/// to judge either, and that is a measurement -- `B02_organic/underhanded-c-nuke_lib` is exactly that,
-/// 43/44 for real. What is not a measurement is a battery where EVERY case looks like it.
+/// Over the BATTERY's sum: one crate failing to build judges no vector either, and that IS a result.
 fn measured_nothing(cases_discovered: usize, vectors_passed: usize, vectors_failed: usize) -> bool {
     cases_discovered > 0 && vectors_passed + vectors_failed == 0
 }
 
-/// Scores ONE case of the pass. Returns its own transcript rather than writing `test.log`, so the
-/// caller can join them: a per-case write would leave the battery log holding whichever case ran last.
+/// Scores ONE case, returning its transcript: a per-case write would leave `test.log` holding the last.
 fn run_runtests(
     paths: &Paths,
     pass: &Pass,
@@ -294,8 +288,7 @@ fn run_runtests(
     let battery = &pass.battery;
     let root = pass.tree.root().to_string_lossy().to_string();
     let subset = pass.tree.root().join(case).to_string_lossy().to_string();
-    // Inside the evaluation tree, so it is removed with it and no run can read another's. Per case,
-    // because one name would have every case overwriting the report the previous one is read from.
+    // In the evaluation tree, so it goes with it; per case, or each would overwrite the last.
     let report = pass.tree.root().join(format!("junit-{case}.xml"));
     let report_arg = report.to_string_lossy().to_string();
     let scripts_dir = paths.corpus_dir.join("deployment/scripts/github-actions");
