@@ -166,8 +166,24 @@ fn materialise_phase<P: Phase>(
     Ok(Some(scope.finish()?))
 }
 
+/// Case by case, not battery-wide: a case is scored on its own and the battery's record is the sum, so
+/// nothing has to finish before a case can be graded. The oracle is asked about ONE case per
+/// invocation -- `--subset` narrows the same materialised tree -- and `Summary::absorb` adds them up.
 fn score_pass(paths: &Paths, pass: &Pass, scoring: &Scoring<'_>) -> Result<()> {
-    let (summary, per_case) = run_runtests(paths, pass)?;
+    let mut summary = Summary::default();
+    let mut per_case: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut transcript = String::new();
+    for case in pass.tree.cases() {
+        let (one, records, text) = run_runtests(paths, pass, &case.name)?;
+        summary.absorb(one);
+        per_case.extend(records);
+        transcript.push_str(&text);
+    }
+    let _ = std::fs::write(
+        paths.output_dir(&pass.battery).join("test.log"),
+        &transcript,
+    );
+
     let scored: BTreeSet<String> = per_case.keys().cloned().collect();
     pass.tree.reconcile(summary.cases_tested, &scored)?;
 
@@ -249,14 +265,19 @@ fn measured_nothing(cases_discovered: usize, vectors_passed: usize, vectors_fail
     cases_discovered > 0 && vectors_passed + vectors_failed == 0
 }
 
+/// Scores ONE case of the pass. Returns its own transcript rather than writing `test.log`, so the
+/// caller can join them: a per-case write would leave the battery log holding whichever case ran last.
 fn run_runtests(
     paths: &Paths,
     pass: &Pass,
-) -> Result<(Summary, HashMap<String, serde_json::Value>)> {
+    case: &str,
+) -> Result<(Summary, HashMap<String, serde_json::Value>, String)> {
     let battery = &pass.battery;
     let root = pass.tree.root().to_string_lossy().to_string();
-    // Inside the evaluation tree, so it is removed with it and no run can read another's.
-    let report = pass.tree.root().join("junit.xml");
+    let subset = pass.tree.root().join(case).to_string_lossy().to_string();
+    // Inside the evaluation tree, so it is removed with it and no run can read another's. Per case,
+    // because one name would have every case overwriting the report the previous one is read from.
+    let report = pass.tree.root().join(format!("junit-{case}.xml"));
     let report_arg = report.to_string_lossy().to_string();
     let scripts_dir = paths.corpus_dir.join("deployment/scripts/github-actions");
 
@@ -272,7 +293,7 @@ fn run_runtests(
             "--root",
             &root,
             "--subset",
-            &root,
+            &subset,
             "--keep-going",
             "--verbose",
             "--junit-xml",
@@ -297,7 +318,6 @@ fn run_runtests(
         String::from_utf8_lossy(&output.stderr)
     );
     print!("{text}");
-    let _ = std::fs::write(paths.output_dir(battery).join("test.log"), &text);
 
     let extract = |pattern: &str| -> usize {
         Regex::new(pattern)
@@ -471,6 +491,7 @@ fn run_runtests(
             failed_cases,
         },
         per_case,
+        text,
     ))
 }
 
