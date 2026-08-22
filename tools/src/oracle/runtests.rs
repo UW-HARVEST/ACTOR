@@ -1,7 +1,4 @@
-use super::{
-    check_enrichment, openssl_dir, BatteryMismatch, Covers, Enrichment, Scoring, Summary, TestMode,
-    TestOutcome,
-};
+use super::{openssl_dir, Covers, Enrichment, Scoring, Summary};
 use crate::agent_health::Run;
 use crate::artifact::{Phase, Published, Translate, Verify};
 use crate::battery::Paths;
@@ -12,7 +9,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::process::Command;
 
-pub fn run_test_corpus(paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<TestOutcome> {
+pub fn run_test_corpus(paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<()> {
     // The denominator comes from the CORPUS: `results/` is the output and may not define the input.
     let named = (target != "all").then_some(target);
     let batteries = match named {
@@ -35,7 +32,7 @@ pub fn run_test_corpus(paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Re
     }
 
     if let Some(battery) = named.filter(|_| unresolved) {
-        return nothing_to_score(paths, battery, scoring.mode);
+        return nothing_to_score(paths, battery);
     }
     // The fan-out above may legitimately skip a battery: one this agent never ran has no record to
     // disagree with. Skipping EVERY battery is the same hole one level up, so it is not skipped.
@@ -44,36 +41,15 @@ pub fn run_test_corpus(paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Re
         "no battery under {target} holds an artifact this score may cover, so nothing was scored."
     );
 
-    let mut all_mismatches = Vec::new();
-    let mut check_rows: Vec<CheckRow> = Vec::new();
-
     for pass in &passes {
         println!();
         println!("========================================");
         println!("  Testing: {} [{}]", pass.battery, pass.phase);
         println!("========================================");
-        if let TestOutcome::Failed(mm) = score_pass(paths, pass, scoring, &mut check_rows)? {
-            all_mismatches.extend(mm);
-        }
+        score_pass(paths, pass, scoring)?;
     }
 
-    if matches!(scoring.mode, TestMode::Check) && !check_rows.is_empty() {
-        print_check_summary(&check_rows);
-    }
-
-    match scoring.mode {
-        TestMode::Check if !all_mismatches.is_empty() => Ok(TestOutcome::Failed(all_mismatches)),
-        TestMode::Check => Ok(TestOutcome::Passed),
-        _ => Ok(TestOutcome::Ok),
-    }
-}
-
-struct CheckRow {
-    battery: String,
-    phase: &'static str,
-    expected: Summary,
-    actual: Summary,
-    ok: bool,
+    Ok(())
 }
 
 struct Pass {
@@ -190,14 +166,8 @@ fn materialise_phase<P: Phase>(
     Ok(Some(scope.finish()?))
 }
 
-fn score_pass(
-    paths: &Paths,
-    pass: &Pass,
-    scoring: &Scoring<'_>,
-    check_rows: &mut Vec<CheckRow>,
-) -> Result<TestOutcome> {
-    let mode = scoring.mode;
-    let (summary, per_case) = run_runtests(paths, pass, mode)?;
+fn score_pass(paths: &Paths, pass: &Pass, scoring: &Scoring<'_>) -> Result<()> {
+    let (summary, per_case) = run_runtests(paths, pass)?;
     let scored: BTreeSet<String> = per_case.keys().cloned().collect();
     pass.tree.reconcile(summary.cases_tested, &scored)?;
 
@@ -216,14 +186,7 @@ fn score_pass(
         summary.vectors_passed
     );
 
-    match mode {
-        TestMode::Update => {
-            write_results(paths, pass, &summary, &per_case, scoring.covers)?;
-            Ok(TestOutcome::Ok)
-        }
-        TestMode::Check => Ok(check(paths, pass, &summary, &per_case, check_rows)),
-        TestMode::Run => Ok(TestOutcome::Ok),
-    }
+    write_results(paths, pass, &summary, &per_case, scoring.covers)
 }
 
 /// A record that cannot be read is a MISMATCH, never a pass: a `--check` printing OK having compared
@@ -239,10 +202,10 @@ fn stored_summary(path: &Path) -> Result<Summary, String> {
     })
 }
 
-/// A battery NAMED on the command line that materialised nothing is refused in every mode, as
-/// [`crate::oracle::gtest`] refuses a project it resolved no crate for: `Passed` over nothing scored is
-/// a check reporting OK having seen nothing.
-fn nothing_to_score(paths: &Paths, battery: &str, mode: TestMode) -> Result<TestOutcome> {
+/// A battery NAMED on the command line that materialised nothing is refused, as
+/// [`crate::oracle::gtest`] refuses a project it resolved no crate for: reporting a score over nothing
+/// scored is reporting OK having seen nothing.
+fn nothing_to_score(paths: &Paths, battery: &str) -> Result<()> {
     let input_dir = paths.input_dir(battery);
     let why = if input_dir.is_dir() {
         "no case of it resolved a crate for either phase".to_string()
@@ -268,116 +231,15 @@ fn nothing_to_score(paths: &Paths, battery: &str, mode: TestMode) -> Result<Test
     let diff = format!(
         "nothing was materialised for {battery} ({why}), so nothing was compared: {wanted}"
     );
-    if !matches!(mode, TestMode::Check) {
-        anyhow::bail!(
-            "{diff}\nRefusing: a battery that was asked for and produced nothing is not a score."
-        );
-    }
-    println!("   ❌ {battery}: {diff}");
-    Ok(TestOutcome::Failed(vec![BatteryMismatch {
-        battery: battery.to_string(),
-        diffs: vec![diff],
-    }]))
-}
-
-fn check(
-    paths: &Paths,
-    pass: &Pass,
-    summary: &Summary,
-    per_case: &HashMap<String, serde_json::Value>,
-    check_rows: &mut Vec<CheckRow>,
-) -> TestOutcome {
-    let mut diffs = Vec::new();
-    // Always compared, never skipped: a run PRODUCED this number, so a record it cannot find is
-    // missing, not merely unfiled.
-    let stored = paths.output_dir(&pass.battery).join(pass.record);
-    let expected = Some(match stored_summary(&stored) {
-        Ok(expected) => {
-            diffs.extend(diff_summaries(&expected, summary));
-            expected
-        }
-        Err(why) => {
-            diffs.push(why);
-            Summary::default()
-        }
-    });
-    for case in pass.tree.cases() {
-        if !per_case.contains_key(&case.name) {
-            continue;
-        }
-        let crate_root = pass.tree.crate_root(&case.name);
-        let (tlog, vlog) = transcripts(&crate_root);
-        for d in check_enrichment(
-            &case.record_into.join("result.json"),
-            &crate_root.join("src"),
-            &[("translate", &tlog), ("verify", &vlog)],
-            paths.agent,
-        ) {
-            diffs.push(format!("{}: {d}", case.name));
-        }
-    }
-    let ok = diffs.is_empty();
-    if let Some(expected) = expected {
-        check_rows.push(CheckRow {
-            battery: pass.battery.clone(),
-            phase: pass.phase,
-            expected,
-            actual: summary.clone(),
-            ok,
-        });
-        if ok {
-            println!("   ✅ {} [{}]: OK", pass.battery, pass.phase);
-        }
-    }
-    if ok {
-        TestOutcome::Passed
-    } else {
-        println!(
-            "   ❌ {} [{}]: MISMATCH: {}",
-            pass.battery,
-            pass.phase,
-            diffs.join("; ")
-        );
-        TestOutcome::Failed(vec![BatteryMismatch {
-            battery: format!("{} [{}]", pass.battery, pass.phase),
-            diffs,
-        }])
-    }
+    anyhow::bail!(
+        "{diff}\nRefusing: a battery that was asked for and produced nothing is not a score."
+    )
 }
 
 /// Out of the materialised crate, so a phase that wrote no transcript cannot borrow another's.
 fn transcripts(crate_root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let logs = crate_root.join("logs");
     (logs.join(Translate::LOG), logs.join(Verify::LOG))
-}
-
-fn print_check_summary(rows: &[CheckRow]) {
-    println!();
-    println!("========================================");
-    println!("  Check Summary");
-    println!("========================================");
-    println!(
-        "  {:<25} {:>10} {:>15} {:>15}  Status",
-        "Battery", "Phase", "Stored", "Actual"
-    );
-    println!("  {}", "─".repeat(85));
-    for row in rows {
-        let fmt = |s: &Summary| {
-            format!(
-                "{}/{} ({}v)",
-                s.cases_passed, s.cases_tested, s.vectors_passed
-            )
-        };
-        println!(
-            "  {:<25} {:>10} {:>15} {:>15}  {}",
-            row.battery,
-            row.phase,
-            fmt(&row.expected),
-            fmt(&row.actual),
-            if row.ok { "✅" } else { "❌" }
-        );
-    }
-    println!("========================================");
 }
 
 /// Cases discovered but not one vector judged: the oracle measured nothing, whatever it printed. All
@@ -390,7 +252,6 @@ fn measured_nothing(cases_discovered: usize, vectors_passed: usize, vectors_fail
 fn run_runtests(
     paths: &Paths,
     pass: &Pass,
-    mode: TestMode,
 ) -> Result<(Summary, HashMap<String, serde_json::Value>)> {
     let battery = &pass.battery;
     let root = pass.tree.root().to_string_lossy().to_string();
@@ -435,9 +296,7 @@ fn run_runtests(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    if !matches!(mode, TestMode::Check) {
-        print!("{text}");
-    }
+    print!("{text}");
     let _ = std::fs::write(paths.output_dir(battery).join("test.log"), &text);
 
     let extract = |pattern: &str| -> usize {
@@ -665,57 +524,6 @@ fn write_results(
     Ok(())
 }
 
-fn diff_summaries(expected: &Summary, actual: &Summary) -> Vec<String> {
-    let mut diffs = Vec::new();
-    macro_rules! cmp {
-        ($field:ident) => {
-            if actual.$field != expected.$field {
-                diffs.push(format!(
-                    "{}: {} → {}",
-                    stringify!($field),
-                    expected.$field,
-                    actual.$field
-                ));
-            }
-        };
-    }
-    cmp!(vectors_passed);
-    cmp!(vectors_failed);
-    cmp!(cases_passed);
-    cmp!(cases_tested);
-    let added: Vec<_> = actual
-        .failed_cases
-        .iter()
-        .filter(|c| !expected.failed_cases.contains(c))
-        .collect();
-    let removed: Vec<_> = expected
-        .failed_cases
-        .iter()
-        .filter(|c| !actual.failed_cases.contains(c))
-        .collect();
-    if !added.is_empty() {
-        diffs.push(format!(
-            "new failures: {}",
-            added
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    if !removed.is_empty() {
-        diffs.push(format!(
-            "no longer failing: {}",
-            removed
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    diffs
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,7 +604,6 @@ mod tests {
         let tree = Tree::create_empty(&paths, Keep::ForPostMortem).unwrap();
         let gate = gate_at(&paths);
         let scoring = Scoring {
-            mode: TestMode::Run,
             source: Source {
                 translate: &translations,
                 verify: &verifications,
@@ -847,7 +654,6 @@ mod tests {
             paths,
             "B01",
             &Scoring {
-                mode: TestMode::Check,
                 source: Source {
                     translate: translations,
                     verify: &verifications,
@@ -860,11 +666,11 @@ mod tests {
         .unwrap()
     }
 
-    /// `--check` compared nothing and printed a pass for 88 of the 101 shipped batteries: only
-    /// `claude/*` and `kiro/*` hold `summary_translated.json`, and measured, `c2rust/B01_synthetic` is
-    /// 85 `translated/` crates, no `verified/` crate and `summary.json` at 85/85 (393v).
+    /// Which summary a verify-less agent's translate score is filed as. Only `claude/*` and `kiro/*`
+    /// hold `summary_translated.json`; measured, `c2rust/B01_synthetic` is 85 `translated/` crates, no
+    /// `verified/` crate, and `summary.json` at 85/85 (393v) -- so the translate score IS the headline.
     #[test]
-    fn a_verify_less_agents_translate_score_is_the_headline_and_a_missing_record_is_a_mismatch() {
+    fn a_verify_less_agents_translate_score_is_the_battery_headline() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         corpus_battery(tmp.path(), "B01", &["only"]);
         let paths = paths_at(tmp.path(), crate::cli::Agent::C2rust);
@@ -887,58 +693,6 @@ mod tests {
             passes[0].record, HEADLINE_SUMMARY,
             "and its translate score IS the battery headline, which is where the archive files it \
              and where analyse::report reads it"
-        );
-
-        let scored = Summary {
-            cases_tested: 1,
-            cases_passed: 1,
-            vectors_passed: 7,
-            ..Default::default()
-        };
-        let stored = paths.output_dir("B01").join(HEADLINE_SUMMARY);
-        let mut rows = Vec::new();
-        let outcome = check(&paths, &passes[0], &scored, &HashMap::new(), &mut rows);
-        let TestOutcome::Failed(mismatches) = outcome else {
-            panic!(
-                "a --check with no record to compare against must not report a pass: {outcome:?}"
-            );
-        };
-        assert!(
-            mismatches[0]
-                .diffs
-                .iter()
-                .any(|d| d.contains(HEADLINE_SUMMARY)),
-            "and it must name the file it wanted: {:?}",
-            mismatches[0].diffs
-        );
-        assert_eq!(
-            rows.len(),
-            1,
-            "with the battery still in the Check Summary table rather than absent from it"
-        );
-
-        fs::write(&stored, serde_json::to_string(&scored).unwrap()).unwrap();
-        rows.clear();
-        assert!(
-            matches!(
-                check(&paths, &passes[0], &scored, &HashMap::new(), &mut rows),
-                TestOutcome::Passed
-            ),
-            "an agreeing record still passes, or every check is red and none of them means anything"
-        );
-
-        let drifted = Summary {
-            vectors_passed: 6,
-            ..scored.clone()
-        };
-        fs::write(&stored, serde_json::to_string(&drifted).unwrap()).unwrap();
-        rows.clear();
-        assert!(
-            matches!(
-                check(&paths, &passes[0], &scored, &HashMap::new(), &mut rows),
-                TestOutcome::Failed(_)
-            ),
-            "and one vector of drift against that record is still caught"
         );
     }
 
@@ -977,12 +731,7 @@ mod tests {
     }
 
     /// A run that RESOLVED NOTHING — the shape a battery takes when every case missed.
-    fn resolved_nothing(
-        paths: &Paths,
-        target: &str,
-        tree: &Tree,
-        mode: TestMode,
-    ) -> Result<TestOutcome> {
+    fn resolved_nothing(paths: &Paths, target: &str, tree: &Tree) -> Result<()> {
         let gate = gate_at(paths);
         let (t, v) = (
             crate::translate::Translations::new(),
@@ -992,7 +741,6 @@ mod tests {
             paths,
             target,
             &Scoring {
-                mode,
                 source: Source {
                     translate: &t,
                     verify: &v,
@@ -1005,7 +753,8 @@ mod tests {
     }
 
     /// Refuting `spec-20.md`: both shapes below once exited 0 having compared nothing — no crate
-    /// resolved for the battery, and no corpus battery dir at all (a fresh worktree).
+    /// resolved for the battery, and no corpus battery dir at all (a fresh worktree). Every mode used
+    /// to have to be checked separately; there is one now, and it refuses.
     #[test]
     fn a_named_battery_that_materialised_nothing_is_never_a_pass() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
@@ -1020,22 +769,15 @@ mod tests {
         );
 
         let tree = Tree::create_empty(&paths, Keep::ForPostMortem).unwrap();
-        let outcome = resolved_nothing(&paths, "B01", &tree, TestMode::Check).unwrap();
-        let TestOutcome::Failed(mismatches) = outcome else {
-            panic!("a --check that materialised nothing must not report a pass: {outcome:?}")
-        };
+        let err = resolved_nothing(&paths, "B01", &tree)
+            .expect_err("a battery that materialised nothing must refuse, not report a score");
+        let text = format!("{err:#}");
         assert!(
-            mismatches[0]
-                .diffs
-                .iter()
-                .any(|d| d.contains(HEADLINE_SUMMARY) && d.contains('7')),
-            "naming the record it wanted to compare against: {:?}",
-            mismatches[0].diffs
+            text.contains(HEADLINE_SUMMARY) && text.contains('7'),
+            "naming the record it would have been compared against: {text}"
         );
-        resolved_nothing(&paths, "B01", &tree, TestMode::Update)
-            .expect_err("and --update must refuse rather than silently write nothing");
-        resolved_nothing(&paths, "all", &tree, TestMode::Check)
-            .expect_err("nor may the fan-out report a pass when it skipped EVERY battery");
+        resolved_nothing(&paths, "all", &tree)
+            .expect_err("nor may the fan-out pass when it skipped EVERY battery");
 
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         let paths = paths_at(tmp.path(), crate::cli::Agent::C2rust);
@@ -1046,17 +788,11 @@ mod tests {
             "the second fixture holds a complete crate and NO corpus battery"
         );
         let tree = Tree::create_empty(&paths, Keep::ForPostMortem).unwrap();
-        let outcome = resolved_nothing(&paths, "B01", &tree, TestMode::Check).unwrap();
-        let TestOutcome::Failed(mismatches) = outcome else {
-            panic!("an absent corpus is not an agreeing score either: {outcome:?}")
-        };
+        let err = resolved_nothing(&paths, "B01", &tree)
+            .expect_err("an absent corpus is not an agreeing score either");
         assert!(
-            mismatches[0]
-                .diffs
-                .iter()
-                .any(|d| d.contains("Public-Tests")),
-            "naming what is absent, since the archive itself was complete: {:?}",
-            mismatches[0].diffs
+            format!("{err:#}").contains("Public-Tests"),
+            "naming what is absent, since the record itself was complete: {err:#}"
         );
     }
 

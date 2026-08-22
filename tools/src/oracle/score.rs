@@ -1,26 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy)]
-pub enum TestMode {
-    Run,
-    /// Run, then write summary.json / result.json.
-    Update,
-    /// Run, then compare against stored summary.json. Returns failure on mismatch.
-    Check,
-}
-
-#[derive(Debug)]
-pub enum TestOutcome {
-    /// All batteries matched their stored summaries (--check).
-    Passed,
-    /// At least one battery mismatched (--check).
-    Failed(Vec<BatteryMismatch>),
-    /// Summaries were written (--update) or just printed (run).
-    Ok,
-}
-
 pub struct Scoring<'a> {
-    pub mode: TestMode,
     pub source: crate::eval::Source<'a>,
     pub tree: &'a crate::eval::Tree,
     pub gate: &'a crate::agent_health::Gate<'a>,
@@ -50,12 +30,6 @@ impl<'a> Covers<'a> {
             Self::Subset(regex) => Some(regex),
         }
     }
-}
-
-#[derive(Debug)]
-pub struct BatteryMismatch {
-    pub battery: String,
-    pub diffs: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

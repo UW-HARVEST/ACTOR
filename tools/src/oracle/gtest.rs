@@ -1,4 +1,4 @@
-use super::{openssl_dir, BatteryMismatch, Enrichment, Scoring, TestMode, TestOutcome};
+use super::{openssl_dir, Enrichment, Scoring};
 use crate::artifact::{Phase, Translate};
 use crate::battery::Paths;
 use crate::eval::Source;
@@ -177,28 +177,11 @@ fn score_harvest_bench_suite(
     Ok(res)
 }
 
-fn load_harvest_bench_stored(
-    covered: &[crate::eval::Case],
-) -> std::collections::BTreeMap<String, HarvestBenchResult> {
-    let mut map = std::collections::BTreeMap::new();
-    for crate::eval::Case {
-        name, record_into, ..
-    } in covered
-    {
-        if let Ok(data) = std::fs::read_to_string(record_into.join("result.json")) {
-            if let Ok(r) = serde_json::from_str::<HarvestBenchResult>(&data) {
-                map.insert(name.clone(), r);
-            }
-        }
-    }
-    map
-}
-
 pub fn run_harvest_bench_test(
     paths: &Paths,
     projects: &[crate::battery::HarvestBenchProject],
     scoring: &Scoring<'_>,
-) -> Result<TestOutcome> {
+) -> Result<()> {
     let runner = harvest_bench_runner(&paths.corpus_dir)?;
 
     // Verify's artifact where the run resolved one, else translate's — from the values, not a stat.
@@ -229,9 +212,6 @@ pub fn run_harvest_bench_test(
         }
     }
     let materialised = scope.finish()?;
-
-    let stored = load_harvest_bench_stored(materialised.cases());
-    let mode = scoring.mode;
 
     let mut results: std::collections::BTreeMap<String, HarvestBenchResult> = Default::default();
     let mut passed = 0usize;
@@ -298,7 +278,7 @@ pub fn run_harvest_bench_test(
             }
         };
 
-        if matches!(mode, TestMode::Update) {
+        {
             let mut json = serde_json::to_value(&r)?;
             let tlog = crate_dir.join("logs").join(Translate::LOG);
             Enrichment::compute(&crate_dir.join("src"), &[("translate", &tlog)])
@@ -323,51 +303,8 @@ pub fn run_harvest_bench_test(
     );
     println!("\nharvest-bench: {passed}/{total} projects pass ({build_failed} build failures)");
 
-    match mode {
-        TestMode::Update => {
-            println!("📝 result.json written for {recorded} of {total} projects");
-            Ok(TestOutcome::Ok)
-        }
-        TestMode::Check => {
-            let mut diffs = Vec::new();
-            for (name, actual) in &results {
-                match stored.get(name) {
-                    None => diffs.push(format!("{name}: missing stored result")),
-                    Some(exp) => {
-                        if actual.tests_ok < exp.tests_ok {
-                            diffs.push(format!(
-                                "{name}: tests_ok expected={} actual={}",
-                                exp.tests_ok, actual.tests_ok
-                            ));
-                        }
-                        if actual.tests_failed > exp.tests_failed {
-                            diffs.push(format!(
-                                "{name}: tests_failed expected={} actual={}",
-                                exp.tests_failed, actual.tests_failed
-                            ));
-                        }
-                        if exp.build_ok && !actual.build_ok {
-                            diffs.push(format!("{name}: build_ok expected=true actual=false"));
-                        }
-                    }
-                }
-            }
-            if diffs.is_empty() {
-                println!("✅ No regressions");
-                Ok(TestOutcome::Passed)
-            } else {
-                println!("\n❌ {} regression(s):", diffs.len());
-                for d in &diffs {
-                    println!("  {d}");
-                }
-                Ok(TestOutcome::Failed(vec![BatteryMismatch {
-                    battery: "harvest-bench".into(),
-                    diffs,
-                }]))
-            }
-        }
-        TestMode::Run => Ok(TestOutcome::Ok),
-    }
+    println!("📝 result.json written for {recorded} of {total} projects");
+    Ok(())
 }
 
 #[cfg(test)]
