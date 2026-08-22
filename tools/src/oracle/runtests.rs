@@ -166,13 +166,16 @@ fn materialise_phase<P: Phase>(
     Ok(Some(scope.finish()?))
 }
 
-/// Case by case, so nothing must finish before a case is graded (`spec-27.md`).
+/// Scores the cases that are READY, however many that is: one oracle invocation covers the whole batch,
+/// so a case that finishes alone is graded alone and a replay -- where every case is ready at once --
+/// costs exactly one call per phase, as it did before any of this (`spec-27.md`).
 fn score_pass(paths: &Paths, pass: &Pass, scoring: &Scoring<'_>) -> Result<()> {
+    let ready: Vec<&str> = pass.tree.cases().iter().map(|c| c.name.as_str()).collect();
     let mut summary = Summary::default();
     let mut per_case: HashMap<String, serde_json::Value> = HashMap::new();
     let mut transcript = String::new();
-    for case in pass.tree.cases() {
-        let (one, records, text) = run_runtests(paths, pass, &case.name)?;
+    for batch in [ready] {
+        let (one, records, text) = run_runtests(paths, pass, &batch)?;
         summary.absorb(one);
         per_case.extend(records);
         transcript.push_str(&text);
@@ -279,17 +282,19 @@ fn measured_nothing(cases_discovered: usize, vectors_passed: usize, vectors_fail
     cases_discovered > 0 && vectors_passed + vectors_failed == 0
 }
 
-/// Scores ONE case, returning its transcript: a per-case write would leave `test.log` holding the last.
+/// Scores one BATCH of cases, returning its transcript: writing `test.log` here would leave it holding
+/// whichever batch ran last.
 fn run_runtests(
     paths: &Paths,
     pass: &Pass,
-    case: &str,
+    cases: &[&str],
 ) -> Result<(Summary, HashMap<String, serde_json::Value>, String)> {
+    anyhow::ensure!(!cases.is_empty(), "asked to score no case at all");
     let battery = &pass.battery;
     let root = pass.tree.root().to_string_lossy().to_string();
-    let subset = pass.tree.root().join(case).to_string_lossy().to_string();
-    // In the evaluation tree, so it goes with it; per case, or each would overwrite the last.
-    let report = pass.tree.root().join(format!("junit-{case}.xml"));
+    // In the evaluation tree, so it goes with it; named for the batch's first case, which appears in
+    // exactly one batch, or a second batch would overwrite the report the first is read from.
+    let report = pass.tree.root().join(format!("junit-{}.xml", cases[0]));
     let report_arg = report.to_string_lossy().to_string();
     let scripts_dir = paths.corpus_dir.join("deployment/scripts/github-actions");
 
@@ -304,13 +309,18 @@ fn run_runtests(
             "runtests.rust",
             "--root",
             &root,
-            "--subset",
-            &subset,
             "--keep-going",
             "--verbose",
             "--junit-xml",
             &report_arg,
         ])
+        // Repeated, one per case in the batch: `--subset` is `action="append"` in the oracle's CLI.
+        .args(cases.iter().flat_map(|c| {
+            [
+                "--subset".to_string(),
+                pass.tree.root().join(c).to_string_lossy().to_string(),
+            ]
+        }))
         .env("PYTHONPATH", &pythonpath)
         .env("OPENSSL_DIR", openssl_dir())
         // The agent translates in a sandbox with no network and leaves `[net] offline = true` in the
