@@ -53,6 +53,11 @@ jobs:
       - name: Build harvest-tools
         run: cargo build --release --locked --manifest-path tools/Cargo.toml
 
+      # Scoring the HB leg shells out to this; it is a separate crate inside the submodule, so building
+      # harvest-tools does not produce it.
+      - name: Build the harvest-bench runner
+        run: cargo build --release --locked --manifest-path harvest-bench/runner/Cargo.toml
+
       # One job, no matrix: `run` produces every output from what it resolved, and the scope is what
       # the store can serve -- so there is no list of batteries here to drift from what is cacheable.
       - name: Reproduce

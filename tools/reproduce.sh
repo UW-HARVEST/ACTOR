@@ -39,6 +39,15 @@ import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)
 VER
 [ -d results/.cache ] || die "results/.cache absent — run: git submodule update --init results test-corpus"
 
+# Everything the HB leg needs, asserted BEFORE the Test-Corpus leg spends 19 minutes earning the right
+# to fail: both were found this way, one CI run apiece.
+for leg in "${LEGS[@]}"; do
+  [ "$leg" = HB ] || continue
+  [ -d harvest-bench/tests ] || die "harvest-bench/tests absent — run: git submodule update --init harvest-bench"
+  [ -x harvest-bench/runner/target/release/harvest-bench ] \
+    || die "the HB scorer is not built: cargo build --release --locked --manifest-path harvest-bench/runner/Cargo.toml"
+done
+
 log=$(mktemp -t reproduce.XXXXXX) || die "mktemp failed"
 trap 'rm -f "$log"' EXIT
 
