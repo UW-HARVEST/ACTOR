@@ -7,11 +7,15 @@
 # it resolved, so `git diff` IS the check: if what it regenerated matches the committed files, the run
 # reproduced them. No row parsing, and nothing a stale file can satisfy.
 #
-# Usage: tools/reproduce.sh [target]        (default: all)
+# `all` means EVERY dataset: Test-Corpus and harvest-bench are earned by separate runs and each writes
+# only its own tables, so reproducing "the published numbers" is both legs plus one combined check.
+#
+# Usage: tools/reproduce.sh [target]        (default: all = Test-Corpus + harvest-bench)
 set -uo pipefail
 
 TARGET="${1:-all}"
 AGENT=claude
+if [ "$TARGET" = all ]; then LEGS=(all HB); else LEGS=("$TARGET"); fi
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Exported as 1.97.1 in the operator's login shell, silently overriding rust-toolchain.toml's
@@ -38,12 +42,14 @@ VER
 log=$(mktemp -t reproduce.XXXXXX) || die "mktemp failed"
 trap 'rm -f "$log"' EXIT
 
-echo
-echo "--- run $TARGET (--replay-only) ---"
-"$BIN" --agent "$AGENT" --replay-only run "$TARGET" 2>&1 | tee "$log"
-[ "${PIPESTATUS[0]}" -eq 0 ] || die "the run failed — the error above says why. Usually either 'built
-   from X but HEAD is Y' (rebuild), or no stored entry for a key (a prompt, model or toolchain moved,
-   so the stored results no longer answer this question)."
+for leg in "${LEGS[@]}"; do
+  echo
+  echo "--- run $leg (--replay-only) ---"
+  "$BIN" --agent "$AGENT" --replay-only run "$leg" 2>&1 | tee -a "$log"
+  [ "${PIPESTATUS[0]}" -eq 0 ] || die "the $leg run failed — the error above says why. Usually either
+   'built from X but HEAD is Y' (rebuild), or no stored entry for a key (a prompt, model or toolchain
+   moved, so the stored results no longer answer this question)."
+done
 
 # Belt to `--replay-only`'s braces: trusting exit 0 alone would let a paid run pass as a replay.
 tallies=$(grep -c 'agent invocation(s)' "$log" || true)

@@ -157,12 +157,26 @@ jobs:
         # with this PR and these nine lines in it -- plus 26. Same rule as before: prune or raise
         # deliberately, never quietly, and `--max-ratio 20` remains what actually stops sprawl.
         #
+        # RAISED 3200 -> 3280 by PR 29, with the reasoning the line above demands -- and this time the
+        # pattern itself is the argument. This is the FOURTH consecutive PR to measure `main` at exactly
+        # the ceiling, because every raise has been "the tree plus epsilon" (26, then 12): a cap pinned to
+        # a snapshot binds on the next PR whatever that PR contains, so it has stopped measuring bloat and
+        # now measures only arrival order. PR 29 adds ~640 counted lines -- `Pool`, `InScope`, the
+        # harvest-bench table generator, an architecture gate, three ceilings -- and 39 comment lines after
+        # compressing its own docs ~50%, deduping a note repeated 3x in main.rs, and deleting an unused
+        # method. 6% against a 14.28% tree, so it makes the tree LESS comment-dense. The operator chose
+        # this over deleting the WHY on why `parallel: usize` was the defect, on why a partial `InScope`
+        # cannot be built, and on the three MEASURED durations (libpng translate 4.71h, mujs verify 6.5h,
+        # zstd verify 4.4h) that are the only evidence the raised ceilings were necessary -- delete those
+        # and the next operator has a magic 86400 with no way to know it was earned. 3280 is 3252 -- the
+        # tree with this PR and these thirteen self-counting lines in it -- plus 28.
+        #
         # .py is in neither HASH nor SLASH, so the budget does not count itself: this
         # script's own docstring and all 250 lines of tools/test_comment_budget.py cost
         # ZERO against both ceilings. Deriving 3100 from the tree needs that fact.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 3200 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 3280 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is

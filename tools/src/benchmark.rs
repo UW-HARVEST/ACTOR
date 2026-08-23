@@ -13,6 +13,43 @@ use crate::{translate, verify};
 use anyhow::Result;
 use std::path::Path;
 
+/// Every unit a run may publish, derived ONCE from what the store served. No `Clone`, private field, and
+/// [`Self::derive`] the only constructor -- so a caller cannot hand a phase one unit at a time, which is
+/// how `run` starved the pool (`spec-27.md`).
+pub struct InScope(Vec<String>);
+
+impl InScope {
+    /// The derivation itself: a unit is publishable only if the store served every case of it
+    /// ([`Benchmark::attests`]). Out-of-scope units are announced by name rather than dropped quietly.
+    pub fn derive(
+        bench: &dyn Benchmark,
+        paths: &Paths,
+        target: &str,
+        resolved: &Translations,
+    ) -> Result<(Self, crate::analyse::report::Attested)> {
+        let mut attested = crate::analyse::report::Attested::default();
+        let mut units = Vec::new();
+        for unit in bench.batteries(paths, target)? {
+            match bench.attests(paths, &unit, resolved) {
+                Ok(()) => {
+                    attested.insert(paths.agent_key.as_str(), &unit);
+                    units.push(unit);
+                }
+                Err(why) => println!("\u{23ed}\u{fe0f}  {unit}: out of scope — {why}"),
+            }
+        }
+        anyhow::ensure!(
+            !units.is_empty(),
+            "the store serves no unit of {target} in full, so this run can publish nothing"
+        );
+        Ok((Self(units), attested))
+    }
+
+    pub fn units(&self) -> &[String] {
+        &self.0
+    }
+}
+
 pub trait Benchmark {
     #[allow(
         dead_code,
@@ -36,20 +73,22 @@ pub trait Benchmark {
         paths: &Paths,
         target: &str,
         filter: Option<&str>,
-        parallel: usize,
+        pool: &crate::agents::Pool,
     ) -> Result<Translations>;
 
     /// Reached from `Run` only when [`Self::verifies`] is true, but also invoked directly by
     /// the `verify` subcommand, so an impl cannot assume that gate ran.
     ///
     /// `translations` is the hand-off: a case absent from it is refused, not seeded from disk.
+    /// EVERY unit, not one at a time: both impls schedule under one pool, so a caller that loops leaves
+    /// it nothing to overlap.
     fn verify(
         &self,
         _paths: &Paths,
-        _target: &str,
+        _scope: &InScope,
         _filter: Option<&str>,
         _force: bool,
-        _parallel: usize,
+        _pool: &crate::agents::Pool,
         _translations: &Translations,
     ) -> Result<Verifications> {
         Ok(Verifications::new())
@@ -167,71 +206,36 @@ impl Benchmark for TestCorpus {
         paths: &Paths,
         target: &str,
         filter_flag: Option<&str>,
-        parallel: usize,
+        pool: &crate::agents::Pool,
     ) -> Result<Translations> {
-        let batteries = resolve_batteries(&paths.corpus_dir, target)?;
         let mut resolved = Translations::new();
-
-        // Shared-source batteries must run single-threaded: their follower configs are
-        // propagated from one real translation. Independent batteries split the rest of
-        // the parallel budget.
-        if batteries.len() > 1 && parallel > 1 {
-            let (shared_bats, indie_bats): (Vec<&str>, Vec<&str>) = batteries
-                .iter()
-                .map(String::as_str)
-                .partition(|b| battery::has_shared_source_groups(&paths.corpus_dir, b));
-
-            let indie_parallel = parallel.saturating_sub(shared_bats.len()).max(1);
-
-            let mut errors: Vec<anyhow::Error> = Vec::new();
-            // Merged as each thread joins; case dirs are disjoint, so no merge drops one.
-            std::thread::scope(|s| {
-                let mut handles = Vec::new();
-                for bat in &shared_bats {
-                    handles.push(s.spawn(move || -> Result<Translations> {
-                        let (name, filter) = parse_target(bat);
+        // One pool for the whole sweep, so there is no budget left to hand-split. The arithmetic here
+        // used to partition `parallel` between shared-source batteries (pinned to 1) and the rest --
+        // necessary only because each call minted its own pool. A group's followers are still derived
+        // sequentially, inside `translate_one_shared`, which is where that constraint actually lives.
+        let mut errors: Vec<anyhow::Error> = Vec::new();
+        std::thread::scope(|s| {
+            let handles: Vec<_> = resolve_batteries(&paths.corpus_dir, target)
+                .into_iter()
+                .flatten()
+                .map(|bat| {
+                    s.spawn(move || -> Result<Translations> {
+                        let (name, filter) = parse_target(&bat);
                         let filter = one_filter(filter, filter_flag)?;
-                        translate::run_test_corpus(paths, &name, filter.as_deref(), 1)
-                    }));
+                        translate::run_test_corpus(paths, &name, filter.as_deref(), pool)
+                    })
+                })
+                .collect();
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(t)) => resolved.extend(t),
+                    Ok(Err(e)) => errors.push(e),
+                    Err(_) => errors.push(anyhow::anyhow!("translate thread panicked")),
                 }
-                if !indie_bats.is_empty() {
-                    handles.push(s.spawn(|| -> Result<Translations> {
-                        let mut mine = Translations::new();
-                        for bat in &indie_bats {
-                            let (name, filter) = parse_target(bat);
-                            let filter = one_filter(filter, filter_flag)?;
-                            mine.extend(translate::run_test_corpus(
-                                paths,
-                                &name,
-                                filter.as_deref(),
-                                indie_parallel,
-                            )?);
-                        }
-                        Ok(mine)
-                    }));
-                }
-                for h in handles {
-                    match h.join() {
-                        Ok(Ok(t)) => resolved.extend(t),
-                        Ok(Err(e)) => errors.push(e),
-                        Err(_) => errors.push(anyhow::anyhow!("translate thread panicked")),
-                    }
-                }
-            });
-            if let Some(first) = errors.into_iter().next() {
-                return Err(first);
             }
-        } else {
-            for bat in &batteries {
-                let (name, filter) = parse_target(bat);
-                let filter = one_filter(filter, filter_flag)?;
-                resolved.extend(translate::run_test_corpus(
-                    paths,
-                    &name,
-                    filter.as_deref(),
-                    parallel,
-                )?);
-            }
+        });
+        if let Some(first) = errors.into_iter().next() {
+            return Err(first);
         }
         Ok(resolved)
     }
@@ -239,31 +243,17 @@ impl Benchmark for TestCorpus {
     fn verify(
         &self,
         paths: &Paths,
-        target: &str,
+        scope: &InScope,
         filter_flag: Option<&str>,
         force: bool,
-        parallel: usize,
+        pool: &crate::agents::Pool,
         translations: &Translations,
     ) -> Result<Verifications> {
-        let batteries = resolve_batteries(&paths.corpus_dir, target)?;
-        if batteries.len() > 1 {
-            verify::run_all(paths, &batteries, force, parallel, translations)
-        } else {
-            let mut resolved = Verifications::new();
-            for bat in &batteries {
-                let (name, filter) = parse_target(bat);
-                let filter = one_filter(filter, filter_flag)?;
-                resolved.extend(verify::run(
-                    paths,
-                    &name,
-                    filter.as_deref(),
-                    force,
-                    parallel,
-                    translations,
-                )?);
-            }
-            Ok(resolved)
-        }
+        // One battery goes through `run_all` too: a second spelling of "verify these" is what drifted.
+        let units = scope.units();
+        let filter = one_filter(units.iter().find_map(|u| parse_target(u).1), filter_flag)?;
+        let names: Vec<String> = units.iter().map(|u| parse_target(u).0).collect();
+        verify::run_all(paths, &names, filter.as_deref(), force, pool, translations)
     }
 
     fn test(&self, paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<()> {
@@ -309,25 +299,29 @@ impl Benchmark for HarvestBench {
         paths: &Paths,
         target: &str,
         filter_flag: Option<&str>,
-        parallel: usize,
+        pool: &crate::agents::Pool,
     ) -> Result<Translations> {
         no_filter_here(filter_flag)?;
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
-        translate::run_harvest_bench(paths, &projects, parallel)
+        translate::run_harvest_bench(paths, &projects, pool)
     }
 
     fn verify(
         &self,
         paths: &Paths,
-        target: &str,
+        scope: &InScope,
         filter_flag: Option<&str>,
         force: bool,
-        parallel: usize,
+        pool: &crate::agents::Pool,
         translations: &Translations,
     ) -> Result<Verifications> {
         no_filter_here(filter_flag)?;
-        let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
-        verify::run_harvest_bench(paths, &projects, parallel, force, translations)
+        let projects: Vec<battery::HarvestBenchProject> =
+            resolve_harvest_bench_projects(&paths.corpus_dir, "HB")?
+                .into_iter()
+                .filter(|p| scope.units().iter().any(|u| u == p.name()))
+                .collect();
+        verify::run_harvest_bench(paths, &projects, pool, force, translations)
     }
 
     fn test(&self, paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<()> {

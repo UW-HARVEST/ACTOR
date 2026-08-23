@@ -3,7 +3,7 @@ use crate::agents::invocation::{Backend, Invocation, KIRO_UNPINNED_MODEL};
 use crate::agents::run::{run_cached, Outcome, PhaseRun, SkipCheck};
 use crate::agents::session::{ClaudeRun, Session};
 use crate::agents::work::IsolatedWorkDir;
-use crate::agents::Semaphore;
+use crate::agents::Pool;
 use crate::artifact::{Published, Verify};
 use crate::battery::{self, Case, Paths};
 use crate::cache::{self, CliVersion, ModelId};
@@ -14,7 +14,6 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 
 /// What a verify sweep RESOLVED, by case dir. A case absent from it is absent from the verified score.
 pub type Verifications = HashMap<PathBuf, Published<Verify>>;
@@ -23,22 +22,30 @@ pub type Verifications = HashMap<PathBuf, Published<Verify>>;
 /// [`Session`], which is also what the cache key records, so the two cannot diverge.
 pub(crate) const VERIFY_TIMEOUT_SECS: u64 = 10800;
 
-/// A group's one session covers every config it has, so its wall clock is a different unit of work.
-/// Scoped rather than raised globally because `timeout=` is in the verify key and the 208 stored
-/// entries measure 126.6 h with a 2.50 h maximum — see `spec-7c.md`.
-const GROUP_VERIFY_TIMEOUT_SECS: u64 = 43200;
+/// For a unit far larger than one Test-Corpus case: a group's session covers every config it has, and a
+/// harvest-bench project is a whole upstream C library. Scoped, not global, because `timeout=` is in the
+/// verify key and Test-Corpus's 208 entries measure 126.6 h with a 2.50 h max (`spec-7c.md`).
+const LARGE_UNIT_VERIFY_TIMEOUT_SECS: u64 = 43200;
 
+/// Harvest-bench's own, at 24 h: measured, mujs needed 6.5 h and zstd 4.4 h. SEPARATE from the group
+/// ceiling, which `B02_synthetic` and `P01` hold entries under -- one constant would re-key those.
+const HB_VERIFY_TIMEOUT_SECS: u64 = 86400;
+
+/// How much wall clock one verify session gets. `WholeProject` was measured: lz4, mujs and zstd all died
+/// at EXACTLY 3.00 h, and an infra failure cannot be sealed, so they earned no entry at all.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Budget {
     OneCase,
     WholeGroup,
+    WholeProject,
 }
 
 impl Budget {
     fn secs(self, one_case: u64) -> u64 {
         match self {
             Self::OneCase => one_case,
-            Self::WholeGroup => GROUP_VERIFY_TIMEOUT_SECS,
+            Self::WholeGroup => LARGE_UNIT_VERIFY_TIMEOUT_SECS,
+            Self::WholeProject => HB_VERIFY_TIMEOUT_SECS,
         }
     }
 }
@@ -50,30 +57,32 @@ pub fn run(
     battery_name: &str,
     filter: Option<&str>,
     force: bool,
-    parallel: usize,
+    pool: &crate::agents::Pool,
     translations: &Translations,
 ) -> Result<Verifications> {
-    let sem = Arc::new(Semaphore::new(parallel));
-    run_with_semaphore(paths, battery_name, filter, force, &sem, translations)
+    run_with_semaphore(paths, battery_name, filter, force, pool, translations)
 }
 
+/// Every battery under ONE semaphore, so `parallel` bounds work in flight across the whole sweep rather
+/// than within each battery. `filter` is threaded rather than dropped: this path passed `None` down, so
+/// an `--include-regex` reaching it silently ran everything -- the same defect
+/// `translate_regex_is_honoured_or_refused` exists for one phase over.
 pub fn run_all(
     paths: &Paths,
     batteries: &[String],
+    filter: Option<&str>,
     force: bool,
-    parallel: usize,
+    pool: &crate::agents::Pool,
     translations: &Translations,
 ) -> Result<Verifications> {
-    let sem = Arc::new(Semaphore::new(parallel));
     let mut resolved = Verifications::new();
 
     let errors: Vec<anyhow::Error> = std::thread::scope(|s| {
         let handles: Vec<_> = batteries
             .iter()
             .map(|bat| {
-                let sem = sem.clone();
                 s.spawn(move || -> Result<Verifications> {
-                    run_with_semaphore(paths, bat, None, force, &sem, translations)
+                    run_with_semaphore(paths, bat, filter, force, pool, translations)
                 })
             })
             .collect();
@@ -149,7 +158,7 @@ fn run_with_semaphore(
     battery_name: &str,
     filter: Option<&str>,
     force: bool,
-    sem: &Arc<Semaphore>,
+    pool: &Pool,
     translations: &Translations,
 ) -> Result<Verifications> {
     let mut resolved = Verifications::new();
@@ -175,7 +184,7 @@ fn run_with_semaphore(
             .iter()
             .map(|c| {
                 let handle = s.spawn(|| {
-                    let _permit = sem.acquire();
+                    let _permit = pool.acquire();
                     let case_dir = output_dir.join(&c.name);
                     // Verify used to gate on one `stat` of the directory it then seeded from.
                     let Some(translated) = translations.get(&case_dir) else {
@@ -397,12 +406,11 @@ fn already(name: &str, case_dir: &Path) -> Option<Published<Verify>> {
 pub fn run_harvest_bench(
     paths: &Paths,
     projects: &[battery::HarvestBenchProject],
-    parallel: usize,
+    pool: &crate::agents::Pool,
     force: bool,
     translations: &Translations,
 ) -> Result<Verifications> {
     let mut resolved = Verifications::new();
-    let sem = Arc::new(Semaphore::new(parallel));
     let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))
         .context("reading verify.md")?;
 
@@ -415,14 +423,13 @@ pub fn run_harvest_bench(
         let handles: Vec<_> = projects
             .iter()
             .map(|p| {
-                let sem = sem.clone();
                 let prompt = &prompt_template;
                 let store = &store;
                 let name = p.name().to_string();
                 let handle = s.spawn({
                     let name = name.clone();
                     move || {
-                        let _permit = sem.acquire();
+                        let _permit = pool.acquire();
                         let case_dir = paths.output_dir(&name);
                         let Some(translated) = translations.get(&case_dir) else {
                             return (name, Verdict::Absent);
@@ -445,7 +452,7 @@ pub fn run_harvest_bench(
                             },
                             paths,
                             store,
-                            Budget::OneCase,
+                            Budget::WholeProject,
                         ) {
                             Ok(Some(published)) => Verdict::Verified(published),
                             Ok(None) => Verdict::Failed,
@@ -896,20 +903,18 @@ mod tests {
     /// 208 stored verify entries depend on the second half.
     #[test]
     fn a_group_gets_the_longer_verify_session_and_a_single_case_keeps_its_own() {
+        // Exhaustive: a variant left on one case's ceiling keeps a limit measured for something smaller.
+        for (budget, want) in [
+            (Budget::OneCase, 7),
+            (Budget::WholeGroup, LARGE_UNIT_VERIFY_TIMEOUT_SECS),
+            (Budget::WholeProject, HB_VERIFY_TIMEOUT_SECS),
+        ] {
+            assert_eq!(budget.secs(7), want, "{budget:?}");
+        }
         assert_eq!(
-            Budget::OneCase.secs(7),
-            7,
-            "one case takes the caller's own ceiling"
-        );
-        assert_eq!(
-            Budget::WholeGroup.secs(7),
-            GROUP_VERIFY_TIMEOUT_SECS,
-            "a group takes the group ceiling whatever the caller's is"
-        );
-        assert_eq!(
-            (VERIFY_TIMEOUT_SECS, GROUP_VERIFY_TIMEOUT_SECS),
+            (VERIFY_TIMEOUT_SECS, LARGE_UNIT_VERIFY_TIMEOUT_SECS),
             (10_800, 43_200),
-            "raising the FIRST of these moves all 208 stored verify keys"
+            "raising the FIRST of these moves all 208 stored Test-Corpus verify keys"
         );
         let one = Session::claude(Budget::OneCase.secs(VERIFY_TIMEOUT_SECS)).shape();
         let group = Session::claude(Budget::WholeGroup.secs(VERIFY_TIMEOUT_SECS)).shape();
@@ -1099,7 +1104,7 @@ mod tests {
         crate_at(&phase(group, crate::battery::TRANSLATED));
 
         // What the translate sweep hands over for those two: the published tree, digested this run.
-        let sem = Arc::new(Semaphore::new(1));
+        let pool = Pool::for_run(1);
         let mut resolved = Translations::new();
         for name in [seeded, group] {
             let dir = paths.output_dir(bat).join(name);
@@ -1112,7 +1117,7 @@ mod tests {
             2,
             "the count printed beside the verify number must be the seeds under THIS battery"
         );
-        let err = run_with_semaphore(&paths, bat, None, false, &sem, &resolved)
+        let err = run_with_semaphore(&paths, bat, None, false, &pool, &resolved)
             .expect_err("a sweep that verified nothing is not a measurement");
         let text = format!("{err:#}");
         assert!(
@@ -1130,7 +1135,7 @@ mod tests {
             absent_dir.clone(),
             Published::<Translate>::unkeyed_from_phase_dir(&absent_dir).unwrap(),
         );
-        run_with_semaphore(&paths, bat, None, false, &sem, &resolved)
+        run_with_semaphore(&paths, bat, None, false, &pool, &resolved)
             .expect("a case whose translation this run resolved is verified, not refused");
     }
 
