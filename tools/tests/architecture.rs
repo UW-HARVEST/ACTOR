@@ -1789,3 +1789,40 @@ fn only_the_pool_mints_the_runs_concurrency_budget() {
         "and the check is not vacuous: agents/mod.rs must be where it IS minted"
     );
 }
+
+/// Preflight is the ONLY door to a phase. A dataset's inputs -- the harvest-bench scorer, a submodule
+/// checkout, python >= 3.10 -- were checked late inside the phase needing them, or in `reproduce.sh`,
+/// which `run`/`translate`/`verify` never touch; CI found two the expensive way. The compiler enforces
+/// that a phase takes vouched paths; this pins the other half, that nobody mints them directly.
+#[test]
+fn only_preflight_vouches_for_the_paths_a_phase_runs_against() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut visit = vec![src.clone()];
+    while let Some(dir) = visit.pop() {
+        for entry in std::fs::read_dir(&dir).expect("src") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                visit.push(path);
+                continue;
+            }
+            if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read");
+                let rel = path.strip_prefix(&src).unwrap().to_path_buf();
+                if text.contains("Preflighted(") && rel != Path::new("benchmark.rs") {
+                    offenders.push(rel);
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these vouch for their own paths instead of going through a Benchmark::preflight: {offenders:?}"
+    );
+    assert!(
+        std::fs::read_to_string(src.join("benchmark.rs"))
+            .expect("read")
+            .contains("Ok(Preflighted(paths))"),
+        "and the check is not vacuous: benchmark.rs must be where a preflight mints one"
+    );
+}

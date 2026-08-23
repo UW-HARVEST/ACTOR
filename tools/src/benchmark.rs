@@ -50,7 +50,43 @@ impl InScope {
     }
 }
 
+/// [`Paths`] a dataset's preflight has vouched for. It OWNS them rather than being a free-standing
+/// token, so nothing is an unused parameter and a proof minted from Test-Corpus cannot be handed to a
+/// harvest-bench phase. [`Benchmark::preflight`] is the only constructor, so no phase is reachable
+/// without one -- CI found two missing inputs the other way, 19 minutes into a leg each time.
+pub struct Preflighted(Paths);
+
+impl std::ops::Deref for Preflighted {
+    type Target = Paths;
+    fn deref(&self) -> &Paths {
+        &self.0
+    }
+}
+
+/// MIT `runtests` needs >= 3.10 and the default `python3` here is 3.9. Lived in `reproduce.sh`, so
+/// `translate` and `test` invoked directly never had it.
+fn require_python_310() -> Result<()> {
+    let ok = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)",
+        ])
+        .status()
+        .map_err(|e| {
+            anyhow::anyhow!("python3 is not runnable ({e}), and scoring goes through it")
+        })?;
+    anyhow::ensure!(
+        ok.success(),
+        "python3 is older than 3.10, which MIT runtests needs"
+    );
+    Ok(())
+}
+
 pub trait Benchmark {
+    /// Everything a phase needs HOURS from now: binaries, interpreters, corpus dirs. Required, not
+    /// defaulted, so a dataset added later cannot quietly have none.
+    fn preflight(&self, paths: Paths) -> Result<Preflighted>;
+
     #[allow(
         dead_code,
         reason = "part of the trait's public surface so a caller holding a \
@@ -70,7 +106,7 @@ pub trait Benchmark {
     /// Returns what it RESOLVED, per case: a value this run produced, not a phase dir to be asked.
     fn translate(
         &self,
-        paths: &Paths,
+        paths: &Preflighted,
         target: &str,
         filter: Option<&str>,
         pool: &crate::agents::Pool,
@@ -84,7 +120,7 @@ pub trait Benchmark {
     /// it nothing to overlap.
     fn verify(
         &self,
-        _paths: &Paths,
+        _paths: &Preflighted,
         _scope: &InScope,
         _filter: Option<&str>,
         _force: bool,
@@ -94,7 +130,7 @@ pub trait Benchmark {
         Ok(Verifications::new())
     }
 
-    fn test(&self, paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<()>;
+    fn test(&self, paths: &Preflighted, target: &str, scoring: &Scoring<'_>) -> Result<()>;
 
     /// Backfills result.json (unsafe/loc/credits); already folded into `test --update`,
     /// so the `enrich` subcommand only re-runs this step.
@@ -173,6 +209,16 @@ fn parse_target(target: &str) -> (String, Option<String>) {
 struct TestCorpus;
 
 impl Benchmark for TestCorpus {
+    fn preflight(&self, paths: Paths) -> Result<Preflighted> {
+        anyhow::ensure!(
+            paths.corpus_dir.is_dir(),
+            "the test-corpus submodule is absent at {} -- run: git submodule update --init test-corpus",
+            paths.corpus_dir.display()
+        );
+        require_python_310()?;
+        Ok(Preflighted(paths))
+    }
+
     fn batteries(&self, paths: &Paths, target: &str) -> Result<Vec<String>> {
         resolve_batteries(&paths.corpus_dir, target)
     }
@@ -203,7 +249,7 @@ impl Benchmark for TestCorpus {
 
     fn translate(
         &self,
-        paths: &Paths,
+        paths: &Preflighted,
         target: &str,
         filter_flag: Option<&str>,
         pool: &crate::agents::Pool,
@@ -242,7 +288,7 @@ impl Benchmark for TestCorpus {
 
     fn verify(
         &self,
-        paths: &Paths,
+        paths: &Preflighted,
         scope: &InScope,
         filter_flag: Option<&str>,
         force: bool,
@@ -256,7 +302,7 @@ impl Benchmark for TestCorpus {
         verify::run_all(paths, &names, filter.as_deref(), force, pool, translations)
     }
 
-    fn test(&self, paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<()> {
+    fn test(&self, paths: &Preflighted, target: &str, scoring: &Scoring<'_>) -> Result<()> {
         oracle::run_test_corpus(paths, target, scoring)
     }
 
@@ -271,6 +317,17 @@ impl Benchmark for TestCorpus {
 struct HarvestBench;
 
 impl Benchmark for HarvestBench {
+    fn preflight(&self, paths: Paths) -> Result<Preflighted> {
+        anyhow::ensure!(
+            paths.corpus_dir.is_dir(),
+            "harvest-bench/tests is absent at {} -- run: git submodule update --init harvest-bench",
+            paths.corpus_dir.display()
+        );
+        // The same function scoring calls, not a second copy of the path.
+        crate::oracle::gtest::harvest_bench_runner(&paths.corpus_dir)?;
+        Ok(Preflighted(paths))
+    }
+
     fn batteries(&self, paths: &Paths, target: &str) -> Result<Vec<String>> {
         Ok(resolve_harvest_bench_projects(&paths.corpus_dir, target)?
             .iter()
@@ -296,7 +353,7 @@ impl Benchmark for HarvestBench {
 
     fn translate(
         &self,
-        paths: &Paths,
+        paths: &Preflighted,
         target: &str,
         filter_flag: Option<&str>,
         pool: &crate::agents::Pool,
@@ -308,7 +365,7 @@ impl Benchmark for HarvestBench {
 
     fn verify(
         &self,
-        paths: &Paths,
+        paths: &Preflighted,
         scope: &InScope,
         filter_flag: Option<&str>,
         force: bool,
@@ -324,7 +381,7 @@ impl Benchmark for HarvestBench {
         verify::run_harvest_bench(paths, &projects, pool, force, translations)
     }
 
-    fn test(&self, paths: &Paths, target: &str, scoring: &Scoring<'_>) -> Result<()> {
+    fn test(&self, paths: &Preflighted, target: &str, scoring: &Scoring<'_>) -> Result<()> {
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
         oracle::run_harvest_bench_test(paths, &projects, scoring)
     }

@@ -1,5 +1,5 @@
 use crate::battery::Credits;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -59,6 +59,11 @@ impl Attested {
         self.0.insert((agent.to_owned(), battery.to_owned()));
     }
 
+    /// Every (agent, unit) this run may publish. A reporter iterating THIS cannot silently omit one.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.iter().map(|(a, b)| (a.as_str(), b.as_str()))
+    }
+
     fn covers(&self, agent: &str, battery: &str) -> bool {
         // `kiro-translate` is a synthetic row off kiro's pre-verify numbers: attested iff kiro is.
         let agent = agent.strip_suffix("-translate").unwrap_or(agent);
@@ -88,45 +93,34 @@ pub fn generate_harvest_bench(repo_root: &Path, attested: &Attested) -> Result<(
     out.push_str(
         "% Tests = upstream GoogleTest cases passing; a build that failed has no tests.\n",
     );
-    let mut wrote_any = false;
-    for agent_entry in sorted_read_dir(&results_dir)? {
-        let agent = agent_entry.file_name().to_string_lossy().to_string();
-        if !agent_entry.path().is_dir() {
-            continue;
-        }
-        for project_entry in sorted_read_dir(&agent_entry.path())? {
-            let project = project_entry.file_name().to_string_lossy().to_string();
-            if !attested.covers(&agent, &project) {
-                println!("   \u{23ed}\u{fe0f}  {agent}/{project}: not resolved by this run, so it is not reported");
-                continue;
-            }
-            let phase = scored_phase_dir(&project_entry.path());
-            let Some(r) = read_json::<HarvestBenchRow>(&phase.join("result.json")) else {
-                continue;
-            };
-            let graded = r.tests_ok + r.tests_failed;
-            let code = r.loc.as_ref().map_or(0, |l| l.code);
-            let unsafe_pct = if code > 0 {
-                let (u, c) = (r.unsafe_.as_ref().map_or(0, |u| u.lines), code);
-                format!("{:.0}\\%", u as f64 / c as f64 * 100.0)
-            } else {
-                "--".to_string()
-            };
-            out.push_str(&format!(
-                "{project} & {} & {}/{graded} & {} & {unsafe_pct} \\\\\n\\hline\n",
-                if r.build_ok { "yes" } else { "\\textbf{no}" },
-                r.tests_ok,
-                r.loc
-                    .as_ref()
-                    .map_or("--".to_string(), |l| fmt_commas(l.code as u32)),
-            ));
-            wrote_any = true;
-        }
+    // Driven by what this run ATTESTED, not `read_dir`: walking the filesystem made absence invisible
+    // twice -- a missing record dropped its row, and an attested project with no dir was never visited.
+    // Either way the table published N-1 rows of N and announced success.
+    for (agent, project) in attested.entries() {
+        let record = scored_phase_dir(&results_dir.join(agent).join(project)).join("result.json");
+        let r: HarvestBenchRow = read_json(&record).with_context(|| {
+            format!(
+                "{agent}/{project} is in this run's scope but has no readable record at {}",
+                record.display()
+            )
+        })?;
+        let graded = r.tests_ok + r.tests_failed;
+        let code = r.loc.as_ref().map_or(0, |l| l.code);
+        let unsafe_pct = if code > 0 {
+            let (u, c) = (r.unsafe_.as_ref().map_or(0, |u| u.lines), code);
+            format!("{:.0}\\%", u as f64 / c as f64 * 100.0)
+        } else {
+            "--".to_string()
+        };
+        out.push_str(&format!(
+            "{project} & {} & {}/{graded} & {} & {unsafe_pct} \\\\\n\\hline\n",
+            if r.build_ok { "yes" } else { "\\textbf{no}" },
+            r.tests_ok,
+            r.loc
+                .as_ref()
+                .map_or("--".to_string(), |l| fmt_commas(l.code as u32)),
+        ));
     }
-    anyhow::ensure!(
-        wrote_any,
-        "every project this run attested is missing its result.json, so the table would be empty"
-    );
 
     let path = tables_dir.join("harvest-bench.tex");
     std::fs::write(&path, &out)?;
@@ -1305,4 +1299,52 @@ fn count_c_loc_dir(dir: &Path) -> u32 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `wrote_any` was the only guard, so six missing records still produced a one-row table and a ✅ --
+    /// the `N/6 projects pass` defect one layer up.
+    #[test]
+    fn a_table_missing_an_attested_projects_record_is_refused_not_published_short() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let hb = tmp.path().join("results/HarvestBench/claude");
+        let record = |project: &str| {
+            let dir = crate::battery::phase_dir(&hb.join(project), crate::battery::TRANSLATED);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("result.json"),
+                r#"{"tests_ok":5,"tests_failed":0,"tests_skipped":0,"build_ok":true}"#,
+            )
+            .unwrap();
+        };
+        record("jansson");
+
+        let mut attested = Attested::default();
+        attested.insert("claude", "jansson");
+        attested.insert("claude", "lz4");
+
+        let table = tmp.path().join("tables/harvest-bench.tex");
+        let err = generate_harvest_bench(tmp.path(), &attested)
+            .expect_err("lz4 is in scope with no record, so the table cannot claim completeness");
+        assert!(
+            format!("{err:#}").contains("lz4"),
+            "and the refusal must name the project it could not report: {err:#}"
+        );
+        assert!(
+            !table.exists(),
+            "nor leave a short table standing for the next reader"
+        );
+
+        // Non-vacuity: the refusal must not be firing for some reason that also blocks the good case.
+        record("lz4");
+        generate_harvest_bench(tmp.path(), &attested).expect("both records exist now");
+        let tex = std::fs::read_to_string(&table).unwrap();
+        assert!(
+            tex.contains("jansson") && tex.contains("lz4"),
+            "both attested projects must appear: {tex}"
+        );
+    }
 }

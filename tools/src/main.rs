@@ -56,7 +56,9 @@ fn main() -> Result<()> {
             // The run's ONE budget; a phase cannot mint a second (see `agents::Pool`).
             let pool = harvest_tools::agents::Pool::for_run(parallel);
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(
+            let bench = benchmark::for_dataset(dataset);
+            // Before the first agent: every binary, interpreter and corpus dir the phases below reach for.
+            let paths = bench.preflight(battery::Paths::new(
                 &repo_root,
                 agent,
                 dataset,
@@ -65,9 +67,8 @@ fn main() -> Result<()> {
                 harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),
-            )?;
+            )?)?;
             let inner = Dataset::strip_prefix(target);
-            let bench = benchmark::for_dataset(dataset);
 
             let translations = bench.translate(&paths, inner, include_regex.as_deref(), &pool)?;
 
@@ -130,7 +131,8 @@ fn main() -> Result<()> {
         } => {
             let pool = harvest_tools::agents::Pool::for_run(parallel);
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(
+            let bench = benchmark::for_dataset(dataset);
+            let paths = bench.preflight(battery::Paths::new(
                 &repo_root,
                 agent,
                 dataset,
@@ -139,14 +141,9 @@ fn main() -> Result<()> {
                 harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),
-            )?;
+            )?)?;
             let inner = Dataset::strip_prefix(target);
-            benchmark::for_dataset(dataset).translate(
-                &paths,
-                inner,
-                include_regex.as_deref(),
-                &pool,
-            )?;
+            bench.translate(&paths, inner, include_regex.as_deref(), &pool)?;
         }
         Command::Verify {
             ref target,
@@ -156,7 +153,8 @@ fn main() -> Result<()> {
         } => {
             let pool = harvest_tools::agents::Pool::for_run(parallel);
             let dataset = Dataset::detect(target);
-            let paths = battery::Paths::new(
+            let bench = benchmark::for_dataset(dataset);
+            let paths = bench.preflight(battery::Paths::new(
                 &repo_root,
                 agent,
                 dataset,
@@ -165,9 +163,8 @@ fn main() -> Result<()> {
                 harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),
-            )?;
+            )?)?;
             let inner = Dataset::strip_prefix(target);
-            let bench = benchmark::for_dataset(dataset);
             // At startup, not per case: this agent has no C-as-oracle verify phase, and
             // the sweep would otherwise print a ✅ per case for a phase that never ran.
             anyhow::ensure!(
@@ -179,7 +176,7 @@ fn main() -> Result<()> {
             // Verify is seeded from a translation THIS RUN resolved, so translations are resolved first —
             // through `cli::seeding`, a store that may only REPLAY. A command named `verify` must not pay
             // the translate agent or replace what it checks, and `--force` reaches verify and nothing else.
-            let seeds = battery::Paths::new(
+            let seeds = bench.preflight(battery::Paths::new(
                 &repo_root,
                 agent,
                 dataset,
@@ -188,7 +185,7 @@ fn main() -> Result<()> {
                 harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
                     cli.allow_unsandboxed,
                 ),
-            )?;
+            )?)?;
             let translations = bench.translate(&seeds, inner, include_regex.as_deref(), &pool)?;
             let (scope, _) =
                 benchmark::InScope::derive(bench.as_ref(), &paths, inner, &translations)?;
@@ -258,7 +255,7 @@ struct Score<'a> {
 /// `process::exit`, which runs no destructor and once left the whole tree standing.
 fn run_test(
     bench: &dyn benchmark::Benchmark,
-    paths: &battery::Paths,
+    paths: &benchmark::Preflighted,
     target: &str,
     score: Score<'_>,
 ) -> Result<()> {
@@ -312,6 +309,9 @@ mod tests {
     struct Refusing;
 
     impl benchmark::Benchmark for Refusing {
+        fn preflight(&self, _paths: battery::Paths) -> Result<benchmark::Preflighted> {
+            unreachable!("the test mints its proof through the real HarvestBench preflight")
+        }
         fn name(&self) -> &'static str {
             "refusing"
         }
@@ -320,7 +320,7 @@ mod tests {
         }
         fn translate(
             &self,
-            _paths: &battery::Paths,
+            _paths: &benchmark::Preflighted,
             _target: &str,
             _filter: Option<&str>,
             _pool: &harvest_tools::agents::Pool,
@@ -329,7 +329,7 @@ mod tests {
         }
         fn test(
             &self,
-            paths: &battery::Paths,
+            paths: &benchmark::Preflighted,
             target: &str,
             scoring: &oracle::Scoring<'_>,
         ) -> Result<()> {
@@ -362,15 +362,37 @@ mod tests {
     #[test]
     fn a_score_that_refuses_still_removes_the_evaluation_tree() {
         let tmp = harvest_tools::io::workdir::test_tempdir().unwrap();
-        let paths = battery::Paths::new(
-            tmp.path(),
-            cli::Agent::C2rust,
-            Dataset::TestCorpus,
-            None,
-            cache::Mode::Bypass,
-            harvest_tools::io::sandbox::Enforcement::AllowUnsandboxed,
-        )
-        .unwrap();
+        let unchecked = || {
+            battery::Paths::new(
+                tmp.path(),
+                cli::Agent::C2rust,
+                Dataset::HarvestBench,
+                None,
+                cache::Mode::Bypass,
+                harvest_tools::io::sandbox::Enforcement::AllowUnsandboxed,
+            )
+            .unwrap()
+        };
+        let bench = benchmark::for_dataset(Dataset::HarvestBench);
+
+        // The only way to obtain what `run_test` takes, which IS the guarantee. Absent inputs first, so
+        // the pass below is not vacuous.
+        let missing = bench
+            .preflight(unchecked())
+            .err()
+            .expect("no harvest-bench/tests, so no phase may start");
+        assert!(
+            format!("{missing:#}").contains("harvest-bench"),
+            "and it must name what is missing: {missing:#}"
+        );
+        std::fs::create_dir_all(tmp.path().join("harvest-bench/tests")).unwrap();
+        let scorer = tmp.path().join("harvest-bench/runner/target/release");
+        std::fs::create_dir_all(&scorer).unwrap();
+        std::fs::write(scorer.join("harvest-bench"), "").unwrap();
+
+        let paths = bench
+            .preflight(unchecked())
+            .expect("every input is present now");
         let translations = harvest_tools::translate::Translations::new();
         let verifications = harvest_tools::verify::Verifications::new();
 
