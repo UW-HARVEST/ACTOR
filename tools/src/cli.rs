@@ -55,16 +55,22 @@ pub enum Agent {
     /// Tests whether the project-type dispatch is structurally necessary.
     /// Verify phase is skipped.
     ClaudeCrossPrompt,
-    /// OpenAI Codex CLI on Amazon Bedrock with gpt-5.5 (us-east-2).  Same
-    /// methodology as `claude`: same prompts, translate-then-verify pipeline.
-    /// Used to validate that ACTOR is portable across multiple agentic
-    /// harnesses (Kiro CLI, Claude Code, Codex).  All requests go through
-    /// Bedrock; OpenAI telemetry/auth is disabled.
+    /// OpenAI Codex CLI on Amazon Bedrock with gpt-5.5 (us-east-2). HISTORICAL, and not
+    /// comparable to `claude`: it was fed `prompts/claude/*.md`, whose sub-agent protocol
+    /// tells the agent to dispatch work through a Task tool Codex does not have, and it
+    /// had no verify phase at all. Kept as-is so its committed records stay honest about
+    /// what produced them. Use `codex-gpt56-sol` for a like-for-like run.
     CodexGpt55,
-    /// OpenAI Codex CLI on Amazon Bedrock with gpt-5.4 (us-west-2).  Same
-    /// methodology as `CodexGpt55`; different model version for cross-model
-    /// comparison within the Codex harness.
+    /// OpenAI Codex CLI on Amazon Bedrock with gpt-5.4 (us-west-2). HISTORICAL, same two
+    /// caveats as `CodexGpt55`; different model version.
     CodexGpt54,
+    /// OpenAI Codex CLI on Amazon Bedrock with gpt-5.6-sol (us-east-2), and the FIRST codex
+    /// variant that is methodologically comparable to `claude`: it runs the same
+    /// translate-then-verify pipeline, and its prompts live in `prompts/codex/`, which carry
+    /// Codex's own single-session protocol in place of Claude Code's Task-tool sub-agent one.
+    /// All requests go through Bedrock. Its retry/auth settings come from
+    /// `~/.codex/config.toml`, which is outside this repo and so outside the cache key.
+    CodexGpt56Sol,
     /// OpenCode CLI, with the model chosen by `--model <provider>/<model-id>`
     /// (e.g. `amazon-bedrock/us.anthropic.claude-sonnet-5`). Same methodology
     /// as `claude`: the SAME `prompts/claude/*.md` prompts and the same
@@ -114,6 +120,7 @@ impl Agent {
             | Agent::ClaudeCrossPrompt
             | Agent::CodexGpt55
             | Agent::CodexGpt54
+            | Agent::CodexGpt56Sol
             | Agent::OpenCode => StreamJson,
             // kiro-cli writes prose ("Credits: ..."); kimi and oneshot write prose;
             // c2rust writes cmake/cargo output; laertes, c2saferrust and smartc2rust
@@ -464,6 +471,7 @@ mod tests {
             Agent::ClaudeCrossPrompt,
             Agent::CodexGpt55,
             Agent::CodexGpt54,
+            Agent::CodexGpt56Sol,
             Agent::OpenCode,
         ] {
             assert_eq!(a.log_format(), LogFormat::StreamJson, "{a:?}");

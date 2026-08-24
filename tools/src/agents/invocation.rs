@@ -86,6 +86,7 @@ pub(crate) const KIRO_UNPINNED_MODEL: &str = "unpinned:kiro-cli-default";
 pub(crate) enum Backend {
     Kiro,
     Claude,
+    Codex,
     OpenCode(crate::agents::opencode::Model),
 }
 
@@ -102,6 +103,9 @@ impl Backend {
         Ok(match self {
             // `--trust-all-tools` and no policy file: there is nothing to record.
             Backend::Kiro => None,
+            // `--dangerously-bypass-approvals-and-sandbox`, so likewise nothing -- and the
+            // absence is the honest record: this backend applies no filesystem policy.
+            Backend::Codex => None,
             Backend::Claude => Some(tokenise(
                 crate::io::sandbox::settings_json(crate::io::sandbox::Policy {
                     repo_root: &roots.repo,
@@ -136,8 +140,22 @@ pub(crate) struct Invocation {
 /// against the backend match, and
 /// `translate::tests::a_verify_prompt_exists_exactly_where_a_verify_phase_does` against the
 /// prompt table.
+/// ONE table for the model and region a codex variant runs, so translate and verify cannot ask for
+/// different ones. `None` is "not a codex variant".
+pub(crate) fn codex_model(agent: Agent) -> Option<(&'static str, &'static str)> {
+    match agent {
+        Agent::CodexGpt55 => Some(("openai.gpt-5.5", "us-east-2")),
+        Agent::CodexGpt54 => Some(("openai.gpt-5.4", "us-west-2")),
+        Agent::CodexGpt56Sol => Some(("openai.gpt-5.6-sol", "us-east-2")),
+        _ => None,
+    }
+}
+
 pub fn has_verify_phase(agent: Agent) -> bool {
-    matches!(agent, Agent::Kiro | Agent::Claude | Agent::OpenCode)
+    matches!(
+        agent,
+        Agent::Kiro | Agent::Claude | Agent::OpenCode | Agent::CodexGpt56Sol
+    )
 }
 
 #[cfg(test)]

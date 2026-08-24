@@ -651,6 +651,14 @@ pub fn prompt_file_for(agent: Agent, kind: PromptKind) -> Option<&'static str> {
             Shared => Some("translate-shared.md"),
             Verify => None,
         },
+        // Same filenames as claude's, read from `prompts/codex/`: the methodology is
+        // identical and only the sub-agent protocol differs, Codex having no Task tool.
+        Agent::CodexGpt56Sol => Some(match kind {
+            Library => "translate-library.md",
+            Executable => "translate-executable.md",
+            Shared => "translate-shared.md",
+            Verify => "verify.md",
+        }),
         Agent::CodexGpt55 | Agent::CodexGpt54 => match kind {
             Library => Some("translate-library.md"),
             Executable => Some("translate-executable.md"),
@@ -728,7 +736,7 @@ fn dispatch_translate(
         Agent::Kiro | Agent::Claude | Agent::OpenCode | Agent::ClaudeCombined
         | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures
         | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
-        | Agent::CodexGpt55 | Agent::CodexGpt54 => {
+        | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => {
             let prompt = require_prompt(paths, PromptKind::independent(is_lib))?;
             translate_case(paths, battery, name, &prompt, store)
         }
@@ -752,7 +760,7 @@ fn dispatch_translate_shared(
         Agent::Kiro | Agent::Claude | Agent::OpenCode | Agent::ClaudeCombined
         | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures
         | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
-        | Agent::CodexGpt55 | Agent::CodexGpt54 => {
+        | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => {
             let prompt = require_prompt(paths, PromptKind::Shared)?;
             translate_case(paths, battery, name, &prompt, store)
         }
@@ -919,7 +927,7 @@ fn preflight_check(agent: Agent, mode: cache::Mode) -> Result<()> {
         | Agent::ClaudeNoFeatures
         | Agent::ClaudeNoSubtask
         | Agent::ClaudeCrossPrompt => ("claude", &["--version"]),
-        Agent::CodexGpt55 | Agent::CodexGpt54 => ("codex", &["--version"]),
+        Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => ("codex", &["--version"]),
         Agent::OpenCode => ("opencode", &["--version"]),
         Agent::C2rust => ("c2rust", &["--version"]),
         Agent::Laertes => ("docker", &["--version"]),
@@ -1005,10 +1013,8 @@ fn preflight_check(agent: Agent, mode: cache::Mode) -> Result<()> {
 enum InTool {
     Kiro,
     Claude,
-    Codex {
-        model: &'static str,
-        region: &'static str,
-    },
+    /// Carries nothing: `invocation::codex_model` is the ONE table verify reads too.
+    Codex,
     OpenCode,
     C2rust,
 }
@@ -1028,14 +1034,7 @@ fn in_tool_translate(agent: Agent) -> Option<InTool> {
         | Agent::ClaudeNoFeatures
         | Agent::ClaudeNoSubtask
         | Agent::ClaudeCrossPrompt => InTool::Claude,
-        Agent::CodexGpt55 => InTool::Codex {
-            model: "openai.gpt-5.5",
-            region: "us-east-2",
-        },
-        Agent::CodexGpt54 => InTool::Codex {
-            model: "openai.gpt-5.4",
-            region: "us-west-2",
-        },
+        Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => InTool::Codex,
         Agent::OpenCode => InTool::OpenCode,
         Agent::C2rust => InTool::C2rust,
         // Each is driven by its own docker pipeline or single API call, reached from
@@ -1081,13 +1080,6 @@ enum Launch {
         model: crate::agents::opencode::Model,
         session: Session,
     },
-    /// Model and region are `-c` overrides so the run does not depend on a global
-    /// ~/.codex/config.toml. No [`Session`] renders this invocation — it is a literal argv — and
-    /// `cache::Recipe` hashes a `Session` precisely because argv carries the scratch path.
-    Codex {
-        model: &'static str,
-        region: &'static str,
-    },
     /// No model to name, and no agent exit recorded, so an opaque log is `Unknown` and mints no
     /// `Completed` either. Also the one backend whose spend a cache would not save.
     C2rust,
@@ -1118,7 +1110,18 @@ fn resolve_launch(paths: &Paths, backend: InTool) -> Result<Launch> {
                 translate_ceiling(paths.dataset),
             ),
         },
-        InTool::Codex { model, region } => Launch::Codex { model, region },
+        // Keyed like every other in-tool backend. Its own unkeyed variant is why no codex
+        // sweep ever left an entry to replay.
+        InTool::Codex => Launch::Keyed(Invocation {
+            backend: Backend::Codex,
+            model: ModelId::new(
+                crate::agents::invocation::codex_model(paths.agent)
+                    .context("a Codex launch resolved for a non-codex agent")?
+                    .0,
+            )?,
+            cli: CliVersion::probe("codex")?,
+            session: Session::codex(translate_ceiling(paths.dataset)),
+        }),
         InTool::C2rust => Launch::C2rust,
     })
 }
@@ -1128,8 +1131,8 @@ fn resolve_launch(paths: &Paths, backend: InTool) -> Result<Launch> {
 /// decision stays pure and testable; both matches are exhaustive, so a new backend decides in both.
 fn skip_check(backend: InTool) -> SkipCheck {
     match backend {
-        InTool::Kiro | InTool::Claude => SkipCheck::Keyed,
-        InTool::OpenCode | InTool::Codex { .. } | InTool::C2rust => SkipCheck::WhateverIsPublished,
+        InTool::Kiro | InTool::Claude | InTool::Codex => SkipCheck::Keyed,
+        InTool::OpenCode | InTool::C2rust => SkipCheck::WhateverIsPublished,
     }
 }
 
@@ -1294,6 +1297,23 @@ fn run_translate_agent(
                     .context("invoking kiro-cli")?;
                 record_agent_exit(status);
             }
+            Backend::Codex => {
+                let (model, region) = crate::agents::invocation::codex_model(paths.agent)
+                    .context("a Codex backend resolved for a non-codex agent")?;
+                // The retry wrapper, not a bare status: codex exits 0 after Bedrock drops the
+                // conversation, so without it an empty translation records as a clean success.
+                invoke_codex_with_retry(
+                    RetrySession {
+                        prompt,
+                        log_path,
+                        work_dir: &cwd,
+                        context_label: "translate",
+                    },
+                    &inv.session,
+                    model,
+                    region,
+                )?;
+            }
             Backend::Claude => {
                 let settings = crate::io::sandbox::write_settings(crate::io::sandbox::Policy {
                     repo_root: &paths.repo_root,
@@ -1342,17 +1362,6 @@ fn run_translate_agent(
                 model,
             )?;
         }
-        Launch::Codex { model, region } => invoke_codex_with_retry(
-            RetrySession {
-                prompt,
-                log_path,
-                work_dir: &cwd,
-                context_label: "translate",
-            },
-            model,
-            region,
-            &std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into()),
-        )?,
         Launch::C2rust => c2rust_translate(&cwd, log_path)?,
     }
 
@@ -2538,22 +2547,22 @@ fn walkdir(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
 }
 
 /// The inputs both retrying agent invocations share, regardless of backend.
-struct RetrySession<'a> {
-    prompt: &'a str,
-    log_path: &'a Path,
-    work_dir: &'a Path,
+pub(crate) struct RetrySession<'a> {
+    pub(crate) prompt: &'a str,
+    pub(crate) log_path: &'a Path,
+    pub(crate) work_dir: &'a Path,
     /// Identifies the case in retry/abort diagnostics.
-    context_label: &'a str,
+    pub(crate) context_label: &'a str,
 }
 
 /// Retry-aware codex invocation: codex exits 0 after a transient Bedrock error
 /// mid-conversation, so without this a Bedrock failure counts as a successful (but
 /// empty) translation. Each retry is a fresh invocation, discarding partial state.
-fn invoke_codex_with_retry(
+pub(crate) fn invoke_codex_with_retry(
     session: RetrySession<'_>,
+    invocation: &crate::agents::session::Session,
     model: &str,
     region: &str,
-    openssl_dir: &str,
 ) -> Result<()> {
     let RetrySession {
         prompt,
@@ -2565,22 +2574,10 @@ fn invoke_codex_with_retry(
     const RETRY_BACKOFF_SECS: u64 = 30;
 
     for attempt in 1..=MAX_RETRIES {
-        let status = Command::new("bash")
-            .arg("-lc")
-            .arg(r#"set -o pipefail; timeout 10800 codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C "$3" -c model="$5" -c model_providers.amazon-bedrock.aws.region="$6" --json "$1" < /dev/null 2>&1 | tee "$2""#)
-            .arg("--")
-            .arg(prompt)
-            .arg(log_path)
-            .arg(work_dir)
-            .arg("__unused__")
-            .arg(model)
-            .arg(region)
-            .env("OPENSSL_DIR", openssl_dir)
-            .current_dir(work_dir)
+        let status = invocation
+            .codex_command(work_dir, prompt, log_path, model, region)
             .status()
-            .with_context(|| format!("invoking codex ({context_label})"))?;
-        // Overwritten each retry, so the exit that decided the outcome is the one
-        // that survives.
+            .with_context(|| format!("invoking codex for {context_label}"))?;
         record_agent_exit(status);
 
         match scan_codex_log_for_transient_error(log_path) {
@@ -3606,10 +3603,13 @@ mod tests {
                 cache::Mode::ReadWrite,
                 SkipCheck::WhateverIsPublished,
             ),
+            // Keyed since codex became a real backend: it used to be its own unkeyed `Launch`
+            // variant, which is why no codex sweep ever left an entry to replay.
+            (Agent::CodexGpt55, cache::Mode::ReadWrite, SkipCheck::Keyed),
             (
-                Agent::CodexGpt55,
+                Agent::CodexGpt56Sol,
                 cache::Mode::ReadWrite,
-                SkipCheck::WhateverIsPublished,
+                SkipCheck::Keyed,
             ),
             (
                 Agent::C2rust,
@@ -3630,15 +3630,9 @@ mod tests {
         }
 
         // And the pairing: a backend `skip_check` calls keyless must be one `resolve_launch` answers
-        // no `Launch::Keyed` for. Only these three need no CLI on PATH — which is the same line.
-        for backend in [
-            InTool::OpenCode,
-            InTool::Codex {
-                model: "openai.gpt-5.5",
-                region: "us-east-2",
-            },
-            InTool::C2rust,
-        ] {
+        // no `Launch::Keyed` for. Only these two need no CLI on PATH — which is the same line, and
+        // is why codex left this list when it gained a key.
+        for backend in [InTool::OpenCode, InTool::C2rust] {
             let launch = resolve_launch(
                 &paths_at(tmp.path(), Agent::OpenCode, corpus, cache::Mode::ReadWrite),
                 backend,

@@ -123,6 +123,7 @@ impl AgentKey {
             | Agent::ClaudeCrossPrompt
             | Agent::CodexGpt55
             | Agent::CodexGpt54
+            | Agent::CodexGpt56Sol
             | Agent::C2rust
             | Agent::Laertes
             | Agent::C2SaferRust

@@ -554,6 +554,16 @@ fn verify_invocation(paths: &Paths, budget: Budget) -> Result<Option<Invocation>
             cli: CliVersion::probe("claude")?,
             session: Session::claude(budget.secs(VERIFY_TIMEOUT_SECS)),
         },
+        Agent::CodexGpt56Sol => {
+            let (model, _region) = crate::agents::invocation::codex_model(paths.agent)
+                .context("codex_model has no entry for a codex variant")?;
+            Invocation {
+                backend: Backend::Codex,
+                model: ModelId::new(model)?,
+                cli: CliVersion::probe("codex")?,
+                session: Session::codex(budget.secs(VERIFY_TIMEOUT_SECS)),
+            }
+        }
         Agent::OpenCode => {
             let model =
                 crate::agents::opencode::parse_model(paths.model.as_deref().unwrap_or_default())?;
@@ -567,10 +577,11 @@ fn verify_invocation(paths: &Paths, budget: Budget) -> Result<Option<Invocation>
                 ),
             }
         }
-        // ClaudeCombined verifies inside translate; ClaudeMinimal and the
-        // prompt-sensitivity ablations (E2/E3/E4/E6) are translate-only by design;
-        // Codex is excluded because it over-fixates on irrelevant linker symbols
-        // during C-as-oracle verification.
+        // ClaudeCombined verifies inside translate; ClaudeMinimal and the prompt-sensitivity
+        // ablations (E2/E3/E4/E6) are translate-only by design. `codex-gpt55`/`codex-gpt54` are
+        // HISTORICAL: they ran before `prompts/codex/` existed, so a verify phase would have fed
+        // them claude's Task-tool sub-agent protocol. Their records stay as earned; the
+        // like-for-like codex run is `codex-gpt56-sol` above.
         Agent::C2rust
         | Agent::Laertes
         | Agent::C2SaferRust
@@ -597,7 +608,7 @@ fn verify_invocation(paths: &Paths, budget: Budget) -> Result<Option<Invocation>
 /// sweep, which the `verify.log` check used to make free. Exhaustive: a new backend decides here.
 fn verify_skip_check(paths: &Paths) -> SkipCheck {
     match paths.agent {
-        Agent::Kiro | Agent::Claude => SkipCheck::Keyed,
+        Agent::Kiro | Agent::Claude | Agent::CodexGpt56Sol => SkipCheck::Keyed,
         Agent::OpenCode
         | Agent::C2rust
         | Agent::Laertes
@@ -721,6 +732,24 @@ fn run_verify_agent(
                 .status()
                 .context("invoking kiro-cli for verification")?;
             record_agent_exit(status);
+        }
+        Backend::Codex => {
+            let (model, region) = crate::agents::invocation::codex_model(paths.agent)
+                .context("a Codex backend resolved for a non-codex agent")?;
+            // The SAME retry wrapper translate uses. Codex exits 0 after Bedrock drops the
+            // conversation, so a bare status would seal an empty verification as a clean pass --
+            // and verify is the phase whose artifact the score is built on.
+            crate::translate::invoke_codex_with_retry(
+                crate::translate::RetrySession {
+                    prompt,
+                    log_path,
+                    work_dir: &work.translated_rust(),
+                    context_label: "verify",
+                },
+                &inv.session,
+                model,
+                region,
+            )?;
         }
         Backend::Claude => {
             // Denies the repo root (the graded oracle, plus results/) and the shared
