@@ -7,6 +7,9 @@ Separate instructions exist for [Evaluation benchmarks and results](#evaluation-
 ## Requirements
 
 - [Rust and the `Cargo` package manager](https://rust-lang.org/tools/install/)
+- [`socat`](https://linux.die.net/man/1/socat): Used for running agents in sandboxes.
+  - macOS and homebrew: `brew install socat`
+  - Ubuntu: `sudo apt update && sudo apt install -y socat`
 
 ## Command-line Tools
 
