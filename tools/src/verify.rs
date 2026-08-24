@@ -577,11 +577,9 @@ fn verify_invocation(paths: &Paths, budget: Budget) -> Result<Option<Invocation>
                 ),
             }
         }
-        // ClaudeCombined verifies inside translate; ClaudeMinimal and the prompt-sensitivity
-        // ablations (E2/E3/E4/E6) are translate-only by design. `codex-gpt55`/`codex-gpt54` are
-        // HISTORICAL: they ran before `prompts/codex/` existed, so a verify phase would have fed
-        // them claude's Task-tool sub-agent protocol. Their records stay as earned; the
-        // like-for-like codex run is `codex-gpt56-sol` above.
+        // ClaudeCombined verifies inside translate; ClaudeMinimal and the E2/E3/E4/E6 ablations are
+        // translate-only by design. `codex-gpt55`/`codex-gpt54` are HISTORICAL -- they predate
+        // `prompts/codex/`, so their records stay as earned; the fair run is `codex-gpt56-sol`.
         Agent::C2rust
         | Agent::Laertes
         | Agent::C2SaferRust
@@ -736,9 +734,8 @@ fn run_verify_agent(
         Backend::Codex => {
             let (model, region) = crate::agents::invocation::codex_model(paths.agent)
                 .context("a Codex backend resolved for a non-codex agent")?;
-            // The SAME retry wrapper translate uses. Codex exits 0 after Bedrock drops the
-            // conversation, so a bare status would seal an empty verification as a clean pass --
-            // and verify is the phase whose artifact the score is built on.
+            // The SAME wrapper translate uses: codex exits 0 after Bedrock drops a conversation, so
+            // a bare status would seal an empty verification -- the artifact the score is built on.
             crate::translate::invoke_codex_with_retry(
                 crate::translate::RetrySession {
                     prompt,

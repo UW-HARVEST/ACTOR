@@ -27,11 +27,9 @@
 pub enum LogFormat {
     /// stream-json carrying a terminal record. Its ABSENCE means truncation.
     StreamJson,
-    /// codex `exec --json`, which is a DIFFERENT dialect: `turn.completed`/`turn.failed`, not
-    /// claude's `result`/`terminal_reason`. Marked `StreamJson` it was the very bug this enum's
-    /// doc describes -- every codex run, including ones that wrote a building, byte-identical
-    /// translation, classified `Infra { reason: "truncated" }` and could never be sealed. That is
-    /// the mechanism behind `Codex 0/338`.
+    /// codex `exec --json`: a DIFFERENT dialect -- `turn.completed`/`turn.failed`, not claude's
+    /// `result`/`terminal_reason`. Marked `StreamJson` it was the bug above, so every codex run
+    /// classified `Infra { truncated }` and could never seal. That is the mechanism of `Codex 0/338`.
     CodexJson,
     /// Prose (kiro, kimi, oneshot) or tool output (c2rust, laertes, c2saferrust).
     /// Proves nothing about completion, so the exit status is the only evidence.
@@ -139,9 +137,8 @@ pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
     }
 }
 
-/// The same shape `translate::scan_codex_log_for_transient_error` reads, and for the same reason:
-/// codex exits 0 after Bedrock drops a conversation, so the exit status proves nothing and only the
-/// terminal record does. `turn.failed` with no later `turn.completed` is a dead run.
+/// The shape `translate::scan_codex_log_for_transient_error` reads, for the same reason: codex exits 0
+/// after Bedrock drops a conversation, so only the terminal record proves anything.
 fn classify_codex_json(tail: &str) -> Health {
     let completed = tail.contains(r#""type":"turn.completed""#);
     let failed = tail.contains(r#""type":"turn.failed""#);
@@ -267,11 +264,9 @@ mod tests {
         classify(text, LogFormat::StreamJson, Exit::Unobserved)
     }
 
-    /// A codex run that WROTE A WORKING TRANSLATION must not read as a killed one. Codex's
-    /// `--json` carries `turn.completed`, never claude's `"type":"result"`, so under the
-    /// stream-json classifier every codex log -- including the one this fixture is trimmed from,
-    /// which built and produced byte-identical output -- came back `Infra { truncated }`, could not
-    /// mint the `Completed` a seal needs, and published nothing. That is `Codex 0/338`.
+    /// A codex run that WROTE A WORKING TRANSLATION must not read as a killed one. This fixture is
+    /// trimmed from one that built and produced byte-identical output, and came back
+    /// `Infra { truncated }` under claude's classifier -- which is `Codex 0/338`.
     #[test]
     fn a_finished_codex_run_is_completed_and_a_dead_one_is_infra() {
         let done = r#"{"type":"item.completed","item":{"id":"item_34","type":"command_execution","exit_code":0}}

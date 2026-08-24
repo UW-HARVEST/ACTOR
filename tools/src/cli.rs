@@ -110,8 +110,7 @@ impl Agent {
     pub fn log_format(self) -> crate::domain::health::LogFormat {
         use crate::domain::health::LogFormat::{CodexJson, Opaque, StreamJson};
         match self {
-            // Its own dialect, NOT claude's: `turn.completed`, no `result` record. Marked
-            // `StreamJson` here, every codex run classified as a truncated infra failure.
+            // Its own dialect: `turn.completed`, no `result` record. See `LogFormat::CodexJson`.
             Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => CodexJson,
             // Claude Code emits `--output-format stream-json`.
             Agent::Claude
@@ -461,9 +460,8 @@ mod tests {
     #[test]
     fn every_agent_declares_a_log_format_and_the_prose_ones_are_opaque() {
         use clap::ValueEnum;
-        // The WHOLE mapping, and a check that it covers the enum: the list form let a new
-        // variant be added to neither group and never be asserted at all -- which is how codex
-        // sat in the StreamJson group for its entire life while emitting a different dialect.
+        // The WHOLE mapping, and a check it covers the enum: the list form let a variant be added
+        // to neither group and never asserted -- which is how codex sat in StreamJson for its life.
         let expected = |a: Agent| match a {
             Agent::Claude
             | Agent::ClaudeCombined

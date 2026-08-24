@@ -1300,8 +1300,8 @@ fn run_translate_agent(
             Backend::Codex => {
                 let (model, region) = crate::agents::invocation::codex_model(paths.agent)
                     .context("a Codex backend resolved for a non-codex agent")?;
-                // The retry wrapper, not a bare status: codex exits 0 after Bedrock drops the
-                // conversation, so without it an empty translation records as a clean success.
+                // The retry wrapper, not a bare status: codex exits 0 after Bedrock drops a
+                // conversation, so an empty translation would record as a clean success.
                 invoke_codex_with_retry(
                     RetrySession {
                         prompt,
@@ -3603,8 +3603,8 @@ mod tests {
                 cache::Mode::ReadWrite,
                 SkipCheck::WhateverIsPublished,
             ),
-            // Keyed since codex became a real backend: it used to be its own unkeyed `Launch`
-            // variant, which is why no codex sweep ever left an entry to replay.
+            // Keyed since codex became a real backend; its own unkeyed variant is why no codex
+            // sweep left an entry.
             (Agent::CodexGpt55, cache::Mode::ReadWrite, SkipCheck::Keyed),
             (
                 Agent::CodexGpt56Sol,
@@ -3630,8 +3630,7 @@ mod tests {
         }
 
         // And the pairing: a backend `skip_check` calls keyless must be one `resolve_launch` answers
-        // no `Launch::Keyed` for. Only these two need no CLI on PATH — which is the same line, and
-        // is why codex left this list when it gained a key.
+        // no `Launch::Keyed` for. Only these two need no CLI on PATH, which is the same line.
         for backend in [InTool::OpenCode, InTool::C2rust] {
             let launch = resolve_launch(
                 &paths_at(tmp.path(), Agent::OpenCode, corpus, cache::Mode::ReadWrite),
