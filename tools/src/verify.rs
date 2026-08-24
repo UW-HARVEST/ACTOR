@@ -734,8 +734,8 @@ fn run_verify_agent(
         Backend::Codex => {
             let (model, region) = crate::agents::invocation::codex_model(paths.agent)
                 .context("a Codex backend resolved for a non-codex agent")?;
-            // The SAME wrapper translate uses: codex exits 0 after Bedrock drops a conversation, so
-            // a bare status would seal an empty verification -- the artifact the score is built on.
+            // The SAME wrapper translate uses, and verify needs it more: this is the artifact the
+            // score is built on.
             crate::translate::invoke_codex_with_retry(
                 crate::translate::RetrySession {
                     prompt,

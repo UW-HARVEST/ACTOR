@@ -1300,8 +1300,7 @@ fn run_translate_agent(
             Backend::Codex => {
                 let (model, region) = crate::agents::invocation::codex_model(paths.agent)
                     .context("a Codex backend resolved for a non-codex agent")?;
-                // The retry wrapper, not a bare status: codex exits 0 after Bedrock drops a
-                // conversation, so an empty translation would record as a clean success.
+                // The retry wrapper, not a bare status -- see `invoke_codex_with_retry`.
                 invoke_codex_with_retry(
                     RetrySession {
                         prompt,

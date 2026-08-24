@@ -138,7 +138,7 @@ pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
 }
 
 /// The shape `translate::scan_codex_log_for_transient_error` reads, for the same reason: codex exits 0
-/// after Bedrock drops a conversation, so only the terminal record proves anything.
+/// after Bedrock drops a conversation, so the exit status proves nothing and only this record does.
 fn classify_codex_json(tail: &str) -> Health {
     let completed = tail.contains(r#""type":"turn.completed""#);
     let failed = tail.contains(r#""type":"turn.failed""#);
@@ -265,8 +265,7 @@ mod tests {
     }
 
     /// A codex run that WROTE A WORKING TRANSLATION must not read as a killed one. This fixture is
-    /// trimmed from one that built and produced byte-identical output, and came back
-    /// `Infra { truncated }` under claude's classifier -- which is `Codex 0/338`.
+    /// trimmed from one that built and produced byte-identical output.
     #[test]
     fn a_finished_codex_run_is_completed_and_a_dead_one_is_infra() {
         let done = r#"{"type":"item.completed","item":{"id":"item_34","type":"command_execution","exit_code":0}}
