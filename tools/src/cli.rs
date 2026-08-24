@@ -108,9 +108,12 @@ impl Agent {
     /// `StreamJson` can never publish, and one wrongly marked `Opaque` would be
     /// sealed on the strength of an exit code its own log contradicts.
     pub fn log_format(self) -> crate::domain::health::LogFormat {
-        use crate::domain::health::LogFormat::{Opaque, StreamJson};
+        use crate::domain::health::LogFormat::{CodexJson, Opaque, StreamJson};
         match self {
-            // Claude Code and the codex CLIs emit `--output-format stream-json`.
+            // Its own dialect, NOT claude's: `turn.completed`, no `result` record. Marked
+            // `StreamJson` here, every codex run classified as a truncated infra failure.
+            Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => CodexJson,
+            // Claude Code emits `--output-format stream-json`.
             Agent::Claude
             | Agent::ClaudeCombined
             | Agent::ClaudeMinimal
@@ -118,9 +121,6 @@ impl Agent {
             | Agent::ClaudeNoFeatures
             | Agent::ClaudeNoSubtask
             | Agent::ClaudeCrossPrompt
-            | Agent::CodexGpt55
-            | Agent::CodexGpt54
-            | Agent::CodexGpt56Sol
             | Agent::OpenCode => StreamJson,
             // kiro-cli writes prose ("Credits: ..."); kimi and oneshot write prose;
             // c2rust writes cmake/cargo output; laertes, c2saferrust and smartc2rust
@@ -460,33 +460,37 @@ mod tests {
 
     #[test]
     fn every_agent_declares_a_log_format_and_the_prose_ones_are_opaque() {
-        // Guards the table against a new variant defaulting to the wrong classifier.
-        for a in [
-            Agent::Claude,
-            Agent::ClaudeCombined,
-            Agent::ClaudeMinimal,
-            Agent::ClaudeNoIter,
-            Agent::ClaudeNoFeatures,
-            Agent::ClaudeNoSubtask,
-            Agent::ClaudeCrossPrompt,
-            Agent::CodexGpt55,
-            Agent::CodexGpt54,
-            Agent::CodexGpt56Sol,
-            Agent::OpenCode,
-        ] {
-            assert_eq!(a.log_format(), LogFormat::StreamJson, "{a:?}");
+        use clap::ValueEnum;
+        // The WHOLE mapping, and a check that it covers the enum: the list form let a new
+        // variant be added to neither group and never be asserted at all -- which is how codex
+        // sat in the StreamJson group for its entire life while emitting a different dialect.
+        let expected = |a: Agent| match a {
+            Agent::Claude
+            | Agent::ClaudeCombined
+            | Agent::ClaudeMinimal
+            | Agent::ClaudeNoIter
+            | Agent::ClaudeNoFeatures
+            | Agent::ClaudeNoSubtask
+            | Agent::ClaudeCrossPrompt
+            | Agent::OpenCode => LogFormat::StreamJson,
+            Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => LogFormat::CodexJson,
+            Agent::Kiro
+            | Agent::C2rust
+            | Agent::Laertes
+            | Agent::C2SaferRust
+            | Agent::SmartC2Rust
+            | Agent::Kimi
+            | Agent::Oneshot => LogFormat::Opaque,
+        };
+        let mut seen = 0;
+        for a in Agent::value_variants() {
+            assert_eq!(a.log_format(), expected(*a), "{a:?}");
+            seen += 1;
         }
-        for a in [
-            Agent::Kiro,
-            Agent::C2rust,
-            Agent::Laertes,
-            Agent::C2SaferRust,
-            Agent::SmartC2Rust,
-            Agent::Kimi,
-            Agent::Oneshot,
-        ] {
-            assert_eq!(a.log_format(), LogFormat::Opaque, "{a:?}");
-        }
+        assert!(
+            seen >= 17,
+            "the sweep must reach every variant, saw only {seen}"
+        );
     }
 
     /// `verify` gained a translate leg, and with it the ability to spend translate's money on the
