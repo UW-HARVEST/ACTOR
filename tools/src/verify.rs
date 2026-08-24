@@ -166,7 +166,14 @@ fn run_with_semaphore(
     let output_dir = paths.output_dir(battery_name);
     let skip = verify_skip_check(paths);
     let store = cache::Store::open(&paths.repo_root, paths.cache_mode)?;
-    let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))?;
+    // Through `read_prompt`, not a second `verify.md` path of its own: this WAS the second
+    // definition, so splitting the prompts broke verify while translate replayed all 209 entries.
+    //
+    // `Option`, not `require_prompt`: an agent with no verify BACKEND does no work here, and
+    // demanding a prompt it will never read would refuse a sweep that is correctly a no-op.
+    // `a_verify_prompt_exists_exactly_where_a_verify_phase_does` pins the other direction -- where a
+    // backend does resolve, the prompt is there.
+    let prompt_template = verify_template(paths)?;
 
     let mut independent: Vec<&battery::IndependentCase> = Vec::new();
     let mut shared: Vec<&battery::SharedSourceGroup> = Vec::new();
@@ -411,8 +418,7 @@ pub fn run_harvest_bench(
     translations: &Translations,
 ) -> Result<Verifications> {
     let mut resolved = Verifications::new();
-    let prompt_template = std::fs::read_to_string(paths.prompts_dir.join("verify.md"))
-        .context("reading verify.md")?;
+    let prompt_template = verify_template(paths)?;
 
     let skip = verify_skip_check(paths);
     let store = cache::Store::open(&paths.repo_root, paths.cache_mode)?;
@@ -624,6 +630,24 @@ fn verify_skip_check(paths: &Paths) -> SkipCheck {
         | Agent::CodexGpt54 => SkipCheck::WhateverIsPublished,
     }
     .through(paths.cache_mode)
+}
+
+/// The verify prompt, empty ONLY for an agent that has no verify backend to read it.
+///
+/// `read_prompt` rather than `require_prompt`, because a no-backend sweep does no work here and
+/// demanding a prompt it will never read would refuse a run that is correctly a no-op. But an empty
+/// template reaching a real backend would invoke the agent with nothing to do and record the result
+/// as a measurement, so the pairing is asserted here rather than trusted to
+/// `a_verify_prompt_exists_exactly_where_a_verify_phase_does`.
+fn verify_template(paths: &Paths) -> Result<String> {
+    let text = crate::translate::read_prompt(paths, crate::translate::PromptKind::Verify)?;
+    anyhow::ensure!(
+        text.is_some() || !crate::agents::invocation::has_verify_phase(paths.agent),
+        "--agent {} has a verify backend but no Verify prompt, so it would be invoked with an \
+         empty one",
+        paths.agent_key.as_str()
+    );
+    Ok(text.unwrap_or_default())
 }
 
 /// The template plus the two substitutions a group needs and an independent case leaves empty.
@@ -1088,10 +1112,15 @@ mod tests {
             paths.input_dir(bat).join(follower).join("test_case"),
         )
         .unwrap();
+        // Both parts, because a composed prompt is body + protocol now. Writing only the old
+        // single file made this test fail on a prompt-read error instead of the refusal it asserts.
+        let shared = paths.repo_root.join("prompts/shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("verify.md"), "verify CASE_DIR_PLACEHOLDER\n").unwrap();
         std::fs::create_dir_all(&paths.prompts_dir).unwrap();
         std::fs::write(
-            paths.prompts_dir.join("verify.md"),
-            "verify CASE_DIR_PLACEHOLDER",
+            paths.prompts_dir.join(crate::translate::PROTOCOL_PART),
+            "## protocol\n",
         )
         .unwrap();
         assert_eq!(
