@@ -679,6 +679,61 @@ pub fn prompt_file_for(agent: Agent, kind: PromptKind) -> Option<&'static str> {
     }
 }
 
+/// The agent-specific tail of a composed prompt, in [`Paths::prompts_dir`].
+pub const PROTOCOL_PART: &str = "protocol.md";
+
+/// Where the file [`prompt_file_for`] names lives, and whether the agent's protocol part follows it.
+///
+/// `Shared` holds the methodology ONCE, in `prompts/shared/`, and composes it with
+/// `<agent>/protocol.md` -- claude and codex differ only in that tail, so keeping two full copies
+/// meant the next edit to the shared 270 lines had to land twice and would drift. `OwnDir` is a
+/// complete document: kiro's set is a different document entirely, and every `ablations/` file is a
+/// deliberate fork whose point is to differ. Exhaustive, so a new agent decides instead of
+/// inheriting -- defaulting into the wrong group is what `LogFormat` did to codex.
+enum PromptBody {
+    Shared,
+    OwnDir,
+}
+
+fn prompt_body(agent: Agent, file: &str) -> PromptBody {
+    // An ablation forks the whole document, protocol included -- today they carry none, which is
+    // itself an uncontrolled difference from their base, but not one this change may alter.
+    if file.starts_with("ablations/") {
+        return PromptBody::OwnDir;
+    }
+    match agent {
+        Agent::Claude
+        | Agent::OpenCode
+        | Agent::CodexGpt56Sol
+        | Agent::CodexGpt55
+        | Agent::CodexGpt54
+        | Agent::ClaudeNoFeatures
+        | Agent::ClaudeNoSubtask
+        | Agent::ClaudeCrossPrompt => PromptBody::Shared,
+        Agent::Kiro
+        | Agent::Kimi
+        | Agent::Oneshot
+        | Agent::ClaudeCombined
+        | Agent::ClaudeMinimal
+        | Agent::ClaudeNoIter
+        | Agent::C2rust
+        | Agent::Laertes
+        | Agent::C2SaferRust
+        | Agent::SmartC2Rust => PromptBody::OwnDir,
+    }
+}
+
+fn read_part(path: &Path, kind: PromptKind) -> Result<String> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the {kind:?} prompt {}", path.display()))?;
+    anyhow::ensure!(
+        !text.trim().is_empty(),
+        "the prompt {} is empty",
+        path.display()
+    );
+    Ok(text)
+}
+
 /// The text of the prompt for `kind`, or `None` when this agent reads none.
 ///
 /// A prompt that IS named but missing on disk is an error, never an empty string: an
@@ -688,15 +743,17 @@ pub fn read_prompt(paths: &Paths, kind: PromptKind) -> Result<Option<String>> {
     let Some(file) = prompt_file_for(paths.agent, kind) else {
         return Ok(None);
     };
-    let path = paths.prompts_dir.join(file);
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading the {kind:?} prompt {}", path.display()))?;
-    anyhow::ensure!(
-        !text.trim().is_empty(),
-        "the prompt {} is empty",
-        path.display()
-    );
-    Ok(Some(text))
+    Ok(Some(match prompt_body(paths.agent, file) {
+        PromptBody::OwnDir => read_part(&paths.prompts_dir.join(file), kind)?,
+        // Concatenated, with no separator inserted: the body keeps its own trailing newline, so the
+        // composition is byte-for-byte what the two files used to be as one. That is the whole
+        // safety property -- `cache::prompt_digest` hashes this text, so a stray byte here re-keys
+        // every stored entry.
+        PromptBody::Shared => {
+            read_part(&paths.repo_root.join("prompts/shared").join(file), kind)?
+                + &read_part(&paths.prompts_dir.join(PROTOCOL_PART), kind)?
+        }
+    }))
 }
 
 /// [`read_prompt`] where the phase cannot run without one.
@@ -3977,6 +4034,81 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The composition must reproduce, BYTE FOR BYTE, the prompts that earned every stored entry.
+    /// `cache::prompt_digest` hashes the assembled text, so one stray byte here silently re-keys
+    /// claude's 209 translate and 208 verify entries and `reproduce.sh` stops replaying anything.
+    /// These digests were taken from the eight committed files before they were split, so this
+    /// pins the refactor to what actually ran rather than to what it now produces.
+    #[test]
+    fn splitting_the_prompts_did_not_change_one_byte_of_them() {
+        use sha2::{Digest, Sha256};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root");
+        // (agent, kind, sha256 of the prompt text as it was before the split)
+        let pinned: &[(Agent, PromptKind, &str)] = &[
+            (
+                Agent::Claude,
+                PromptKind::Library,
+                "59679282382af82b1f94785dd56a6180ed10f68b78e891beaee4ef22d35c52d4",
+            ),
+            (
+                Agent::Claude,
+                PromptKind::Executable,
+                "5338715804cd1ccb0ac4260f7ee732e8f013973648143dd021366c6ad38eba56",
+            ),
+            (
+                Agent::Claude,
+                PromptKind::Shared,
+                "99aba087ca0c53bdcff869003b51f85d855ad88f11065822b6256f6363e271ea",
+            ),
+            (
+                Agent::Claude,
+                PromptKind::Verify,
+                "377d52565d1b9ad08aaad9b8bf0c5b6602f11c9c0b3a60609a0d6f0ba739f363",
+            ),
+            (
+                Agent::CodexGpt56Sol,
+                PromptKind::Library,
+                "fa12f10bc2deeb451e28a2e2667259e7be3034ae90ded9f74f910ac27e093ee7",
+            ),
+            (
+                Agent::CodexGpt56Sol,
+                PromptKind::Executable,
+                "85206c0351f4141186eafb36d6676b5075f1ae669af17a748e37dad0bfbd3a0b",
+            ),
+            (
+                Agent::CodexGpt56Sol,
+                PromptKind::Shared,
+                "b59c8ddf1fd3a8f2a32c99f9d450f2c4f9a0e90bf1cb705bfdf3ed6f799fe0c2",
+            ),
+            (
+                Agent::CodexGpt56Sol,
+                PromptKind::Verify,
+                "f5c29dea157af28971d447181e3dbb4412484d1cf15d3805cc71cbe11ea6d379",
+            ),
+        ];
+        for (agent, kind, want) in pinned {
+            let paths = Paths::new(
+                repo,
+                *agent,
+                crate::cli::Dataset::TestCorpus,
+                None,
+                cache::Mode::Bypass,
+                crate::io::sandbox::Enforcement::AllowUnsandboxed,
+            )
+            .unwrap();
+            let text = read_prompt(&paths, *kind)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{agent:?}/{kind:?} must still resolve a prompt"));
+            let got = format!("{:x}", Sha256::digest(text.as_bytes()));
+            assert_eq!(
+                &got, want,
+                "{agent:?}/{kind:?}: the composed prompt is not the one that ran"
+            );
         }
     }
 
