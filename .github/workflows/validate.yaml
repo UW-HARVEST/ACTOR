@@ -23,18 +23,21 @@ jobs:
       - name: Check out submodules at their pinned commits
         run: |
           git config --global url."https://x-access-token:${{ secrets.SUBMODULE_PAT }}@github.com/".insteadOf "https://github.com/"
-          git submodule update --init results test-corpus
+          git submodule update --init results test-corpus harvest-bench
 
       - name: Assert the submodules are at their pins
         run: |
           fail=0
-          for m in results test-corpus; do
+          for m in results test-corpus harvest-bench; do
             want=$(git ls-tree HEAD "$m" | awk '{print $3}')
             have=$(git -C "$m" rev-parse HEAD)
             echo "$m: pinned $want / checked out $have"
             [ "$want" = "$have" ] || { echo "::error::$m is not at its pin"; fail=1; }
           done
           test -d results/.cache || { echo "::error::results/.cache is absent — the pin predates the commit that ships the cache"; fail=1; }
+          # Not cosmetic: omitting harvest-bench here let the Test-Corpus leg run 19 minutes to completion
+          # before the HB leg died on a missing tests/ dir. Refuse at second 0 instead.
+          test -d harvest-bench/tests || { echo "::error::harvest-bench/tests is absent, so the HB leg cannot run"; fail=1; }
           exit $fail
 
       - name: Set up Rust
@@ -49,6 +52,11 @@ jobs:
 
       - name: Build harvest-tools
         run: cargo build --release --locked --manifest-path tools/Cargo.toml
+
+      # Scoring the HB leg shells out to this; it is a separate crate inside the submodule, so building
+      # harvest-tools does not produce it.
+      - name: Build the harvest-bench runner
+        run: cargo build --release --locked --manifest-path harvest-bench/runner/Cargo.toml
 
       # One job, no matrix: `run` produces every output from what it resolved, and the scope is what
       # the store can serve -- so there is no list of batteries here to drift from what is cacheable.

@@ -1750,3 +1750,79 @@ fn nothing_in_the_pure_layer_names_the_filesystem_a_process_or_the_environment()
          the identifier `option_env` and so is not covered by the entry `env!` matches."
     );
 }
+
+/// The run's concurrency budget is minted ONCE. `parallel: usize` was a number that six call sites
+/// turned into their own `Semaphore`, so `run`'s per-unit loop handed every call an N-wide pool holding
+/// a single job -- harvest-bench translated 3-up then verified strictly serially for hours. `Pool` is
+/// now the only constructor and `Semaphore::new` is private to `agents`, which the compiler enforces;
+/// this pins the other half, that no module reaches around it. Matched as a CALL, or the prose
+/// naming the function in a comment counts as an offender -- which it did, in `main.rs`.
+#[test]
+fn only_the_pool_mints_the_runs_concurrency_budget() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut visit = vec![src.clone()];
+    while let Some(dir) = visit.pop() {
+        for entry in std::fs::read_dir(&dir).expect("src") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                visit.push(path);
+                continue;
+            }
+            if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read");
+                let rel = path.strip_prefix(&src).unwrap().to_path_buf();
+                if text.contains("Semaphore::new(") && rel != Path::new("agents/mod.rs") {
+                    offenders.push(rel);
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these mint their own semaphore instead of borrowing the run's Pool: {offenders:?}"
+    );
+    assert!(
+        std::fs::read_to_string(src.join("agents/mod.rs"))
+            .expect("read")
+            .contains("Semaphore::new("),
+        "and the check is not vacuous: agents/mod.rs must be where it IS minted"
+    );
+}
+
+/// Preflight is the ONLY door to a phase. A dataset's inputs -- the harvest-bench scorer, a submodule
+/// checkout, python >= 3.10 -- were checked late inside the phase needing them, or in `reproduce.sh`,
+/// which `run`/`translate`/`verify` never touch; CI found two the expensive way. The compiler enforces
+/// that a phase takes vouched paths; this pins the other half, that nobody mints them directly.
+#[test]
+fn only_preflight_vouches_for_the_paths_a_phase_runs_against() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut visit = vec![src.clone()];
+    while let Some(dir) = visit.pop() {
+        for entry in std::fs::read_dir(&dir).expect("src") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                visit.push(path);
+                continue;
+            }
+            if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read");
+                let rel = path.strip_prefix(&src).unwrap().to_path_buf();
+                if text.contains("Preflighted(") && rel != Path::new("benchmark.rs") {
+                    offenders.push(rel);
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these vouch for their own paths instead of going through a Benchmark::preflight: {offenders:?}"
+    );
+    assert!(
+        std::fs::read_to_string(src.join("benchmark.rs"))
+            .expect("read")
+            .contains("Ok(Preflighted(paths))"),
+        "and the check is not vacuous: benchmark.rs must be where a preflight mints one"
+    );
+}

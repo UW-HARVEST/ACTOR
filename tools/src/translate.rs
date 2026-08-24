@@ -9,7 +9,6 @@ use crate::agents::run::{
 };
 use crate::agents::session::{ClaudeRun, Session};
 use crate::agents::work::IsolatedWorkDir;
-use crate::agents::Semaphore;
 use crate::analyse::cargo_toml::{self, CargoToml};
 use crate::artifact::{Published, Publishing, Translate};
 use crate::battery::{self, Case, Paths};
@@ -54,6 +53,19 @@ enum Resolution {
 /// Wall-clock cap on one agentic session. Reaches the command through
 /// [`crate::agents::session::Session`], which is also what the cache key records.
 const TRANSLATE_TIMEOUT_SECS: u64 = 10800;
+
+/// libpng's translate died on the 3 h ceiling at exactly 10802 s (`exit_code: 124`) after five others
+/// finished inside 1.3 h; raised to 24 h on the operator's instruction.
+const HB_TRANSLATE_TIMEOUT_SECS: u64 = 86400;
+
+/// Scoped BY DATASET because `timeout=` is in the translate recipe: one ceiling would move all 209 stored
+/// Test-Corpus keys. Harvest-bench's own entries did move -- a keyed component cannot be raised without it.
+fn translate_ceiling(dataset: crate::cli::Dataset) -> u64 {
+    match dataset {
+        crate::cli::Dataset::TestCorpus => TRANSLATE_TIMEOUT_SECS,
+        crate::cli::Dataset::HarvestBench => HB_TRANSLATE_TIMEOUT_SECS,
+    }
+}
 
 const KIRO_TRANSLATE_TIMEOUT_SECS: u64 = 5400;
 
@@ -136,7 +148,7 @@ pub fn run_test_corpus(
     paths: &Paths,
     battery_name: &str,
     filter: Option<&str>,
-    parallel: usize,
+    pool: &crate::agents::Pool,
 ) -> Result<Translations> {
     preflight_check(paths.agent, paths.cache_mode)?;
     let skip = translate_skip_check(paths);
@@ -158,7 +170,6 @@ pub fn run_test_corpus(
         }
     }
 
-    let sem = Semaphore::new(parallel);
     let mut resolved: Translations = HashMap::new();
     let ind_results: Vec<CaseResult> = std::thread::scope(|s| {
         let handles: Vec<(String, _)> = independent
@@ -168,7 +179,7 @@ pub fn run_test_corpus(
                 (
                     c.name.clone(),
                     s.spawn(|| {
-                        let _permit = sem.acquire();
+                        let _permit = pool.acquire();
                         translate_one_independent(paths, &output_dir, battery_name, c, &store, skip)
                     }),
                 )
@@ -754,7 +765,7 @@ fn dispatch_translate_shared(
 pub fn run_harvest_bench(
     paths: &Paths,
     projects: &[battery::HarvestBenchProject],
-    parallel: usize,
+    pool: &crate::agents::Pool,
 ) -> Result<Translations> {
     // Ahead of `preflight_check`, so an agent with no translate phase here refuses once
     // before a CLI it will never run is probed, rather than panicking once per project.
@@ -778,7 +789,6 @@ pub fn run_harvest_bench(
          both a `test_case/` and a `gtest_suite/`. Did you `git submodule update --init`?"
     );
     let total = projects.len();
-    let sem = Semaphore::new(parallel);
     let store = cache::Store::open(&paths.repo_root, paths.cache_mode)?;
 
     let mut resolved: Translations = HashMap::new();
@@ -787,13 +797,12 @@ pub fn run_harvest_bench(
             .iter()
             .map(|p| {
                 let prompt = &prompt;
-                let sem = &sem;
                 let store = &store;
                 let name = p.name().to_owned(); // see run_test_corpus
                 (
                     name,
                     s.spawn(move || {
-                        let _permit = sem.acquire();
+                        let _permit = pool.acquire();
                         translate_one_harvest_bench(paths, p, prompt, store, skip)
                     }),
                 )
@@ -1100,13 +1109,13 @@ fn resolve_launch(paths: &Paths, backend: InTool) -> Result<Launch> {
             model: claude_model()?,
             cli: CliVersion::probe("claude")?,
             // The same builder verify uses, so the phases cannot drift on flags for one CLI.
-            session: Session::claude(TRANSLATE_TIMEOUT_SECS),
+            session: Session::claude(translate_ceiling(paths.dataset)),
         }),
         InTool::OpenCode => Launch::OpenCode {
             model: opencode_model(paths)?,
             session: Session::opencode(
                 crate::agents::opencode::Phase::Translate,
-                TRANSLATE_TIMEOUT_SECS,
+                translate_ceiling(paths.dataset),
             ),
         },
         InTool::Codex { model, region } => Launch::Codex { model, region },
@@ -3493,6 +3502,23 @@ mod tests {
         );
     }
 
+    /// Exhaustive over `Dataset`: the value is in the translate recipe, so a dataset on the wrong ceiling
+    /// either gets a limit measured for something smaller or re-keys the other dataset's entries.
+    #[test]
+    fn each_dataset_gets_its_own_translate_ceiling_and_test_corpus_does_not_move() {
+        for (dataset, want) in [
+            (crate::cli::Dataset::TestCorpus, 10_800),
+            (crate::cli::Dataset::HarvestBench, 86_400),
+        ] {
+            assert_eq!(translate_ceiling(dataset), want, "{dataset:?}");
+        }
+        assert_ne!(
+            Session::claude(translate_ceiling(crate::cli::Dataset::TestCorpus)).shape(),
+            Session::claude(translate_ceiling(crate::cli::Dataset::HarvestBench)).shape(),
+            "the two must be different recipes, or scoping bought nothing"
+        );
+    }
+
     /// The honest limit of a keyless BACKEND: where no key can be asked about, "is something published
     /// here" is all there is to ask, and it stays. A shared-source group used to be the other half of
     /// this and no longer is — it is keyed like any other case, so it may not adopt what it finds.
@@ -3777,7 +3803,8 @@ mod tests {
     #[test]
     fn an_agent_with_no_in_tool_translate_phase_refuses_instead_of_panicking() {
         let paths = paths_for(Agent::Laertes, crate::cli::Dataset::HarvestBench);
-        let err = run_harvest_bench(&paths, &[], 1).expect_err("must refuse, not panic");
+        let err = run_harvest_bench(&paths, &[], &crate::agents::Pool::for_run(1))
+            .expect_err("must refuse, not panic");
         assert!(
             format!("{err:#}").contains("no in-tool translate phase"),
             "{err:#}"

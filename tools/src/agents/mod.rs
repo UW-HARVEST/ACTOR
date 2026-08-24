@@ -15,6 +15,22 @@ pub mod work;
 
 use std::sync::{Condvar, Mutex};
 
+/// THE run's concurrency budget, minted once and lent to every phase. `parallel: usize` was the defect:
+/// six sites re-derived a number into their own pool, so `run`'s per-unit loop gave each call an N-wide
+/// pool holding one job (`spec-27.md`). A borrower cannot mint a second: `new` below is private.
+pub struct Pool(Semaphore);
+
+impl Pool {
+    /// Called ONCE per run, from `main`.
+    pub fn for_run(parallel: usize) -> Self {
+        Self(Semaphore::new(parallel))
+    }
+
+    pub fn acquire(&self) -> SemaphoreGuard<'_> {
+        self.0.acquire()
+    }
+}
+
 pub struct Semaphore {
     state: Mutex<usize>,
     cvar: Condvar,
@@ -22,7 +38,7 @@ pub struct Semaphore {
 }
 
 impl Semaphore {
-    pub fn new(max: usize) -> Self {
+    fn new(max: usize) -> Self {
         Self {
             state: Mutex::new(0),
             cvar: Condvar::new(),

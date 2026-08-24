@@ -157,12 +157,29 @@ jobs:
         # with this PR and these nine lines in it -- plus 26. Same rule as before: prune or raise
         # deliberately, never quietly, and `--max-ratio 20` remains what actually stops sprawl.
         #
+        # RAISED 3200 -> 3320 by PR 29, with the reasoning the line above demands -- and this time the
+        # PATTERN is the argument. This was the FOURTH consecutive PR to measure `main` at exactly the
+        # ceiling, because every raise has been "the tree plus epsilon" (26, then 12): a cap pinned to a
+        # snapshot binds on the next PR whatever that PR contains, so it stopped measuring bloat and now
+        # measures arrival order. PR 29 adds ~900 counted lines -- `Pool`, `InScope`, `Preflighted`,
+        # `ProjectScore`, the harvest-bench table generator, two architecture gates, three measured
+        # ceilings -- and 60 comment lines, 6.7% against a 14.35% tree, so it leaves the tree LESS
+        # comment-dense than it found it. That is after pruning 26 of its own: the CMake story was told
+        # five times and is now told once on the type it shaped, and one doc paragraph was a duplicate
+        # left by an earlier shape of `ProjectScore`. What survived is the WHY the operator chose to keep
+        # over the number: why `parallel: usize` was the defect, why a partial `InScope` cannot be built,
+        # why `build_ok: bool` printed `Builds: no` against seven crates that compiled, and the three
+        # MEASURED durations (libpng translate 4.71 h, mujs verify 6.5 h, zstd verify 4.4 h) that are the
+        # only evidence the raised ceilings were earned -- delete those and the next operator inherits a
+        # magic 86400. 3320 is 3293 -- the tree with this PR and these fifteen self-counting lines in it
+        # -- plus 27. Prune or raise deliberately, never quietly; `--max-ratio 20` still stops sprawl.
+        #
         # .py is in neither HASH nor SLASH, so the budget does not count itself: this
         # script's own docstring and all 250 lines of tools/test_comment_budget.py cost
         # ZERO against both ceilings. Deriving 3100 from the tree needs that fact.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 3200 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 3320 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is

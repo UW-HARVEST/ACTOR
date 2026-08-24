@@ -618,6 +618,9 @@ pub struct Paths {
     pub results_dir: PathBuf,
     pub prompts_dir: PathBuf,
     pub agent: Agent,
+    /// KEPT, not merely used to derive the dirs above: a phase's wall-clock ceiling depends on it, and
+    /// recovering it from `results_dir`'s spelling would be a string where a type belongs.
+    pub dataset: Dataset,
     /// How this run is spelled in the results tree, the cache key and the recorded
     /// provenance — one value, so the three cannot disagree.
     pub agent_key: crate::cache::AgentKey,
@@ -687,6 +690,7 @@ impl Paths {
             enforcement,
             prompts_dir,
             agent,
+            dataset,
             agent_key,
             model: model.map(String::from),
         })
