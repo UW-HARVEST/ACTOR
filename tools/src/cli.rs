@@ -55,16 +55,22 @@ pub enum Agent {
     /// Tests whether the project-type dispatch is structurally necessary.
     /// Verify phase is skipped.
     ClaudeCrossPrompt,
-    /// OpenAI Codex CLI on Amazon Bedrock with gpt-5.5 (us-east-2).  Same
-    /// methodology as `claude`: same prompts, translate-then-verify pipeline.
-    /// Used to validate that ACTOR is portable across multiple agentic
-    /// harnesses (Kiro CLI, Claude Code, Codex).  All requests go through
-    /// Bedrock; OpenAI telemetry/auth is disabled.
+    /// OpenAI Codex CLI on Amazon Bedrock with gpt-5.5 (us-east-2). HISTORICAL, and not
+    /// comparable to `claude`: it was fed `prompts/claude/*.md`, whose sub-agent protocol
+    /// tells the agent to dispatch work through a Task tool Codex does not have, and it
+    /// had no verify phase at all. Kept as-is so its committed records stay honest about
+    /// what produced them. Use `codex-gpt56-sol` for a like-for-like run.
     CodexGpt55,
-    /// OpenAI Codex CLI on Amazon Bedrock with gpt-5.4 (us-west-2).  Same
-    /// methodology as `CodexGpt55`; different model version for cross-model
-    /// comparison within the Codex harness.
+    /// OpenAI Codex CLI on Amazon Bedrock with gpt-5.4 (us-west-2). HISTORICAL, same two
+    /// caveats as `CodexGpt55`; different model version.
     CodexGpt54,
+    /// OpenAI Codex CLI on Amazon Bedrock with gpt-5.6-sol (us-east-2), and the FIRST codex
+    /// variant that is methodologically comparable to `claude`: it runs the same
+    /// translate-then-verify pipeline, and its prompts live in `prompts/codex/`, which carry
+    /// Codex's own single-session protocol in place of Claude Code's Task-tool sub-agent one.
+    /// All requests go through Bedrock. Its retry/auth settings come from
+    /// `~/.codex/config.toml`, which is outside this repo and so outside the cache key.
+    CodexGpt56Sol,
     /// OpenCode CLI, with the model chosen by `--model <provider>/<model-id>`
     /// (e.g. `amazon-bedrock/us.anthropic.claude-sonnet-5`). Same methodology
     /// as `claude`: the SAME `prompts/claude/*.md` prompts and the same
@@ -102,9 +108,11 @@ impl Agent {
     /// `StreamJson` can never publish, and one wrongly marked `Opaque` would be
     /// sealed on the strength of an exit code its own log contradicts.
     pub fn log_format(self) -> crate::domain::health::LogFormat {
-        use crate::domain::health::LogFormat::{Opaque, StreamJson};
+        use crate::domain::health::LogFormat::{CodexJson, Opaque, StreamJson};
         match self {
-            // Claude Code and the codex CLIs emit `--output-format stream-json`.
+            // Its own dialect: `turn.completed`, no `result` record. See `LogFormat::CodexJson`.
+            Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => CodexJson,
+            // Claude Code emits `--output-format stream-json`.
             Agent::Claude
             | Agent::ClaudeCombined
             | Agent::ClaudeMinimal
@@ -112,8 +120,6 @@ impl Agent {
             | Agent::ClaudeNoFeatures
             | Agent::ClaudeNoSubtask
             | Agent::ClaudeCrossPrompt
-            | Agent::CodexGpt55
-            | Agent::CodexGpt54
             | Agent::OpenCode => StreamJson,
             // kiro-cli writes prose ("Credits: ..."); kimi and oneshot write prose;
             // c2rust writes cmake/cargo output; laertes, c2saferrust and smartc2rust
@@ -453,32 +459,36 @@ mod tests {
 
     #[test]
     fn every_agent_declares_a_log_format_and_the_prose_ones_are_opaque() {
-        // Guards the table against a new variant defaulting to the wrong classifier.
-        for a in [
-            Agent::Claude,
-            Agent::ClaudeCombined,
-            Agent::ClaudeMinimal,
-            Agent::ClaudeNoIter,
-            Agent::ClaudeNoFeatures,
-            Agent::ClaudeNoSubtask,
-            Agent::ClaudeCrossPrompt,
-            Agent::CodexGpt55,
-            Agent::CodexGpt54,
-            Agent::OpenCode,
-        ] {
-            assert_eq!(a.log_format(), LogFormat::StreamJson, "{a:?}");
+        use clap::ValueEnum;
+        // The WHOLE mapping, and a check it covers the enum: the list form let a variant be added
+        // to neither group and never asserted -- which is how codex sat in StreamJson for its life.
+        let expected = |a: Agent| match a {
+            Agent::Claude
+            | Agent::ClaudeCombined
+            | Agent::ClaudeMinimal
+            | Agent::ClaudeNoIter
+            | Agent::ClaudeNoFeatures
+            | Agent::ClaudeNoSubtask
+            | Agent::ClaudeCrossPrompt
+            | Agent::OpenCode => LogFormat::StreamJson,
+            Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => LogFormat::CodexJson,
+            Agent::Kiro
+            | Agent::C2rust
+            | Agent::Laertes
+            | Agent::C2SaferRust
+            | Agent::SmartC2Rust
+            | Agent::Kimi
+            | Agent::Oneshot => LogFormat::Opaque,
+        };
+        let mut seen = 0;
+        for a in Agent::value_variants() {
+            assert_eq!(a.log_format(), expected(*a), "{a:?}");
+            seen += 1;
         }
-        for a in [
-            Agent::Kiro,
-            Agent::C2rust,
-            Agent::Laertes,
-            Agent::C2SaferRust,
-            Agent::SmartC2Rust,
-            Agent::Kimi,
-            Agent::Oneshot,
-        ] {
-            assert_eq!(a.log_format(), LogFormat::Opaque, "{a:?}");
-        }
+        assert!(
+            seen >= 17,
+            "the sweep must reach every variant, saw only {seen}"
+        );
     }
 
     /// `verify` gained a translate leg, and with it the ability to spend translate's money on the

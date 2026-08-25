@@ -661,6 +661,9 @@ impl Paths {
             ),
         };
         let prompts_dir = match agent {
+            // Codex's own set: `prompts/claude/*.md` carry a sub-agent protocol built on Claude
+            // Code's Task tool, so every codex run so far was told to use a tool it cannot call.
+            Agent::CodexGpt56Sol => repo_root.join("prompts/codex"),
             Agent::Claude
             | Agent::ClaudeCombined
             | Agent::ClaudeMinimal

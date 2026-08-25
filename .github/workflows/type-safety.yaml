@@ -174,12 +174,27 @@ jobs:
         # magic 86400. 3320 is 3293 -- the tree with this PR and these fifteen self-counting lines in it
         # -- plus 27. Prune or raise deliberately, never quietly; `--max-ratio 20` still stops sprawl.
         #
+        # RAISED 3320 -> 3470 by the codex-fair-comparison branch, and the reasoning is that every
+        # line of it documents a number that was WRONG IN PRINT. Four defects, each measured rather
+        # than argued: `Execution failed` was one of three runtests failure shapes and the parser
+        # matched two, so 76 cases over 10 agents were scored as PASSES -- `claude-cross-prompt` alone
+        # 56 of them against a published 63/210, an E4 ablation inflated ninefold. `measured_nothing`
+        # asked about vectors not cases, so it refused the exact shape four agents already publish for
+        # P01 and the code could not re-derive four rows of its own tables. `assemble` let an agent's
+        # `logs/verify.log` publish over the harness transcript, turning a 127,649-byte log ending in
+        # `turn.completed` into 1,357 bytes and a successful verify into a refused battery. And
+        # `unwrap_or(0)` printed `\ActorKiroTests{0/338}` for an agent whose records say 325/338.
+        # Delete those and the next reader inherits four magic constants and no way to know any of it
+        # happened -- the numbers are the evidence, and evidence in a commit message nobody greps is
+        # evidence lost. The tree is 14.66% comment against a 20% ratio ceiling, so density is not the
+        # thing moving. 3470 is 3434 plus 36. Prune or raise deliberately, never quietly.
+        #
         # .py is in neither HASH nor SLASH, so the budget does not count itself: this
         # script's own docstring and all 250 lines of tools/test_comment_budget.py cost
         # ZERO against both ceilings. Deriving 3100 from the tree needs that fact.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 3320 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 3470 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is

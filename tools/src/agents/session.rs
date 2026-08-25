@@ -39,6 +39,10 @@ pub const AGENT_ENV: &[(&str, &str)] = &[
     ("CLAUDE_CODE_RETRY_WATCHDOG", "1"),
 ];
 
+/// Empty, measured: codex's translate set only `OPENSSL_DIR`, which [`Session::shell`] supplies. Its
+/// retry/auth settings live in `~/.codex/config.toml` -- outside the key, like kiro's `kiro_plain`.
+const CODEX_AGENT_ENV: &[(&str, &str)] = &[];
+
 const CLAUDE_MAX_TURNS: u32 = 1000;
 const CLAUDE_PERMISSION_MODE: &str = "bypassPermissions";
 
@@ -88,6 +92,30 @@ impl Session {
              < /dev/null 2>&1 | tee \"$2\"",
             s.prefix(),
             s.session_flags(),
+        );
+        Self { script, ..s }
+    }
+
+    /// Routed through `Session` for the reason every other backend is: translate built this inline
+    /// with a hardcoded `timeout 10800`, so the ceiling was invisible to `Recipe::digest` and verify
+    /// could not ask for the same command. `$5`/`$6` are positional so a `.`-bearing model id cannot
+    /// be re-lexed; codex has no `--agents`, and `-p/--profile` ships nothing from this repo.
+    pub fn codex(timeout_secs: u64) -> Self {
+        let s = Self {
+            program: "codex",
+            timeout_secs,
+            max_turns: None,
+            permission_mode: None,
+            caps: None,
+            agents_json: "",
+            agent_env: CODEX_AGENT_ENV,
+            script: String::new(),
+        };
+        let script = format!(
+            "{} exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \
+             -C \"$3\" -c model=\"$5\" -c model_providers.amazon-bedrock.aws.region=\"$6\" \
+             --json \"$1\" < /dev/null 2>&1 | tee \"$2\"",
+            s.prefix(),
         );
         Self { script, ..s }
     }
@@ -247,6 +275,26 @@ impl Session {
             // cover only the top-level session.
             .env("CLAUDE_CODE_SUBAGENT_MODEL", run.model.as_str())
             .current_dir(run.cwd);
+        c
+    }
+
+    /// `__unused__` holds `$4`'s place: claude's script uses it for the agents file, and keeping the
+    /// positions aligned across backends is what lets one `shell()` serve all of them.
+    pub fn codex_command(
+        &self,
+        cwd: &Path,
+        prompt: &str,
+        log: &Path,
+        model: &str,
+        region: &str,
+    ) -> Command {
+        let mut c = self.shell();
+        c.arg(prompt)
+            .arg(log)
+            .arg(cwd)
+            .arg("__unused__")
+            .arg(model)
+            .arg(region);
         c
     }
 

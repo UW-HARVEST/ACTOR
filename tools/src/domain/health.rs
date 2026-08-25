@@ -27,6 +27,10 @@
 pub enum LogFormat {
     /// stream-json carrying a terminal record. Its ABSENCE means truncation.
     StreamJson,
+    /// codex `exec --json`: a DIFFERENT dialect -- `turn.completed`/`turn.failed`, not claude's
+    /// `result`/`terminal_reason`. Marked `StreamJson` it was the bug above, so every codex run
+    /// classified `Infra { truncated }` and could never seal. That is the mechanism of `Codex 0/338`.
+    CodexJson,
     /// Prose (kiro, kimi, oneshot) or tool output (c2rust, laertes, c2saferrust).
     /// Proves nothing about completion, so the exit status is the only evidence.
     Opaque,
@@ -104,6 +108,7 @@ impl Health {
 pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
     match format {
         LogFormat::StreamJson => classify_stream_json(text),
+        LogFormat::CodexJson => classify_codex_json(text),
         // An opaque log cannot distinguish "finished" from "killed", so the exit
         // status carries the whole burden of proof.
         LogFormat::Opaque => match exit {
@@ -129,6 +134,28 @@ pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
                 why: "opaque log and no observed exit status".into(),
             },
         },
+    }
+}
+
+/// The shape `translate::scan_codex_log_for_transient_error` reads, for the same reason: codex exits 0
+/// after Bedrock drops a conversation, so the exit status proves nothing and only this record does.
+fn classify_codex_json(tail: &str) -> Health {
+    let completed = tail.contains(r#""type":"turn.completed""#);
+    let failed = tail.contains(r#""type":"turn.failed""#);
+    if completed {
+        return Health::Completed;
+    }
+    if failed {
+        return Health::Infra {
+            reason: "turn.failed".into(),
+            detail: last_str(tail, "message")
+                .unwrap_or_else(|| "codex reported turn.failed".into()),
+        };
+    }
+    // Neither: the process died mid-turn, exactly as a truncated stream-json log did.
+    Health::Infra {
+        reason: "truncated".into(),
+        detail: "no codex terminal record: the agent was killed before finishing".into(),
     }
 }
 
@@ -235,6 +262,43 @@ mod tests {
     /// What the audit sees: a transcript and nothing else.
     fn from_log(text: &str) -> Health {
         classify(text, LogFormat::StreamJson, Exit::Unobserved)
+    }
+
+    /// A codex run that WROTE A WORKING TRANSLATION must not read as a killed one. This fixture is
+    /// trimmed from one that built and produced byte-identical output.
+    #[test]
+    fn a_finished_codex_run_is_completed_and_a_dead_one_is_infra() {
+        let done = r#"{"type":"item.completed","item":{"id":"item_34","type":"command_execution","exit_code":0}}
+{"type":"turn.completed","usage":{"input_tokens":230888,"output_tokens":4573}}"#;
+        assert_eq!(
+            classify(done, LogFormat::CodexJson, Exit::Success),
+            Health::Completed,
+            "a completed codex turn is a result"
+        );
+        // Non-vacuity: the old classifier really did reject this exact text, so the fixture
+        // contains the trap rather than merely passing under a rule that accepts anything.
+        assert!(
+            matches!(
+                classify(done, LogFormat::StreamJson, Exit::Success),
+                Health::Infra { .. }
+            ),
+            "fixture check: claude's classifier must be the thing that mis-reads it"
+        );
+
+        let dead = r#"{"type":"error","message":"unexpected status 404 Not Found: The model does not exist"}
+{"type":"turn.failed","error":{"message":"unexpected status 404 Not Found"}}"#;
+        let Health::Infra { reason, .. } = classify(dead, LogFormat::CodexJson, Exit::Success)
+        else {
+            panic!("turn.failed with no turn.completed is a dead run, whatever the exit status")
+        };
+        assert_eq!(reason, "turn.failed");
+
+        // And a log cut off mid-turn is still truncated, not a pass.
+        let cut = r#"{"type":"turn.started"}"#;
+        assert!(matches!(
+            classify(cut, LogFormat::CodexJson, Exit::Success),
+            Health::Infra { .. }
+        ));
     }
 
     #[test]

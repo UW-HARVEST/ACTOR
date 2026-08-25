@@ -651,6 +651,14 @@ pub fn prompt_file_for(agent: Agent, kind: PromptKind) -> Option<&'static str> {
             Shared => Some("translate-shared.md"),
             Verify => None,
         },
+        // Same filenames as claude's, read from `prompts/codex/`: the methodology is
+        // identical and only the sub-agent protocol differs, Codex having no Task tool.
+        Agent::CodexGpt56Sol => Some(match kind {
+            Library => "translate-library.md",
+            Executable => "translate-executable.md",
+            Shared => "translate-shared.md",
+            Verify => "verify.md",
+        }),
         Agent::CodexGpt55 | Agent::CodexGpt54 => match kind {
             Library => Some("translate-library.md"),
             Executable => Some("translate-executable.md"),
@@ -671,6 +679,61 @@ pub fn prompt_file_for(agent: Agent, kind: PromptKind) -> Option<&'static str> {
     }
 }
 
+/// The agent-specific tail of a composed prompt, in [`Paths::prompts_dir`].
+pub const PROTOCOL_PART: &str = "protocol.md";
+
+/// Where the file [`prompt_file_for`] names lives, and whether the agent's protocol part follows it.
+///
+/// `Shared` holds the methodology ONCE, in `prompts/shared/`, and composes it with
+/// `<agent>/protocol.md` -- claude and codex differ only in that tail, so keeping two full copies
+/// meant the next edit to the shared 270 lines had to land twice and would drift. `OwnDir` is a
+/// complete document: kiro's set is a different document entirely, and every `ablations/` file is a
+/// deliberate fork whose point is to differ. Exhaustive, so a new agent decides instead of
+/// inheriting -- defaulting into the wrong group is what `LogFormat` did to codex.
+enum PromptBody {
+    Shared,
+    OwnDir,
+}
+
+fn prompt_body(agent: Agent, file: &str) -> PromptBody {
+    // An ablation forks the whole document, protocol included -- today they carry none, which is
+    // itself an uncontrolled difference from their base, but not one this change may alter.
+    if file.starts_with("ablations/") {
+        return PromptBody::OwnDir;
+    }
+    match agent {
+        Agent::Claude
+        | Agent::OpenCode
+        | Agent::CodexGpt56Sol
+        | Agent::CodexGpt55
+        | Agent::CodexGpt54
+        | Agent::ClaudeNoFeatures
+        | Agent::ClaudeNoSubtask
+        | Agent::ClaudeCrossPrompt => PromptBody::Shared,
+        Agent::Kiro
+        | Agent::Kimi
+        | Agent::Oneshot
+        | Agent::ClaudeCombined
+        | Agent::ClaudeMinimal
+        | Agent::ClaudeNoIter
+        | Agent::C2rust
+        | Agent::Laertes
+        | Agent::C2SaferRust
+        | Agent::SmartC2Rust => PromptBody::OwnDir,
+    }
+}
+
+fn read_part(path: &Path, kind: PromptKind) -> Result<String> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the {kind:?} prompt {}", path.display()))?;
+    anyhow::ensure!(
+        !text.trim().is_empty(),
+        "the prompt {} is empty",
+        path.display()
+    );
+    Ok(text)
+}
+
 /// The text of the prompt for `kind`, or `None` when this agent reads none.
 ///
 /// A prompt that IS named but missing on disk is an error, never an empty string: an
@@ -680,15 +743,17 @@ pub fn read_prompt(paths: &Paths, kind: PromptKind) -> Result<Option<String>> {
     let Some(file) = prompt_file_for(paths.agent, kind) else {
         return Ok(None);
     };
-    let path = paths.prompts_dir.join(file);
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading the {kind:?} prompt {}", path.display()))?;
-    anyhow::ensure!(
-        !text.trim().is_empty(),
-        "the prompt {} is empty",
-        path.display()
-    );
-    Ok(Some(text))
+    Ok(Some(match prompt_body(paths.agent, file) {
+        PromptBody::OwnDir => read_part(&paths.prompts_dir.join(file), kind)?,
+        // Concatenated, with no separator inserted: the body keeps its own trailing newline, so the
+        // composition is byte-for-byte what the two files used to be as one. That is the whole
+        // safety property -- `cache::prompt_digest` hashes this text, so a stray byte here re-keys
+        // every stored entry.
+        PromptBody::Shared => {
+            read_part(&paths.repo_root.join("prompts/shared").join(file), kind)?
+                + &read_part(&paths.prompts_dir.join(PROTOCOL_PART), kind)?
+        }
+    }))
 }
 
 /// [`read_prompt`] where the phase cannot run without one.
@@ -728,7 +793,7 @@ fn dispatch_translate(
         Agent::Kiro | Agent::Claude | Agent::OpenCode | Agent::ClaudeCombined
         | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures
         | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
-        | Agent::CodexGpt55 | Agent::CodexGpt54 => {
+        | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => {
             let prompt = require_prompt(paths, PromptKind::independent(is_lib))?;
             translate_case(paths, battery, name, &prompt, store)
         }
@@ -752,7 +817,7 @@ fn dispatch_translate_shared(
         Agent::Kiro | Agent::Claude | Agent::OpenCode | Agent::ClaudeCombined
         | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures
         | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt
-        | Agent::CodexGpt55 | Agent::CodexGpt54 => {
+        | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => {
             let prompt = require_prompt(paths, PromptKind::Shared)?;
             translate_case(paths, battery, name, &prompt, store)
         }
@@ -919,7 +984,7 @@ fn preflight_check(agent: Agent, mode: cache::Mode) -> Result<()> {
         | Agent::ClaudeNoFeatures
         | Agent::ClaudeNoSubtask
         | Agent::ClaudeCrossPrompt => ("claude", &["--version"]),
-        Agent::CodexGpt55 | Agent::CodexGpt54 => ("codex", &["--version"]),
+        Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => ("codex", &["--version"]),
         Agent::OpenCode => ("opencode", &["--version"]),
         Agent::C2rust => ("c2rust", &["--version"]),
         Agent::Laertes => ("docker", &["--version"]),
@@ -1005,10 +1070,8 @@ fn preflight_check(agent: Agent, mode: cache::Mode) -> Result<()> {
 enum InTool {
     Kiro,
     Claude,
-    Codex {
-        model: &'static str,
-        region: &'static str,
-    },
+    /// Carries nothing: `invocation::codex_model` is the ONE table verify reads too.
+    Codex,
     OpenCode,
     C2rust,
 }
@@ -1028,14 +1091,7 @@ fn in_tool_translate(agent: Agent) -> Option<InTool> {
         | Agent::ClaudeNoFeatures
         | Agent::ClaudeNoSubtask
         | Agent::ClaudeCrossPrompt => InTool::Claude,
-        Agent::CodexGpt55 => InTool::Codex {
-            model: "openai.gpt-5.5",
-            region: "us-east-2",
-        },
-        Agent::CodexGpt54 => InTool::Codex {
-            model: "openai.gpt-5.4",
-            region: "us-west-2",
-        },
+        Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => InTool::Codex,
         Agent::OpenCode => InTool::OpenCode,
         Agent::C2rust => InTool::C2rust,
         // Each is driven by its own docker pipeline or single API call, reached from
@@ -1081,13 +1137,6 @@ enum Launch {
         model: crate::agents::opencode::Model,
         session: Session,
     },
-    /// Model and region are `-c` overrides so the run does not depend on a global
-    /// ~/.codex/config.toml. No [`Session`] renders this invocation — it is a literal argv — and
-    /// `cache::Recipe` hashes a `Session` precisely because argv carries the scratch path.
-    Codex {
-        model: &'static str,
-        region: &'static str,
-    },
     /// No model to name, and no agent exit recorded, so an opaque log is `Unknown` and mints no
     /// `Completed` either. Also the one backend whose spend a cache would not save.
     C2rust,
@@ -1118,7 +1167,18 @@ fn resolve_launch(paths: &Paths, backend: InTool) -> Result<Launch> {
                 translate_ceiling(paths.dataset),
             ),
         },
-        InTool::Codex { model, region } => Launch::Codex { model, region },
+        // Keyed like every other in-tool backend. Its own unkeyed variant is why no codex
+        // sweep ever left an entry to replay.
+        InTool::Codex => Launch::Keyed(Invocation {
+            backend: Backend::Codex,
+            model: ModelId::new(
+                crate::agents::invocation::codex_model(paths.agent)
+                    .context("a Codex launch resolved for a non-codex agent")?
+                    .0,
+            )?,
+            cli: CliVersion::probe("codex")?,
+            session: Session::codex(translate_ceiling(paths.dataset)),
+        }),
         InTool::C2rust => Launch::C2rust,
     })
 }
@@ -1128,8 +1188,8 @@ fn resolve_launch(paths: &Paths, backend: InTool) -> Result<Launch> {
 /// decision stays pure and testable; both matches are exhaustive, so a new backend decides in both.
 fn skip_check(backend: InTool) -> SkipCheck {
     match backend {
-        InTool::Kiro | InTool::Claude => SkipCheck::Keyed,
-        InTool::OpenCode | InTool::Codex { .. } | InTool::C2rust => SkipCheck::WhateverIsPublished,
+        InTool::Kiro | InTool::Claude | InTool::Codex => SkipCheck::Keyed,
+        InTool::OpenCode | InTool::C2rust => SkipCheck::WhateverIsPublished,
     }
 }
 
@@ -1294,6 +1354,22 @@ fn run_translate_agent(
                     .context("invoking kiro-cli")?;
                 record_agent_exit(status);
             }
+            Backend::Codex => {
+                let (model, region) = crate::agents::invocation::codex_model(paths.agent)
+                    .context("a Codex backend resolved for a non-codex agent")?;
+                // The retry wrapper, not a bare status -- see `invoke_codex_with_retry`.
+                invoke_codex_with_retry(
+                    RetrySession {
+                        prompt,
+                        log_path,
+                        work_dir: &cwd,
+                        context_label: "translate",
+                    },
+                    &inv.session,
+                    model,
+                    region,
+                )?;
+            }
             Backend::Claude => {
                 let settings = crate::io::sandbox::write_settings(crate::io::sandbox::Policy {
                     repo_root: &paths.repo_root,
@@ -1342,17 +1418,6 @@ fn run_translate_agent(
                 model,
             )?;
         }
-        Launch::Codex { model, region } => invoke_codex_with_retry(
-            RetrySession {
-                prompt,
-                log_path,
-                work_dir: &cwd,
-                context_label: "translate",
-            },
-            model,
-            region,
-            &std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into()),
-        )?,
         Launch::C2rust => c2rust_translate(&cwd, log_path)?,
     }
 
@@ -2538,22 +2603,22 @@ fn walkdir(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
 }
 
 /// The inputs both retrying agent invocations share, regardless of backend.
-struct RetrySession<'a> {
-    prompt: &'a str,
-    log_path: &'a Path,
-    work_dir: &'a Path,
+pub(crate) struct RetrySession<'a> {
+    pub(crate) prompt: &'a str,
+    pub(crate) log_path: &'a Path,
+    pub(crate) work_dir: &'a Path,
     /// Identifies the case in retry/abort diagnostics.
-    context_label: &'a str,
+    pub(crate) context_label: &'a str,
 }
 
 /// Retry-aware codex invocation: codex exits 0 after a transient Bedrock error
 /// mid-conversation, so without this a Bedrock failure counts as a successful (but
 /// empty) translation. Each retry is a fresh invocation, discarding partial state.
-fn invoke_codex_with_retry(
+pub(crate) fn invoke_codex_with_retry(
     session: RetrySession<'_>,
+    invocation: &crate::agents::session::Session,
     model: &str,
     region: &str,
-    openssl_dir: &str,
 ) -> Result<()> {
     let RetrySession {
         prompt,
@@ -2565,22 +2630,10 @@ fn invoke_codex_with_retry(
     const RETRY_BACKOFF_SECS: u64 = 30;
 
     for attempt in 1..=MAX_RETRIES {
-        let status = Command::new("bash")
-            .arg("-lc")
-            .arg(r#"set -o pipefail; timeout 10800 codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C "$3" -c model="$5" -c model_providers.amazon-bedrock.aws.region="$6" --json "$1" < /dev/null 2>&1 | tee "$2""#)
-            .arg("--")
-            .arg(prompt)
-            .arg(log_path)
-            .arg(work_dir)
-            .arg("__unused__")
-            .arg(model)
-            .arg(region)
-            .env("OPENSSL_DIR", openssl_dir)
-            .current_dir(work_dir)
+        let status = invocation
+            .codex_command(work_dir, prompt, log_path, model, region)
             .status()
-            .with_context(|| format!("invoking codex ({context_label})"))?;
-        // Overwritten each retry, so the exit that decided the outcome is the one
-        // that survives.
+            .with_context(|| format!("invoking codex for {context_label}"))?;
         record_agent_exit(status);
 
         match scan_codex_log_for_transient_error(log_path) {
@@ -3606,10 +3659,13 @@ mod tests {
                 cache::Mode::ReadWrite,
                 SkipCheck::WhateverIsPublished,
             ),
+            // Keyed since codex became a real backend; its own unkeyed variant is why no codex
+            // sweep left an entry.
+            (Agent::CodexGpt55, cache::Mode::ReadWrite, SkipCheck::Keyed),
             (
-                Agent::CodexGpt55,
+                Agent::CodexGpt56Sol,
                 cache::Mode::ReadWrite,
-                SkipCheck::WhateverIsPublished,
+                SkipCheck::Keyed,
             ),
             (
                 Agent::C2rust,
@@ -3630,15 +3686,8 @@ mod tests {
         }
 
         // And the pairing: a backend `skip_check` calls keyless must be one `resolve_launch` answers
-        // no `Launch::Keyed` for. Only these three need no CLI on PATH — which is the same line.
-        for backend in [
-            InTool::OpenCode,
-            InTool::Codex {
-                model: "openai.gpt-5.5",
-                region: "us-east-2",
-            },
-            InTool::C2rust,
-        ] {
+        // no `Launch::Keyed` for. Only these two need no CLI on PATH, which is the same line.
+        for backend in [InTool::OpenCode, InTool::C2rust] {
             let launch = resolve_launch(
                 &paths_at(tmp.path(), Agent::OpenCode, corpus, cache::Mode::ReadWrite),
                 backend,
@@ -3985,6 +4034,81 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The composition must reproduce, BYTE FOR BYTE, the prompts that earned every stored entry.
+    /// `cache::prompt_digest` hashes the assembled text, so one stray byte here silently re-keys
+    /// claude's 209 translate and 208 verify entries and `reproduce.sh` stops replaying anything.
+    /// These digests were taken from the eight committed files before they were split, so this
+    /// pins the refactor to what actually ran rather than to what it now produces.
+    #[test]
+    fn splitting_the_prompts_did_not_change_one_byte_of_them() {
+        use sha2::{Digest, Sha256};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root");
+        // (agent, kind, sha256 of the prompt text as it was before the split)
+        let pinned: &[(Agent, PromptKind, &str)] = &[
+            (
+                Agent::Claude,
+                PromptKind::Library,
+                "59679282382af82b1f94785dd56a6180ed10f68b78e891beaee4ef22d35c52d4",
+            ),
+            (
+                Agent::Claude,
+                PromptKind::Executable,
+                "5338715804cd1ccb0ac4260f7ee732e8f013973648143dd021366c6ad38eba56",
+            ),
+            (
+                Agent::Claude,
+                PromptKind::Shared,
+                "99aba087ca0c53bdcff869003b51f85d855ad88f11065822b6256f6363e271ea",
+            ),
+            (
+                Agent::Claude,
+                PromptKind::Verify,
+                "377d52565d1b9ad08aaad9b8bf0c5b6602f11c9c0b3a60609a0d6f0ba739f363",
+            ),
+            (
+                Agent::CodexGpt56Sol,
+                PromptKind::Library,
+                "fa12f10bc2deeb451e28a2e2667259e7be3034ae90ded9f74f910ac27e093ee7",
+            ),
+            (
+                Agent::CodexGpt56Sol,
+                PromptKind::Executable,
+                "85206c0351f4141186eafb36d6676b5075f1ae669af17a748e37dad0bfbd3a0b",
+            ),
+            (
+                Agent::CodexGpt56Sol,
+                PromptKind::Shared,
+                "b59c8ddf1fd3a8f2a32c99f9d450f2c4f9a0e90bf1cb705bfdf3ed6f799fe0c2",
+            ),
+            (
+                Agent::CodexGpt56Sol,
+                PromptKind::Verify,
+                "f5c29dea157af28971d447181e3dbb4412484d1cf15d3805cc71cbe11ea6d379",
+            ),
+        ];
+        for (agent, kind, want) in pinned {
+            let paths = Paths::new(
+                repo,
+                *agent,
+                crate::cli::Dataset::TestCorpus,
+                None,
+                cache::Mode::Bypass,
+                crate::io::sandbox::Enforcement::AllowUnsandboxed,
+            )
+            .unwrap();
+            let text = read_prompt(&paths, *kind)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{agent:?}/{kind:?} must still resolve a prompt"));
+            let got = format!("{:x}", Sha256::digest(text.as_bytes()));
+            assert_eq!(
+                &got, want,
+                "{agent:?}/{kind:?}: the composed prompt is not the one that ran"
+            );
         }
     }
 

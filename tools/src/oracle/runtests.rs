@@ -242,11 +242,51 @@ fn transcripts(crate_root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     (logs.join(Translate::LOG), logs.join(Verify::LOG))
 }
 
-/// Cases discovered but not one vector judged: the oracle measured nothing, whatever it printed. All
-/// 128 of P01's crates once failed to build on a runner whose registry lacked their dependency, and the
-/// pass reported `0/128` and regenerated `tables/` from it -- caught only by `git diff`.
-fn measured_nothing(cases_discovered: usize, vectors_passed: usize, vectors_failed: usize) -> bool {
-    cases_discovered > 0 && vectors_passed + vectors_failed == 0
+/// Cases discovered but NOT ONE of them reaching any verdict: the oracle never ran, whatever it
+/// printed. All 128 of P01's crates once failed to build on a runner whose registry lacked their
+/// dependency, and the pass reported `0/128` and regenerated `tables/` from it -- caught only by
+/// `git diff`.
+///
+/// Keyed on cases, not vectors, and that correction matters: "every crate failed to build" IS a
+/// result, and it is one four agents already publish. `smartc2rust`, `c2rust`, `c2saferrust` and
+/// `gpt-5.4` each record `0/128` for P01 with `Tested: 0, Failed: 128, Vectors: 0/0` -- the exact
+/// shape the vector form refused, so the code could not re-derive four rows of its own tables.
+/// Nobody noticed because `reproduce.sh` replays claude only.
+///
+/// The registry class this was written for is now stopped at source by `CARGO_NET_OFFLINE=false`
+/// below, and any table that moves for any reason is caught by `reproduce.sh`'s byte-identical
+/// diff. What remains here is the one signal counts can honestly carry: a battery where the oracle
+/// judged nothing at all, not one where it judged everything a failure.
+fn measured_nothing(cases_discovered: usize, cases_tested: usize, cases_failed: usize) -> bool {
+    cases_discovered > 0 && cases_tested + cases_failed == 0
+}
+
+/// The cases runtests failed OUTRIGHT, with the reason, from its text alone.
+///
+/// Pure and separately testable because the shape LIST is where the bug was: only `Build failed` and
+/// `Test failed (` were matched, so `Execution failed` -- a case whose binary never ran -- stayed out
+/// of `failed_cases`, and `cases_passed = discovered - failed.len()` counted it as a PASS. 76 such
+/// cases sit in the committed logs across 10 agents, every one scored as passing;
+/// `claude-cross-prompt` alone holds 56 of them against a published 63/210. It stayed hidden because
+/// the one battery where EVERY case took this shape was refused by `measured_nothing` instead, so the
+/// parser gap surfaced as a different error.
+fn hard_failures(text: &str) -> Result<Vec<(String, &'static str)>> {
+    let shapes = [
+        (Regex::new(r"^- (\S+): Build failed")?, "build failed"),
+        (
+            Regex::new(r"^- (\S+): Execution failed")?,
+            "execution failed",
+        ),
+    ];
+    let mut out = Vec::new();
+    for line in text.lines() {
+        for (re, label) in &shapes {
+            if let Some(caps) = re.captures(line) {
+                out.push((caps[1].to_string(), *label));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn run_runtests(
@@ -309,42 +349,39 @@ fn run_runtests(
     };
 
     let cases_discovered = extract(r"Test Cases Discovered:\s+(\d+)");
+    let cases_tested = extract(r"Test Cases Tested:\s+(\d+)");
+    let cases_failed = extract(r"Test Cases Failed:\s+(\d+)");
     let vectors_passed = extract(r"Test Vectors Passed:\s+(\d+)");
     let vectors_failed = extract(r"Test Vectors Failed:\s+(\d+)");
     let vectors_skipped = extract(r"Test Vectors Skipped:\s+(\d+)");
 
     anyhow::ensure!(
-        !measured_nothing(cases_discovered, vectors_passed, vectors_failed),
-        "{battery} [{}] discovered {cases_discovered} case(s) and ran NO test vector, so this is not a \
-         score of zero -- nothing was measured. Every crate failing to build looks exactly like this. \
-         The build output is in {}.",
+        !measured_nothing(cases_discovered, cases_tested, cases_failed),
+        "{battery} [{}] discovered {cases_discovered} case(s) and reached a verdict on NONE of them, \
+         so this is not a score of zero -- the oracle never ran. The build output is in {}.",
         pass.phase,
         paths.output_dir(battery).join("test.log").display(),
     );
 
-    // runtests' grammar: "- NAME: Build failed …", or "- NAME: Test failed (testN: REASON" — ONE
-    // vector, opening a block of diff lines, then "expected rc=A, actual rc=B", then ")" — and
-    // "Executing NAME" for a case that ran. Accumulated per vector so vectors_failed is exact and the
-    // diff snippets reach result.json rather than only the battery test.log.
+    // runtests' grammar: "- NAME: Build failed …", "- NAME: Execution failed: …", or "- NAME: Test
+    // failed (testN: REASON" — ONE vector, opening a block of diff lines, then "expected rc=A, actual
+    // rc=B", then ")" — and "Executing NAME" for a case that ran. Accumulated per vector so
+    // vectors_failed is exact and the diff snippets reach result.json rather than only the test.log.
     let mut per_case: HashMap<String, serde_json::Value> = HashMap::new();
     let mut failed_cases: Vec<String> = Vec::new();
 
-    let build_fail_re = Regex::new(r"^- (\S+): Build failed")?;
-    for line in text.lines() {
-        if let Some(caps) = build_fail_re.captures(line) {
-            let name = caps[1].to_string();
-            if !failed_cases.contains(&name) {
-                failed_cases.push(name.clone());
-            }
-            per_case.insert(
-                name.clone(),
-                serde_json::json!({
-                    "case": name, "battery": battery,
-                    "vectors_failed": 1, "passed": false,
-                    "error": "build failed",
-                }),
-            );
+    for (name, label) in hard_failures(&text)? {
+        if !failed_cases.contains(&name) {
+            failed_cases.push(name.clone());
         }
+        per_case.insert(
+            name.clone(),
+            serde_json::json!({
+                "case": name, "battery": battery,
+                "vectors_failed": 1, "passed": false,
+                "error": label,
+            }),
+        );
     }
 
     // Consecutive blocks can belong to the same case, one per failed vector.
@@ -707,25 +744,66 @@ mod tests {
         );
     }
 
-    /// Exhaustive over the shapes the parsed counts can take, because the one that matters is
-    /// indistinguishable from a real zero in the printed output: `0/128 cases, 0/0 vectors`.
+    /// A case whose binary never ran is a FAILURE, and the scanner must see it.
+    ///
+    /// The real line from `codex-gpt56-sol/P00_perlin_noise`, whose crate built but whose `[[bin]]`
+    /// the verify phase had removed, so the executable did not exist. runtests printed `[FAIL]` and
+    /// counted it in `Test Cases Failed`, but no pattern matched, so it scored as a pass.
     #[test]
-    fn a_battery_that_judged_no_vector_measured_nothing_however_many_cases_it_found() {
-        for (found, passed, failed, nothing) in [
-            // Every crate failed to build: the CI shape this exists for.
-            (128, 0, 0, true),
-            (1, 0, 0, true),
-            // A genuine zero SCORE still judged vectors, so it is a measurement.
-            (128, 0, 128, false),
-            (42, 1001, 24, false),
-            (1, 30, 0, false),
+    fn a_case_whose_binary_never_ran_is_recorded_as_failed() {
+        let real = "- 001_perlin_noise: Execution failed: CommandError(\"Command Failed \
+                    target/release/driver FileNotFoundError(2, 'No such file or directory')\")";
+        assert_eq!(
+            hard_failures(real).unwrap(),
+            vec![("001_perlin_noise".to_string(), "execution failed")],
+            "runtests counted this in Test Cases Failed, so it must reach failed_cases"
+        );
+        // The shape that always worked, still working.
+        assert_eq!(
+            hard_failures("- 014_dead_code: Build failed: error[E0433]").unwrap(),
+            vec![("014_dead_code".to_string(), "build failed")]
+        );
+        // Non-vacuity: a healthy log yields nothing, so this is not matching every line.
+        assert!(
+            hard_failures("   Executing 001_helloworld\n- Test Vectors Passed: 7")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Exhaustive over the count shapes, with the real ones named: the whole point is that "every
+    /// crate failed to build" and "the oracle never ran" print almost identically, and only one of
+    /// them is a result.
+    ///
+    /// The vector-keyed form of this guard called BOTH of them unmeasured, which made four published
+    /// table rows unreproducible by the code that wrote them.
+    #[test]
+    fn a_battery_where_no_case_reached_a_verdict_measured_nothing() {
+        for (discovered, tested, failed, nothing, why) in [
+            // No case reached ANY verdict: the oracle did not run. Refuse.
+            (128, 0, 0, true, "128 discovered, nothing attempted"),
+            (1, 0, 0, true, "one case, nothing attempted"),
+            // Every crate failed to build IS a result -- measured on smartc2rust/P01_sphincs_plus,
+            // which publishes 0/128 with exactly these counts, as do c2rust, c2saferrust and gpt-5.4.
+            (
+                128,
+                0,
+                128,
+                false,
+                "smartc2rust P01: all 128 failed to build",
+            ),
+            // codex-gpt56-sol's P00_perlin_noise: one case, binary missing, verdict reached.
+            (1, 0, 1, false, "P00: the one case failed to run"),
+            // smartc2rust/B01_synthetic: a partial battery.
+            (85, 41, 47, false, "partial: 41 tested, 47 failed"),
+            (42, 18, 0, false, "everything passed"),
             // Nothing discovered is `nothing_to_score`'s business, not this guard's.
-            (0, 0, 0, false),
+            (0, 0, 0, false, "nothing discovered"),
         ] {
             assert_eq!(
-                measured_nothing(found, passed, failed),
+                measured_nothing(discovered, tested, failed),
                 nothing,
-                "{found} case(s), {passed} passed, {failed} failed"
+                "{why}: {discovered} discovered, {tested} tested, {failed} failed"
             );
         }
     }
