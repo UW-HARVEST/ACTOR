@@ -645,7 +645,11 @@ impl Paths {
         // The same value the cache key and every `"agent"` field use: a second table
         // here is what let 208 result files record an agent name no `--agent` value
         // spells, under a `codex-gpt55/` directory.
-        let agent_key = crate::cache::AgentKey::new(agent, model)?;
+        let agent_key = crate::cache::AgentKey::new(
+            agent,
+            model,
+            crate::agents::invocation::resolved_model(agent, model)?,
+        )?;
         let (corpus_dir, results_dir) = match dataset {
             Dataset::TestCorpus => (
                 repo_root.join("test-corpus"),

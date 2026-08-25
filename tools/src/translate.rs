@@ -1734,7 +1734,6 @@ struct Conversation<'a> {
     user: &'a str,
 }
 
-const BEDROCK_MODEL_ID: &str = "moonshotai.kimi-k2.5";
 const BEDROCK_REGION: &str = "us-east-1";
 const BEDROCK_MAX_TOKENS: u32 = 16384;
 
@@ -1871,7 +1870,7 @@ fn detect_is_library(dir: &Path) -> Option<bool> {
 
 fn bedrock_converse(convo: Conversation<'_>, log_path: &Path) -> Result<LlmResponse> {
     let request = serde_json::json!({
-        "modelId": BEDROCK_MODEL_ID,
+        "modelId": crate::agents::invocation::KIMI_MODEL,
         "system": [{"text": convo.system}],
         "messages": [{"role": "user", "content": [{"text": convo.user}]}],
         "inferenceConfig": {"maxTokens": BEDROCK_MAX_TOKENS, "temperature": 0.0}
@@ -1902,8 +1901,9 @@ fn bedrock_converse(convo: Conversation<'_>, log_path: &Path) -> Result<LlmRespo
     let response_file = log_path.with_file_name("translation.response.json");
     let _ = std::fs::write(&response_file, &stdout);
 
+    let kimi_model = crate::agents::invocation::KIMI_MODEL;
     let log_content = format!(
-        "=== BEDROCK REQUEST ===\nModel: {BEDROCK_MODEL_ID}\nRegion: {BEDROCK_REGION}\n\n\
+        "=== BEDROCK REQUEST ===\nModel: {kimi_model}\nRegion: {BEDROCK_REGION}\n\n\
          === SYSTEM PROMPT ===\n{}\n\n\
          === USER MESSAGE (first 2000 chars) ===\n{}\n\n\
          === STDERR ===\n{stderr}",
@@ -2787,7 +2787,7 @@ mod tests {
     /// ExitStatus cannot be constructed directly, so shell out for a real one.
     /// main's tests predate `AgentKey`; this is the one spelling they share.
     fn test_agent_key() -> crate::cache::AgentKey {
-        crate::cache::AgentKey::new(Agent::Claude, None).expect("claude has a fixed name")
+        crate::cache::AgentKey::new(Agent::Claude, None, None).expect("claude has a fixed name")
     }
 
     fn exit_status(code: i32) -> std::process::ExitStatus {

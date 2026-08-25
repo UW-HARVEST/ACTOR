@@ -189,12 +189,20 @@ jobs:
         # evidence lost. The tree is 14.66% comment against a 20% ratio ceiling, so density is not the
         # thing moving. 3470 is 3434 plus 36. Prune or raise deliberately, never quietly.
         #
+        # RAISED 3470 -> 3510 for the AgentKey/model collapse. `KeyInputs` carried `agent` and `model`
+        # as separate fields, so a caller could pair one run's agent with another run's model and the
+        # key recorded the mismatch as a legitimate entry -- and a fixture already did exactly that,
+        # pairing a claude key resolving `global.anthropic.claude-opus-5[1m]` with the literal
+        # `claude-opus-5[1m]`. The 40 lines document why the resolution is INJECTED (reaching from
+        # `cache` into `agents`/`translate` grew the module cycle 5 -> 7 and the gate refused it) and
+        # why the model still reaches the key after the collapse. 3510 is 3487 plus 23.
+        #
         # .py is in neither HASH nor SLASH, so the budget does not count itself: this
         # script's own docstring and all 250 lines of tools/test_comment_budget.py cost
         # ZERO against both ceilings. Deriving 3100 from the tree needs that fact.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 3470 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 3510 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is

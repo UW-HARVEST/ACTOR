@@ -93,12 +93,22 @@ impl ModelId {
 /// `"agent": "oneshot"` for two different models. clap's `ValueEnum` name is the one
 /// spelling that cannot drift from what `--agent` accepts.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct AgentKey(String);
+pub struct AgentKey {
+    /// What the KEY calls this agent, and what every record and table spells. NEVER changes: every
+    /// stored entry was hashed with it, so a new spelling orphans the lot.
+    name: String,
+    /// From the SAME table the invocation uses, so a key cannot name one model while the agent runs
+    /// another. `None` only where a backend runs no model: c2rust and the docker arms.
+    model: Option<ModelId>,
+}
 
 impl AgentKey {
-    /// `model` is required for the variants where one agent covers many models, since
-    /// there the model is part of the identity rather than a parameter of it.
-    pub fn new(agent: Agent, model: Option<&str>) -> Result<Self> {
+    /// `model_flag` is required where one agent covers many models, since there the model is identity
+    /// rather than a parameter. `resolved` is INJECTED rather than looked up here: resolving it needs
+    /// `agents::invocation` and `translate`, and reaching for them from `cache` grew the module cycle
+    /// 5 -> 7. No constructor omits it.
+    pub fn new(agent: Agent, model_flag: Option<&str>, resolved: Option<ModelId>) -> Result<Self> {
+        let model = model_flag;
         let name = match agent {
             Agent::OpenCode => {
                 let raw = model.context(
@@ -140,11 +150,35 @@ impl AgentKey {
                 && !name.starts_with('-'),
             "agent key must be a single path component, got {name:?}"
         );
-        Ok(Self(name))
+        Ok(Self {
+            name,
+            model: resolved,
+        })
+    }
+
+    /// Test-only: an arbitrary name/model pair, so a test can vary the model ALONE and prove it still
+    /// reaches the key. Production has no such constructor, which is the point.
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str, model: &str) -> Result<Self> {
+        Ok(Self {
+            name: name.to_string(),
+            model: Some(ModelId::new(model)?),
+        })
+    }
+
+    /// The model this run asks for, or `None` where it asks for none.
+    pub fn model(&self) -> Option<&ModelId> {
+        self.model.as_ref()
+    }
+
+    /// As the key feeds it. Empty for a backend running none, distinct from every real id because
+    /// `ModelId::new` refuses empty.
+    fn model_key_part(&self) -> &str {
+        self.model.as_ref().map_or("", |m| m.as_str())
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.name
     }
 }
 
@@ -420,11 +454,10 @@ impl Preimage {
 /// an entry, which is silent corruption rather than a visible failure.
 pub struct KeyInputs<'a> {
     pub phase: &'static str,
+    /// Agent AND model as ONE value: two fields let a caller pair one run's agent with another's
+    /// model, and the key recorded the mismatch as a legitimate entry -- the very class this struct's
+    /// `No Default` note guards against, left open inside it.
     pub agent: &'a AgentKey,
-    /// The model the backend named in this run will actually be asked for — resolved
-    /// per backend, because a key naming claude's model for an opencode run makes two
-    /// sweeps at different `--model` values share an entry.
-    pub model: &'a ModelId,
     pub toolchain: &'a ToolchainId,
     pub prompt: &'a PromptDigest,
     pub recipe: &'a RecipeDigest,
@@ -438,7 +471,6 @@ impl KeyInputs<'_> {
         let Self {
             phase,
             agent,
-            model,
             toolchain,
             prompt,
             recipe,
@@ -447,10 +479,12 @@ impl KeyInputs<'_> {
         let mut h = Sha256::new();
         feed(&mut h, KEY_ALGORITHM.as_bytes());
         feed(&mut h, &SCHEMA.to_le_bytes());
+        // The same two strings in the same order as when `model` was its own field, so every stored
+        // entry still hashes to the key it is filed under. Collapsing the fields must not re-key.
         for part in [
             *phase,
             agent.as_str(),
-            model.as_str(),
+            agent.model_key_part(),
             toolchain.as_str(),
             prompt.as_str(),
             recipe.as_str(),
@@ -484,7 +518,6 @@ impl KeyInputs<'_> {
         let Self {
             phase,
             agent,
-            model,
             toolchain,
             prompt,
             recipe,
@@ -495,7 +528,7 @@ impl KeyInputs<'_> {
             "key": key.as_str(),
             "phase": phase,
             "agent": agent.as_str(),
-            "model": model.as_str(),
+            "model": agent.model_key_part(),
             "cli": cli.as_str(),
             "toolchain": toolchain.as_str(),
             "prompt": prompt.as_str(),
@@ -1290,7 +1323,7 @@ pub(crate) mod tests {
         fn new() -> Self {
             Self {
                 phase: <Verify as Phase>::DIR,
-                agent: AgentKey::new(Agent::Claude, None).unwrap(),
+                agent: AgentKey::new(Agent::Claude, None, None).unwrap(),
                 model: ModelId::new("claude-opus-5[1m]").unwrap(),
                 cli: CliVersion("2.1.231.653 (Claude Code)".into()),
                 toolchain: ToolchainId("1.94.0 x86_64-unknown-linux-gnu".into()),
@@ -1304,7 +1337,6 @@ pub(crate) mod tests {
             KeyInputs {
                 phase: self.phase,
                 agent: &self.agent,
-                model: &self.model,
                 toolchain: &self.toolchain,
                 prompt: &self.prompt,
                 recipe: &self.recipe,
@@ -1343,7 +1375,7 @@ pub(crate) mod tests {
             (Agent::SmartC2Rust, "smartc2rust"),
             (Agent::Kimi, "kimi"),
         ] {
-            assert_eq!(AgentKey::new(agent, None).unwrap().as_str(), want);
+            assert_eq!(AgentKey::new(agent, None, None).unwrap().as_str(), want);
         }
     }
 
@@ -1351,8 +1383,9 @@ pub(crate) mod tests {
     fn the_agent_key_distinguishes_models_where_one_variant_covers_many() {
         // 418 files record `"agent": "oneshot"` for two different models, and every
         // opencode run would record plain "opencode".
-        let gpt = AgentKey::new(Agent::Oneshot, Some("openai/gpt-5.4")).unwrap();
-        let gemini = AgentKey::new(Agent::Oneshot, Some("google/gemini-3.1-pro-preview")).unwrap();
+        let gpt = AgentKey::new(Agent::Oneshot, Some("openai/gpt-5.4"), None).unwrap();
+        let gemini =
+            AgentKey::new(Agent::Oneshot, Some("google/gemini-3.1-pro-preview"), None).unwrap();
         assert_eq!(gpt.as_str(), "gpt-5.4");
         assert_eq!(gemini.as_str(), "gemini-3.1-pro-preview");
         assert_ne!(gpt, gemini);
@@ -1360,6 +1393,7 @@ pub(crate) mod tests {
         let oc = AgentKey::new(
             Agent::OpenCode,
             Some("amazon-bedrock/us.anthropic.claude-sonnet-5"),
+            None,
         );
         assert_eq!(oc.unwrap().as_str(), "opencode-claude-sonnet-5");
     }
@@ -1368,10 +1402,10 @@ pub(crate) mod tests {
     fn the_agent_key_refuses_a_model_that_would_name_another_directory() {
         // It is a directory component under `results/` and under the store, and for
         // these two variants it comes straight from `--model`.
-        assert!(AgentKey::new(Agent::Oneshot, Some("openai/..")).is_err());
-        assert!(AgentKey::new(Agent::Oneshot, Some("openai/")).is_err());
-        assert!(AgentKey::new(Agent::Oneshot, None).is_err());
-        assert!(AgentKey::new(Agent::OpenCode, None).is_err());
+        assert!(AgentKey::new(Agent::Oneshot, Some("openai/.."), None).is_err());
+        assert!(AgentKey::new(Agent::Oneshot, Some("openai/"), None).is_err());
+        assert!(AgentKey::new(Agent::Oneshot, None, None).is_err());
+        assert!(AgentKey::new(Agent::OpenCode, None, None).is_err());
     }
 
     #[test]
@@ -1507,12 +1541,14 @@ pub(crate) mod tests {
     fn key_changes_with_every_component() {
         let base = Inputs::new().key();
 
+        // Same NAME, different model: the model reaches the key through the agent now, so this is
+        // what proves it still counts rather than having been dropped by the collapse.
         let mut v = Inputs::new();
-        v.model = ModelId::new("claude-sonnet-5").unwrap();
+        v.agent = AgentKey::for_test(v.agent.as_str(), "claude-sonnet-5").unwrap();
         assert_ne!(base, v.key(), "model must matter");
 
         let mut v = Inputs::new();
-        v.agent = AgentKey::new(Agent::Kiro, None).unwrap();
+        v.agent = AgentKey::new(Agent::Kiro, None, None).unwrap();
         assert_ne!(base, v.key(), "agent must matter");
 
         let mut v = Inputs::new();
@@ -1632,12 +1668,14 @@ pub(crate) mod tests {
         sonnet.agent = AgentKey::new(
             Agent::OpenCode,
             Some("amazon-bedrock/us.anthropic.claude-sonnet-5"),
+            Some(ModelId::new("amazon-bedrock/us.anthropic.claude-sonnet-5").unwrap()),
         )
         .unwrap();
         sonnet.model = ModelId::new("amazon-bedrock/us.anthropic.claude-sonnet-5").unwrap();
 
         let mut gpt = Inputs::new();
-        gpt.agent = AgentKey::new(Agent::OpenCode, Some("amazon-bedrock/openai.gpt-5.5")).unwrap();
+        gpt.agent =
+            AgentKey::new(Agent::OpenCode, Some("amazon-bedrock/openai.gpt-5.5"), None).unwrap();
         gpt.model = ModelId::new("amazon-bedrock/openai.gpt-5.5").unwrap();
 
         assert_ne!(sonnet.key(), gpt.key());
