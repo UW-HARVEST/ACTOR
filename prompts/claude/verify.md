@@ -102,6 +102,10 @@ value-dependent and out-of-range-index bugs. Fix the Rust (never the C) on any
 divergence; check a row off only once it passes across the randomized inputs.
 This is necessary but only half the job.
 
+If the project also builds a binary executable (a driver), run the C and Rust
+binaries on the same inputs and compare their stdout byte-for-byte in this
+phase too.
+
 ### Phase C — Error-path differential tests (GATED on `ERRORS.md`)
 
 For EVERY ROW in `ERRORS.md`, write a differential test that constructs that
@@ -135,6 +139,8 @@ done; do not stop early just because symbols match or happy-path tests pass):
 
 - [ ] `SYMBOLS.md`: `nm -D` shows 0 missing/undefined non-libc symbols in Rust.
 - [ ] Phase B: EVERY row in `CONFIGS.md` passes across randomized inputs.
+- [ ] If the project builds a binary, C and Rust stdout match byte-for-byte
+      on the same inputs.
 - [ ] Phase C: EVERY row in `ERRORS.md` has a passing error-path differential test.
 - [ ] All of the above hold under EVERY feature combination — this code is
       shared across ALL configurations, not just the default.
@@ -150,6 +156,17 @@ do NOT try to verify everything in a single session. Create a plan, then
 work through each subtask with a focused scope covering a specific subset of
 the code or functionality to verify and fix. After each subtask completes,
 check that its fixes didn't break anything else.
+
+**Delegate fixing work to sub-agents.** Your own context window is the most valuable.
+You keep the phase artifacts (`SYMBOLS.md`, `ERRORS.md`, `CONFIGS.md` -- sub-agents do not edit them),
+building the C and Rust libraries, running the tests, comparing outputs, and
+deciding which functions diverge. Almost everything else -- reading a large C
+source file to understand an algorithm, locating the matching Rust code,
+applying the actual fix -- should go to a sub-agent, so neither the C nor the
+buggy Rust has to live in your context. When you dispatch a fix, pre-inject
+what the sub-agent needs (the exact divergence, the relevant type definitions
+or specific `grep` commands) instead of letting it re-read whole files, and
+re-run the failing test yourself after it returns to confirm the fix.
 
 Add `libloading = "0.8"` to [dev-dependencies] in translated_rust/Cargo.toml.
 Do NOT modify anything in c_src/.
