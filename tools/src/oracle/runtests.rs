@@ -261,6 +261,34 @@ fn measured_nothing(cases_discovered: usize, cases_tested: usize, cases_failed: 
     cases_discovered > 0 && cases_tested + cases_failed == 0
 }
 
+/// The cases runtests failed OUTRIGHT, with the reason, from its text alone.
+///
+/// Pure and separately testable because the shape LIST is where the bug was: only `Build failed` and
+/// `Test failed (` were matched, so `Execution failed` -- a case whose binary never ran -- stayed out
+/// of `failed_cases`, and `cases_passed = discovered - failed.len()` counted it as a PASS. 76 such
+/// cases sit in the committed logs across 10 agents, every one scored as passing;
+/// `claude-cross-prompt` alone holds 56 of them against a published 63/210. It stayed hidden because
+/// the one battery where EVERY case took this shape was refused by `measured_nothing` instead, so the
+/// parser gap surfaced as a different error.
+fn hard_failures(text: &str) -> Result<Vec<(String, &'static str)>> {
+    let shapes = [
+        (Regex::new(r"^- (\S+): Build failed")?, "build failed"),
+        (
+            Regex::new(r"^- (\S+): Execution failed")?,
+            "execution failed",
+        ),
+    ];
+    let mut out = Vec::new();
+    for line in text.lines() {
+        for (re, label) in &shapes {
+            if let Some(caps) = re.captures(line) {
+                out.push((caps[1].to_string(), *label));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn run_runtests(
     paths: &Paths,
     pass: &Pass,
@@ -335,29 +363,25 @@ fn run_runtests(
         paths.output_dir(battery).join("test.log").display(),
     );
 
-    // runtests' grammar: "- NAME: Build failed …", or "- NAME: Test failed (testN: REASON" — ONE
-    // vector, opening a block of diff lines, then "expected rc=A, actual rc=B", then ")" — and
-    // "Executing NAME" for a case that ran. Accumulated per vector so vectors_failed is exact and the
-    // diff snippets reach result.json rather than only the battery test.log.
+    // runtests' grammar: "- NAME: Build failed …", "- NAME: Execution failed: …", or "- NAME: Test
+    // failed (testN: REASON" — ONE vector, opening a block of diff lines, then "expected rc=A, actual
+    // rc=B", then ")" — and "Executing NAME" for a case that ran. Accumulated per vector so
+    // vectors_failed is exact and the diff snippets reach result.json rather than only the test.log.
     let mut per_case: HashMap<String, serde_json::Value> = HashMap::new();
     let mut failed_cases: Vec<String> = Vec::new();
 
-    let build_fail_re = Regex::new(r"^- (\S+): Build failed")?;
-    for line in text.lines() {
-        if let Some(caps) = build_fail_re.captures(line) {
-            let name = caps[1].to_string();
-            if !failed_cases.contains(&name) {
-                failed_cases.push(name.clone());
-            }
-            per_case.insert(
-                name.clone(),
-                serde_json::json!({
-                    "case": name, "battery": battery,
-                    "vectors_failed": 1, "passed": false,
-                    "error": "build failed",
-                }),
-            );
+    for (name, label) in hard_failures(&text)? {
+        if !failed_cases.contains(&name) {
+            failed_cases.push(name.clone());
         }
+        per_case.insert(
+            name.clone(),
+            serde_json::json!({
+                "case": name, "battery": battery,
+                "vectors_failed": 1, "passed": false,
+                "error": label,
+            }),
+        );
     }
 
     // Consecutive blocks can belong to the same case, one per failed vector.
@@ -717,6 +741,33 @@ mod tests {
             stored_summary(&stored).unwrap().vectors_passed,
             7,
             "the fixture must hold the record whose never being read is the defect"
+        );
+    }
+
+    /// A case whose binary never ran is a FAILURE, and the scanner must see it.
+    ///
+    /// The real line from `codex-gpt56-sol/P00_perlin_noise`, whose crate built but whose `[[bin]]`
+    /// the verify phase had removed, so the executable did not exist. runtests printed `[FAIL]` and
+    /// counted it in `Test Cases Failed`, but no pattern matched, so it scored as a pass.
+    #[test]
+    fn a_case_whose_binary_never_ran_is_recorded_as_failed() {
+        let real = "- 001_perlin_noise: Execution failed: CommandError(\"Command Failed \
+                    target/release/driver FileNotFoundError(2, 'No such file or directory')\")";
+        assert_eq!(
+            hard_failures(real).unwrap(),
+            vec![("001_perlin_noise".to_string(), "execution failed")],
+            "runtests counted this in Test Cases Failed, so it must reach failed_cases"
+        );
+        // The shape that always worked, still working.
+        assert_eq!(
+            hard_failures("- 014_dead_code: Build failed: error[E0433]").unwrap(),
+            vec![("014_dead_code".to_string(), "build failed")]
+        );
+        // Non-vacuity: a healthy log yields nothing, so this is not matching every line.
+        assert!(
+            hard_failures("   Executing 001_helloworld\n- Test Vectors Passed: 7")
+                .unwrap()
+                .is_empty()
         );
     }
 
