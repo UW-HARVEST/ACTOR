@@ -249,8 +249,8 @@ impl Seed {
     /// being useless for the future re-key this exists for.
     pub fn export_into(&self, dest: &Path) -> Result<()> {
         match self {
-            Seed::FromCorpus(root) => copy_carrying(root, dest, Carry::IntoWorkTree),
-            Seed::FromArtifact(root) => copy_carrying(root, dest, Carry::FromArtifact),
+            Seed::FromCorpus(root) => copy_carrying(root, dest, Carry::IntoWorkTree, None),
+            Seed::FromArtifact(root) => copy_carrying(root, dest, Carry::FromArtifact, None),
         }
     }
 
@@ -335,7 +335,7 @@ fn seed<Q: Phase>(src: &Path, root: PathBuf, keep: Scratch, at: SeedAt) -> Resul
         SeedAt::CrateRoot => crate_root,
         SeedAt::COracle => crate_root.join(C_ORACLE_DIR),
     };
-    copy_carrying(src, &dest, Carry::IntoWorkTree)?;
+    copy_carrying(src, &dest, Carry::IntoWorkTree, None)?;
     Ok(WorkTree {
         root,
         _scratch: Some(keep),
@@ -379,9 +379,25 @@ impl Carry {
     }
 }
 
-fn copy_carrying(src: &Path, dest: &Path, carry: Carry) -> Result<()> {
+/// `reserved` is a relative path the artifact may NOT overwrite, because the harness owns it.
+///
+/// Exactly one file needs this: the phase transcript at `logs/<P::LOG>`. `logs/` is
+/// `Disposition::Ignore`, which `Carry::FromArtifact` admits, so an agent that happens to create
+/// `logs/verify.log` in its own work tree had that file published straight over the transcript --
+/// turning a run whose stored copy shows `turn.completed` into one the audit reads as truncated and
+/// refuses. Skipped rather than renamed-and-kept only because the transcript is proof of completion
+/// and the agent's same-named log is a duplicate of output it also wrote elsewhere; the skip is
+/// announced so it is never silent.
+fn copy_carrying(src: &Path, dest: &Path, carry: Carry, reserved: Option<&Path>) -> Result<()> {
     std::fs::create_dir_all(dest)?;
     visit(src, src, false, &|d| carry.admits(d), &mut |rel, abs| {
+        if Some(rel.as_path()) == reserved {
+            println!(
+                "   \u{26a0}\u{fe0f}  not carrying {} from the artifact: the harness's transcript lives there",
+                rel.as_path().display()
+            );
+            return Ok(());
+        }
         let to = dest.join(rel.as_path());
         if let Some(parent) = to.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1019,8 +1035,13 @@ impl<P: Phase> Sealed<P> {
     /// Takes a destination and returns nothing, so there is still no expression that
     /// yields a path *to* a sealed artifact. Uses the same [`Carry`] variant as the
     /// results-tree overlay, so a replay cannot differ from a fresh run.
+    ///
+    /// Reserves nothing: the destination here is the store or the evaluation tree, neither of which
+    /// holds a transcript to protect, and the stored copy SHOULD keep the agent's own `logs/` as
+    /// evidence. Replay stays identical to a fresh run because both reach the results tree through
+    /// `assemble`, which is where the reservation applies.
     pub fn export_into(&self, dest: &Path) -> Result<()> {
-        copy_carrying(&self.root, dest, Carry::FromArtifact)
+        copy_carrying(&self.root, dest, Carry::FromArtifact, None)
     }
 
     /// Consumes `self`: [`Publishing::edited`] changes the tree, so a `Sealed` usable afterwards would
@@ -1233,9 +1254,10 @@ impl Fingerprint {
 fn assemble<P: Phase>(from: &Path, case_dir: &Path, dst: &Path) -> Result<()> {
     let translated = crate::battery::phase_dir(case_dir, crate::battery::TRANSLATED);
     if translated.is_dir() && P::DIR != crate::battery::TRANSLATED {
-        copy_carrying(&translated, dst, Carry::FromPreviousPhase)?;
+        copy_carrying(&translated, dst, Carry::FromPreviousPhase, None)?;
     }
-    copy_carrying(from, dst, Carry::FromArtifact)
+    let transcript = Path::new("logs").join(P::LOG);
+    copy_carrying(from, dst, Carry::FromArtifact, Some(&transcript))
 }
 
 /// Publish a tree that no [`Completed`] can prove, carrying exactly what [`Sealed::publish`]
@@ -1322,7 +1344,7 @@ mod tests {
         );
         let dest = crate::io::workdir::test_tempdir().unwrap();
         let out = dest.path().join("code");
-        copy_carrying(src.path(), &out, Carry::FromArtifact).unwrap();
+        copy_carrying(src.path(), &out, Carry::FromArtifact, None).unwrap();
 
         for hashed in [
             "Cargo.toml",
@@ -1374,7 +1396,7 @@ mod tests {
         );
         let dest = crate::io::workdir::test_tempdir().unwrap();
         let out = dest.path().join("work");
-        copy_carrying(src.path(), &out, Carry::IntoWorkTree).unwrap();
+        copy_carrying(src.path(), &out, Carry::IntoWorkTree, None).unwrap();
 
         assert!(
             out.join("c_src/src/lib.c").is_file(),
@@ -2094,6 +2116,56 @@ mod tests {
     /// recorded file the guard just stat'd can be absent from the artifact it seals. A stored case
     /// does this: `B02_synthetic/tu_linkage` holds both legs at the oracle root, and of the 13 files
     /// the guard records there — 9 corpus reference source, the rest cmake's own — none is carried.
+    /// The transcript is the harness's proof the agent finished, and `assemble` must not let the
+    /// artifact overwrite it.
+    ///
+    /// `logs/` is `Disposition::Ignore`, which `Carry::FromArtifact` admits, so an agent that wrote
+    /// its own `logs/verify.log` in the work tree had that file published straight over the
+    /// transcript. Measured on a real run: the stored copy of
+    /// `B01_synthetic/024_struct_and_static` holds 127,649 bytes ending in `turn.completed`, while
+    /// the published copy was 1,357 bytes of the agent's cmake/cargo output with no JSON at all --
+    /// so a verify that SUCCEEDED was audited as truncated and refused the whole 85-case battery.
+    #[test]
+    fn the_artifact_cannot_publish_over_the_harness_transcript() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let case = tmp.path().join("case");
+
+        // The transcript, as the live run wrote it.
+        let transcript = phase_log::<Verify>(&case);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "{\"type\":\"turn.completed\"}\n").unwrap();
+
+        // An artifact carrying a same-named log of its own, plus one that does not collide.
+        let art = tmp.path().join("artifact");
+        std::fs::create_dir_all(art.join("logs")).unwrap();
+        std::fs::write(art.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(
+            art.join("logs").join(Verify::LOG),
+            "cmake output, no JSON\n",
+        )
+        .unwrap();
+        std::fs::write(art.join("logs").join("cargo-build.log"), "built\n").unwrap();
+
+        let dst = crate::battery::phase_dir(&case, Verify::DIR);
+        assemble::<Verify>(&art, &case, &dst).unwrap();
+
+        assert!(
+            std::fs::read_to_string(&transcript)
+                .unwrap()
+                .contains("turn.completed"),
+            "the transcript must survive publish, or a completed run audits as truncated"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("logs").join("cargo-build.log")).unwrap(),
+            "built\n",
+            "and the artifact's OTHER logs must still be carried: only the collision is reserved"
+        );
+        assert!(
+            dst.join("Cargo.toml").is_file(),
+            "non-vacuity: assemble really did copy the artifact"
+        );
+    }
+
     #[test]
     fn a_run_that_makes_the_reference_read_as_build_output_is_refused() {
         for (left_behind, hidden) in [
@@ -2110,7 +2182,7 @@ mod tests {
             );
             let out = crate::io::workdir::test_tempdir().unwrap();
             let published = out.path().join("published");
-            copy_carrying(&work.crate_dir(), &published, Carry::FromArtifact).unwrap();
+            copy_carrying(&work.crate_dir(), &published, Carry::FromArtifact, None).unwrap();
             assert!(
                 !published.join(C_ORACLE_DIR).join(hidden).exists(),
                 "fixture assumption for {left_behind}: the artifact really does lose it"
@@ -2184,7 +2256,7 @@ mod tests {
             std::os::unix::fs::symlink(elsewhere, oracle.join("out")).unwrap();
         };
         let at_the_root: Plant = |oracle, elsewhere| {
-            copy_carrying(oracle, elsewhere, Carry::IntoWorkTree).unwrap();
+            copy_carrying(oracle, elsewhere, Carry::IntoWorkTree, None).unwrap();
             std::fs::remove_dir_all(oracle).unwrap();
             std::os::unix::fs::symlink(elsewhere, oracle).unwrap();
         };
