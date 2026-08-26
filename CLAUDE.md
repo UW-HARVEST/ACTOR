@@ -64,45 +64,106 @@ already exists (`Sealed::publish`), route to it instead of hand-rolling a second
 ### Storage
 
 The target design for the store. Where the code still disagrees, that is debt, not licence:
-`.cache/<SCHEMA>/<phase>/…`, the `failed/` subtree, and keying the toolchain and the recipe
-all predate these rules.
+`.cache/<SCHEMA>/<phase>/…`, the `failed/` subtree, keying the toolchain and the recipe, and the
+oracle tamper check all predate these rules.
 
 **Git versions the layout; the layout does not version itself.** `SCHEMA` does one job three
-times — hashed into the key, a path level (`.cache/4/`), and a field in `meta.json` — and only
-the field earns it. A version level in every path buys nothing but side-by-side coexistence
-during a migration, which git already gives: 279,505 directory renames landed in one commit,
-re-keyed nothing, and were revertible throughout. Migrate into a fresh tree, keep the old one
-under another name until `reproduce.sh all` is green, then delete it. Keep ONE `format` field
-and refuse loudly on mismatch, so a reader never guesses at a layout it does not understand.
+times — hashed into the key, a path level (`.cache/4/`), and a field in `meta.json` — and only the
+field earns it. A version level in every path buys nothing but side-by-side coexistence during a
+migration, which git already gives: 279,505 directory renames landed in one commit, re-keyed
+nothing, and were revertible throughout. Migrate into a fresh tree, keep the old one under another
+name until `reproduce.sh all` is green, then delete it. Keep ONE `format` field and refuse loudly
+on mismatch, so a reader never guesses at a layout it does not understand.
 
-**A phase is a function from a working dir and a prompt to a working dir.** The unit is the
-whole working directory — `c_src/` beside the translation, which may be empty — hashed as one
-tree with its contents uninspected. Verify's input IS translate's output, so the two are not
-different kinds of operation: `phase` is not key material, and there is ONE tree algorithm
-rather than a corpus one and an artifact one. Every tree that appears, as an input or an
-output, is stored once and referenced by hash.
+**One function, applied once per phase.** `run_or_replay(working_dir, prompt) -> tree` is the whole
+cached operation, and nothing in it asks which phase it is — translate and verify differ only in
+the prompt handed to them. So `phase` is not key material, `SeedAt` has no reason to exist, and
+there is ONE tree algorithm rather than a corpus one and an artifact one.
+
+```
+corpus ─assemble─▶ W0 ─run_or_replay(W0, translate)─▶ T1 ─transform─▶ W1
+                                  W1 ─run_or_replay(W1, verify)─▶ T2 ─transform─▶ publish/score
+```
+
+**The unit is the working directory.** `c_src/` beside the translation, hashed as one tree with its
+contents uninspected. `W0` has the same shape as `W1`, with an empty translation. Every change
+happens inside it.
+
+**Two kinds of edge, and only one is cached.** An AGENT RUN is nondeterministic and expensive, so
+it is keyed on `tool ‖ model ‖ input_tree ‖ prompt` and stored, with N attempts per key. A HARNESS
+TRANSFORM is deterministic and cheap, so it is recomputed and never cached — and it must stay
+OUTSIDE the cache, or harness logic is baked into the agent's artifact and changing it invalidates
+runs that are still good. `post_process_independent` is one of these: it renames `[lib]` to the
+corpus runner's name and appends `[workspace]`, so verify's input is `transform(translate output)`
+and NOT translate's output. Measured: 216 of 216 paired entries differ, and `agents/run.rs` records
+0 of 84 matching from the other direction.
+
+**Restore rather than detect.** `c_src` is the pinned corpus, so a working dir is always assembled
+with the corpus's copy and the agent's edits to it are discarded before hashing — which is why
+tampering cannot persist and a tamper check is unnecessary. Nothing in the grading path reads the C
+anyway: `runtests.rust` scores the Rust against static `test_vectors/`, so the check protected
+provenance only, and a restore protects it better and covers the next phase too. Restoring is about
+what is ASSEMBLED; it does not license storing less than was hashed.
+
+**Store the preimage of every hash.** An entry keeps the exact bytes that were hashed — the whole
+`before` working dir, the whole `after`, the raw prompt text — even where they duplicate the corpus.
+This is the single property that keeps the design changeable: alter the ignore rules, the path
+prefix, the digest algorithm or the definition of a tree, and every key is recomputable from stored
+bytes with no agent re-run. It is the only reason re-keying was possible when the store gained a
+model level, and it is the cheapest insurance available — storage costs nothing next to a sweep,
+which costs $625 and twelve hours. Derive nothing that a hash was taken over.
 
 **Key the identity; path the rendering.** The key hashes raw identifiers (`claude`,
 `global.anthropic.claude-opus-5[1m]`); the path uses filesystem-safe slugs
-(`claude/claude-opus-5-1m`). `model_dir_slug` is lossy on purpose, and a lossy rendering used
-as key material is how `openai/gpt-5.4` came to name the directory `oneshot/4`. Renaming a
-directory must never re-key an entry.
+(`claude/claude-opus-5-1m`). `model_dir_slug` is lossy on purpose, and a lossy rendering used as
+key material is how `openai/gpt-5.4` came to name the directory `oneshot/4`. Renaming a directory
+must never re-key an entry.
 
 **Key only what changes the answer; pin and record the rest.** The toolchain is fixed by
-`rust-toolchain.toml`, so keying it strands every entry on a bump and proves nothing — refuse
-at preflight if the active one differs, and record it. #109 removed `cli` for exactly this.
+`rust-toolchain.toml`, so keying it strands every entry on a bump and proves nothing — refuse at
+preflight if the active one differs, and record it. #109 removed `cli` for exactly this.
 
-**Every run pins its model, and a sentinel is not a model.** kiro keyed
-`unpinned:kiro-cli-default` on a comment claiming kiro-cli takes no `--model`; it takes one,
-and because nothing passed it, 0 files under `results/Test-Corpus/kiro/` name a model and
-those rows are unattributable forever. Assert the flag on the command line, not on the
-transcript — a missing pin is invisible after the run.
+**Every run pins its model, and a sentinel is not a model.** kiro keyed `unpinned:kiro-cli-default`
+on a comment claiming kiro-cli takes no `--model`; it takes one, and because nothing passed it, 0
+files under `results/Test-Corpus/kiro/` name a model and those rows are unattributable forever.
+Assert the flag on the command line, not on the transcript — a missing pin is invisible after the
+run.
 
-**One key addresses a set of attempts, so ambiguity is a refusal.** Agents are
-nondeterministic, and dropping `phase`, `toolchain` and `recipe` collapses more runs onto one
-key. A table records the exact output tree it was built from; a replay with no recorded pin
-serves the single completed attempt and REFUSES two. Silently picking one is how a published
-number changes under you.
+**One key addresses a set of attempts, so ambiguity is a refusal.** Agents are nondeterministic,
+and dropping `phase`, `toolchain` and `recipe` collapses more runs onto one key. A table records
+the exact output tree it was built from; a replay with no recorded pin serves the single completed
+attempt and REFUSES two. Silently picking one is how a published number changes under you.
+
+**Both trees raw, and exactly two records per attempt.** The path already carries tool, model, input
+tree and prompt, so recording those again is the redundancy this replaces — 15 metadata fields
+across three files become 7 in one. What is NOT redundant is the trees: `before` and `after` are
+both stored whole, as hashed.
+
+```
+.cache/claude/claude-opus-5-1m/
+    <input_tree>/before/                the raw working dir that hashes to <input_tree>
+    <input_tree>/<prompt>/prompt.json   {digest, text}
+    <input_tree>/<prompt>/1/after/      the raw working dir the agent produced
+    <input_tree>/<prompt>/1/agent.json  {outcome, output_tree, wall_secs,
+                                         cost_usd, cli, harness, toolchain}
+    <input_tree>/<prompt>/1/run.log     the transcript
+```
+
+`before/` is stored once per input tree and shared by every prompt and attempt beneath it. A
+`before` that no longer reproduces its own directory name is a corrupt entry, and that check is
+worth running: it is the whole basis of re-keyability.
+
+`outcome` is CLASSIFIED from the transcript, never the exit code: every session pipes through
+`tee`, so a killed agent reported a clean 0 until `set -o pipefail` was asserted. `output_tree` is
+not optional — with several attempts under one key it is the only thing selection can read. Keep
+`run.log`, because `agent.json` is derived from it: outcome, cost and the model-pin check all read
+it, so dropping it makes the record unverifiable and un-rederivable.
+
+**What used to be `seal` is four steps, not one.** CLASSIFY the transcript, RESTORE `c_src` from
+the corpus, SCRUB absolute paths to a token, DIGEST. Only the last is `seal`'s remaining job.
+`scrub` must stay ahead of the digest or every key carries a per-run nonce; and with failures
+stored like anything else, the `Completed` capability token has nothing left to guard — the
+outcome is a field, and selection is what refuses to serve it.
 
 ### Testing
 
