@@ -75,28 +75,35 @@ nothing, and were revertible throughout. Migrate into a fresh tree, keep the old
 name until `reproduce.sh all` is green, then delete it. Keep ONE `format` field and refuse loudly
 on mismatch, so a reader never guesses at a layout it does not understand.
 
-**One function, applied once per phase.** `run_or_replay(working_dir, prompt) -> tree` is the whole
-cached operation, and nothing in it asks which phase it is — translate and verify differ only in
-the prompt handed to them. So `phase` is not key material, `SeedAt` has no reason to exist, and
-there is ONE tree algorithm rather than a corpus one and an artifact one.
+**The unit is an AGENT INVOCATION, and a pipeline is a chain of them.** One function,
+`run_or_replay(working_dir, prompt) -> working_dir`, and nothing in it knows where in the chain it
+sits. There is no such thing as a translate entry or a verify entry — there are invocations, each
+with its own cache entry, differing only in the working dir handed in and the prompt. So `phase` is
+not key material, `SeedAt` has no reason to exist, there is ONE tree algorithm rather than a corpus
+one and an artifact one, and adding a third step to the chain requires no new concept.
 
 ```
-corpus ─assemble─▶ W0 ─run_or_replay(W0, translate)─▶ T1 ─transform─▶ W1
-                                  W1 ─run_or_replay(W1, verify)─▶ T2 ─transform─▶ publish/score
+W0 = assemble(corpus)                       c_src/ + empty translation/
+W1 = run_or_replay(W0, prompt_1)   ← entry   then transform(W1)
+W2 = run_or_replay(W1, prompt_2)   ← entry   then transform(W2)
+Wn = run_or_replay(W(n-1), prompt_n)         … same function every time
 ```
 
-**The unit is the working directory.** `c_src/` beside the translation, hashed as one tree with its
-contents uninspected. `W0` has the same shape as `W1`, with an empty translation. Every change
-happens inside it.
+What we run today happens to be a chain of two, with `prompt_1` translating and `prompt_2`
+verifying. That is a fact about the prompts, not about the machinery.
+
+**Every working dir has one shape.** `c_src/` beside the translation, hashed as one tree with its
+contents uninspected. The first in a chain differs only in that its translation is empty — not in
+kind, not in layout, not in how it is hashed. Every change happens inside the working dir.
 
 **Two kinds of edge, and only one is cached.** An AGENT RUN is nondeterministic and expensive, so
 it is keyed on `tool ‖ model ‖ input_tree ‖ prompt` and stored, with N attempts per key. A HARNESS
 TRANSFORM is deterministic and cheap, so it is recomputed and never cached — and it must stay
 OUTSIDE the cache, or harness logic is baked into the agent's artifact and changing it invalidates
 runs that are still good. `post_process_independent` is one of these: it renames `[lib]` to the
-corpus runner's name and appends `[workspace]`, so verify's input is `transform(translate output)`
-and NOT translate's output. Measured: 216 of 216 paired entries differ, and `agents/run.rs` records
-0 of 84 matching from the other direction.
+corpus runner's name and appends `[workspace]`, so the NEXT invocation's `before` is
+`transform(previous after)` and not the previous `after` itself. Measured: 216 of 216 paired entries
+differ, and `agents/run.rs` records 0 of 84 matching from the other direction.
 
 **Restore rather than detect.** `c_src` is the pinned corpus, so a working dir is always assembled
 with the corpus's copy and the agent's edits to it are discarded before hashing — which is why
