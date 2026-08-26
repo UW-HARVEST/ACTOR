@@ -359,11 +359,11 @@ impl Tree {
     /// The store's only door. The bytes must hash to what the entry recorded, or the entry is
     /// corrupt -- which is the check the whole design rests on, since a `before` that no longer
     /// reproduces its own name cannot be re-keyed.
-    pub(crate) fn adopt_stored(at: PathBuf, recorded: &TreeDigest) -> Result<Self> {
+    pub(crate) fn adopt_stored(at: PathBuf, recorded: &str) -> Result<Self> {
         let digest = digest_tree(&at)?;
         anyhow::ensure!(
-            &digest == recorded,
-            "the stored tree at {} hashes to {digest:?} but its entry records {recorded:?}",
+            digest.as_str() == recorded,
+            "the stored tree at {} hashes to {digest:?} but its entry records {recorded}",
             at.display()
         );
         Ok(Self {
@@ -371,6 +371,12 @@ impl Tree {
             at,
             _scratch: None,
         })
+    }
+
+    /// Copy the bytes out, for the store alone. Not a path escape: the caller states WHERE, and
+    /// what it receives is a copy it owns rather than a handle on the tree.
+    pub(crate) fn copy_into(&self, dest: &Path) -> Result<()> {
+        copy_carrying(&self.at, dest, Carry::FromArtifact, None)
     }
 
     /// A fresh working dir holding this tree's bytes. `corpus_c` is stated rather than remembered
@@ -500,10 +506,11 @@ mod tests {
         let store = crate::io::workdir::test_tempdir().unwrap();
         let at = store.path().join("before");
         copy_carrying(&sealed.at, &at, Carry::FromPreviousPhase, None).unwrap();
-        Tree::adopt_stored(at.clone(), &recorded).expect("an intact copy is adoptable");
+        Tree::adopt_stored(at.clone(), recorded.as_str()).expect("an intact copy is adoptable");
 
         std::fs::write(at.join(TRANSLATION).join("lib.rs"), "two\n").unwrap();
-        let err = Tree::adopt_stored(at, &recorded).expect_err("a mutated copy must be refused");
+        let err =
+            Tree::adopt_stored(at, recorded.as_str()).expect_err("a mutated copy must be refused");
         assert!(
             format!("{err:#}").contains("records"),
             "and must name both digests: {err:#}"
