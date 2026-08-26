@@ -62,6 +62,31 @@ pub struct Run {
 }
 
 impl Run {
+    /// Derived from the resolved paths, so a caller cannot pair one run's label with another's
+    /// directory. `label` is what a table's Agent column prints; `dir` is where the artifacts are.
+    fn of(paths: &crate::battery::Paths) -> Self {
+        let tool = crate::cli::tool_dir(paths.tool);
+        let label = match paths.variant {
+            crate::cli::Variant::Default => tool.to_string(),
+            v => format!("{tool}-{}", v.dir()),
+        };
+        Self {
+            label,
+            dir: paths
+                .results_dir
+                .strip_prefix(
+                    paths
+                        .results_dir
+                        .ancestors()
+                        .nth(3)
+                        .unwrap_or(&paths.results_dir),
+                )
+                .unwrap_or(&paths.results_dir)
+                .to_string_lossy()
+                .into_owned(),
+        }
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -74,14 +99,8 @@ impl Run {
 pub struct Attested(std::collections::BTreeSet<(Run, String)>);
 
 impl Attested {
-    pub fn insert(&mut self, agent: &crate::cache::AgentKey, unit: &str) {
-        self.0.insert((
-            Run {
-                label: agent.as_str().to_owned(),
-                dir: agent.dir(),
-            },
-            unit.to_owned(),
-        ));
+    pub fn insert(&mut self, paths: &crate::battery::Paths, unit: &str) {
+        self.0.insert((Run::of(paths), unit.to_owned()));
     }
 
     /// Every (run, unit) this run may publish. A reporter iterating THIS cannot silently omit one.
@@ -1360,13 +1379,17 @@ mod tests {
     fn a_table_missing_an_attested_projects_record_is_refused_not_published_short() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         // The key's own `dir()`: a fixture spelling the path itself would survive a layout change.
-        let key = crate::cache::AgentKey::new(
-            crate::cli::Agent::Claude,
+        let paths = crate::battery::Paths::new(
+            tmp.path(),
+            crate::cli::Tool::Claude,
+            crate::cli::Variant::Default,
+            crate::cli::Dataset::HarvestBench,
             None,
-            crate::agents::invocation::resolved_model(crate::cli::Agent::Claude, None).unwrap(),
+            crate::store::Mode::ReadWrite,
+            crate::io::sandbox::Enforcement::Required,
         )
         .unwrap();
-        let hb = tmp.path().join("results/HarvestBench").join(key.dir());
+        let hb = paths.results_dir.clone();
         let record = |project: &str| {
             let dir = crate::battery::phase_dir(&hb.join(project), crate::battery::TRANSLATED);
             std::fs::create_dir_all(&dir).unwrap();
@@ -1379,8 +1402,8 @@ mod tests {
         record("jansson");
 
         let mut attested = Attested::default();
-        attested.insert(&key, "jansson");
-        attested.insert(&key, "lz4");
+        attested.insert(&paths, "jansson");
+        attested.insert(&paths, "lz4");
 
         let table = tmp.path().join("tables/harvest-bench.tex");
         let err = generate_harvest_bench(tmp.path(), &attested)

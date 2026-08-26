@@ -76,9 +76,9 @@ pub(crate) fn merge_agent_exit(metrics: &mut serde_json::Value) {
 /// Must be built exactly once per invocation: `merge_agent_exit` consumes the
 /// recorded exit. The one value then feeds both `verification.json` and the cache
 /// entry, so the two cannot disagree about the same run.
-pub fn agent_provenance(agent: &crate::cache::AgentKey, duration_secs: u64) -> serde_json::Value {
+pub fn agent_provenance(tool: &str, duration_secs: u64) -> serde_json::Value {
     let mut p = serde_json::json!({
-        "agent": agent.as_str(),
+        "agent": tool,
         "duration_secs": duration_secs,
         "success": true,
         "timestamp": chrono::Utc::now().to_rfc3339(),

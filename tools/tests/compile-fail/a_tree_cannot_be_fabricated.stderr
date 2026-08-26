@@ -1,0 +1,22 @@
+warning: unreachable expression
+ --> tests/compile-fail/a_tree_cannot_be_fabricated.rs:7:13
+  |
+6 |         digest: unimplemented!(),
+  |                 ---------------- any code following this expression is unreachable
+7 |         at: unimplemented!(),
+  |             ^^^^^^^^^^^^^^^^ unreachable expression
+  |
+  = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+  = note: this warning originates in the macro `unimplemented` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0451]: fields `digest`, `at` and `_scratch` of struct `Tree` are private
+ --> tests/compile-fail/a_tree_cannot_be_fabricated.rs:6:9
+  |
+5 |     let _forged = harvest_tools::tree::Tree {
+  |                   ------------------------- in this type
+6 |         digest: unimplemented!(),
+  |         ^^^^^^ private field
+7 |         at: unimplemented!(),
+  |         ^^ private field
+8 |         _scratch: None,
+  |         ^^^^^^^^ private field

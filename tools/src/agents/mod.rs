@@ -7,11 +7,8 @@
 //! through that one file.
 
 pub mod exit;
-pub mod invocation;
 pub mod opencode;
-pub mod run;
 pub mod session;
-pub mod work;
 
 use std::sync::{Condvar, Mutex};
 

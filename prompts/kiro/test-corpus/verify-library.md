@@ -9,12 +9,12 @@ C code does something unexpected, replicate that behavior — do not "fix" it.
 
 Working directory: CASE_DIR_PLACEHOLDER
 
-- `translated_rust/c_src/` contains the original C source code
-- `translated_rust/src/` contains the Rust translation
+- `c_src/` contains the original C source code
+- `translation/` contains the Rust crate you are verifying
 - The C code can be compiled as a shared library. Look at c_src/CMakeLists.txt
   to understand the build system. Build it with:
   ```
-  cd translated_rust/c_src && mkdir -p build && cd build && \
+  cd c_src && mkdir -p build && cd build && \
   cmake .. -DCMAKE_POSITION_INDEPENDENT_CODE=ON CMAKE_BUILD_FLAGS && \
   cmake --build .
   ```
@@ -27,7 +27,7 @@ Your task:
    combination. Fix all compile errors before proceeding. Modules or code
    that only apply to certain backends must use `#[cfg(feature = "...")]`.
 3. Build the C code as a shared library for the default configuration.
-4. Write Rust integration tests (in translated_rust/tests/) that use
+4. Write Rust integration tests (in translation/tests/) that use
    `libloading` to load BOTH the C .so AND the Rust .so, and compare their
    outputs through the FFI boundary. Never call Rust functions directly —
    always load the Rust .so via libloading and call its exported symbols,

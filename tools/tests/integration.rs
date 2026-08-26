@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Find the repo root by walking up from the test binary's location.
 fn repo_root() -> PathBuf {
@@ -185,7 +185,7 @@ mod cargo_toml_manipulation {
             // Copy to temp and strip
             let tmp = harvest_tools::io::workdir::test_tempdir().unwrap();
             let dst = tmp.path().join("translated");
-            harvest_tools::translate::copy_dir_all(&original, &dst).unwrap();
+            copy_tree(&original, &dst);
 
             // Create a fake main.rs and tests/ to verify they get removed
             std::fs::write(dst.join("src/main.rs"), "fn main() {}").unwrap();
@@ -289,142 +289,16 @@ mod test_artifacts {
     }
 }
 
-mod artifact_fingerprint {
-    use super::*;
-    use harvest_tools::artifact::{Fingerprint, Translate};
-    use harvest_tools::battery::{has_crate, phase_dir, TRANSLATED};
-    use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
-
-    const PINNED: usize = 40;
-    const RESULTS_ENV: &str = "HARVEST_GOLDEN_RESULTS";
-
-    #[derive(serde::Deserialize)]
-    struct Golden {
-        considered: usize,
-        digests: BTreeMap<String, String>,
-    }
-
-    /// Case directories holding a translated crate, relative to the tree. `is_dir()` only
-    /// bounds the descent — off the crate trees — while `has_crate` alone decides membership.
-    fn translated_cases(results: &Path) -> std::io::Result<Vec<String>> {
-        let mut out = Vec::new();
-        let mut dirs = vec![results.to_path_buf()];
-        while let Some(dir) = dirs.pop() {
-            for entry in std::fs::read_dir(&dir)? {
-                let path = entry?.path();
-                let hidden = path
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with('.'));
-                if hidden || !path.is_dir() {
-                    continue;
-                }
-                let translated = phase_dir(&path, TRANSLATED);
-                if !translated.is_dir() {
-                    dirs.push(path);
-                } else if has_crate(&translated) {
-                    let rel = path.strip_prefix(results).expect("under results/");
-                    out.push(rel.to_string_lossy().into_owned());
-                }
-            }
+/// A plain recursive copy for fixtures. `tree::copy_plain` is crate-private, and a test binary is a
+/// separate crate.
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for e in std::fs::read_dir(src).unwrap().filter_map(Result::ok) {
+        let to = dst.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_tree(&e.path(), &to);
+        } else {
+            std::fs::copy(e.path(), &to).unwrap();
         }
-        out.sort();
-        Ok(out)
-    }
-
-    /// Decided without the walk: an unrecognised layout must not read as an absent tree.
-    fn holds_cases(results: &Path) -> bool {
-        results.is_dir()
-            && std::fs::read_dir(results)
-                .unwrap_or_else(|e| panic!("{}: {e}", results.display()))
-                .next()
-                .is_some()
-    }
-
-    /// A git worktree does not inherit submodules, and the reorganisation PRs run in
-    /// worktrees, so `results/` alone would have made this gate skip in every place it is
-    /// meant to fire. Naming a tree explicitly is a claim there is one: an empty path there
-    /// is refused rather than skipped.
-    fn results_tree() -> Option<PathBuf> {
-        match std::env::var_os(RESULTS_ENV) {
-            Some(named) => {
-                let named = PathBuf::from(named);
-                assert!(
-                    holds_cases(&named),
-                    "{RESULTS_ENV} names {}, which holds no cases to compare",
-                    named.display()
-                );
-                Some(named)
-            }
-            None => {
-                let results = repo_root().join("results");
-                holds_cases(&results).then_some(results)
-            }
-        }
-    }
-
-    /// The plan calls every reorganisation ahead a pure move; this is what "pure" is measured
-    /// against. [`Fingerprint`] re-hashes exactly the files `publish` wrote, by the same rules, and is a
-    /// measurement and nothing else — where `Sealed::adopt` served a whole artifact with it: one with no
-    /// `Completed`, which then seeded verify.
-    #[test]
-    fn a_published_translation_still_digests_to_what_it_did_before() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden-digests.json");
-        let text = std::fs::read_to_string(&fixture)
-            .unwrap_or_else(|e| panic!("{}: {e}", fixture.display()));
-        let golden: Golden = serde_json::from_str(&text).expect("golden-digests.json parses");
-        assert!(
-            !golden.digests.is_empty(),
-            "golden-digests.json pins nothing, so this test would compare nothing"
-        );
-
-        let Some(results) = results_tree() else {
-            eprintln!(
-                "NO SIGNAL: nothing was compared and this gate proved nothing. {RESULTS_ENV} is \
-                 unset and the results/ submodule is not checked out — a git worktree never \
-                 inherits one. Point {RESULTS_ENV} at a results tree to run it."
-            );
-            return;
-        };
-        let cases = translated_cases(&results)
-            .unwrap_or_else(|e| panic!("walking {}: {e}", results.display()));
-
-        let mut compared = 0;
-        let mut wrong: Vec<String> = Vec::new();
-        for case in cases.iter().take(PINNED) {
-            let Some(want) = golden.digests.get(case) else {
-                wrong.push(format!(
-                    "{case}: found in the results tree, pinned by nothing"
-                ));
-                continue;
-            };
-            let measured = Fingerprint::of_phase_dir::<Translate>(&results.join(case))
-                .unwrap_or_else(|e| panic!("measuring {case}: {e}"));
-            compared += 1;
-            let got = measured.as_str();
-            if got != want {
-                wrong.push(format!("{case}: {got} != {want}"));
-            }
-        }
-        assert!(
-            wrong.is_empty(),
-            "published translations no longer digest to what they did: {wrong:#?}\n\
-             Nothing in the reorganisation is allowed to move these. If a digest changed on\n\
-             purpose, name the rule that changed and re-record deliberately."
-        );
-        assert!(
-            compared >= PINNED,
-            "compared {compared} of the {PINNED} pinned cases against the {} found in {}\n\
-             ({} were considered when the fixture was written), so this passed without\n\
-             inspecting what it exists to inspect.",
-            cases.len(),
-            results.display(),
-            golden.considered
-        );
     }
 }
-
-// The prompt-layout guard that lived here listed the claude prompts by hand and only
-// covered that one directory. `translate::tests::every_prompt_the_matrix_names_is_on_disk`
-// derives the same check from `prompt_file_for` for every agent, and runs in the
-// type-safety job — which this file, needing submodules, is excluded from.

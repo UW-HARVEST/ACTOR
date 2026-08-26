@@ -53,22 +53,6 @@ pub enum Exit {
     Unobserved,
 }
 
-/// PROOF that an agent invocation ran to completion.
-///
-/// The private unit field makes [`Health::completed`] the only way to obtain one,
-/// so code requiring `&Completed` is unreachable for an infra-failed run as a
-/// compile error, not a forgettable runtime check. See
-/// `crate::artifact::Scrubbed::seal`.
-pub struct Completed(());
-
-impl Completed {
-    /// `#[cfg(test)]` so production code still cannot forge a proof.
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
-        Self(())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
     /// Ran to completion. Says nothing about whether the translation or
@@ -83,9 +67,10 @@ pub enum Health {
 }
 
 impl Health {
-    /// The ONLY constructor of [`Completed`].
-    pub fn completed(&self) -> Option<Completed> {
-        matches!(self, Health::Completed).then_some(Completed(()))
+    /// Whether the run finished. Says nothing about whether the translation SUCCEEDED -- that is a
+    /// result, and the scorer's business.
+    pub fn is_completed(&self) -> bool {
+        matches!(self, Health::Completed)
     }
 
     pub fn is_infra(&self) -> bool {
@@ -395,17 +380,15 @@ mod tests {
             Health::Completed
         );
         assert!(
-            classify(log, LogFormat::Opaque, Exit::Success)
-                .completed()
-                .is_some(),
-            "the proof seal() needs must be obtainable"
+            classify(log, LogFormat::Opaque, Exit::Success).is_completed(),
+            "an opaque log with a clean exit is the one case that classifies completed"
         );
         // ...and the old path really did refuse it, so this test is not vacuous.
-        assert!(from_log(log).completed().is_none());
+        assert!(!from_log(log).is_completed());
     }
 
     #[test]
-    fn an_opaque_log_is_never_sealed_on_a_failure_or_without_an_observation() {
+    fn an_opaque_log_never_completes_on_a_failure_or_without_an_observation() {
         for exit in [
             Exit::Failure { code: Some(1) },
             Exit::Failure { code: None },
@@ -413,10 +396,8 @@ mod tests {
             Exit::Unobserved,
         ] {
             assert!(
-                classify("error: could not compile\n", LogFormat::Opaque, exit)
-                    .completed()
-                    .is_none(),
-                "must not mint a proof for {exit:?}"
+                !classify("error: could not compile\n", LogFormat::Opaque, exit).is_completed(),
+                "must not classify {exit:?} as completed"
             );
         }
     }

@@ -9,6 +9,7 @@
 //! One entry per key. Several attempts are not representable, so a table's numbers follow from the
 //! key alone and there is no selection rule, no recorded pin and no tie to break.
 
+use crate::io::workdir::Roots;
 use crate::tree::{Tree, TreeDigest};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -68,6 +69,40 @@ pub fn model_dir(model: &str) -> String {
 /// might land on, and hex carries no `-`, so the substitution stays injective.
 fn digest_dir(d: &str) -> String {
     d.replace(':', "-")
+}
+
+/// Machine-specific paths, tokenised, so a prompt hashes the same on every machine.
+///
+/// Without it the scratch directory name is a nonce in the key and no entry ever hits: caching would
+/// look enabled while never working.
+pub fn normalise(text: &str, roots: &Roots) -> String {
+    let mut out = text.to_string();
+    // `to_str`, never `to_string_lossy`: lossy mapping sends every invalid byte to
+    // U+FFFD, so two different roots can produce the same substitution string and two
+    // different prompts the same digest — a false cache *hit*, the one failure mode
+    // this key exists to prevent. Skipping a non-UTF-8 root instead leaves the literal
+    // path in the normalised text, which can only cost a miss.
+    let mut subs: Vec<(&str, &str)> = [
+        (Some(roots.work.as_path()), "$WORK"),
+        (Some(roots.repo.as_path()), "$REPO"),
+        // Longest-first below puts $REPO ahead of this, so a path under the repo is never
+        // rewritten as `$REPOPARENT/ACTOR/...` and the checkout's own name stays out of the key.
+        (roots.repo_parent.as_deref(), "$REPOPARENT"),
+        (roots.work_base.as_deref(), "$WORKBASE"),
+        (roots.home.as_deref(), "$HOME"),
+    ]
+    .into_iter()
+    .filter_map(|(p, token)| p?.to_str().map(|s| (s, token)))
+    .collect();
+    // Longest first: a work root nested under the scratch base would otherwise be
+    // rewritten as `$WORKBASE/harvest-work-AbCdEf`, putting the per-run name in the key.
+    subs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+    for (from, to) in subs {
+        if !from.is_empty() {
+            out = out.replace(from, to);
+        }
+    }
+    out
 }
 
 /// The prompt as the key names it: the FINAL text, after substitution and path normalisation.
@@ -270,6 +305,61 @@ impl Store {
             serde_json::to_string_pretty(record)?,
         )?;
         Ok(())
+    }
+
+    /// Entry count and bytes on disk. An entry is a directory holding an `agent.json`, which is what
+    /// `cache stats` reports -- counting directories would count the tree levels above them too.
+    pub fn stats(&self) -> Result<(usize, u64)> {
+        fn walk(dir: &Path, entries: &mut usize, bytes: &mut u64) -> Result<()> {
+            if dir.join("agent.json").is_file() {
+                *entries += 1;
+            }
+            for e in std::fs::read_dir(dir)?.filter_map(std::result::Result::ok) {
+                let meta = e.metadata()?;
+                if meta.is_dir() {
+                    walk(&e.path(), entries, bytes)?;
+                } else {
+                    *bytes += meta.len();
+                }
+            }
+            Ok(())
+        }
+        let (mut entries, mut bytes) = (0, 0);
+        if self.root.is_dir() {
+            walk(&self.root, &mut entries, &mut bytes)?;
+        }
+        Ok((entries, bytes))
+    }
+
+    /// Every entry whose run did not complete, as `(entry path AS TEXT, outcome)`.
+    ///
+    /// Text, not a `PathBuf`: a caller holding a path can run a command in the store.
+    ///
+    /// A walk over ordinary entries, not a second tree: a failure is an entry with a non-`Completed`
+    /// outcome, which is what removed the `failed/` subtree and the second walker that read it.
+    pub fn failures(&self) -> Result<Vec<(String, Outcome)>> {
+        fn walk(dir: &Path, out: &mut Vec<(String, Outcome)>) -> Result<()> {
+            let record = dir.join("agent.json");
+            if record.is_file() {
+                let parsed: AgentRecord = serde_json::from_str(&std::fs::read_to_string(&record)?)
+                    .with_context(|| format!("reading {}", record.display()))?;
+                if parsed.outcome != Outcome::Completed {
+                    out.push((dir.display().to_string(), parsed.outcome));
+                }
+                return Ok(());
+            }
+            for e in std::fs::read_dir(dir)?.filter_map(std::result::Result::ok) {
+                if e.metadata()?.is_dir() {
+                    walk(&e.path(), out)?;
+                }
+            }
+            Ok(())
+        }
+        let mut out = Vec::new();
+        if self.root.is_dir() {
+            walk(&self.root, &mut out)?;
+        }
+        Ok(out)
     }
 
     pub fn count(&self, f: impl FnOnce(&mut Counts)) {

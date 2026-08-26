@@ -234,6 +234,42 @@ pub fn test_tempdir() -> Result<tempfile::TempDir> {
         .with_context(|| format!("creating a scratch tree in {}", dir.display()))
 }
 
+/// A stand-in executable, for tests that must observe how the harness reacts to a program's exit and
+/// output without depending on a real CLI being installed.
+#[cfg(test)]
+pub(crate) fn fake_program(dir: &Path, name: &str, body: &str) -> String {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let at = dir.join(name);
+    // Written, flushed, synced and CLOSED before the mode is set, and only then executed.
+    {
+        let mut f = std::fs::File::create(&at).expect("create fake program");
+        f.write_all(format!("#!/usr/bin/env bash\n{body}\n").as_bytes())
+            .expect("write fake program");
+        f.sync_all().expect("sync fake program");
+    }
+    std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    // Then PROVE it is executable before handing it over. A sibling test thread that forked while
+    // this file's descriptor was open leaves the fork holding it, and the exec fails with ETXTBSY (26)
+    // -- a SPAWN error, which a caller's `expect_err` cannot tell from the runner failure it is
+    // actually testing. That read as a one-in-three "the fake runner did write a report" from a
+    // fixture that had written one. Probed with no arguments, which every fake here ignores because
+    // they all loop over `$@`.
+    for attempt in 0..50 {
+        match std::process::Command::new(&at).output() {
+            Ok(_) => return at.to_string_lossy().into_owned(),
+            Err(e) if e.raw_os_error() == Some(26) && attempt < 49 => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!(
+                "the fake program at {} cannot be executed: {e}",
+                at.display()
+            ),
+        }
+    }
+    unreachable!("the loop above returns or panics")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

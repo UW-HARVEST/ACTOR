@@ -197,40 +197,21 @@ jobs:
         # `cache` into `agents`/`translate` grew the module cycle 5 -> 7 and the gate refused it) and
         # why the model still reaches the key after the collapse. 3510 is 3487 plus 23.
         #
-        # RAISED 3510 -> 3585 for the `<harness>/<model>` store layout, and what the lines buy is three
-        # naming defects that were each invisible on disk. `bare_model_id` stripped "the vendor prefix"
-        # as everything-before-the-first-dot, so `openai/gpt-5.4` slugged to `4` and the directory was
-        # `oneshot/4`; `results_slug` had shipped the same rule. kiro resolved a SENTINEL,
-        # `unpinned:kiro-cli-default`, which the same function cut at the colon into a directory named
-        # `kiro/unpinned`. And kiro's session script carried no `--model` at all while its key recorded
-        # one, so every published kiro row came from whichever model the picker had last made active --
-        # `claude-opus-4.7` when this was found, unrecoverable for the rows already published, because 0
-        # files under `results/Test-Corpus/kiro/` name a model. That is why those results now sit under
-        # `kiro/unrecorded/` rather than being relabelled with a model nobody recorded. The rest
-        # documents why the layout is two levels and why the collapse did not re-key: same bytes, same
-        # order, 279,505 files renamed and not one entry recomputed. 14 lines of duplication were pruned
-        # first -- the vendor-strip story was told twice and is now told once, on the test that names the
-        # failure. 3585 is the tree WITH these self-counting lines in it, 3575, plus 10.
+        # LOWERED 3780 -> 2100, which is the raises above coming due. The rebuild replaced the phase
+        # type-states with one agent invocation and deleted `translate.rs`, `verify.rs`, `cache.rs`,
+        # `artifact.rs`, `agents/run.rs` and `agents/work.rs` -- 12,213 lines, 1,329 of them comments.
+        # src/ went 23,002 -> 12,662 lines and the comment total 3,575 -> 2,067. 2100 is 2,067 plus 33.
         #
-        # RAISED 3585 -> 3780 for `src/tree.rs`, and this one is EXPECTED TO COME BACK DOWN. The
-        # rebuild replaces the phase type-states with one agent invocation, and the modules it
-        # deletes carry 438 comment lines in `translate.rs`, 376 in `artifact.rs` and 139 in
-        # `verify.rs`. The new module's 57 are the WHY of the shape: why `c_src/` and `translation/`
-        # are siblings rather than nested (an artifact CMake-built the original library from a nested
-        # `c_src/` and linked it), why restoring the C replaces detecting a change to it, why a
-        # `Tree` yields no path, and why `scrub` must precede any digest. Four whole-path tests name
-        # the failure each pins. Carried to 3780 for `store.rs` and `invocation.rs` on the same terms
-        # and for the last time: the switch-over deletes `translate.rs` and `verify.rs`, which carry
-        # 577 comment lines between them, so the next move on this number is downwards.
-        # Lower this to the measured total when the old drivers are gone --
-        # that step is the point of the change, not a follow-up.
+        # Three raises (3510 -> 3585 -> 3720 -> 3780) were each taken on the stated promise that they
+        # came back down when the old drivers went. A raise defended by a promise is worth only the
+        # record of the promise being kept, so: kept, and this is the record.
         #
         # .py is in neither HASH nor SLASH, so the budget does not count itself: this
         # script's own docstring and all 250 lines of tools/test_comment_budget.py cost
         # ZERO against both ceilings. Deriving 3100 from the tree needs that fact.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 3780 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 2100 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is

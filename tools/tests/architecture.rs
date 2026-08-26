@@ -15,10 +15,6 @@ fn src_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
-fn src(name: &str) -> PathBuf {
-    src_dir().join(name)
-}
-
 /// `src/artifact.rs` is `artifact`, `src/domain/contents.rs` is `domain::contents`, and
 /// `src/domain/mod.rs` is `domain`. Rules key on this rather than on the leaf filename,
 /// which stops naming the same code the moment a module becomes a directory.
@@ -160,13 +156,12 @@ fn the_shape_rules_cannot_pass_while_inspecting_nothing() {
     // instead of quietly narrowing what every rule below inspects. Add files, raise it.
     const MIN_FILES: usize = 34;
     const REQUIRED: &[&str] = &[
-        "Sealed",
-        "Publishing",
-        "Published",
-        "WorkTree",
-        "Scrubbed",
-        "Corpus",
+        "WorkDir",
+        "Tree",
         "TreeDigest",
+        "Key",
+        "Invocation",
+        "Runner",
     ];
 
     let found = rust_sources();
@@ -292,8 +287,8 @@ fn no_public_path_escapes_the_artifact_modules() {
     let mut leaks: Vec<String> = Vec::new();
 
     for module in [
-        "artifact",
-        "cache",
+        "tree",
+        "store",
         "tree",
         "domain::relpath",
         "domain::contents",
@@ -353,22 +348,14 @@ fn no_public_path_escapes_the_artifact_modules() {
 /// CLI itself, is how a key comes to name something that did not run.
 #[test]
 fn digests_cannot_be_fabricated() {
-    const GUARDED: &[&str] = &[
-        "TreeDigest",
-        "PromptDigest",
-        "RecipeDigest",
-        "CacheKey",
-        "ToolchainId",
-        "AgentKey",
-        "CliVersion",
-    ];
+    const GUARDED: &[&str] = &["TreeDigest", "Prompt", "ModelId"];
     let mut bad: Vec<String> = Vec::new();
     // Every guarded name must be FOUND, not merely un-violated. Without this the rule inspects
     // whatever happens to still live in the listed modules: moving `TreeDigest` to `tree` took it
     // out of scope silently, and the gate stayed green having stopped looking at it.
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
-    for module in ["artifact", "cache", "tree"] {
+    for module in ["store", "tree"] {
         let file = parse(&module_file(module));
         // Four of the seven are emitted by `digest_newtype!`, so no `Item::Struct` exists for them
         // and this rule inspected NOTHING for `PromptDigest`, `RecipeDigest`, `CacheKey` and
@@ -455,29 +442,14 @@ fn digests_cannot_be_fabricated() {
 #[test]
 fn compile_fail_cases_still_assert_what_they_were_written_for() {
     let expected: BTreeMap<&str, Vec<&str>> = [
-        ("sealed_has_no_path", vec!["E0599"]), // no method named `path`
-        ("sealed_is_not_a_command_cwd", vec!["E0277"]), // AsRef<Path> not satisfied
-        ("phases_are_not_interchangeable", vec!["E0308"]), // mismatched types
-        ("completed_cannot_be_forged", vec!["E0603"]), // private constructor
-        ("oracle_cannot_be_forged", vec!["E0603"]), // private constructor
-        ("worktree_cannot_be_used_after_scrub", vec!["E0382"]), // scrub() consumed it
-        ("scrubbed_cannot_be_used_after_seal", vec!["E0382"]), // seal() consumed it
-        ("materialise_at_refuses_a_results_tree_path", vec!["E0308"]), // needs a Cwd, not a Path
-        ("a_verification_cannot_seed_a_translation", vec!["E0277"]), // no such SeededBy impl
-        ("phase_cannot_be_implemented_downstream", vec!["E0277"]), // sealed supertrait
-        ("sealed_does_not_display", vec!["E0277"]), // no Display impl
-        ("materialise_at_refuses_a_results_tree_path", vec!["E0308"]), // not a ScratchPath
-        // The two ways a score could once name a phase dir instead of taking the run's own output.
-        (
-            "a_score_cannot_come_from_a_phase_dir",
-            vec!["E0599", "E0425"],
-        ),
-        // Both doors that once minted from a directory: E0599 is `Sealed::adopt`, gone; E0624 is
-        // `Published::unkeyed_from_phase_dir`, gone the moment that `pub(crate)` widens.
-        (
-            "a_published_artifact_cannot_be_adopted_from_a_directory",
-            vec!["E0599", "E0624"],
-        ),
+        // A tree names bytes some step produced. Buildable from a path, a caller could feed a step a
+        // tree nothing produced -- the guarantee `SeededBy` gave before phases stopped being types.
+        ("a_tree_cannot_be_fabricated", vec!["E0451"]), // private fields
+        // Nothing runs in a sealed tree: obtaining a path IS being able to execute there.
+        ("a_tree_yields_no_path", vec!["E0599"]), // no method named `path`
+        // `seal` consumes the working dir; running in it afterwards produces bytes the digest does
+        // not describe.
+        ("a_working_dir_cannot_be_used_after_sealing", vec!["E0382"]),
     ]
     .into_iter()
     .collect();
@@ -731,89 +703,12 @@ fn only_battery_defines_the_has_crate_predicate() {
     );
 }
 
-/// The three key-deriving functions must keep their exhaustive patterns.
-///
-/// `Recipe::digest`, `KeyInputs::key` and `KeyInputs::meta` open with a full destructuring
-/// pattern precisely so adding a field fails to compile (E0027) rather than silently
-/// leaving the cache key unchanged, which would let two different invocations share an
-/// entry. Each escape below restores that silence: `..` and `field: _` skip a field,
-/// `let _ = x` and the bare `_ = x` consume a binding without hashing it (the latter is
-/// destructuring assignment, and compiles with no `let` at all), and
-/// `#[allow(unused_variables)]` disables the other half of the guarantee.
-#[test]
-fn the_key_deriving_functions_keep_their_exhaustive_patterns() {
-    const GUARDED: &[&str] = &["digest", "key", "meta"];
-    let text = std::fs::read_to_string(src("cache.rs")).expect("cache.rs");
-    let file = syn::parse_file(&text).expect("cache.rs parses");
-    let mut bad: Vec<String> = Vec::new();
-
-    for item in file.items {
-        let syn::Item::Impl(imp) = item else { continue };
-        let owner = type_name(&imp.self_ty);
-        if owner != "Recipe" && owner != "KeyInputs" {
-            continue;
-        }
-        for it in imp.items {
-            let syn::ImplItem::Fn(f) = it else { continue };
-            let name = f.sig.ident.to_string();
-            if !GUARDED.contains(&name.as_str()) {
-                continue;
-            }
-            let mut note = |what: &str| bad.push(format!("{owner}::{name}: {what}"));
-            if f.attrs.iter().any(|a| {
-                let p = a
-                    .path()
-                    .segments
-                    .iter()
-                    .map(|s| s.ident.to_string())
-                    .collect::<Vec<_>>()
-                    .join("::");
-                let t = a
-                    .meta
-                    .require_list()
-                    .map(|l| l.tokens.to_string())
-                    .unwrap_or_default();
-                p.contains("allow") && t.contains("unused_variables")
-            }) {
-                note("#[allow(unused_variables)]");
-            }
-            for st in &f.block.stmts {
-                match st {
-                    syn::Stmt::Local(l) => {
-                        if let syn::Pat::Struct(ps) = &l.pat {
-                            if ps.rest.is_some() {
-                                note("`..` in the destructuring pattern");
-                            }
-                            if ps
-                                .fields
-                                .iter()
-                                .any(|fp| matches!(&*fp.pat, syn::Pat::Wild(_)))
-                            {
-                                note("a field bound to `_`");
-                            }
-                        }
-                        if matches!(&l.pat, syn::Pat::Wild(_)) {
-                            note("`let _ =` discards a binding");
-                        }
-                    }
-                    // bare `_ = x;` is destructuring assignment: no `let`, compiles clean
-                    syn::Stmt::Expr(syn::Expr::Assign(a), _) => {
-                        if matches!(&*a.left, syn::Expr::Infer(_)) {
-                            note("bare `_ =` discards a binding");
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    assert!(
-        bad.is_empty(),
-        "a key-deriving function can now skip a field silently: {bad:#?}\n\
-         Keep the pattern exhaustive and feed every binding, so a new field is a compile\n\
-         error rather than two invocations quietly sharing a cache entry."
-    );
-}
+// The exhaustive-destructuring rule that lived here guarded `Recipe::digest` and `KeyInputs::key`:
+// a component added to the key struct and forgotten in the hash would let two different invocations
+// share an entry. Both functions are gone -- the key is the PATH now, and
+// `store::tests::the_path_carries_every_component_of_the_key` asserts the same property by varying
+// each component and demanding a different directory. That is the stronger test: it checks the
+// mapping rather than the syntax that produces it, so a `..` pattern could not evade it.
 
 /// Modules whose NON-TEST code calls `obtain`, in EITHER spelling, one entry per call site,
 /// sorted. Takes `(module, source)` pairs so planted calls can test the extraction itself.
@@ -831,7 +726,7 @@ fn the_key_deriving_functions_keep_their_exhaustive_patterns() {
 /// call inside one — `matches!(s.obtain(..), Ok(_))` read as no call at all. Those tokens are
 /// scanned for `obtain` in call position as well. The scan is hung off `visit_macro` rather
 /// than run over the whole file so that the `cfg` skip still governs what it reaches.
-fn obtain_call_sites(sources: &[(String, String)]) -> Vec<String> {
+fn lookup_call_sites(sources: &[(String, String)]) -> Vec<String> {
     /// `obtain(..)` and `obtain::<Verify>(..)` anywhere in a token stream, counted. Between
     /// the name and its argument list only a turbofish may stand, so idents and the puncts
     /// it is spelled with are stepped over and anything else ends the match.
@@ -847,7 +742,7 @@ fn obtain_call_sites(sources: &[(String, String)]) -> Vec<String> {
             if let TokenTree::Group(g) = token {
                 found += calls_in_tokens(g.stream());
             }
-            if !matches!(token, TokenTree::Ident(id) if id == "obtain") {
+            if !matches!(token, TokenTree::Ident(id) if id == "lookup") {
                 continue;
             }
             let mut j = i + 1;
@@ -892,16 +787,16 @@ fn obtain_call_sites(sources: &[(String, String)]) -> Vec<String> {
             syn::visit::visit_macro(self, m);
         }
         fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
-            if c.method == "obtain" {
+            if c.method == "lookup" {
                 self.hits.push(self.module.clone());
             }
             syn::visit::visit_expr_method_call(self, c);
         }
-        /// `Store::obtain(store, ..)` is an `ExprCall` over a path, not an `ExprMethodCall`,
+        /// `Store::lookup(store, ..)` is an `ExprCall` over a path, not an `ExprMethodCall`,
         /// so a receiver-only visitor reports a second cached path as no path at all.
         fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
             if let syn::Expr::Path(p) = &*c.func {
-                if p.path.segments.last().is_some_and(|s| s.ident == "obtain") {
+                if p.path.segments.last().is_some_and(|s| s.ident == "lookup") {
                     self.hits.push(self.module.clone());
                 }
             }
@@ -921,11 +816,11 @@ fn obtain_call_sites(sources: &[(String, String)]) -> Vec<String> {
     out
 }
 
-/// One cached execution path, hence exactly one `Store::obtain` call site.
+/// One cached execution path, hence exactly one `Store::lookup` call site.
 ///
-/// Everything `agents::run::run_cached` claims — one key, one publish, one metrics write, no
+/// Everything `invocation::run_or_replay` claims — one key, one publish, one metrics write, no
 /// replay branch a caller can get wrong — holds only while it is the sole way to reach the
-/// store. A second `obtain` restores the fork silently: both sites would cache, both would
+/// store. A second `lookup` restores the fork silently: both sites would cache, both would
 /// look right, and nothing would go red while the two drifted apart.
 #[test]
 fn the_store_is_obtained_from_exactly_one_place() {
@@ -934,14 +829,14 @@ fn the_store_is_obtained_from_exactly_one_place() {
         .map(|p| (module_path(&p), read(&p)))
         .collect();
     assert_eq!(
-        obtain_call_sites(&sources),
-        ["agents::run"],
-        "Store::obtain must be called by the one driver and nowhere else. Route the phase \
-         through `agents::run::run_cached` instead of consulting the store again.\n\
+        lookup_call_sites(&sources),
+        ["invocation"],
+        "Store::lookup must be called by the one driver and nowhere else. Route the phase \
+         through `invocation::run_or_replay` instead of consulting the store again.\n\
          What this rule still cannot see, stated so nobody reads a green as more than it is: \
-         a call whose name is never lexed as the ident `obtain` — assembled by token pasting, \
+         a call whose name is never lexed as the ident `lookup` — assembled by token pasting, \
          emitted by a proc-macro or a build script — or one reached through a binding rather \
-         than named at the call site (`let f = Store::obtain; f(..)`). `#[cfg(test)]` items \
+         than named at the call site (`let f = Store::lookup; f(..)`). `#[cfg(test)]` items \
          are skipped by design."
     );
 
@@ -954,36 +849,35 @@ fn the_store_is_obtained_from_exactly_one_place() {
         (
             "cfg_any",
             "#[cfg(any(test, feature = \"x\"))]\n\
-             fn a(s: &Store, i: &KeyInputs) { let _ = s.obtain(i, || Ok(None)); }",
+             fn a(s: &Store, i: &KeyInputs) { let _ = s.lookup(i); }",
         ),
         (
             "cfg_not_test",
             "#[cfg(not(test))]\n\
-             pub fn shipped(s: &Store, i: &KeyInputs) { let _ = s.obtain(i, || Ok(None)); }",
+             pub fn shipped(s: &Store, i: &KeyInputs) { let _ = s.lookup(i); }",
         ),
         (
             "in_macro",
-            "fn m(s: &Store, i: &KeyInputs) { let _ = matches!(s.obtain(i, || Ok(None)), Ok(_)); }",
+            "fn m(s: &Store, i: &KeyInputs) { let _ = matches!(s.lookup(i), Ok(_)); }",
         ),
         (
             "qualified",
-            "fn third(s: &Store, i: &KeyInputs) { let _ = cache::Store::obtain::<Verify>(s, i, \
-             || Ok(None)); }",
+            "fn third(s: &Store, i: &KeyInputs) { let _ = store::Store::lookup(s, i); }",
         ),
         (
             "receiver",
-            "fn second(s: &Store, i: &KeyInputs) { let _ = s.obtain(i, || Ok(None)); }",
+            "fn second(s: &Store, i: &KeyInputs) { let _ = s.lookup(i); }",
         ),
         (
             "test_only",
             "#[cfg(test)]\nmod tests { fn t(s: &Store, i: &KeyInputs) {\n    \
-             let _ = s.obtain(i, || Ok(None));\n    \
-             let _ = matches!(s.obtain(i, || Ok(None)), Ok(_));\n} }",
+             let _ = s.lookup(i);\n    \
+             let _ = matches!(s.lookup(i), Ok(_));\n} }",
         ),
     ]
     .map(|(module, source)| (module.to_owned(), source.to_owned()));
     assert_eq!(
-        obtain_call_sites(&planted),
+        lookup_call_sites(&planted),
         [
             "cfg_any",
             "cfg_not_test",
@@ -1126,9 +1020,9 @@ fn the_digest_path_is_lossless() {
     const GUARDED: &[(&str, &str)] = &[
         ("tree", "hash_tree"), // where the path bytes are actually fed
         ("tree", "digest_tree"),
-        ("artifact", "scrub"),
+        ("tree", "scrub"),
         ("domain::contents", "classify"), // decides WHICH files hash_tree hashes
-        ("cache", "normalise"),
+        ("store", "normalise"),
     ];
     const BANNED: &[&str] = &["to_string_lossy", "display().to_string"];
 
@@ -1180,7 +1074,7 @@ fn the_digest_path_is_lossless() {
 /// [`CYCLE_BASELINE`] is: one that STARTS naming a phase dir fails, which is what stops a twentieth
 /// site. It does not cap the count INSIDE a listed module. The two scorers came off it when scoring
 /// moved to `crate::eval`: both take the artifact as a VALUE, so neither can resolve one from a path.
-const PHASE_DIR_READERS: &[&str] = &["analyse::report", "artifact", "oracle", "translate"];
+const PHASE_DIR_READERS: &[&str] = &["analyse::report", "oracle"];
 
 /// Every spelling `battery` exports (or exported) for a case's layout, including the two phase names,
 /// since `case_dir(b, c).join(battery::VERIFIED)` resolves one while naming no resolver. `crate_dir`
@@ -1274,17 +1168,28 @@ fn only_the_pipeline_names_a_phase_directory() {
 
 /// The forward chain, in order. `Publishing` and `Published` are on it because site 17 WAS a backward
 /// step: `Sealed::publish` took `&self`, so a `Sealed` outlived its own publish.
-const TYPESTATE_ORDER: &[&str] = &["WorkTree", "Scrubbed", "Sealed", "Publishing", "Published"];
+const TYPESTATE_ORDER: &[&str] = &["WorkDir", "Tree"];
 
 #[test]
 fn typestates_have_private_fields_and_consuming_transitions() {
     let mut family: Vec<String> = Vec::new();
+    let mut declared: Vec<String> = Vec::new();
     let mut leaks: Vec<String> = Vec::new();
 
     for path in rust_sources() {
         let file = path.file_name().unwrap().to_string_lossy().into_owned();
         for item in parse(&path).items {
             let syn::Item::Struct(s) = item else { continue };
+            if TYPESTATE_ORDER.contains(&s.ident.to_string().as_str()) {
+                declared.push(s.ident.to_string());
+                for f in &s.fields {
+                    if let Some(fname) = f.ident.as_ref() {
+                        if is_public(&f.vis) {
+                            leaks.push(format!("{file}: {}.{fname} is not private", s.ident));
+                        }
+                    }
+                }
+            }
             if !s
                 .fields
                 .iter()
@@ -1311,10 +1216,13 @@ fn typestates_have_private_fields_and_consuming_transitions() {
          A phase-tagged struct with a reachable field can be rebuilt with a different tag,\n\
          which is the whole invariant the PhantomData exists to carry."
     );
+    // The family used to be found by its `PhantomData<P>` phase tag. There are no phase types now,
+    // so membership is stated: these two ARE the state machine, and a rename must come here rather
+    // than silently emptying the rule.
     for want in TYPESTATE_ORDER {
         assert!(
-            family.iter().any(|f| f == want),
-            "{want} no longer carries a PhantomData phase tag; TYPESTATE_ORDER is stale"
+            declared.iter().any(|d| d == want),
+            "{want} is no longer declared, so this rule inspects nothing for it"
         );
     }
 
@@ -1369,7 +1277,7 @@ fn typestates_have_private_fields_and_consuming_transitions() {
 /// and `analyse` out of the component; `session` and `opencode` are members of `agents` now
 /// rather than nodes of their own. The one edge holding `agents` in is `cache`, which names
 /// `Session` to hash a recipe and `opencode` to slug a model directory.
-const CYCLE_BASELINE: &[&str] = &["agents", "artifact", "battery", "cache", "cli"];
+const CYCLE_BASELINE: &[&str] = &["battery", "runners"];
 
 fn top_level_module(root: &Path, file: &Path) -> Option<String> {
     let rel = file.strip_prefix(root).ok()?;
@@ -1627,7 +1535,7 @@ fn a_module_cycle_may_only_shrink() {
         cycles(&graph.edges)
     );
 
-    // A ring of six is the one violation no plantable src/ tree reaches cheaply.
+    // A ring one longer than the baseline is the violation no plantable src/ tree reaches cheaply.
     let ring: Vec<&str> = CYCLE_BASELINE.iter().copied().chain(["scoring"]).collect();
     let planted: BTreeMap<String, BTreeSet<String>> = ring
         .iter()
@@ -1641,10 +1549,14 @@ fn a_module_cycle_may_only_shrink() {
         .collect();
     let caught = cycle_violations(&planted, CYCLE_BASELINE);
     assert!(
-        caught
-            .iter()
-            .any(|v| v == "the largest cycle has 6 modules; the baseline records 5"),
-        "a planted six-module ring did not read as bigger than the five the baseline\n\
+        caught.iter().any(|v| {
+            v == &format!(
+                "the largest cycle has {} modules; the baseline records {}",
+                CYCLE_BASELINE.len() + 1,
+                CYCLE_BASELINE.len()
+            )
+        }),
+        "a planted ring one longer than the baseline did not read as bigger than it\n\
          records: {caught:#?}"
     );
 

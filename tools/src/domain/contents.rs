@@ -1,33 +1,6 @@
 use crate::domain::relpath::RelPath;
 use std::path::Path;
 
-/// What a copy carries, named by **purpose** rather than by exclusion list: a caller
-/// names the purpose and cannot name the exclusions, so the list used to write a cache
-/// entry and the one used to overlay a results tree cannot drift apart.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Carry {
-    /// Into an agent's work tree. `logs/` travels, because that is what the verify agent
-    /// has always been able to see and narrowing it would silently change the experiment.
-    /// Build output does not, unlike the earlier top-level-name filter: cmake refuses a
-    /// cache whose `CMAKE_CACHEFILE_DIR` no longer matches, and a nested
-    /// `c_src/build/CMakeCache.txt` naming a dead scratch dir could only break a build
-    /// the agent attempted there.
-    IntoWorkTree,
-    /// Out of a sealed artifact — into the cache store, and out of the store into the
-    /// results tree. ONE variant for both, deliberately: a replay re-assembles from the
-    /// stored copy, so anything the store dropped becomes a hit/miss difference. It must
-    /// exclude nothing [`classify`] hashes, or a stored copy cannot re-derive the digest
-    /// recorded beside it and every cache read fails validation — a cache that looks
-    /// enabled and never hits. Re-carrying `c_src` over the copy seeded from the previous
-    /// phase therefore rewrites the same bytes: [`crate::artifact::Scrubbed::seal`] refuses
-    /// an artifact whose C oracle differs from the one the agent was given, other than by
-    /// what building it produced, which seal deletes before it hashes anything.
-    FromArtifact,
-    /// Seeding a tree from the preceding phase. `logs/` stays behind: it is harness
-    /// output, and the current phase's own log is being written live.
-    FromPreviousPhase,
-}
-
 /// What a file contributes to. The agent's build output is legitimately its work, but it
 /// is regenerable, 9x the bytes (4,536 MB vs 500 MB over `results/`), and where per-run
 /// paths get baked in — so it is neither carried nor hashed.
@@ -69,18 +42,6 @@ const ROOT_ONLY_IGNORED_DIRS: &[&str] = &["logs", ".claude"];
 /// [`crate::artifact::Scrubbed::seal`] grades a run by comparing this subtree file by file
 /// before and after, so a rule firing inside it hides a change to the reference. 26 real
 /// `c_src/doc/footer.html.bak` files sat in that blind spot.
-impl Carry {
-    pub(crate) fn admits(self, d: Disposition) -> bool {
-        match d {
-            // No arm here may return false: an artifact whose stored copy omits a hashed
-            // file cannot re-derive its own digest, so every cache read fails validation.
-            Disposition::StoreAndHash => true,
-            Disposition::BuildOutput => false,
-            Disposition::Ignore => self != Carry::FromPreviousPhase,
-        }
-    }
-}
-
 pub(crate) const C_ORACLE_DIR: &str = "c_src";
 
 /// `in_build_dir` must be true if any ancestor within the tree was itself classified

@@ -23,6 +23,22 @@ const TAIL_BYTES: u64 = 16 * 1024;
 /// `exit` for the mirror-image reason: nothing in an opaque log tells a finished run from a
 /// killed one, so [`classify`] gives the exit the whole burden of proof, and a hardcoded
 /// [`Exit::Unobserved`] left such a backend only `Unknown` — a gate that cannot fire.
+/// What the run cost, read from the transcript.
+///
+/// `None` where the format carries no spend: kiro writes prose, so there is nothing to read, and a
+/// `0.0` there would be a measurement nobody made -- the shape that put `\ActorKiroTests{0/338}` in
+/// print against records saying 325/338.
+pub fn cost_usd(log: &Path, format: LogFormat) -> Option<f64> {
+    if format == LogFormat::Opaque {
+        return None;
+    }
+    let text = read_tail(log).ok()?;
+    text.lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find_map(|r| r["total_cost_usd"].as_f64())
+}
+
 pub fn classify_log(log: &Path, format: LogFormat, exit: Exit) -> Health {
     match read_tail(log) {
         Ok(tail) => classify(&tail, format, exit),

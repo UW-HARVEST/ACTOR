@@ -154,7 +154,7 @@ mod tests {
     }
 
     /// `result.json` is still written back INTO the artifact directory, so it must stay outside the
-    /// digest and every [`crate::domain::contents::Carry`]; the rest lands in [`crate::eval`]'s tree.
+    /// digest and the one traversal policy; the rest lands in [`crate::eval`]'s tree.
     #[test]
     fn every_file_the_scorer_writes_back_is_excluded_from_the_artifact() {
         use crate::domain::contents::{classify, Disposition};

@@ -1,8 +1,8 @@
 use super::{openssl_dir, Covers, Enrichment, Scoring, Summary};
 use crate::agent_health::Run;
-use crate::artifact::{Phase, Published, Translate, Verify};
 use crate::battery::Paths;
-use crate::eval::{Materialised, Source};
+use crate::eval::Materialised;
+use crate::prompt::Role;
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
@@ -72,8 +72,11 @@ enum Headline {
 }
 
 impl Headline {
-    fn for_agent(agent: crate::cli::Agent) -> Self {
-        if crate::agents::invocation::has_verify_phase(agent) {
+    /// Whether a translate pass owns the headline summary depends on whether the chain DECLARES a
+    /// verify step -- not on whether one resolved, and not on the tool. A one-step chain's translate
+    /// numbers ARE the result; a two-step chain's are not, even on a sweep that ran only the first.
+    fn for_chain(declares_verify: bool) -> Self {
+        if declares_verify {
             Self::Verified
         } else {
             Self::Translated
@@ -115,35 +118,40 @@ fn covered_runs(paths: &Paths, batteries: &[String], covers: Covers<'_>) -> Resu
 }
 
 fn materialise_battery(paths: &Paths, battery: &str, scoring: &Scoring<'_>) -> Result<Vec<Pass>> {
-    let Source { translate, verify } = scoring.source;
-    let translated = materialise_phase::<Translate>(paths, battery, scoring, translate)?;
-    let verified = materialise_phase::<Verify>(paths, battery, scoring, verify)?;
-
+    // One loop over the roles the chain ran, rather than one call per phase type. A third step needs
+    // no third branch here.
     let mut wanted = Vec::new();
-    if let Some(tree) = translated {
-        let record = Headline::for_agent(paths.agent).translate_summary(verified.is_some());
-        wanted.push((Translate::DIR, record, tree));
+    let mut resolved_roles = Vec::new();
+    for role in scoring.roles {
+        if let Some(tree) = materialise_role(paths, battery, scoring, *role)? {
+            resolved_roles.push(*role);
+            wanted.push((role.dir(), tree));
+        }
     }
-    if let Some(tree) = verified {
-        wanted.push((Verify::DIR, HEADLINE_SUMMARY, tree));
-    }
-
+    // Two different questions, and conflating them lets a `--steps 1` sweep file a translate number
+    // over the headline of a chain that declares a verify step.
+    let declares_verify = scoring.roles.contains(&Role::Verify);
+    let verify_resolved = resolved_roles.contains(&Role::Verify);
     Ok(wanted
         .into_iter()
-        .map(|(phase, record, tree)| Pass {
+        .map(|(phase, tree)| Pass {
             battery: battery.to_string(),
             phase,
-            record,
+            record: if phase == Role::Verify.dir() {
+                HEADLINE_SUMMARY
+            } else {
+                Headline::for_chain(declares_verify).translate_summary(verify_resolved)
+            },
             tree,
         })
         .collect())
 }
 
-fn materialise_phase<P: Phase>(
+fn materialise_role(
     paths: &Paths,
     battery: &str,
     scoring: &Scoring<'_>,
-    resolved: &HashMap<std::path::PathBuf, Published<P>>,
+    role: Role,
 ) -> Result<Option<Materialised>> {
     let input_dir = paths.input_dir(battery);
     if !input_dir.is_dir() {
@@ -151,13 +159,14 @@ fn materialise_phase<P: Phase>(
     }
     let output_dir = paths.output_dir(battery);
 
-    let mut scope = scoring.tree.scope(&format!("{battery}/{}", P::DIR))?;
+    let mut scope = scoring.tree.scope(&format!("{battery}/{}", role.dir()))?;
     let mut any = false;
     for name in covered_cases(paths, battery, scoring.covers)? {
-        let Some(artifact) = resolved.get(&output_dir.join(&name)) else {
+        let published = output_dir.join(&name).join(role.dir());
+        let Some(tree) = scoring.resolved.get(&published) else {
             continue;
         };
-        scope.materialise(&name, artifact, &input_dir.join(&name))?;
+        scope.materialise(&name, tree, &input_dir.join(&name), &published)?;
         any = true;
     }
     if !any {
@@ -239,7 +248,10 @@ fn nothing_to_score(paths: &Paths, battery: &str) -> Result<()> {
 /// Out of the materialised crate, so a phase that wrote no transcript cannot borrow another's.
 fn transcripts(crate_root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let logs = crate_root.join("logs");
-    (logs.join(Translate::LOG), logs.join(Verify::LOG))
+    (
+        logs.join(Role::Translate.log()),
+        logs.join(Role::Verify.log()),
+    )
 }
 
 /// Cases discovered but NOT ONE of them reaching any verdict: the oracle never ran, whatever it
@@ -564,13 +576,27 @@ fn write_results(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::{Keep, Tree};
+    use crate::eval::{EvalTree, Keep};
     use std::fs;
 
+    /// A PUBLISHED phase dir: the crate directly, which is what `has_crate` asks about and what the
+    /// scorer's `translated_rust/` is assembled from.
     fn crate_at(dir: &std::path::Path) {
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::write(dir.join("Cargo.toml"), "[package]\n[workspace]\n").unwrap();
         fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+    }
+
+    /// A TREE: the working-dir shape, `c_src/` beside `translation/`. Distinct from a published phase
+    /// dir on purpose -- conflating the two is what this split exists to prevent.
+    fn tree_of(at: &std::path::Path) -> crate::tree::Tree {
+        let crate_dir = at.join(crate::tree::TRANSLATION);
+        fs::create_dir_all(crate_dir.join("src")).unwrap();
+        fs::write(crate_dir.join("Cargo.toml"), "[package]\n[workspace]\n").unwrap();
+        fs::write(crate_dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::create_dir_all(at.join(crate::tree::C_SRC)).unwrap();
+        fs::write(at.join(crate::tree::C_SRC).join("lib.c"), "int f(void);\n").unwrap();
+        crate::tree::Tree::for_test(at).unwrap()
     }
 
     fn corpus_battery(root: &Path, battery: &str, cases: &[&str]) {
@@ -585,14 +611,14 @@ mod tests {
         }
     }
 
-    fn paths_at(root: &Path, agent: crate::cli::Agent) -> Paths {
-        fs::create_dir_all(root.join("results")).unwrap();
+    fn paths_at(root: &Path, tool: crate::cli::Tool, variant: crate::cli::Variant) -> Paths {
         Paths::new(
             root,
-            agent,
+            tool,
+            variant,
             crate::cli::Dataset::TestCorpus,
             None,
-            crate::cache::Mode::Bypass,
+            crate::store::Mode::ReadWrite,
             crate::io::sandbox::Enforcement::AllowUnsandboxed,
         )
         .unwrap()
@@ -600,7 +626,7 @@ mod tests {
 
     fn gate_at(paths: &Paths) -> crate::agent_health::Gate<'_> {
         crate::agent_health::Gate {
-            format: paths.agent.log_format(),
+            format: crate::runners::log_format(paths.tool),
             on_failure: crate::agent_health::OnInfraFailure::Refuse,
             results_dir: &paths.results_dir,
         }
@@ -612,15 +638,19 @@ mod tests {
     fn a_stale_verified_dir_neither_promotes_the_battery_nor_scores_its_case() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         corpus_battery(tmp.path(), "B01", &["fresh", "stale"]);
-        let paths = paths_at(tmp.path(), crate::cli::Agent::Claude);
+        let paths = paths_at(
+            tmp.path(),
+            crate::cli::Tool::Claude,
+            crate::cli::Variant::Default,
+        );
 
         // `stale` is the trap: no translation this run, a COMPLETE verified/ crate from an earlier.
         let fresh = paths.case_dir("B01", "fresh");
-        crate_at(&fresh.join(Translate::DIR));
+        crate_at(&fresh.join(Role::Translate.dir()));
         let stale = paths.case_dir("B01", "stale");
-        crate_at(&stale.join(Verify::DIR));
+        crate_at(&stale.join(Role::Verify.dir()));
         assert!(
-            crate::battery::has_crate(&stale.join(Verify::DIR)),
+            crate::battery::has_crate(&stale.join(Role::Verify.dir())),
             "the fixture must hold the stale verified crate the old chooser preferred"
         );
         assert_eq!(
@@ -632,19 +662,16 @@ mod tests {
             "and both cases must be candidates, or nothing was declined"
         );
 
-        let mut translations = crate::translate::Translations::new();
-        translations.insert(
-            fresh.clone(),
-            Published::<Translate>::unkeyed_from_phase_dir(&fresh).unwrap(),
+        let mut resolved = crate::eval::Resolved::new();
+        resolved.insert(
+            fresh.join(Role::Translate.dir()),
+            tree_of(&fresh.join("tree")),
         );
-        let verifications = crate::verify::Verifications::new();
-        let tree = Tree::create_empty(&paths, Keep::ForPostMortem).unwrap();
+        let tree = EvalTree::create_empty(&paths, Keep::ForPostMortem).unwrap();
         let gate = gate_at(&paths);
         let scoring = Scoring {
-            source: Source {
-                translate: &translations,
-                verify: &verifications,
-            },
+            roles: crate::prompt::chain(paths.tool, paths.variant),
+            resolved: &resolved,
             tree: &tree,
             gate: &gate,
             covers: Covers::WholeBattery,
@@ -654,7 +681,7 @@ mod tests {
         let phases: Vec<&str> = passes.iter().map(|p| p.phase).collect();
         assert_eq!(
             phases,
-            vec![Translate::DIR],
+            vec![Role::Translate.dir()],
             "a battery that verified nothing must not get a verified pass from one leftover dir"
         );
         assert_eq!(
@@ -681,20 +708,17 @@ mod tests {
 
     fn one_case_pass(
         paths: &Paths,
-        tree: &Tree,
-        translations: &crate::translate::Translations,
+        tree: &EvalTree,
+        resolved: &crate::eval::Resolved,
         covers: Covers<'_>,
     ) -> Vec<Pass> {
-        let verifications = crate::verify::Verifications::new();
         let gate = gate_at(paths);
         materialise_battery(
             paths,
             "B01",
             &Scoring {
-                source: Source {
-                    translate: translations,
-                    verify: &verifications,
-                },
+                roles: crate::prompt::chain(paths.tool, paths.variant),
+                resolved,
                 tree,
                 gate: &gate,
                 covers,
@@ -710,17 +734,21 @@ mod tests {
     fn a_verify_less_agents_translate_score_is_the_battery_headline() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         corpus_battery(tmp.path(), "B01", &["only"]);
-        let paths = paths_at(tmp.path(), crate::cli::Agent::C2rust);
+        let paths = paths_at(
+            tmp.path(),
+            crate::cli::Tool::C2rust,
+            crate::cli::Variant::Default,
+        );
         let case = paths.case_dir("B01", "only");
-        crate_at(&case.join(Translate::DIR));
-        let mut translations = crate::translate::Translations::new();
-        translations.insert(
-            case.clone(),
-            Published::<Translate>::unkeyed_from_phase_dir(&case).unwrap(),
+        crate_at(&case.join(Role::Translate.dir()));
+        let mut resolved = crate::eval::Resolved::new();
+        resolved.insert(
+            case.join(Role::Translate.dir()),
+            tree_of(&case.join("tree")),
         );
 
-        let tree = Tree::create_empty(&paths, Keep::ForPostMortem).unwrap();
-        let passes = one_case_pass(&paths, &tree, &translations, Covers::WholeBattery);
+        let tree = EvalTree::create_empty(&paths, Keep::ForPostMortem).unwrap();
+        let passes = one_case_pass(&paths, &tree, &resolved, Covers::WholeBattery);
         assert_eq!(
             passes.len(),
             1,
@@ -809,20 +837,15 @@ mod tests {
     }
 
     /// A run that RESOLVED NOTHING — the shape a battery takes when every case missed.
-    fn resolved_nothing(paths: &Paths, target: &str, tree: &Tree) -> Result<()> {
+    fn resolved_nothing(paths: &Paths, target: &str, tree: &EvalTree) -> Result<()> {
         let gate = gate_at(paths);
-        let (t, v) = (
-            crate::translate::Translations::new(),
-            crate::verify::Verifications::new(),
-        );
+        let resolved = crate::eval::Resolved::new();
         run_test_corpus(
             paths,
             target,
             &Scoring {
-                source: Source {
-                    translate: &t,
-                    verify: &v,
-                },
+                roles: crate::prompt::chain(paths.tool, paths.variant),
+                resolved: &resolved,
                 tree,
                 gate: &gate,
                 covers: Covers::WholeBattery,
@@ -837,16 +860,20 @@ mod tests {
     fn a_named_battery_that_materialised_nothing_is_never_a_pass() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         corpus_battery(tmp.path(), "B01", &["case1"]);
-        let paths = paths_at(tmp.path(), crate::cli::Agent::C2rust);
+        let paths = paths_at(
+            tmp.path(),
+            crate::cli::Tool::C2rust,
+            crate::cli::Variant::Default,
+        );
         let case = paths.case_dir("B01", "case1");
-        fs::create_dir_all(case.join(Translate::DIR).join("logs")).unwrap();
+        fs::create_dir_all(case.join(Role::Translate.dir()).join("logs")).unwrap();
         stored_1_of_1(&paths, "B01");
         assert!(
-            !crate::battery::has_crate(&case.join(Translate::DIR)),
+            !crate::battery::has_crate(&case.join(Role::Translate.dir())),
             "and no crate for it, or something was scored after all"
         );
 
-        let tree = Tree::create_empty(&paths, Keep::ForPostMortem).unwrap();
+        let tree = EvalTree::create_empty(&paths, Keep::ForPostMortem).unwrap();
         let err = resolved_nothing(&paths, "B01", &tree)
             .expect_err("a battery that materialised nothing must refuse, not report a score");
         let text = format!("{err:#}");
@@ -858,14 +885,18 @@ mod tests {
             .expect_err("nor may the fan-out pass when it skipped EVERY battery");
 
         let tmp = crate::io::workdir::test_tempdir().unwrap();
-        let paths = paths_at(tmp.path(), crate::cli::Agent::C2rust);
-        crate_at(&paths.case_dir("B01", "case1").join(Translate::DIR));
+        let paths = paths_at(
+            tmp.path(),
+            crate::cli::Tool::C2rust,
+            crate::cli::Variant::Default,
+        );
+        crate_at(&paths.case_dir("B01", "case1").join(Role::Translate.dir()));
         stored_1_of_1(&paths, "B01");
         assert!(
             !paths.input_dir("B01").is_dir(),
             "the second fixture holds a complete crate and NO corpus battery"
         );
-        let tree = Tree::create_empty(&paths, Keep::ForPostMortem).unwrap();
+        let tree = EvalTree::create_empty(&paths, Keep::ForPostMortem).unwrap();
         let err = resolved_nothing(&paths, "B01", &tree)
             .expect_err("an absent corpus is not an agreeing score either");
         assert!(
@@ -902,13 +933,17 @@ mod tests {
     fn a_subset_sweep_does_not_file_its_own_count_under_the_batterys_name() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         corpus_battery(tmp.path(), "B01", &["one", "two"]);
-        let paths = paths_at(tmp.path(), crate::cli::Agent::C2rust);
+        let paths = paths_at(
+            tmp.path(),
+            crate::cli::Tool::C2rust,
+            crate::cli::Variant::Default,
+        );
         let case = paths.case_dir("B01", "one");
-        crate_at(&case.join(Translate::DIR));
-        let mut translations = crate::translate::Translations::new();
-        translations.insert(
-            case.clone(),
-            Published::<Translate>::unkeyed_from_phase_dir(&case).unwrap(),
+        crate_at(&case.join(Role::Translate.dir()));
+        let mut resolved = crate::eval::Resolved::new();
+        resolved.insert(
+            case.join(Role::Translate.dir()),
+            tree_of(&case.join("tree")),
         );
 
         let stored = paths.output_dir("B01").join(HEADLINE_SUMMARY);
@@ -922,8 +957,8 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = Tree::create_empty(&paths, Keep::ForPostMortem).unwrap();
-        let passes = one_case_pass(&paths, &tree, &translations, Covers::Subset("one"));
+        let tree = EvalTree::create_empty(&paths, Keep::ForPostMortem).unwrap();
+        let passes = one_case_pass(&paths, &tree, &resolved, Covers::Subset("one"));
         write_results(
             &paths,
             &passes[0],
@@ -960,16 +995,23 @@ mod tests {
         const DEAD: &str = r#"{"type":"result","is_error":true,"terminal_reason":"api_error","api_error_status":403,"result":"expired token"}"#;
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         corpus_battery(tmp.path(), "B01", &["fresh", "dead"]);
-        let paths = paths_at(tmp.path(), crate::cli::Agent::ClaudeCombined);
+        let paths = paths_at(
+            tmp.path(),
+            crate::cli::Tool::Claude,
+            crate::cli::Variant::Combined,
+        );
 
         let fresh = paths.case_dir("B01", "fresh");
-        crate_at(&fresh.join(Translate::DIR));
+        crate_at(&fresh.join(Role::Translate.dir()));
         let dead = paths.case_dir("B01", "dead");
-        let log = crate::artifact::phase_log::<Translate>(&dead);
+        let log = dead
+            .join(Role::Translate.dir())
+            .join("logs")
+            .join(Role::Translate.log());
         fs::create_dir_all(log.parent().unwrap()).unwrap();
         fs::write(&log, DEAD).unwrap();
         assert!(
-            !crate::battery::has_crate(&dead.join(Translate::DIR)),
+            !crate::battery::has_crate(&dead.join(Role::Translate.dir())),
             "the fixture must publish nothing for the dead case, or there is nothing invisible"
         );
 

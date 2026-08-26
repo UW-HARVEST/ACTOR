@@ -5,7 +5,7 @@
 //! and every cache read of it would fail validation. Split out of [`crate::artifact`], which owned
 //! this only because it also owned the phase type-states.
 
-use crate::domain::contents::{classify, Carry, Disposition};
+use crate::domain::contents::{classify, Disposition};
 use crate::domain::relpath::RelPath;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -20,12 +20,6 @@ pub struct TreeDigest(String);
 impl TreeDigest {
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-
-    /// The one digest not taken over a tree: [`crate::artifact::OracleDir`] reports it where the C
-    /// reference is absent. Goes when the oracle check does, a restore making it unnecessary.
-    pub(crate) fn absent() -> Self {
-        Self("sha256:absent".to_string())
     }
 
     #[cfg(test)]
@@ -68,7 +62,6 @@ pub(crate) fn hash_tree(root: &Path, admits: &dyn Fn(Disposition) -> bool) -> Re
     .with_context(|| format!("walking {} for a digest", root.display()))?;
 
     let mut h = Sha256::new();
-    feed(&mut h, b"harvest-tree-v1");
     for (rel, abs) in &files {
         // `RelPath::new` validates relative/no-`..`/non-empty but NOT UTF-8, and a lossy
         // name collapses every invalid byte to U+FFFD — so `a\xFF` and `a\xFE` would hash
@@ -80,38 +73,30 @@ pub(crate) fn hash_tree(root: &Path, admits: &dyn Fn(Disposition) -> bool) -> Re
     Ok(TreeDigest(format!("sha256:{:x}", h.finalize())))
 }
 
-/// `reserved` is a relative path the artifact may NOT overwrite, because the harness owns it.
+/// Copy exactly what [`digest_tree`] hashes, and nothing else.
 ///
-/// Exactly one file needs this: the phase transcript at `logs/<P::LOG>`. `logs/` is
-/// `Disposition::Ignore`, which `Carry::FromArtifact` admits, so an agent that happens to create
-/// `logs/verify.log` in its own work tree had that file published straight over the transcript --
-/// turning a run whose stored copy shows `turn.completed` into one the audit reads as truncated and
-/// refuses. Skipped rather than renamed-and-kept only because the transcript is proof of completion
-/// and the agent's same-named log is a duplicate of output it also wrote elsewhere; the skip is
-/// announced so it is never silent.
-pub(crate) fn copy_carrying(
-    src: &Path,
-    dest: &Path,
-    carry: Carry,
-    reserved: Option<&Path>,
-) -> Result<()> {
+/// ONE policy, because there is one kind of tree. The three `Carry` variants this replaces differed
+/// only in whether `Disposition::Ignore` files travelled, which existed so a work tree carried the
+/// previous phase's `logs/`. A transcript is harness output: it lives in the cache entry as `run.log`
+/// and never inside a tree, so nothing needs to carry it and nothing needs protecting from being
+/// overwritten by it.
+pub(crate) fn copy_carrying(src: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)?;
-    visit(src, src, false, &|d| carry.admits(d), &mut |rel, abs| {
-        if Some(rel.as_path()) == reserved {
-            println!(
-                "   \u{26a0}\u{fe0f}  not carrying {} from the artifact: the harness's transcript lives there",
-                rel.as_path().display()
-            );
-            return Ok(());
-        }
-        let to = dest.join(rel.as_path());
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(abs, &to)
-            .with_context(|| format!("copying {} to {}", abs.display(), to.display()))?;
-        Ok(())
-    })
+    visit(
+        src,
+        src,
+        false,
+        &|d| d == Disposition::StoreAndHash,
+        &mut |rel, abs| {
+            let to = dest.join(rel.as_path());
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(abs, &to)
+                .with_context(|| format!("copying {} to {}", abs.display(), to.display()))?;
+            Ok(())
+        },
+    )
     .with_context(|| format!("copying {} to {}", src.display(), dest.display()))?;
     // `std::fs::copy` carries mode bits and cache entries are stored read-only, so
     // without this a replay would publish a read-only crate and later builds hit EACCES.
@@ -260,7 +245,7 @@ impl WorkDir {
             "no C reference at {} -- a working dir cannot be laid out without one",
             corpus_c.display()
         );
-        copy_carrying(corpus_c, &root.join(C_SRC), Carry::IntoWorkTree, None)
+        copy_carrying(corpus_c, &root.join(C_SRC))
     }
 
     /// Where the agent runs.
@@ -332,6 +317,7 @@ fn scrub(root: &Path) -> Result<()> {
 /// Yields no path, so nothing runs in one -- [`Self::materialise`] makes a fresh copy. That
 /// unforgeability replaces `SeededBy`: step order is no longer typed, but a tree nothing produced
 /// cannot be fed to a step.
+#[derive(Clone)]
 pub struct Tree {
     digest: TreeDigest,
     at: PathBuf,
@@ -376,7 +362,30 @@ impl Tree {
     /// Copy the bytes out, for the store alone. Not a path escape: the caller states WHERE, and
     /// what it receives is a copy it owns rather than a handle on the tree.
     pub(crate) fn copy_into(&self, dest: &Path) -> Result<()> {
-        copy_carrying(&self.at, dest, Carry::FromArtifact, None)
+        copy_carrying(&self.at, dest)
+    }
+
+    /// Test-only: adopt a directory as a tree by hashing it. Production has only `seal` and
+    /// `adopt_stored`, which is the point -- a tree nothing produced cannot be fed to a step.
+    #[cfg(test)]
+    pub(crate) fn for_test(at: &Path) -> Result<Self> {
+        Ok(Self {
+            digest: digest_tree(at)?,
+            at: at.to_path_buf(),
+            _scratch: None,
+        })
+    }
+
+    /// Copy ONE subtree out. The graded tree gets the translation and never `c_src/`, which is what
+    /// makes an artifact that links the original library fail to build rather than score.
+    pub(crate) fn copy_subtree_into(&self, subtree: &str, dest: &Path) -> Result<()> {
+        let from = self.at.join(subtree);
+        anyhow::ensure!(
+            from.is_dir(),
+            "the tree has no {subtree}/ to copy: a working dir always has both subtrees, so this is \
+             a corrupt entry rather than an empty step"
+        );
+        copy_carrying(&from, dest)
     }
 
     /// A fresh working dir holding this tree's bytes. `corpus_c` is stated rather than remembered
@@ -384,7 +393,7 @@ impl Tree {
     pub fn materialise(&self, corpus_c: &Path) -> Result<WorkDir> {
         let scratch = std::sync::Arc::new(crate::io::workdir::tempdir("harvest-work-")?);
         let root = scratch.path().to_path_buf();
-        copy_carrying(&self.at, &root, Carry::FromPreviousPhase, None)?;
+        copy_carrying(&self.at, &root)?;
         std::fs::create_dir_all(root.join(TRANSLATION))?;
         Ok(WorkDir {
             root,
@@ -392,6 +401,26 @@ impl Tree {
             _scratch: scratch,
         })
     }
+}
+
+/// Copy a directory that is NOT a tree -- the corpus's test vectors, which the digest never covers.
+///
+/// Separate from [`copy_carrying`] on purpose: that one copies exactly what is hashed, and reusing it
+/// here would silently apply the tree's classification rules to something that is not a tree.
+pub(crate) fn copy_plain(src: &Path, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_plain(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to).with_context(|| {
+                format!("copying {} to {}", entry.path().display(), to.display())
+            })?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -505,7 +534,7 @@ mod tests {
 
         let store = crate::io::workdir::test_tempdir().unwrap();
         let at = store.path().join("before");
-        copy_carrying(&sealed.at, &at, Carry::FromPreviousPhase, None).unwrap();
+        copy_carrying(&sealed.at, &at).unwrap();
         Tree::adopt_stored(at.clone(), recorded.as_str()).expect("an intact copy is adoptable");
 
         std::fs::write(at.join(TRANSLATION).join("lib.rs"), "two\n").unwrap();

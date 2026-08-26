@@ -1,7 +1,6 @@
 use super::{openssl_dir, Enrichment, Scoring};
-use crate::artifact::{Phase, Translate};
 use crate::battery::Paths;
-use crate::eval::Source;
+use crate::prompt::Role;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -219,9 +218,6 @@ pub fn run_harvest_bench_test(
 ) -> Result<()> {
     let runner = harvest_bench_runner(&paths.corpus_dir)?;
 
-    // Verify's artifact where the run resolved one, else translate's — from the values, not a stat.
-    let Source { translate, verify } = scoring.source;
-
     // Every project REQUESTED, not only those that resolved a crate: a run that died on `api_error`
     // publishes nothing, so grading the resolved set grades the one set with no infra failure in it.
     scoring.gate.grade(
@@ -238,12 +234,20 @@ pub fn run_harvest_bench_test(
     let mut absent: Vec<&str> = Vec::new();
     for project in projects {
         let case_dir = paths.output_dir(project.name());
-        if let Some(v) = verify.get(&case_dir) {
-            scope.materialise(project.name(), v, &case_dir)?;
-        } else if let Some(t) = translate.get(&case_dir) {
-            scope.materialise(project.name(), t, &case_dir)?;
-        } else {
-            absent.push(project.name());
+        // The LAST role the chain resolved, from the values rather than a stat: a chain's final tree
+        // is what its numbers describe, and asking the filesystem which phase dir exists is what let
+        // a five-day-old `verified/` be scored as this run's.
+        let last = scoring.roles.iter().rev().find_map(|r| {
+            scoring
+                .resolved
+                .get(&case_dir.join(r.dir()))
+                .map(|t| (*r, t))
+        });
+        match last {
+            Some((role, tree)) => {
+                scope.materialise(project.name(), tree, &case_dir, &case_dir.join(role.dir()))?;
+            }
+            None => absent.push(project.name()),
         }
     }
     let materialised = scope.finish()?;
@@ -313,7 +317,7 @@ pub fn run_harvest_bench_test(
 
         {
             let mut json = serde_json::to_value(&r)?;
-            let tlog = crate_dir.join("logs").join(Translate::LOG);
+            let tlog = crate_dir.join("logs").join(Role::Translate.log());
             Enrichment::compute(&crate_dir.join("src"), &[("translate", &tlog)])
                 .merge_into(&mut json);
             std::fs::write(
@@ -390,7 +394,7 @@ mod tests {
     fn a_runner_that_errors_is_not_scored_from_the_file_it_left() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         let report = tmp.path().join("harvest_bench_report.json");
-        let fake = crate::cache::fake_program(
+        let fake = crate::io::workdir::fake_program(
             tmp.path(),
             "fake-runner",
             &format!(
@@ -418,7 +422,7 @@ mod tests {
 
     /// Exits 0 and writes `body`, so what follows is decided by the report alone.
     fn runner_writing(dir: &Path, name: &str, body: &str) -> PathBuf {
-        PathBuf::from(crate::cache::fake_program(
+        PathBuf::from(crate::io::workdir::fake_program(
             dir,
             name,
             &format!(

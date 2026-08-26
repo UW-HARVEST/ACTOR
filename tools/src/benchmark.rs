@@ -1,15 +1,14 @@
-//! One lifecycle — translate → [verify?] → enrich → score(test) — written once in
-//! `main.rs` against this trait; datasets differ only in how each phase is carried out.
-//! Each `impl` must stay thin, delegating to `translate` / `verify` / `oracle` rather than
-//! reimplementing them.
+//! What differs BETWEEN datasets, and nothing else.
+//!
+//! Running the chain is `crate::chain`'s job and identical for both; a dataset differs only in what
+//! it must preflight, how it enumerates its units, when a unit may be published, and how it is
+//! scored. `translate` and `verify` are gone from this trait: they were the same function at two
+//! prompts, so a dataset had no business having one method per step.
 
-use crate::agents::invocation::has_verify_phase;
 use crate::battery::{self, Paths};
-use crate::cli::{Agent, Dataset};
+use crate::cli::Dataset;
+use crate::eval::Resolved;
 use crate::oracle::{self, Scoring};
-use crate::translate::Translations;
-use crate::verify::Verifications;
-use crate::{translate, verify};
 use anyhow::Result;
 use std::path::Path;
 
@@ -25,14 +24,14 @@ impl InScope {
         bench: &dyn Benchmark,
         paths: &Paths,
         target: &str,
-        resolved: &Translations,
+        resolved: &Resolved,
     ) -> Result<(Self, crate::analyse::report::Attested)> {
         let mut attested = crate::analyse::report::Attested::default();
         let mut units = Vec::new();
         for unit in bench.batteries(paths, target)? {
             match bench.attests(paths, &unit, resolved) {
                 Ok(()) => {
-                    attested.insert(&paths.agent_key, &unit);
+                    attested.insert(paths, &unit);
                     units.push(unit);
                 }
                 Err(why) => println!("\u{23ed}\u{fe0f}  {unit}: out of scope — {why}"),
@@ -93,43 +92,12 @@ pub trait Benchmark {
                   Box<dyn Benchmark> can identify it; not every call site needs it yet"
     )]
     fn name(&self) -> &'static str;
-
-    fn verifies(&self, agent: Agent) -> bool;
-
     fn batteries(&self, paths: &Paths, target: &str) -> Result<Vec<String>>;
 
     /// May this unit's number be PUBLISHED? Only if EVERY case came from a keyed replay: one case the
     /// store cannot name leaves the number resting on an artifact nothing attests, and counting the
     /// attested subset would be a smaller denominator nobody asked for.
-    fn attests(&self, paths: &Paths, battery: &str, resolved: &Translations) -> Result<()>;
-
-    /// Returns what it RESOLVED, per case: a value this run produced, not a phase dir to be asked.
-    fn translate(
-        &self,
-        paths: &Preflighted,
-        target: &str,
-        filter: Option<&str>,
-        pool: &crate::agents::Pool,
-    ) -> Result<Translations>;
-
-    /// Reached from `Run` only when [`Self::verifies`] is true, but also invoked directly by
-    /// the `verify` subcommand, so an impl cannot assume that gate ran.
-    ///
-    /// `translations` is the hand-off: a case absent from it is refused, not seeded from disk.
-    /// EVERY unit, not one at a time: both impls schedule under one pool, so a caller that loops leaves
-    /// it nothing to overlap.
-    fn verify(
-        &self,
-        _paths: &Preflighted,
-        _scope: &InScope,
-        _filter: Option<&str>,
-        _force: bool,
-        _pool: &crate::agents::Pool,
-        _translations: &Translations,
-    ) -> Result<Verifications> {
-        Ok(Verifications::new())
-    }
-
+    fn attests(&self, paths: &Paths, battery: &str, resolved: &Resolved) -> Result<()>;
     fn test(&self, paths: &Preflighted, target: &str, scoring: &Scoring<'_>) -> Result<()>;
 
     /// Backfills result.json (unsafe/loc/credits); already folded into `test --update`,
@@ -173,7 +141,10 @@ fn resolve_harvest_bench_projects(
 /// rather than a small one. `battery::discover` applies ONE regex, and this crate's `regex` has no
 /// lookahead to and them together, so naming a case in the target AND passing the flag is refused
 /// rather than resolved by preferring one -- silently dropping either is the bug being fixed.
-fn one_filter(from_target: Option<String>, from_flag: Option<&str>) -> Result<Option<String>> {
+pub(crate) fn one_filter(
+    from_target: Option<String>,
+    from_flag: Option<&str>,
+) -> Result<Option<String>> {
     match (from_target, from_flag) {
         (Some(t), Some(f)) => anyhow::bail!(
             "the target names a case ({t}) and --include-regex was also given ({f}); both filter \
@@ -187,7 +158,7 @@ fn one_filter(from_target: Option<String>, from_flag: Option<&str>) -> Result<Op
 
 /// Harvest-bench's unit is a project, not a case, and nothing below it filters -- so a filter
 /// here cannot be honoured. Refuse instead of accepting it and doing nothing.
-fn no_filter_here(from_flag: Option<&str>) -> Result<()> {
+pub(crate) fn no_filter_here(from_flag: Option<&str>) -> Result<()> {
     if let Some(f) = from_flag {
         anyhow::bail!(
             "--include-regex ({f}) does not apply to harvest-bench: its unit is a project, and \
@@ -198,11 +169,36 @@ fn no_filter_here(from_flag: Option<&str>) -> Result<()> {
 }
 
 /// Split a `battery` or `battery/case` target into (battery, optional case regex).
-fn parse_target(target: &str) -> (String, Option<String>) {
+pub(crate) fn parse_target(target: &str) -> (String, Option<String>) {
     if let Some((battery, case)) = target.split_once('/') {
         (battery.to_string(), Some(format!("{}$", case)))
     } else {
         (target.to_string(), None)
+    }
+}
+
+/// Resolve a target and a flag into the units to run and the one case filter that applies.
+///
+/// One regex, because `battery::discover` applies one and this crate's `regex` has no lookahead to
+/// and two together. Naming a case in the target AND passing the flag is refused rather than resolved
+/// by preferring one: silently dropping either is a four-figure mistake at harvest-bench prices.
+pub fn scope(
+    bench: &dyn Benchmark,
+    paths: &Paths,
+    target: &str,
+    include_regex: Option<&str>,
+) -> Result<(Vec<String>, Option<String>)> {
+    match paths.dataset {
+        Dataset::TestCorpus => {
+            let (unit, from_target) = parse_target(target);
+            let filter = one_filter(from_target, include_regex)?;
+            Ok((bench.batteries(paths, &unit)?, filter))
+        }
+        // Harvest-bench's unit is a project, and nothing below it filters by case.
+        Dataset::HarvestBench => {
+            no_filter_here(include_regex)?;
+            Ok((bench.batteries(paths, target)?, None))
+        }
     }
 }
 
@@ -223,18 +219,17 @@ impl Benchmark for TestCorpus {
         resolve_batteries(&paths.corpus_dir, target)
     }
 
-    fn attests(&self, paths: &Paths, battery: &str, resolved: &Translations) -> Result<()> {
+    fn attests(&self, paths: &Paths, battery: &str, resolved: &Resolved) -> Result<()> {
         let output_dir = paths.output_dir(battery);
         let cases = battery::all_case_names(&battery::discover(&paths.corpus_dir, battery, None)?);
         let missing = cases
             .iter()
-            .filter(|n| !resolved.contains_key(&output_dir.join(n)))
+            .filter(|n| !resolved.keys().any(|k| k.starts_with(output_dir.join(n))))
             .count();
-        let unkeyed = crate::translate::unkeyed_seeds(resolved, &output_dir);
         anyhow::ensure!(
-            missing == 0 && unkeyed == 0,
-            "the store serves {} of its {} case(s) ({missing} unresolved, {unkeyed} with no key)",
-            cases.len() - missing - unkeyed,
+            missing == 0,
+            "the store serves {} of its {} case(s), {missing} unresolved",
+            cases.len() - missing,
             cases.len()
         );
         Ok(())
@@ -242,66 +237,6 @@ impl Benchmark for TestCorpus {
     fn name(&self) -> &'static str {
         "test-corpus"
     }
-
-    fn verifies(&self, agent: Agent) -> bool {
-        has_verify_phase(agent)
-    }
-
-    fn translate(
-        &self,
-        paths: &Preflighted,
-        target: &str,
-        filter_flag: Option<&str>,
-        pool: &crate::agents::Pool,
-    ) -> Result<Translations> {
-        let mut resolved = Translations::new();
-        // One pool for the whole sweep, so there is no budget left to hand-split. The arithmetic here
-        // used to partition `parallel` between shared-source batteries (pinned to 1) and the rest --
-        // necessary only because each call minted its own pool. A group's followers are still derived
-        // sequentially, inside `translate_one_shared`, which is where that constraint actually lives.
-        let mut errors: Vec<anyhow::Error> = Vec::new();
-        std::thread::scope(|s| {
-            let handles: Vec<_> = resolve_batteries(&paths.corpus_dir, target)
-                .into_iter()
-                .flatten()
-                .map(|bat| {
-                    s.spawn(move || -> Result<Translations> {
-                        let (name, filter) = parse_target(&bat);
-                        let filter = one_filter(filter, filter_flag)?;
-                        translate::run_test_corpus(paths, &name, filter.as_deref(), pool)
-                    })
-                })
-                .collect();
-            for h in handles {
-                match h.join() {
-                    Ok(Ok(t)) => resolved.extend(t),
-                    Ok(Err(e)) => errors.push(e),
-                    Err(_) => errors.push(anyhow::anyhow!("translate thread panicked")),
-                }
-            }
-        });
-        if let Some(first) = errors.into_iter().next() {
-            return Err(first);
-        }
-        Ok(resolved)
-    }
-
-    fn verify(
-        &self,
-        paths: &Preflighted,
-        scope: &InScope,
-        filter_flag: Option<&str>,
-        force: bool,
-        pool: &crate::agents::Pool,
-        translations: &Translations,
-    ) -> Result<Verifications> {
-        // One battery goes through `run_all` too: a second spelling of "verify these" is what drifted.
-        let units = scope.units();
-        let filter = one_filter(units.iter().find_map(|u| parse_target(u).1), filter_flag)?;
-        let names: Vec<String> = units.iter().map(|u| parse_target(u).0).collect();
-        verify::run_all(paths, &names, filter.as_deref(), force, pool, translations)
-    }
-
     fn test(&self, paths: &Preflighted, target: &str, scoring: &Scoring<'_>) -> Result<()> {
         oracle::run_test_corpus(paths, target, scoring)
     }
@@ -335,52 +270,17 @@ impl Benchmark for HarvestBench {
             .collect())
     }
 
-    fn attests(&self, paths: &Paths, project: &str, resolved: &Translations) -> Result<()> {
+    fn attests(&self, paths: &Paths, project: &str, resolved: &Resolved) -> Result<()> {
         let dir = paths.results_dir.join(project);
         anyhow::ensure!(
-            resolved.contains_key(&dir) && crate::translate::unkeyed_seeds(resolved, &dir) == 0,
-            "the store does not serve {project} with a key"
+            resolved.keys().any(|k| k.starts_with(&dir)),
+            "the store does not serve {project}"
         );
         Ok(())
     }
     fn name(&self) -> &'static str {
         "harvest-bench"
     }
-
-    fn verifies(&self, agent: Agent) -> bool {
-        has_verify_phase(agent)
-    }
-
-    fn translate(
-        &self,
-        paths: &Preflighted,
-        target: &str,
-        filter_flag: Option<&str>,
-        pool: &crate::agents::Pool,
-    ) -> Result<Translations> {
-        no_filter_here(filter_flag)?;
-        let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
-        translate::run_harvest_bench(paths, &projects, pool)
-    }
-
-    fn verify(
-        &self,
-        paths: &Preflighted,
-        scope: &InScope,
-        filter_flag: Option<&str>,
-        force: bool,
-        pool: &crate::agents::Pool,
-        translations: &Translations,
-    ) -> Result<Verifications> {
-        no_filter_here(filter_flag)?;
-        let projects: Vec<battery::HarvestBenchProject> =
-            resolve_harvest_bench_projects(&paths.corpus_dir, "HB")?
-                .into_iter()
-                .filter(|p| scope.units().iter().any(|u| u == p.name()))
-                .collect();
-        verify::run_harvest_bench(paths, &projects, pool, force, translations)
-    }
-
     fn test(&self, paths: &Preflighted, target: &str, scoring: &Scoring<'_>) -> Result<()> {
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
         oracle::run_harvest_bench_test(paths, &projects, scoring)

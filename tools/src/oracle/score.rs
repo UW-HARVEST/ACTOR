@@ -1,8 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 pub struct Scoring<'a> {
-    pub source: crate::eval::Source<'a>,
-    pub tree: &'a crate::eval::Tree,
+    /// Which steps this run actually resolved, in order. Data rather than two typed fields, so a
+    /// chain of three needs no third field and no third branch downstream.
+    pub roles: &'a [crate::prompt::Role],
+    /// Every tree this run produced, by the phase dir it was published into.
+    pub resolved: &'a crate::eval::Resolved,
+    pub tree: &'a crate::eval::EvalTree,
     pub gate: &'a crate::agent_health::Gate<'a>,
     pub covers: Covers<'a>,
 }
