@@ -75,6 +75,12 @@ nothing, and were revertible throughout. Migrate into a fresh tree, keep the old
 name until `reproduce.sh all` is green, then delete it. Keep ONE `format` field and refuse loudly
 on mismatch, so a reader never guesses at a layout it does not understand.
 
+The same applies to `KEY_ALGORITHM`, `TREE_ALGORITHM`, `ORACLE_TREE_ALGORITHM` and
+`PROMPT_ALGORITHM` — version strings hashed into their own digests. They are redundant on their own
+terms: change which components a key covers, or their order, and every key changes anyway, because
+the components are length-prefixed and hashed in sequence. A tag would only earn its place if the
+formula's meaning could change while the hash stayed equal. Delete them.
+
 **The unit is an AGENT INVOCATION, and a pipeline is a chain of them.** One function,
 `run_or_replay(working_dir, prompt) -> working_dir`, and nothing in it knows where in the chain it
 sits. There is no such thing as a translate entry or a verify entry — there are invocations, each
@@ -104,6 +110,14 @@ runs that are still good. `post_process_independent` is one of these: it renames
 corpus runner's name and appends `[workspace]`, so the NEXT invocation's `before` is
 `transform(previous after)` and not the previous `after` itself. Measured: 216 of 216 paired entries
 differ, and `agents/run.rs` records 0 of 84 matching from the other direction.
+
+**The graded tree contains no C.** `runtests`' own discovery needs exactly `<case>/translated_rust/`
+and `<case>/test_vectors/` and reads nothing else, so the eval tree is assembled from the
+translation and the corpus vectors alone. An artifact that tries to link the original C then fails
+to build at grading time, because there is no C there to link. Agents are misaligned; this is not
+a policy to enforce per agent but a shape that makes the shortcut unrepresentable. One published
+artifact CMake-built the original library, `objcopy`-renamed all 881 public symbols and jumped to
+them from naked asm, and scored full marks at 1,013 lines against another agent's 27,044.
 
 **Restore rather than detect.** `c_src` is the pinned corpus, so a working dir is always assembled
 with the corpus's copy and the agent's edits to it are discarded before hashing — which is why
@@ -136,29 +150,37 @@ files under `results/Test-Corpus/kiro/` name a model and those rows are unattrib
 Assert the flag on the command line, not on the transcript — a missing pin is invisible after the
 run.
 
-**One key addresses a set of attempts, so ambiguity is a refusal.** Agents are nondeterministic,
-and dropping `phase`, `toolchain` and `recipe` collapses more runs onto one key. A table records
-the exact output tree it was built from; a replay with no recorded pin serves the single completed
-attempt and REFUSES two. Silently picking one is how a published number changes under you.
+**One key, one entry. Several attempts must not be representable.** The cache is a function: a key
+maps to one value, so a table's numbers follow from the key alone and reproducibility is structural
+rather than a selection rule to get right. There is no attempt level, no pin to record, no tie to
+break. An entry whose `outcome` is not `completed` does not satisfy a lookup — it is a record, and a
+re-run replaces it.
 
-**Both trees raw, and exactly two records per attempt.** The path already carries tool, model, input
-tree and prompt, so recording those again is the redundancy this replaces — 15 metadata fields
-across three files become 7 in one. What is NOT redundant is the trees: `before` and `after` are
-both stored whole, as hashed.
+**Both trees raw, and one record beside them.** The path already carries tool, model, before-tree
+and prompt, so recording those again is the redundancy this replaces. What is NOT redundant is the
+trees: `before` and `after` are stored whole, as hashed.
 
 ```
-.cache/claude/claude-opus-5-1m/
-    <input_tree>/before/                the raw working dir that hashes to <input_tree>
-    <input_tree>/<prompt>/prompt.json   {digest, text}
-    <input_tree>/<prompt>/1/after/      the raw working dir the agent produced
-    <input_tree>/<prompt>/1/agent.json  {outcome, output_tree, wall_secs,
-                                         cost_usd, cli, harness, toolchain}
-    <input_tree>/<prompt>/1/run.log     the transcript
+key = sha256(tool ‖ model ‖ before_hash ‖ prompt_hash)
+
+.cache/<tool>/<model>/<before_hash>/
+    before/                      the raw working dir that hashes to <before_hash>
+    <prompt_hash>/
+        prompt.json              {digest, text}
+        after/                   the raw working dir the agent left
+        agent.json               {outcome, output_tree, wall_secs, cost_usd, cli}
+        run.log                  the transcript
 ```
 
-`before/` is stored once per input tree and shared by every prompt and attempt beneath it. A
-`before` that no longer reproduces its own directory name is a corrupt entry, and that check is
-worth running: it is the whole basis of re-keyability.
+`before/` is stored once and shared by every prompt beneath it. Nothing else is recorded: not the
+ACTOR commit, not the toolchain. Neither can influence the entry, because the cached function is
+`(before, prompt) -> after` with both inputs content-hashed and every harness transform outside the
+cache. `output_tree` stays, not as bookkeeping but as an integrity check on the `after/` beside it —
+the same reason a `before/` that no longer reproduces its own directory name is a corrupt entry.
+
+`<tool>` is the spelling `--agent` accepts (`claude`, `codex`, `kiro`), so the path cannot drift
+from the CLI surface. Today's function is called `harness_dir`, which collides with `harness`
+meaning the ACTOR commit everywhere else; it is the TOOL level and should say so.
 
 `outcome` is CLASSIFIED from the transcript, never the exit code: every session pipes through
 `tee`, so a killed agent reported a clean 0 until `set -o pipefail` was asserted. `output_tree` is
