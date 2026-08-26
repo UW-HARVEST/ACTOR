@@ -2,7 +2,7 @@ use crate::agents::exit::{
     agent_provenance, clear_agent_exit, merge_agent_exit, observed_exit, record_agent_exit,
 };
 use crate::agents::invocation::{
-    assert_pins_honoured, claude_model, Backend, Invocation, KIRO_UNPINNED_MODEL,
+    assert_pins_honoured, claude_model, Backend, Invocation, KIRO_MODEL,
 };
 use crate::agents::run::{
     displace_and_warn, run_cached, write_phase_metrics, Outcome, PhaseRun, Recorded, SkipCheck,
@@ -1149,7 +1149,7 @@ fn resolve_launch(paths: &Paths, backend: InTool) -> Result<Launch> {
     Ok(match backend {
         InTool::Kiro => Launch::Keyed(Invocation {
             backend: Backend::Kiro,
-            model: ModelId::new(KIRO_UNPINNED_MODEL)?,
+            model: ModelId::new(KIRO_MODEL)?,
             cli: CliVersion::probe("kiro-cli")?,
             session: Session::kiro(KIRO_TRANSLATE_TIMEOUT_SECS),
         }),
@@ -1349,7 +1349,7 @@ fn run_translate_agent(
             Backend::Kiro => {
                 let status = inv
                     .session
-                    .kiro_command(&cwd, prompt, log_path)
+                    .kiro_command(&cwd, prompt, log_path, &inv.model)
                     .status()
                     .context("invoking kiro-cli")?;
                 record_agent_exit(status);

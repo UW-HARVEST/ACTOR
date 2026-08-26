@@ -74,10 +74,13 @@ pub fn assert_pins_honoured(log_path: &Path, want: &ModelId, cli: &CliVersion) -
     Ok(())
 }
 
-/// kiro-cli takes no `--model` and reports none in its prose transcript, so no honest
-/// model id exists to key. Named as unpinned rather than filled in with a plausible
-/// one, which is what the claude default used to do.
-pub(crate) const KIRO_UNPINNED_MODEL: &str = "unpinned:kiro-cli-default";
+/// The model every `--agent kiro` invocation is pinned to, passed as `kiro-cli chat --model`.
+///
+/// This was the sentinel `unpinned:kiro-cli-default`, on the belief that kiro-cli takes no `--model`.
+/// It does. So every kiro row published before this pin came from whichever model the picker had last
+/// made active, and nothing under `results/Test-Corpus/kiro/` records which -- 0 of its files name a
+/// model, which is why those results live under `unrecorded/`.
+pub(crate) const KIRO_MODEL: &str = "claude-opus-5";
 
 /// Kimi takes no `--model`: `kimi_translate_case` passes `None` and this is what its Bedrock call
 /// carries. Beside the other model constants, not in `translate`, or `agents -> translate` merges two
@@ -167,7 +170,7 @@ pub(crate) fn codex_model(agent: Agent) -> Option<(&'static str, &'static str)> 
 /// model is asked for. Exhaustive, so a new agent decides rather than inheriting.
 pub(crate) fn resolved_model(agent: Agent, model_flag: Option<&str>) -> Result<Option<ModelId>> {
     Ok(Some(match agent {
-        Agent::Kiro => ModelId::new(KIRO_UNPINNED_MODEL)?,
+        Agent::Kiro => ModelId::new(KIRO_MODEL)?,
         Agent::Claude
         | Agent::ClaudeCombined
         | Agent::ClaudeMinimal

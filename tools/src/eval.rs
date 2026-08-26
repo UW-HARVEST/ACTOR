@@ -51,10 +51,7 @@ pub struct Tree {
 
 impl Tree {
     pub fn create_empty(paths: &Paths, keep: Keep) -> Result<Self> {
-        let root = paths
-            .repo_root
-            .join(EVAL_DIR)
-            .join(paths.agent_key.as_str());
+        let root = paths.repo_root.join(EVAL_DIR).join(paths.agent_key.dir());
         if root.exists() {
             std::fs::remove_dir_all(&root)
                 .with_context(|| format!("emptying {}", root.display()))?;
@@ -283,7 +280,7 @@ mod tests {
         let planted = tmp
             .path()
             .join(EVAL_DIR)
-            .join(paths.agent_key.as_str())
+            .join(paths.agent_key.dir())
             .join("B01/leftover/translated_rust");
         fs::create_dir_all(&planted).unwrap();
         fs::write(planted.join("Cargo.toml"), "[package]").unwrap();

@@ -32,7 +32,7 @@ impl InScope {
         for unit in bench.batteries(paths, target)? {
             match bench.attests(paths, &unit, resolved) {
                 Ok(()) => {
-                    attested.insert(paths.agent_key.as_str(), &unit);
+                    attested.insert(&paths.agent_key, &unit);
                     units.push(unit);
                 }
                 Err(why) => println!("\u{23ed}\u{fe0f}  {unit}: out of scope — {why}"),

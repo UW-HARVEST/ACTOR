@@ -807,10 +807,11 @@ mod tests {
         let filed = store.failures().unwrap();
         assert_eq!(filed.len(), 1, "one failed run, one record: {filed:?}");
         let (phase, who, key, attempt) = &filed[0];
+        let run_dir = keys.agent.dir();
         assert_eq!(
             (phase.as_str(), who.as_str(), attempt.as_str()),
-            (VERIFIED, keys.agent.as_str(), "1"),
-            "filed under the phase and agent that failed, as attempt 1: {filed:?}"
+            (VERIFIED, run_dir.as_str(), "1"),
+            "filed under the phase and RUN that failed, as attempt 1: {filed:?}"
         );
         let kept = f
             .repo

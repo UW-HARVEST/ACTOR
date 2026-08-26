@@ -84,6 +84,81 @@ impl ModelId {
     }
 }
 
+/// The harness an agent belongs to, as the directory level ABOVE the model.
+///
+/// The three codex variants are one harness at three models, so they share a directory and the model
+/// distinguishes them -- which is what makes `<harness>/<model>` lossless. The claude ablations do NOT
+/// collapse: each is a different experiment, not claude at another model. Not derived from `cli_name`
+/// by stripping a suffix, which is the string surgery this table exists to avoid.
+fn harness_dir(agent: Agent) -> &'static str {
+    match agent {
+        Agent::Kiro => "kiro",
+        Agent::Claude => "claude",
+        Agent::ClaudeCombined => "claude-combined",
+        Agent::ClaudeMinimal => "claude-minimal",
+        Agent::ClaudeNoIter => "claude-no-iter",
+        Agent::ClaudeNoFeatures => "claude-no-features",
+        Agent::ClaudeNoSubtask => "claude-no-subtask",
+        Agent::ClaudeCrossPrompt => "claude-cross-prompt",
+        Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => "codex",
+        Agent::OpenCode => "opencode",
+        Agent::Oneshot => "oneshot",
+        Agent::Kimi => "kimi",
+        Agent::C2rust => "c2rust",
+        Agent::Laertes => "laertes",
+        Agent::C2SaferRust => "c2saferrust",
+        Agent::SmartC2Rust => "smartc2rust",
+    }
+}
+
+/// A model id stripped to its identity: last path segment, no `:tag`, no region prefix, no vendor
+/// prefix. Routing is not identity, so the same model reached two ways must not name two directories.
+/// Shared with [`crate::agents::opencode::results_slug`], which grew a second copy of this the moment
+/// a model became a path component anywhere else.
+pub(crate) fn bare_model_id(id: &str) -> &str {
+    let id = id.rsplit('/').next().unwrap_or(id);
+    let id = id.split_once(':').map_or(id, |(head, _)| head);
+    let bare = ["us.", "eu.", "global.", "au.", "jp."]
+        .iter()
+        .find_map(|p| id.strip_prefix(p))
+        .unwrap_or(id);
+    // KNOWN vendors only; see `only_a_known_vendor_prefix_is_stripped_never_the_version`.
+    [
+        "anthropic.",
+        "openai.",
+        "moonshotai.",
+        "google.",
+        "deepseek.",
+        "meta.",
+        "mistral.",
+        "amazon.",
+        "qwen.",
+        "ai21.",
+        "cohere.",
+    ]
+    .iter()
+    .find_map(|v| bare.strip_prefix(v))
+    .unwrap_or(bare)
+}
+
+/// The model as a DIRECTORY component.
+///
+/// [`bare_model_id`] then every character a shell would treat specially replaced: a directory literally
+/// named `claude-opus-5[1m]` is a bracket glob, and `results/` is walked by shell commands constantly --
+/// the same hazard [`ModelId::new`] already refuses on a command line.
+pub(crate) fn model_dir_slug(model: &ModelId) -> String {
+    let bare = bare_model_id(model.as_str());
+    let mut out = String::with_capacity(bare.len());
+    for c in bare.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
 /// Which agent produced an artifact, as the results tree, the cache and the recorded
 /// provenance all spell it.
 ///
@@ -94,11 +169,13 @@ impl ModelId {
 /// spelling that cannot drift from what `--agent` accepts.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AgentKey {
+    /// Which agent, so [`Self::dir`] can answer without re-deriving it from `name` by string surgery.
+    agent: Agent,
     /// What the KEY calls this agent, and what every record and table spells. NEVER changes: every
     /// stored entry was hashed with it, so a new spelling orphans the lot.
     name: String,
     /// From the SAME table the invocation uses, so a key cannot name one model while the agent runs
-    /// another. `None` only where a backend runs no model: c2rust and the docker arms.
+    /// another. `None` only where a backend runs no model at all: c2rust and the docker arms.
     model: Option<ModelId>,
 }
 
@@ -151,6 +228,7 @@ impl AgentKey {
             "agent key must be a single path component, got {name:?}"
         );
         Ok(Self {
+            agent,
             name,
             model: resolved,
         })
@@ -161,12 +239,31 @@ impl AgentKey {
     #[cfg(test)]
     pub(crate) fn for_test(name: &str, model: &str) -> Result<Self> {
         Ok(Self {
+            agent: Agent::Claude,
             name: name.to_string(),
             model: Some(ModelId::new(model)?),
         })
     }
 
-    /// The model this run asks for, or `None` where it asks for none.
+    /// Where this run's artifacts live: `<harness>/<model>`, or just `<harness>` for a backend that
+    /// runs no model.
+    ///
+    /// Two levels because one was ambiguous: `results/Test-Corpus/claude/` names no model and
+    /// `HARVEST_CLAUDE_MODEL` overrides the default, so two models could write the same battery's
+    /// `summary.json` and `report` would publish one "claude" row assembled from both. The key
+    /// already distinguished them; only the directory did not.
+    ///
+    /// A `String`, not a `PathBuf`: this is a NAME, and the caller joining it onto its own base is
+    /// what decides a location.
+    pub fn dir(&self) -> String {
+        let harness = harness_dir(self.agent);
+        match &self.model {
+            Some(m) => format!("{harness}/{}", model_dir_slug(m)),
+            None => harness.to_string(),
+        }
+    }
+
+    /// The model this run pins, or `None` where the backend runs none.
     pub fn model(&self) -> Option<&ModelId> {
         self.model.as_ref()
     }
@@ -455,8 +552,7 @@ impl Preimage {
 pub struct KeyInputs<'a> {
     pub phase: &'static str,
     /// Agent AND model as ONE value: two fields let a caller pair one run's agent with another's
-    /// model, and the key recorded the mismatch as a legitimate entry -- the very class this struct's
-    /// `No Default` note guards against, left open inside it.
+    /// model, and the key recorded the mismatch as a legitimate entry.
     pub agent: &'a AgentKey,
     pub toolchain: &'a ToolchainId,
     pub prompt: &'a PromptDigest,
@@ -789,7 +885,7 @@ impl Store {
         self.root
             .join(SCHEMA.to_string())
             .join(inputs.phase)
-            .join(inputs.agent.as_str())
+            .join(inputs.agent.dir())
             .join(key.as_str())
     }
 
@@ -799,7 +895,7 @@ impl Store {
             .join(SCHEMA.to_string())
             .join(FAILED)
             .join(inputs.phase)
-            .join(inputs.agent.as_str())
+            .join(inputs.agent.dir())
             .join(key.as_str())
     }
 
@@ -946,19 +1042,26 @@ impl Store {
     }
 
     /// For `harvest-tools cache failures`: a record nobody can list is not a record.
+    /// `(phase, run, key, attempt)`, where `run` is the `<harness>/<model>` an entry is filed under.
+    ///
+    /// Uniform depth: only a KEYED backend reaches the store and every keyed backend runs a model, so
+    /// the model level is always there -- which is why this walk descends a fixed depth rather than
+    /// guessing.
     pub fn failures(&self) -> Result<Vec<(String, String, String, String)>> {
         let mut out = Vec::new();
         let root = self.root.join(SCHEMA.to_string()).join(FAILED);
         for phase in children(&root)? {
-            for agent in children(&phase)? {
-                for key in children(&agent)? {
-                    for attempt in children(&key)? {
-                        out.push((
-                            name_of(&phase),
-                            name_of(&agent),
-                            name_of(&key),
-                            name_of(&attempt),
-                        ));
+            for harness in children(&phase)? {
+                for model in children(&harness)? {
+                    for key in children(&model)? {
+                        for attempt in children(&key)? {
+                            out.push((
+                                name_of(&phase),
+                                format!("{}/{}", name_of(&harness), name_of(&model)),
+                                name_of(&key),
+                                name_of(&attempt),
+                            ));
+                        }
                     }
                 }
             }
@@ -1245,6 +1348,30 @@ pub(crate) fn fake_program(dir: &Path, name: &str, body: &str) -> String {
 pub(crate) mod tests {
     /// Asserted over every mode, so a mode added later decides here rather than defaulting into
     /// "failures are fine".
+    /// Stripping "the vendor prefix" as everything-before-the-first-dot ate the VERSION: `gpt-5.4`
+    /// carries no vendor prefix but does carry a dot, so the old rule left `4` and the directory became
+    /// `oneshot/4`. `results_slug` shipped the same rule, mangling every such id.
+    #[test]
+    fn only_a_known_vendor_prefix_is_stripped_never_the_version() {
+        for (id, want) in [
+            // The case that was broken: no vendor prefix, but a dot in the version.
+            ("openai/gpt-5.4", "gpt-5.4"),
+            ("gpt-5.6-sol", "gpt-5.6-sol"),
+            ("global.anthropic.claude-opus-5[1m]", "claude-opus-5[1m]"),
+            (
+                "amazon-bedrock/us.anthropic.claude-sonnet-5",
+                "claude-sonnet-5",
+            ),
+            ("moonshotai.kimi-k2.5", "kimi-k2.5"),
+            (
+                "openrouter/deepseek/deepseek-v4-pro:floor",
+                "deepseek-v4-pro",
+            ),
+        ] {
+            assert_eq!(bare_model_id(id), want, "{id}");
+        }
+    }
+
     #[test]
     fn only_a_replay_only_sweep_refuses_to_report_a_partial_result() {
         for mode in [Mode::ReadWrite, Mode::Bypass, Mode::Refresh] {
@@ -1321,10 +1448,16 @@ pub(crate) mod tests {
 
     impl Inputs {
         fn new() -> Self {
+            // Resolved ONCE and shared. The fixture built a model-less key beside the literal
+            // `claude-opus-5[1m]`, so its entries landed one directory level short of production's
+            // `<harness>/<model>` and the failure walk read the key as a model.
+            let resolved = crate::agents::invocation::resolved_model(Agent::Claude, None)
+                .unwrap()
+                .expect("claude runs a model");
             Self {
                 phase: <Verify as Phase>::DIR,
-                agent: AgentKey::new(Agent::Claude, None, None).unwrap(),
-                model: ModelId::new("claude-opus-5[1m]").unwrap(),
+                agent: AgentKey::new(Agent::Claude, None, Some(resolved.clone())).unwrap(),
+                model: resolved,
                 cli: CliVersion("2.1.231.653 (Claude Code)".into()),
                 toolchain: ToolchainId("1.94.0 x86_64-unknown-linux-gnu".into()),
                 prompt: PromptDigest("sha256:p".into()),
@@ -1351,6 +1484,30 @@ pub(crate) mod tests {
         fn key(&self) -> CacheKey {
             self.key_inputs().key()
         }
+    }
+
+    /// `<harness>/<model>`, and the pair must recover the variant: `codex-gpt54` and `codex-gpt56-sol`
+    /// share a harness directory, so if the model level were dropped or slugged to the same string
+    /// they would collide and one would overwrite the other's results.
+    #[test]
+    fn the_directory_names_the_harness_and_the_model_it_ran() {
+        let dir = |agent, flag| {
+            let m = crate::agents::invocation::resolved_model(agent, flag).unwrap();
+            AgentKey::new(agent, flag, m).unwrap().dir()
+        };
+        assert_eq!(dir(Agent::Claude, None), "claude/claude-opus-5-1m");
+        let a = dir(Agent::CodexGpt54, None);
+        let b = dir(Agent::CodexGpt56Sol, None);
+        assert_eq!(a, "codex/gpt-5.4");
+        assert_eq!(b, "codex/gpt-5.6-sol");
+        assert_ne!(a, b, "two codex variants must not share a directory");
+        // kiro-cli DOES take `--model`, so kiro is pinned and gets a model level like every other
+        // agent. It resolved the sentinel `unpinned:kiro-cli-default`, cut at the colon to `unpinned`.
+        assert_eq!(dir(Agent::Kiro, None), "kiro/claude-opus-5");
+        // A backend that runs no model gets no model level, rather than an empty one.
+        assert_eq!(dir(Agent::C2rust, None), "c2rust");
+        // The ablations are separate experiments, not claude at another model.
+        assert_ne!(dir(Agent::ClaudeNoIter, None), dir(Agent::Claude, None));
     }
 
     #[test]
@@ -1674,8 +1831,12 @@ pub(crate) mod tests {
         sonnet.model = ModelId::new("amazon-bedrock/us.anthropic.claude-sonnet-5").unwrap();
 
         let mut gpt = Inputs::new();
-        gpt.agent =
-            AgentKey::new(Agent::OpenCode, Some("amazon-bedrock/openai.gpt-5.5"), None).unwrap();
+        gpt.agent = AgentKey::new(
+            Agent::OpenCode,
+            Some("amazon-bedrock/openai.gpt-5.5"),
+            Some(ModelId::new("amazon-bedrock/openai.gpt-5.5").unwrap()),
+        )
+        .unwrap();
         gpt.model = ModelId::new("amazon-bedrock/openai.gpt-5.5").unwrap();
 
         assert_ne!(sonnet.key(), gpt.key());
@@ -1920,7 +2081,7 @@ pub(crate) mod tests {
             .join(SCHEMA.to_string())
             .join(FAILED)
             .join(<Verify as Phase>::DIR)
-            .join(held.agent.as_str())
+            .join(held.agent.dir())
             .join(key.as_str())
             .join("1");
         let meta: serde_json::Value =
@@ -2026,13 +2187,13 @@ pub(crate) mod tests {
             vec![
                 (
                     <Verify as Phase>::DIR.to_string(),
-                    held.agent.as_str().to_string(),
+                    held.agent.dir(),
                     key.as_str().to_string(),
                     "1".to_string()
                 ),
                 (
                     <Verify as Phase>::DIR.to_string(),
-                    held.agent.as_str().to_string(),
+                    held.agent.dir(),
                     key.as_str().to_string(),
                     "2".to_string()
                 ),

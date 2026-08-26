@@ -48,26 +48,41 @@ struct BatteryRow {
     unsafe_lines: u32,
 }
 
-/// The (agent, battery) pairs a run RESOLVED, and so the only ones a table may report: `report` used
+/// How one run is spelled in the two places that disagree: `label` is what a table's Agent column
+/// prints, `dir` is where its artifacts live. One `String` was both until the store grew a model level.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct Run {
+    label: String,
+    dir: String,
+}
+
+impl Run {
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+/// The (run, unit) pairs a run RESOLVED, and so the only ones a table may report: `report` used
 /// to walk `results/` and publish whatever it found, which by [`crate::eval::Source`]'s measurement
 /// was ~95% unattested. A set built BY the run cannot name a pair the run did not resolve.
 #[derive(Debug, Default)]
-pub struct Attested(std::collections::BTreeSet<(String, String)>);
+pub struct Attested(std::collections::BTreeSet<(Run, String)>);
 
 impl Attested {
-    pub fn insert(&mut self, agent: &str, battery: &str) {
-        self.0.insert((agent.to_owned(), battery.to_owned()));
+    /// Takes the KEY, so a caller cannot pair one run's label with another's path.
+    pub fn insert(&mut self, agent: &crate::cache::AgentKey, unit: &str) {
+        self.0.insert((
+            Run {
+                label: agent.as_str().to_owned(),
+                dir: agent.dir(),
+            },
+            unit.to_owned(),
+        ));
     }
 
-    /// Every (agent, unit) this run may publish. A reporter iterating THIS cannot silently omit one.
-    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.0.iter().map(|(a, b)| (a.as_str(), b.as_str()))
-    }
-
-    fn covers(&self, agent: &str, battery: &str) -> bool {
-        // `kiro-translate` is a synthetic row off kiro's pre-verify numbers: attested iff kiro is.
-        let agent = agent.strip_suffix("-translate").unwrap_or(agent);
-        self.0.contains(&(agent.to_owned(), battery.to_owned()))
+    /// Every (run, unit) this run may publish. A reporter iterating THIS cannot silently omit one.
+    pub fn entries(&self) -> impl Iterator<Item = (&Run, &str)> {
+        self.0.iter().map(|(r, u)| (r, u.as_str()))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -96,11 +111,13 @@ pub fn generate_harvest_bench(repo_root: &Path, attested: &Attested) -> Result<(
     // Driven by what this run ATTESTED, not `read_dir`: walking the filesystem made absence invisible
     // twice -- a missing record dropped its row, and an attested project with no dir was never visited.
     // Either way the table published N-1 rows of N and announced success.
-    for (agent, project) in attested.entries() {
-        let record = scored_phase_dir(&results_dir.join(agent).join(project)).join("result.json");
+    for (run, project) in attested.entries() {
+        let record =
+            scored_phase_dir(&results_dir.join(&run.dir).join(project)).join("result.json");
         let r: HarvestBenchRow = read_json(&record).with_context(|| {
             format!(
-                "{agent}/{project} is in this run's scope but has no readable record at {}",
+                "{}/{project} is in this run's scope but has no readable record at {}",
+                run.label,
                 record.display()
             )
         })?;
@@ -163,22 +180,19 @@ pub fn generate(repo_root: &Path, attested: &Attested) -> Result<()> {
 
     let mut rows: Vec<BatteryRow> = Vec::new();
 
-    for agent_entry in sorted_read_dir(&results_dir)? {
-        let agent = agent_entry.file_name().to_string_lossy().to_string();
-        let agent_dir = agent_entry.path();
-        if !agent_dir.is_dir() {
-            continue;
-        }
-
-        for bat_entry in sorted_read_dir(&agent_dir)? {
-            let battery = bat_entry.file_name().to_string_lossy().to_string();
-            let bat_dir = bat_entry.path();
+    // Attested-driven like `generate_harvest_bench`: the tree is `<harness>/<model>/<battery>` keyed
+    // and `<baseline>/<battery>` for the docker arms, so no fixed-depth walk reads both and a guessing
+    // one reads a model level as a battery.
+    for (run, battery) in attested.entries() {
+        {
+            let agent = run.label();
+            let battery = battery.to_string();
+            let bat_dir = results_dir.join(&run.dir).join(&battery);
             if !bat_dir.is_dir() {
-                continue;
-            }
-
-            if !attested.covers(&agent, &battery) {
-                println!("   \u{23ed}\u{fe0f}  {agent}/{battery}: not resolved by this run, so it is not reported");
+                println!(
+                    "   \u{23ed}\u{fe0f}  {agent}/{battery}: no directory at {}",
+                    bat_dir.display()
+                );
                 continue;
             }
 
@@ -195,7 +209,7 @@ pub fn generate(repo_root: &Path, attested: &Attested) -> Result<()> {
                 .or_insert_with(|| count_c_loc_battery(&test_corpus_dir, &battery));
 
             rows.push(BatteryRow {
-                agent: agent.clone(),
+                agent: agent.to_string(),
                 battery: battery.clone(),
                 cases_passed: summary.cases_passed,
                 cases_tested: summary.cases_tested,
@@ -403,7 +417,13 @@ pub fn generate(repo_root: &Path, attested: &Attested) -> Result<()> {
     //      that trips no other invariant and is indistinguishable from a genuine
     //      baseline zero. kiro-translate is absent here on purpose: it is the
     //      virtual no-validate agent, covered by the invariant just below.
-    for agent in ["kiro", "claude", "codex-gpt54"] {
+    // Literal, not `AgentKey::dir()`: these are the dirs the PUBLISHED rows were built from, and
+    // kiro's predate model pinning -- 0 of its files name a model, so nothing can derive `unrecorded`.
+    for agent in [
+        "kiro/unrecorded",
+        "claude/claude-opus-5-1m",
+        "codex/gpt-5.4",
+    ] {
         anyhow::ensure!(
             results_dir.join(agent).is_dir(),
             "TRACTOR agent-dir invariant failed: results/Test-Corpus/{agent} is missing \
@@ -413,9 +433,9 @@ pub fn generate(repo_root: &Path, attested: &Attested) -> Result<()> {
     // Without at least one summary_translated.json the pre-verify scoring pass
     // did not run, and the no-validate row would silently read 0/338.
     anyhow::ensure!(
-        sorted_read_dir(&results_dir.join("kiro")).map(|bats| bats.iter().any(|b|
+        sorted_read_dir(&results_dir.join("kiro/unrecorded")).map(|bats| bats.iter().any(|b|
             b.path().join("summary_translated.json").is_file())).unwrap_or(false),
-        "no-validate invariant failed: no results/Test-Corpus/kiro/<battery>/summary_translated.json \
+        "no-validate invariant failed: no results/Test-Corpus/kiro/unrecorded/<battery>/summary_translated.json \
          found (the pre-verify scoring pass did not run; \\ActorKiroNoValidate* would be 0/338)."
     );
     // (2) P01/P00 must collapse to one distinct source. If symlinks did not
@@ -1339,7 +1359,14 @@ mod tests {
     #[test]
     fn a_table_missing_an_attested_projects_record_is_refused_not_published_short() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
-        let hb = tmp.path().join("results/HarvestBench/claude");
+        // The key's own `dir()`: a fixture spelling the path itself would survive a layout change.
+        let key = crate::cache::AgentKey::new(
+            crate::cli::Agent::Claude,
+            None,
+            crate::agents::invocation::resolved_model(crate::cli::Agent::Claude, None).unwrap(),
+        )
+        .unwrap();
+        let hb = tmp.path().join("results/HarvestBench").join(key.dir());
         let record = |project: &str| {
             let dir = crate::battery::phase_dir(&hb.join(project), crate::battery::TRANSLATED);
             std::fs::create_dir_all(&dir).unwrap();
@@ -1352,8 +1379,8 @@ mod tests {
         record("jansson");
 
         let mut attested = Attested::default();
-        attested.insert("claude", "jansson");
-        attested.insert("claude", "lz4");
+        attested.insert(&key, "jansson");
+        attested.insert(&key, "lz4");
 
         let table = tmp.path().join("tables/harvest-bench.tex");
         let err = generate_harvest_bench(tmp.path(), &attested)

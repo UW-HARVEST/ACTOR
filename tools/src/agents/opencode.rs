@@ -116,18 +116,7 @@ pub fn parse_model(s: &str) -> Result<Model> {
 /// not identity, so the same model in two regions must not produce two results
 /// dirs. Vendor prefix likewise — the agent name already says which harness ran.
 pub fn results_slug(m: &Model) -> String {
-    // Last slash segment, matching Agent::Oneshot's convention.
-    let id = m.model_id.rsplit('/').next().unwrap_or(&m.model_id);
-    let id = id.split_once(':').map_or(id, |(head, _)| head);
-    let bare = id
-        .strip_prefix("us.")
-        .or_else(|| id.strip_prefix("eu."))
-        .or_else(|| id.strip_prefix("global."))
-        .or_else(|| id.strip_prefix("au."))
-        .or_else(|| id.strip_prefix("jp."))
-        .unwrap_or(id);
-    let bare = bare.split_once('.').map_or(bare, |(_, rest)| rest);
-    format!("opencode-{bare}")
+    format!("opencode-{}", crate::cache::bare_model_id(&m.model_id))
 }
 
 // ── Phase ──────────────────────────────────────────────────────────────

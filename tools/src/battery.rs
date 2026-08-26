@@ -653,15 +653,11 @@ impl Paths {
         let (corpus_dir, results_dir) = match dataset {
             Dataset::TestCorpus => (
                 repo_root.join("test-corpus"),
-                repo_root
-                    .join("results/Test-Corpus")
-                    .join(agent_key.as_str()),
+                repo_root.join("results/Test-Corpus").join(agent_key.dir()),
             ),
             Dataset::HarvestBench => (
                 repo_root.join("harvest-bench/tests"),
-                repo_root
-                    .join("results/HarvestBench")
-                    .join(agent_key.as_str()),
+                repo_root.join("results/HarvestBench").join(agent_key.dir()),
             ),
         };
         let prompts_dir = match agent {
