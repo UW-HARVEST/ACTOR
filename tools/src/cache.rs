@@ -14,10 +14,10 @@
 //! decided in the test phase, and the test phase is not cached.
 
 use crate::agents::session::Session;
-use crate::artifact::{Access, Phase, Sealed};
+use crate::artifact::{Phase, Sealed};
 use crate::cli::Agent;
 use crate::io::workdir::Roots;
-use crate::tree::{feed, TreeDigest};
+use crate::tree::{feed, set_read_only, Access, TreeDigest};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -829,8 +829,6 @@ pub struct Store {
     /// One miss diagnostic, not 85: repeats bury the field that differs.
     explained: std::sync::atomic::AtomicBool,
 }
-
-use crate::artifact::set_read_only;
 
 impl Store {
     /// Open the store at `<repo>/results/.cache/`.
@@ -1898,7 +1896,7 @@ pub(crate) mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let tree = self.tree.take().expect("dropped once");
-            crate::artifact::set_read_only(tree.path(), Access::Writable)
+            set_read_only(tree.path(), Access::Writable)
                 .expect("unlocking the fixture tree so it can be deleted");
             tree.close().expect("deleting the fixture tree");
         }
@@ -2553,9 +2551,9 @@ pub(crate) mod tests {
             .unwrap();
 
         let dir = store.entry_dir(&inputs, &key);
-        crate::artifact::set_read_only(&dir, Access::Writable).unwrap();
+        set_read_only(&dir, Access::Writable).unwrap();
         std::fs::remove_file(dir.join("agent/run.json")).unwrap();
-        crate::artifact::set_read_only(&dir, Access::ReadOnly).unwrap();
+        set_read_only(&dir, Access::ReadOnly).unwrap();
 
         let mut ran = false;
         let got = store
@@ -2651,7 +2649,7 @@ pub(crate) mod tests {
         );
 
         // Non-vacuity: a byte flipped in input/ must change what it re-hashes to.
-        crate::artifact::set_read_only(&dir, Access::Writable).unwrap();
+        set_read_only(&dir, Access::Writable).unwrap();
         std::fs::write(dir.join("input/seed.txt"), "tampered").unwrap();
         let after = record.seed.digest_at(&dir.join("input")).unwrap();
         assert_ne!(
@@ -2685,13 +2683,13 @@ pub(crate) mod tests {
         other.prompt = PromptDigest("sha256:unstorable".into());
         let other_inputs = other.key_inputs();
         let cache_root = f.repo.join("results/.cache");
-        crate::artifact::set_read_only(&cache_root, Access::ReadOnly).unwrap();
+        set_read_only(&cache_root, Access::ReadOnly).unwrap();
 
         let out = store.obtain(&other_inputs, &test_cli(), &test_record(), || {
             Ok(Attempt::Produced(produced(&f.case, "pub fn b() {}")))
         });
 
-        crate::artifact::set_read_only(&cache_root, Access::Writable).unwrap();
+        set_read_only(&cache_root, Access::Writable).unwrap();
 
         let obtained = out
             .expect("a store failure must NOT propagate: the agent already ran and was paid for")
@@ -2718,7 +2716,7 @@ pub(crate) mod tests {
             .join(format!("{}.partial", key.as_str()));
         std::fs::create_dir_all(staging.join("code/src")).unwrap();
         std::fs::write(staging.join("code/src/lib.rs"), "half-written").unwrap();
-        crate::artifact::set_read_only(&staging, Access::ReadOnly).unwrap();
+        set_read_only(&staging, Access::ReadOnly).unwrap();
 
         store
             .obtain(&inputs, &test_cli(), &test_record(), || {
@@ -2805,12 +2803,12 @@ pub(crate) mod tests {
 
         // Defeat the read-only bit first: this is the scenario the digest check exists for.
         let dir = store.entry_dir(&inputs, &key);
-        crate::artifact::set_read_only(&dir, Access::Writable).unwrap();
+        set_read_only(&dir, Access::Writable).unwrap();
         std::fs::write(dir.join("code/src/lib.rs"), "pub fn a() { /* smuggled */ }").unwrap();
         // RE-LOCK: an entry found in the wild is 0o555, and quarantining one is a
         // cross-parent rename, which needs write permission on the moved directory. Left
         // unlocked, this test passes without the quarantine ever having worked.
-        crate::artifact::set_read_only(&dir, Access::ReadOnly).unwrap();
+        set_read_only(&dir, Access::ReadOnly).unwrap();
 
         let mut ran = false;
         let got = store

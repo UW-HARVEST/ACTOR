@@ -69,6 +69,18 @@ const ROOT_ONLY_IGNORED_DIRS: &[&str] = &["logs", ".claude"];
 /// [`crate::artifact::Scrubbed::seal`] grades a run by comparing this subtree file by file
 /// before and after, so a rule firing inside it hides a change to the reference. 26 real
 /// `c_src/doc/footer.html.bak` files sat in that blind spot.
+impl Carry {
+    pub(crate) fn admits(self, d: Disposition) -> bool {
+        match d {
+            // No arm here may return false: an artifact whose stored copy omits a hashed
+            // file cannot re-derive its own digest, so every cache read fails validation.
+            Disposition::StoreAndHash => true,
+            Disposition::BuildOutput => false,
+            Disposition::Ignore => self != Carry::FromPreviousPhase,
+        }
+    }
+}
+
 pub(crate) const C_ORACLE_DIR: &str = "c_src";
 
 /// `in_build_dir` must be true if any ancestor within the tree was itself classified

@@ -13,7 +13,7 @@
 use crate::domain::contents::{classify, Carry, Disposition, C_ORACLE_DIR};
 use crate::domain::health::Completed;
 use crate::domain::relpath::RelPath;
-use crate::tree::{digest_tree, hash_tree, is_cmake_build_dir, visit, TreeDigest};
+use crate::tree::{copy_carrying, digest_tree, hash_tree, is_cmake_build_dir, visit, TreeDigest};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -341,104 +341,6 @@ fn seed<Q: Phase>(src: &Path, root: PathBuf, keep: Scratch, at: SeedAt) -> Resul
         root,
         _scratch: Some(keep),
         _phase: PhantomData,
-    })
-}
-
-impl Carry {
-    fn admits(self, d: Disposition) -> bool {
-        match d {
-            // No arm here may return false: an artifact whose stored copy omits a hashed
-            // file cannot re-derive its own digest, so every cache read fails validation.
-            Disposition::StoreAndHash => true,
-            Disposition::BuildOutput => false,
-            Disposition::Ignore => self != Carry::FromPreviousPhase,
-        }
-    }
-}
-
-/// `reserved` is a relative path the artifact may NOT overwrite, because the harness owns it.
-///
-/// Exactly one file needs this: the phase transcript at `logs/<P::LOG>`. `logs/` is
-/// `Disposition::Ignore`, which `Carry::FromArtifact` admits, so an agent that happens to create
-/// `logs/verify.log` in its own work tree had that file published straight over the transcript --
-/// turning a run whose stored copy shows `turn.completed` into one the audit reads as truncated and
-/// refuses. Skipped rather than renamed-and-kept only because the transcript is proof of completion
-/// and the agent's same-named log is a duplicate of output it also wrote elsewhere; the skip is
-/// announced so it is never silent.
-fn copy_carrying(src: &Path, dest: &Path, carry: Carry, reserved: Option<&Path>) -> Result<()> {
-    std::fs::create_dir_all(dest)?;
-    visit(src, src, false, &|d| carry.admits(d), &mut |rel, abs| {
-        if Some(rel.as_path()) == reserved {
-            println!(
-                "   \u{26a0}\u{fe0f}  not carrying {} from the artifact: the harness's transcript lives there",
-                rel.as_path().display()
-            );
-            return Ok(());
-        }
-        let to = dest.join(rel.as_path());
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(abs, &to)
-            .with_context(|| format!("copying {} to {}", abs.display(), to.display()))?;
-        Ok(())
-    })
-    .with_context(|| format!("copying {} to {}", src.display(), dest.display()))?;
-    // `std::fs::copy` carries mode bits and cache entries are stored read-only, so
-    // without this a replay would publish a read-only crate and later builds hit EACCES.
-    set_read_only(dest, Access::Writable)
-}
-
-/// Which way [`set_read_only`] goes. As a `bool` the call site read `set_read_only(dest,
-/// false)`, where `false` says nothing about which; backwards, it either leaves the store
-/// writable or publishes a crate later builds cannot write to.
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-pub(crate) enum Access {
-    ReadOnly,
-    Writable,
-}
-
-impl Access {
-    fn locked(self) -> bool {
-        self == Access::ReadOnly
-    }
-}
-
-/// Types stop *this crate* from executing in a stored artifact; `0o555`/`0o444` also
-/// binds what the types cannot see — a shell-out, a stray `cargo build --manifest-path` —
-/// which then fails with `EACCES` instead of quietly filling the store with `target/`
-/// dirs and mutating the artifact it was reading.
-pub(crate) fn set_read_only(root: &Path, access: Access) -> Result<()> {
-    fn perms(mode: u32) -> std::fs::Permissions {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::Permissions::from_mode(mode)
-    }
-    fn walk(p: &Path, access: Access) -> Result<()> {
-        let meta = std::fs::symlink_metadata(p)?;
-        if meta.is_dir() {
-            // A `0o555` directory cannot have entries added or removed, so unlocking on
-            // the way down and locking on the way out is what makes this reversible.
-            if !access.locked() {
-                std::fs::set_permissions(p, perms(0o755))?;
-            }
-            for e in std::fs::read_dir(p)? {
-                walk(&e?.path(), access)?;
-            }
-            if access.locked() {
-                std::fs::set_permissions(p, perms(0o555))?;
-            }
-        } else if !meta.file_type().is_symlink() {
-            // chmod follows symlinks: locking one would lock a target outside this tree.
-            std::fs::set_permissions(p, perms(if access.locked() { 0o444 } else { 0o644 }))?;
-        }
-        Ok(())
-    }
-    walk(root, access).with_context(|| {
-        format!(
-            "making {} {}writable",
-            root.display(),
-            if access.locked() { "non-" } else { "" }
-        )
     })
 }
 
