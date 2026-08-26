@@ -47,33 +47,48 @@ pub fn run_unit(
     let roles = prompt::chain(paths.tool, paths.variant);
     let roles = &roles[..steps.map_or(roles.len(), |n| n.min(roles.len()))];
 
-    let mut out = Ran {
+    // Concurrent, bounded by the pool's width: the loop here was sequential, so `--parallel` bought
+    // nothing at all -- a permit acquired inside a sequential loop is never contended. Workers pull
+    // from one queue rather than a thread per case, so 338 cases do not become 338 threads.
+    let queue = std::sync::Mutex::new(discovered.cases.iter());
+    let collected: std::sync::Mutex<Ran> = std::sync::Mutex::new(Ran {
         resolved: Resolved::new(),
         failures: Vec::new(),
-    };
-    for case in &discovered.cases {
-        let (name, shape, lib_name) = describe(case, paths, unit);
-        let corpus_case = paths.input_dir(unit).join(&name).join("test_case");
-        let case_dir = paths.case_dir(unit, &name);
-        match run_case(RunCase {
-            paths,
-            store,
-            roles,
-            name: &name,
-            shape,
-            lib_name: lib_name.as_deref(),
-            corpus_case: &corpus_case,
-            case_dir: &case_dir,
-            pool,
-        }) {
-            Ok(published) => out.resolved.extend(published),
-            Err(e) => {
-                println!("  \u{274c} {name}: {e:#}");
-                out.failures.push(name);
-            }
+    });
+
+    std::thread::scope(|scope| {
+        for _ in 0..pool.width().max(1) {
+            scope.spawn(|| loop {
+                let Some(case) = queue.lock().expect("case queue").next() else {
+                    return;
+                };
+                let (name, shape, lib_name) = describe(case, paths, unit);
+                let corpus_case = paths.input_dir(unit).join(&name).join("test_case");
+                let case_dir = paths.case_dir(unit, &name);
+                let outcome = run_case(RunCase {
+                    paths,
+                    store,
+                    roles,
+                    name: &name,
+                    shape,
+                    lib_name: lib_name.as_deref(),
+                    corpus_case: &corpus_case,
+                    case_dir: &case_dir,
+                    pool,
+                });
+                let mut out = collected.lock().expect("collected results");
+                match outcome {
+                    Ok(published) => out.resolved.extend(published),
+                    Err(e) => {
+                        println!("  \u{274c} {name}: {e:#}");
+                        out.failures.push(name);
+                    }
+                }
+            });
         }
-    }
-    Ok(out)
+    });
+
+    Ok(collected.into_inner().expect("collected results"))
 }
 
 /// The per-case parameters. A struct because half of them are `&Path` and positional arguments of the

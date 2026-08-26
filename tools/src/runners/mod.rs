@@ -26,6 +26,12 @@ pub const KIRO_MODEL: &str = "claude-opus-5";
 /// Kimi takes no `--model`; this is what its Bedrock call carries.
 pub const KIMI_MODEL: &str = "moonshotai.kimi-k2.5";
 
+/// Codex's default. The FIRST codex model methodologically comparable to claude: it runs the same
+/// chain and reads `prompts/codex/`, whose protocol replaces Claude Code's Task-tool sub-agent one
+/// with Codex's own single-session form. `gpt-5.4` and `gpt-5.5` are still reachable by `--model`,
+/// and both are historical -- they were fed claude's prompts and had no verify step at all.
+pub const CODEX_MODEL_DEFAULT: &str = "openai.gpt-5.6-sol";
+
 /// The agent CLI build that will run, from `<program> --version`.
 ///
 /// RECORDED, never keyed: the CLIs auto-update through a shim, and keying them stranded every entry
@@ -93,8 +99,11 @@ pub fn resolve_model(tool: Tool, flag: Option<&str>) -> Result<Option<ModelId>> 
         ),
         Tool::Kiro => pinned(KIRO_MODEL),
         Tool::Kimi => pinned(KIMI_MODEL),
-        // The model IS the identity for these: three codex entries used to be three enum variants.
-        Tool::Codex | Tool::Oneshot | Tool::OpenCode => {
+        // Defaulted like claude's and kiro's: a codex run with no `--model` is still a pinned run,
+        // and the two older models stay reachable by naming them.
+        Tool::Codex => pinned(flag.unwrap_or(CODEX_MODEL_DEFAULT)),
+        // The model IS the identity for these, and there is no canonical one to default to.
+        Tool::Oneshot | Tool::OpenCode => {
             let flag = flag.with_context(|| {
                 format!(
                     "--tool {} needs --model: the model is part of its identity, not a default",
@@ -288,6 +297,29 @@ mod tests {
             assert!(
                 matches!(resolve_model(tool, None), Ok(None)),
                 "{tool:?} runs no model, so it must resolve none rather than refusing"
+            );
+        }
+    }
+
+    /// A codex run with no `--model` must still be a PINNED run. It used to refuse, which meant a
+    /// three-way sweep could not name codex without also naming a model -- and the two older codex
+    /// models are historical: both were fed claude's prompts and had no verify step.
+    #[test]
+    fn codex_defaults_to_the_model_that_is_comparable_to_claude() {
+        let defaulted = resolve_model(Tool::Codex, None).unwrap().expect("a pin");
+        assert_eq!(defaulted.as_str(), CODEX_MODEL_DEFAULT);
+        assert_eq!(codex_region(defaulted.as_str()), "us-east-2");
+        // And naming one still overrides it, or the historical models become unreachable.
+        let named = resolve_model(Tool::Codex, Some("openai.gpt-5.4"))
+            .unwrap()
+            .expect("a pin");
+        assert_eq!(named.as_str(), "openai.gpt-5.4");
+        assert_eq!(codex_region(named.as_str()), "us-west-2");
+        // The two whose model IS their identity still refuse: there is no canonical one to default.
+        for tool in [Tool::Oneshot, Tool::OpenCode] {
+            assert!(
+                resolve_model(tool, None).is_err(),
+                "{tool:?} has no defensible default model"
             );
         }
     }

@@ -108,6 +108,12 @@ impl Attested {
         self.0.iter().map(|(r, u)| (r, u.as_str()))
     }
 
+    /// Take another run's attestation into this one. Every tool's rows belong in one `tables/` write:
+    /// writing per tool has each rewrite the file from its own rows and blank the rest.
+    pub fn absorb(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

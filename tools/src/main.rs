@@ -20,7 +20,12 @@ fn main() -> Result<()> {
         })?;
     }
 
-    harvest_tools::prompt::supports(cli.tool, cli.variant)?;
+    anyhow::ensure!(!cli.tool.is_empty(), "--tool names no tool");
+    // Refused before any work: an ablation on a tool with no ablation prompts would otherwise read
+    // the base prompt and file the result as an experiment that never ran.
+    for &tool in &cli.tool {
+        harvest_tools::prompt::supports(tool, cli.variant)?;
+    }
 
     let enforcement =
         harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(cli.allow_unsandboxed);
@@ -30,60 +35,58 @@ fn main() -> Result<()> {
             ref target,
             steps,
             ref include_regex,
-            parallel,
         } => {
-            // The run's ONE budget; a step cannot mint a second (see `agents::Pool`).
-            let pool = harvest_tools::agents::Pool::for_run(parallel);
             let dataset = Dataset::detect(target);
-            let bench = benchmark::for_dataset(dataset);
-            let paths = bench.preflight(battery::Paths::new(
-                &repo_root,
-                cli.tool,
-                cli.variant,
-                dataset,
-                cli.model.as_deref(),
-                mode,
-                enforcement,
-            )?)?;
             let inner = Dataset::strip_prefix(target);
-            let store = store::Store::open(&repo_root, mode)?;
+            let covers = oracle::Covers::from_include_regex(include_regex.as_deref());
 
-            // ONE loop over the units, each running the whole chain. There is no translate pass and
-            // no verify pass: a unit's cases go end to end, which is what `run_or_replay` being one
-            // function buys.
-            let (units, filter) =
-                benchmark::scope(bench.as_ref(), &paths, inner, include_regex.as_deref())?;
-            let mut resolved = eval::Resolved::new();
-            for unit in &units {
-                let ran = chain::run_unit(&paths, &store, unit, filter.as_deref(), steps, &pool)?;
-                resolved.extend(ran.resolved);
-            }
-            println!("{}", store.tally_line());
+            // One thread per tool, each with its own budget: `--parallel 3` over three tools is three
+            // in flight PER TOOL. Nothing is shared that a parallel run could corrupt -- each tool has
+            // its own results tree, evaluation tree and store prefix
+            // (`battery::tests::no_two_tools_share_an_output_or_evaluation_path`).
+            // Borrowed once outside the closures: `move` on a `PathBuf` or an `Option<String>` would
+            // take it from the enclosing scope, which still needs both after the join.
+            let root = repo_root.as_path();
+            let model = cli.model.as_deref();
+            let variant = cli.variant;
+            let keep = eval::Keep::from_keep_eval_tree_flag(cli.keep_eval_tree);
+            let attested: Vec<report::Attested> = std::thread::scope(|scope| {
+                let handles: Vec<_> = cli
+                    .tool
+                    .iter()
+                    .map(|&tool| {
+                        scope.spawn(move || {
+                            run_tool(RunTool {
+                                repo_root: root,
+                                tool,
+                                variant,
+                                model,
+                                dataset,
+                                inner,
+                                steps,
+                                include_regex: include_regex.as_deref(),
+                                covers,
+                                parallel: cli.parallel,
+                                mode,
+                                enforcement,
+                                keep,
+                            })
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| panic!("a tool's thread panicked"))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
 
-            let (scope, attested) =
-                benchmark::InScope::derive(bench.as_ref(), &paths, inner, &resolved)?;
-            let roles = {
-                let all = harvest_tools::prompt::chain(cli.tool, cli.variant);
-                &all[..steps.map_or(all.len(), |n| n.min(all.len()))]
-            };
-            for unit in scope.units() {
-                run_test(
-                    bench.as_ref(),
-                    &paths,
-                    unit,
-                    Score {
-                        on_failure: agent_health::OnInfraFailure::Refuse,
-                        keep: eval::Keep::from_keep_eval_tree_flag(cli.keep_eval_tree),
-                        roles,
-                        resolved: &resolved,
-                        covers: oracle::Covers::from_include_regex(include_regex.as_deref()),
-                    },
-                )?;
-            }
-
-            // Written ONCE from the whole scope: per unit it would erase every other unit's rows.
-            // Each dataset writes only ITS tables -- the two are earned by separate runs, so folding
-            // them together would have a Test-Corpus run blank every harvest-bench row it never saw.
+            // Written ONCE, from every tool's attestation merged. Per tool it would rewrite `tables/`
+            // from that tool's rows alone and blank the others' -- which is what one run per tool did.
+            // Each dataset still writes only ITS tables: the two are earned by separate runs, so
+            // folding them together would have a Test-Corpus run blank every harvest-bench row.
             let whole_scope = include_regex.is_none()
                 && inner
                     == match dataset {
@@ -91,9 +94,16 @@ fn main() -> Result<()> {
                         Dataset::HarvestBench => "HB",
                     };
             if whole_scope {
+                let merged =
+                    attested
+                        .into_iter()
+                        .fold(report::Attested::default(), |mut acc, a| {
+                            acc.absorb(a);
+                            acc
+                        });
                 match dataset {
-                    Dataset::TestCorpus => report::generate(&repo_root, &attested)?,
-                    Dataset::HarvestBench => report::generate_harvest_bench(&repo_root, &attested)?,
+                    Dataset::TestCorpus => report::generate(&repo_root, &merged)?,
+                    Dataset::HarvestBench => report::generate_harvest_bench(&repo_root, &merged)?,
                 }
                 println!("\u{1f4ca} Tables regenerated (tables/)");
             }
@@ -119,7 +129,7 @@ fn main() -> Result<()> {
             let dataset = Dataset::detect(target);
             let paths = battery::Paths::new(
                 &repo_root,
-                cli.tool,
+                cli.tool[0],
                 cli.variant,
                 dataset,
                 cli.model.as_deref(),
@@ -130,6 +140,73 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Everything one tool's run needs. A struct because half of these are `&str`/`Option<&str>` and
+/// positional arguments of the same type transpose silently.
+struct RunTool<'a> {
+    repo_root: &'a std::path::Path,
+    tool: cli::Tool,
+    variant: cli::Variant,
+    model: Option<&'a str>,
+    dataset: Dataset,
+    inner: &'a str,
+    steps: Option<usize>,
+    include_regex: Option<&'a str>,
+    covers: oracle::Covers<'a>,
+    parallel: usize,
+    mode: store::Mode,
+    enforcement: harvest_tools::io::sandbox::Enforcement,
+    keep: eval::Keep,
+}
+
+/// One tool, end to end: preflight, run every unit's chain, score, and report what it attested.
+///
+/// Returns the attestation rather than writing tables, so the caller can merge every tool's rows into
+/// one `tables/` write instead of having each tool clobber the last.
+fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
+    // This tool's ONE budget; a step cannot mint a second (see `agents::Pool`).
+    let pool = harvest_tools::agents::Pool::for_run(r.parallel);
+    let bench = benchmark::for_dataset(r.dataset);
+    let paths = bench.preflight(battery::Paths::new(
+        r.repo_root,
+        r.tool,
+        r.variant,
+        r.dataset,
+        r.model,
+        r.mode,
+        r.enforcement,
+    )?)?;
+    let store = store::Store::open(r.repo_root, r.mode)?;
+
+    // ONE loop over the units, each running the whole chain. There is no translate pass and no verify
+    // pass: a unit's cases go end to end, which is what `run_or_replay` being one function buys.
+    let (units, filter) = benchmark::scope(bench.as_ref(), &paths, r.inner, r.include_regex)?;
+    let mut resolved = eval::Resolved::new();
+    for unit in &units {
+        let ran = chain::run_unit(&paths, &store, unit, filter.as_deref(), r.steps, &pool)?;
+        resolved.extend(ran.resolved);
+    }
+    println!("{} {}", cli::tool_dir(r.tool), store.tally_line());
+
+    let (scope, attested) = benchmark::InScope::derive(bench.as_ref(), &paths, r.inner, &resolved)?;
+    let all_roles = harvest_tools::prompt::chain(r.tool, r.variant);
+    let roles = &all_roles[..r.steps.map_or(all_roles.len(), |n| n.min(all_roles.len()))];
+    for unit in scope.units() {
+        run_test(
+            bench.as_ref(),
+            &paths,
+            unit,
+            Score {
+                on_failure: agent_health::OnInfraFailure::Refuse,
+                keep: r.keep,
+                roles,
+                resolved: &resolved,
+                covers: r.covers,
+            },
+        )?;
+    }
+    Ok(attested)
 }
 
 struct Score<'a> {

@@ -133,16 +133,29 @@ impl Dataset {
 // applied in `parse_args` instead. See `Cli::parse_args`.
 #[command(name = "harvest-tools", about = "C-to-Rust translation pipeline")]
 pub struct Cli {
-    /// Which program runs the invocations.
-    #[arg(long, value_enum, default_value_t = Tool::Claude)]
-    pub tool: Tool,
+    /// Which program runs the invocations. Comma-separated to run several at once:
+    /// `--tool claude,codex,kiro`.
+    ///
+    /// Each tool gets its own results tree, its own store prefix and its own concurrency budget, so
+    /// `--parallel 3` with three tools is three in flight PER TOOL. Their tables are written once,
+    /// from the three attestations merged -- one run per tool would have each rewrite `tables/` from
+    /// its own rows and blank the others'.
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "claude")]
+    pub tool: Vec<Tool>,
 
     /// Which prompt set. An ablation is a prompt, not a tool: the program, the model and the CLI are
     /// identical and only the text differs, which the key separates by prompt hash.
     #[arg(long = "prompt", value_enum, default_value_t = Variant::Default)]
     pub variant: Variant,
 
-    /// Model id. Required for `--tool codex`, `oneshot` and `opencode`, where the model IS the
+    /// Max concurrent invocations PER TOOL.
+    ///
+    /// Beside `--tool` rather than on `run`, because it is that list's budget: with three tools this
+    /// is three in flight each, nine in total. Only `run` reads it.
+    #[arg(long, default_value_t = 1)]
+    pub parallel: usize,
+
+    /// Model id. Required for `--tool oneshot` and `opencode`, where the model IS the
     /// identity; fixed by the tool otherwise.
     #[arg(long)]
     pub model: Option<String>,
@@ -216,9 +229,6 @@ pub enum Command {
         /// Only process cases matching this regex.
         #[arg(long)]
         include_regex: Option<String>,
-        /// Max concurrent invocations.
-        #[arg(long, default_value_t = 1)]
-        parallel: usize,
     },
     /// Inspect the agent-invocation cache
     Cache {
@@ -306,6 +316,48 @@ mod tests {
         assert_eq!(
             parse(&["--replay-only"]).unwrap(),
             crate::store::Mode::ReplayOnly
+        );
+    }
+
+    /// `--tool claude,codex,kiro --parallel 3` is the form a three-way sweep is launched with, so the
+    /// parse is worth pinning: a `--tool` that took only the LAST value would silently run one tool
+    /// and report it as three.
+    #[test]
+    fn one_tool_flag_names_every_tool_a_sweep_runs() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "harvest-tools",
+            "--tool",
+            "claude,codex,kiro",
+            "--parallel",
+            "3",
+            "run",
+            "all",
+        ])
+        .expect("the comma-separated form must parse");
+        assert_eq!(cli.tool, vec![Tool::Claude, Tool::Codex, Tool::Kiro]);
+        assert_eq!(
+            cli.parallel, 3,
+            "and the budget is three PER tool, not three shared"
+        );
+        // Repeating the flag is the other spelling of the same thing.
+        let repeated = Cli::try_parse_from([
+            "harvest-tools",
+            "--tool",
+            "claude",
+            "--tool",
+            "kiro",
+            "run",
+            "all",
+        ])
+        .expect("repeated flags must parse");
+        assert_eq!(repeated.tool, vec![Tool::Claude, Tool::Kiro]);
+        // And the default is still a single tool, not an empty list.
+        assert_eq!(
+            Cli::try_parse_from(["harvest-tools", "run", "all"])
+                .unwrap()
+                .tool,
+            vec![Tool::Claude]
         );
     }
 }
