@@ -64,8 +64,8 @@ already exists (`Sealed::publish`), route to it instead of hand-rolling a second
 ### Storage
 
 The target design for the store. Where the code still disagrees, that is debt, not licence:
-`.cache/<SCHEMA>/<phase>/…`, the `failed/` subtree, keying the toolchain and the recipe, and the
-oracle tamper check all predate these rules.
+`.cache/<SCHEMA>/<phase>/…`, the `failed/` subtree, keying the toolchain and the recipe, the oracle
+tamper check, and a graded tree that carries the C all predate these rules.
 
 **Git versions the layout; the layout does not version itself.** `SCHEMA` does one job three
 times — hashed into the key, a path level (`.cache/4/`), and a field in `meta.json` — and only the
@@ -103,7 +103,7 @@ contents uninspected. The first in a chain differs only in that its translation 
 kind, not in layout, not in how it is hashed. Every change happens inside the working dir.
 
 **Two kinds of edge, and only one is cached.** An AGENT RUN is nondeterministic and expensive, so
-it is keyed on `tool ‖ model ‖ input_tree ‖ prompt` and stored, with N attempts per key. A HARNESS
+it is keyed on `tool ‖ model ‖ before_hash ‖ prompt_hash` and stored. A HARNESS
 TRANSFORM is deterministic and cheap, so it is recomputed and never cached — and it must stay
 OUTSIDE the cache, or harness logic is baked into the agent's artifact and changing it invalidates
 runs that are still good. `post_process_independent` is one of these: it renames `[lib]` to the
@@ -123,7 +123,7 @@ them from naked asm, and scored full marks at 1,013 lines against another agent'
 with the corpus's copy and the agent's edits to it are discarded before hashing — which is why
 tampering cannot persist and a tamper check is unnecessary. Nothing in the grading path reads the C
 anyway: `runtests.rust` scores the Rust against static `test_vectors/`, so the check protected
-provenance only, and a restore protects it better and covers the next phase too. Restoring is about
+provenance only, and a restore protects it better and covers the next invocation too. Restoring is about
 what is ASSEMBLED; it does not license storing less than was hashed.
 
 **Store the preimage of every hash.** An entry keeps the exact bytes that were hashed — the whole
@@ -184,15 +184,25 @@ meaning the ACTOR commit everywhere else; it is the TOOL level and should say so
 
 `outcome` is CLASSIFIED from the transcript, never the exit code: every session pipes through
 `tee`, so a killed agent reported a clean 0 until `set -o pipefail` was asserted. `output_tree` is
-not optional — with several attempts under one key it is the only thing selection can read. Keep
+not optional — it is what makes a corrupted `after/` detectable rather than silently served. Keep
 `run.log`, because `agent.json` is derived from it: outcome, cost and the model-pin check all read
 it, so dropping it makes the record unverifiable and un-rederivable.
 
 **What used to be `seal` is four steps, not one.** CLASSIFY the transcript, RESTORE `c_src` from
 the corpus, SCRUB absolute paths to a token, DIGEST. Only the last is `seal`'s remaining job.
 `scrub` must stay ahead of the digest or every key carries a per-run nonce; and with failures
-stored like anything else, the `Completed` capability token has nothing left to guard — the
-outcome is a field, and selection is what refuses to serve it.
+stored like anything else, the `Completed` capability token has nothing left to guard — the outcome
+is a field, and the lookup is what declines to serve an entry that is not `completed`.
+
+None of the above was found by looking for bugs. It came out of writing down what one case does from
+corpus to table, and the specification is what made the defects visible: a lossy slug naming
+`oneshot/4`; a sentinel naming `kiro/unpinned`; kiro invoked with no `--model` at all, making every
+published kiro row unattributable; an entry whose `output_tree` described a tree nothing downstream
+used, in 216 of 216 pairs; `\CostPOne` silently dropped from the paper when a path moved under it;
+`.eval/` failing its own cleanliness check after a fully green replay; codex missing from the session
+test table, so both rules there exempted the backend they were added for; and an artifact that
+`objcopy`-renamed 881 symbols out of the original C library and scored full marks by jumping to
+them. Structure is not tidiness. It is the only thing that made any of those visible.
 
 ### Testing
 
