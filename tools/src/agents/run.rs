@@ -256,13 +256,14 @@ pub(crate) fn write_phase_metrics<P: Phase>(
 mod tests {
     use super::*;
     use crate::agents::session::Session;
-    use crate::artifact::{phase_metrics, Published, Sealed, TreeDigest};
+    use crate::artifact::{phase_metrics, Published, Sealed};
     use crate::battery::{has_crate, phase_dir, TRANSLATED, VERIFIED};
     use crate::cache::tests::fixture;
     use crate::cache::{fake_program, prompt_digest, Counts, Mode, NotProduced, Produced, Recipe};
     use crate::cli::{honouring, Agent, Reuse};
     use crate::domain::health::Completed;
     use crate::io::workdir::Roots;
+    use crate::tree::TreeDigest;
     use std::path::PathBuf;
 
     /// Owns every key component, so two runs can borrow provably identical ones and the

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 pub struct IsolatedWorkDir<P: crate::artifact::Phase> {
     work: crate::artifact::WorkTree<P>,
     /// Digest of the artifact or corpus this was materialised from.
-    input: crate::artifact::TreeDigest,
+    input: crate::tree::TreeDigest,
     /// WHERE that artifact or corpus is, kept so the store can record the tree the key was
     /// computed from and not only its digest. Both constructors were handed this path and threw
     /// it away, which is why an entry could never re-derive its own input.
@@ -89,7 +89,7 @@ impl<P: crate::artifact::Phase> IsolatedWorkDir<P> {
         &self.seed
     }
 
-    pub fn input_digest(&self) -> &crate::artifact::TreeDigest {
+    pub fn input_digest(&self) -> &crate::tree::TreeDigest {
         &self.input
     }
 

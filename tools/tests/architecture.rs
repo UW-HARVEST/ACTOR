@@ -353,11 +353,54 @@ fn digests_cannot_be_fabricated() {
         "CliVersion",
     ];
     let mut bad: Vec<String> = Vec::new();
+    // Every guarded name must be FOUND, not merely un-violated. Without this the rule inspects
+    // whatever happens to still live in the listed modules: moving `TreeDigest` to `tree` took it
+    // out of scope silently, and the gate stayed green having stopped looking at it.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
 
-    for module in ["artifact", "cache"] {
-        for item in parse(&module_file(module)).items {
+    for module in ["artifact", "cache", "tree"] {
+        let file = parse(&module_file(module));
+        // Four of the seven are emitted by `digest_newtype!`, so no `Item::Struct` exists for them
+        // and this rule inspected NOTHING for `PromptDigest`, `RecipeDigest`, `CacheKey` and
+        // `ToolchainId` from the day that macro was introduced. Auditing the generator once covers
+        // every name it emits; counting the invocations is what makes them `seen`.
+        for item in &file.items {
+            let syn::Item::Macro(m) = item else { continue };
+            let invoked = m
+                .mac
+                .path
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "digest_newtype");
+            if !invoked {
+                continue;
+            }
+            if let Some(last) = m.mac.tokens.clone().into_iter().last() {
+                let name = last.to_string();
+                if GUARDED.contains(&name.as_str()) {
+                    seen.insert(name);
+                }
+            }
+        }
+        let text = read(&module_file(module));
+        if let Some(at) = text.find("macro_rules! digest_newtype") {
+            let body = &text[at..];
+            let end = body.find("\n}\n").map_or(body.len(), |e| e + 3);
+            let body = &body[..end];
+            if !body.contains("pub struct $name(String);") {
+                bad.push(format!(
+                    "{module}: digest_newtype! no longer emits a private tuple field, so every \
+                     type it generates is unguarded"
+                ));
+            }
+            if body.contains("impl From") {
+                bad.push(format!("{module}: digest_newtype! emits a From impl"));
+            }
+        }
+        for item in file.items {
             match &item {
                 syn::Item::Struct(s) if GUARDED.contains(&s.ident.to_string().as_str()) => {
+                    seen.insert(s.ident.to_string());
                     for f in &s.fields {
                         if is_public(&f.vis) {
                             bad.push(format!("{}: {} has a public field", module, s.ident));
@@ -382,6 +425,12 @@ fn digests_cannot_be_fabricated() {
         bad.is_empty(),
         "a digest became forgeable: {bad:#?}\n\
          The only way to obtain one must be to hash something real."
+    );
+    let unseen: Vec<&&str> = GUARDED.iter().filter(|g| !seen.contains(**g)).collect();
+    assert!(
+        unseen.is_empty(),
+        "this rule inspected nothing for {unseen:#?} — the type moved out of the modules listed \
+         above, so add its module rather than leaving the guard blind to it."
     );
 }
 
@@ -1065,8 +1114,8 @@ fn returned_ty(sig: &syn::Signature) -> Option<&syn::Type> {
 #[test]
 fn the_digest_path_is_lossless() {
     const GUARDED: &[(&str, &str)] = &[
-        ("artifact", "hash_tree"), // where the path bytes are actually fed
-        ("artifact", "digest_tree"),
+        ("tree", "hash_tree"), // where the path bytes are actually fed
+        ("tree", "digest_tree"),
         ("artifact", "scrub"),
         ("domain::contents", "classify"), // decides WHICH files hash_tree hashes
         ("cache", "normalise"),
@@ -1106,7 +1155,7 @@ fn the_digest_path_is_lossless() {
          and skip where a `&str` is required."
     );
 
-    let hashing = &calls[&("artifact".to_string(), "hash_tree".to_string())];
+    let hashing = &calls[&("tree".to_string(), "hash_tree".to_string())];
     assert!(
         hashing.contains(&"as_encoded_bytes".to_string()),
         "hash_tree no longer feeds as_encoded_bytes: {hashing:?}\n\

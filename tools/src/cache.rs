@@ -14,9 +14,10 @@
 //! decided in the test phase, and the test phase is not cached.
 
 use crate::agents::session::Session;
-use crate::artifact::{Access, Phase, Sealed, TreeDigest};
+use crate::artifact::{Access, Phase, Sealed};
 use crate::cli::Agent;
 use crate::io::workdir::Roots;
+use crate::tree::{feed, TreeDigest};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -409,11 +410,6 @@ pub fn normalise(text: &str, roots: &Roots) -> String {
         }
     }
     out
-}
-
-fn feed(h: &mut Sha256, bytes: &[u8]) {
-    h.update((bytes.len() as u64).to_le_bytes());
-    h.update(bytes);
 }
 
 /// Named so the entry's record and the hasher cannot disagree about which algorithm ran.

@@ -18,4 +18,5 @@ pub mod oracle;
 pub mod provenance;
 pub mod refusal;
 pub mod translate;
+pub mod tree;
 pub mod verify;

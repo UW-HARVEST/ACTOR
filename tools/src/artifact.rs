@@ -13,6 +13,7 @@
 use crate::domain::contents::{classify, Carry, Disposition, C_ORACLE_DIR};
 use crate::domain::health::Completed;
 use crate::domain::relpath::RelPath;
+use crate::tree::{digest_tree, hash_tree, is_cmake_build_dir, visit, TreeDigest};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -343,30 +344,6 @@ fn seed<Q: Phase>(src: &Path, root: PathBuf, keep: Scratch, at: SeedAt) -> Resul
     })
 }
 
-/// A `sha256:<hex>` tree digest. No `From<String>`: the only way to obtain one is to
-/// hash a tree, so it cannot be confused with an arbitrary string.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct TreeDigest(String);
-
-impl TreeDigest {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(s: &str) -> Self {
-        Self(s.to_string())
-    }
-}
-
-impl fmt::Debug for TreeDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // 19 = `sha256:` plus 12 hex chars, enough to compare by eye.
-        let short: String = self.0.chars().take(19).collect();
-        write!(f, "{short}…")
-    }
-}
-
 impl Carry {
     fn admits(self, d: Disposition) -> bool {
         match d {
@@ -465,102 +442,10 @@ pub(crate) fn set_read_only(root: &Path, access: Access) -> Result<()> {
     })
 }
 
-fn is_cmake_build_dir(dir: &Path) -> bool {
-    dir.join("CMakeCache.txt").is_file() || dir.join("CMakeFiles").is_dir()
-}
-
-/// Length-prefixed, hence injective: the upstream `harvest_core::fs::hash_dir` separates
-/// fields with bare NULs, so `("a\0b", "")` and `("a", "b")` collide there on binary.
-fn feed(h: &mut Sha256, bytes: &[u8]) {
-    h.update((bytes.len() as u64).to_le_bytes());
-    h.update(bytes);
-}
-
-/// Deterministic digest over the `StoreAndHash` files of a tree. Ported from
-/// `harvest_core::fs::hash_dir`, plus a classification filter, the length prefixing above,
-/// and following symlinks to hash content rather than the link target — the links around
-/// phase dirs are staging artifacts whose targets are per-run paths.
 /// Named so the entry's record and the hasher cannot disagree about which algorithm ran.
 pub const TREE_ALGORITHM: &str = "harvest-tree-v1";
 /// The oracle walk hashes a different file set, so it is a different algorithm.
 pub const ORACLE_TREE_ALGORITHM: &str = "harvest-oracle-tree-v1";
-
-fn digest_tree(root: &Path) -> Result<TreeDigest> {
-    hash_tree(root, &|d| d == Disposition::StoreAndHash)
-}
-
-fn hash_tree(root: &Path, admits: &dyn Fn(Disposition) -> bool) -> Result<TreeDigest> {
-    let mut files: std::collections::BTreeMap<RelPath, PathBuf> = Default::default();
-    visit(root, root, false, admits, &mut |rel, abs| {
-        files.insert(rel.clone(), abs.to_path_buf());
-        Ok(())
-    })
-    .with_context(|| format!("walking {} for a digest", root.display()))?;
-
-    let mut h = Sha256::new();
-    feed(&mut h, b"harvest-tree-v1");
-    for (rel, abs) in &files {
-        // `RelPath::new` validates relative/no-`..`/non-empty but NOT UTF-8, and a lossy
-        // name collapses every invalid byte to U+FFFD — so `a\xFF` and `a\xFE` would hash
-        // alike, losing the injectivity the rest of this digest rests on.
-        feed(&mut h, rel.as_path().as_os_str().as_encoded_bytes());
-        let bytes = std::fs::read(abs).with_context(|| format!("reading {}", abs.display()))?;
-        feed(&mut h, &bytes);
-    }
-    Ok(TreeDigest(format!("sha256:{:x}", h.finalize())))
-}
-
-/// **The** traversal of an artifact tree: hashing and copying both go through it, so
-/// "which files are part of this artifact" has exactly one answer. `admits` gates descent
-/// as well as emission, so a directory the caller does not want is never opened.
-fn visit(
-    root: &Path,
-    dir: &Path,
-    in_build_dir: bool,
-    admits: &dyn Fn(Disposition) -> bool,
-    emit: &mut dyn FnMut(&RelPath, &Path) -> Result<()>,
-) -> Result<()> {
-    let build_here = in_build_dir || is_cmake_build_dir(dir);
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let Ok(Ok(rel)) = path.strip_prefix(root).map(RelPath::new) else {
-            continue;
-        };
-
-        if !admits(classify(&rel, build_here)) {
-            continue;
-        }
-        let ft = entry.file_type()?;
-        let ft = if ft.is_symlink() {
-            // Resolved rather than emitted, because this traversal follows links deliberately
-            // (see [`digest_tree`]); one whose per-run target is gone has nothing to follow, and
-            // the shipped `results/` holds 17 of those, 16 inside a published phase dir.
-            // NotFound only, propagating the rest, mirroring `children_but_logs` above. Swallowing
-            // every error here would drop an unresolvable entry from BOTH the copy AND the digest,
-            // so the two would agree, the store would validate the truncated tree, and nothing
-            // could report it -- where the base behaviour was a loud refusal from `read`/`copy`.
-            // ELOOP is the input that proves the difference: a symlink cycle must still refuse.
-            match std::fs::metadata(&path) {
-                Ok(m) => m.file_type(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e).with_context(|| format!("resolving {}", path.display())),
-            }
-        } else {
-            ft
-        };
-        if ft.is_dir() {
-            visit(root, &path, build_here, admits, emit)?;
-        } else if ft.is_file() {
-            emit(&rel, &path)?;
-        }
-        // Anything else is skipped. Agent workspaces hold non-regular files — CRUST's
-        // `impcheck` creates `.pipe` FIFOs — and `std::fs::copy`/`std::fs::read` open before
-        // they stat, so a FIFO blocks until a writer appears: one stray pipe hangs a publish,
-        // a digest, and the sweep worker whose permit is held across both.
-    }
-    Ok(())
-}
 
 /// Disk-backed, never tmpfs (see [`crate::io::workdir`]); removed once the last handle to
 /// it drops. Shared rather than solely owned so that a [`ScratchPath`] cut from it
@@ -689,7 +574,7 @@ impl OracleDir {
         if self.0.is_dir() {
             hash_tree(&self.0, &oracle_admits)
         } else {
-            Ok(TreeDigest("sha256:absent".into()))
+            Ok(TreeDigest::absent())
         }
     }
 
@@ -1240,7 +1125,7 @@ impl Fingerprint {
             P::DIR,
             root.display()
         );
-        Ok(Self(digest_tree(&root)?.0))
+        Ok(Self(digest_tree(&root)?.as_str().to_string()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -1410,17 +1295,6 @@ mod tests {
             !out.join("c_src/build").exists(),
             "a nested cmake build tree must NOT travel: its cache names a dead scratch dir"
         );
-    }
-
-    #[test]
-    fn feed_is_injective_where_nul_separators_are_not() {
-        let mut a = Sha256::new();
-        feed(&mut a, b"a\0b");
-        feed(&mut a, b"");
-        let mut b = Sha256::new();
-        feed(&mut b, b"a");
-        feed(&mut b, b"b");
-        assert_ne!(format!("{:x}", a.finalize()), format!("{:x}", b.finalize()));
     }
 
     /// Pinned from the pre-`as_encoded_bytes` implementation. On Unix an `OsStr` *is* its
@@ -2595,7 +2469,7 @@ mod tests {
     #[test]
     fn debug_on_sealed_reveals_the_digest_not_the_location() {
         // Formatting must not be a way to recover a path and run something there.
-        let d = TreeDigest("sha256:abc123def456".into());
+        let d = TreeDigest::for_test("sha256:abc123def456");
         let s = format!("{d:?}");
         assert!(s.starts_with("sha256:"), "{s}");
         assert!(!s.contains('/'), "a digest must not look like a path: {s}");
