@@ -284,10 +284,20 @@ fn no_public_path_escapes_the_artifact_modules() {
         // RelPath is guaranteed relative with no `..`, so it names no location and
         // cannot be a working directory or a build target.
         ("RelPath", "as_path"),
+        // A WorkDir is the one place that IS meant to be run in; `Tree` is deliberately absent, so
+        // adding `Tree::path` fires here rather than quietly making a sealed tree executable.
+        ("WorkDir", "root"),
+        ("WorkDir", "translation"),
     ];
     let mut leaks: Vec<String> = Vec::new();
 
-    for module in ["artifact", "cache", "domain::relpath", "domain::contents"] {
+    for module in [
+        "artifact",
+        "cache",
+        "tree",
+        "domain::relpath",
+        "domain::contents",
+    ] {
         for item in parse(&module_file(module)).items {
             match item {
                 syn::Item::Impl(imp) => {

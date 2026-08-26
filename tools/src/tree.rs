@@ -219,9 +219,296 @@ pub(crate) fn visit(
     Ok(())
 }
 
+/// The two subtrees every working dir has. A first invocation differs from a later one only in that
+/// its translation is empty -- not in shape, not in layout, not in how it is hashed.
+///
+/// Siblings, not nested: with the C inside the crate a `build.rs` can CMake-build the original
+/// library and link it, and one published artifact did exactly that -- 881 `objcopy`-renamed symbols
+/// reached by naked-asm `jmp`, full marks at 1,013 lines against another agent's 27,044.
+pub const C_SRC: &str = "c_src";
+pub const TRANSLATION: &str = "translation";
+
+/// A directory an agent may run in.
+///
+/// Remembers the corpus its C came from, so [`Self::seal`] restores from the SAME reference the
+/// agent was given: a caller free to pass another at seal time could swap the oracle silently.
+pub struct WorkDir {
+    root: PathBuf,
+    corpus_c: PathBuf,
+    /// Shared, so N cases can be cut from one scratch root rather than N, and held so the
+    /// directory outlives every path taken from it.
+    _scratch: std::sync::Arc<tempfile::TempDir>,
+}
+
+impl WorkDir {
+    /// The first work dir of a chain: the C from the corpus, an empty translation.
+    pub fn assemble(corpus_c: &Path) -> Result<Self> {
+        let scratch = std::sync::Arc::new(crate::io::workdir::tempdir("harvest-work-")?);
+        let root = scratch.path().to_path_buf();
+        Self::lay_out(&root, corpus_c)?;
+        std::fs::create_dir_all(root.join(TRANSLATION))?;
+        Ok(Self {
+            root,
+            corpus_c: corpus_c.to_path_buf(),
+            _scratch: scratch,
+        })
+    }
+
+    fn lay_out(root: &Path, corpus_c: &Path) -> Result<()> {
+        anyhow::ensure!(
+            corpus_c.is_dir(),
+            "no C reference at {} -- a working dir cannot be laid out without one",
+            corpus_c.display()
+        );
+        copy_carrying(corpus_c, &root.join(C_SRC), Carry::IntoWorkTree, None)
+    }
+
+    /// Where the agent runs.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The crate root: what gets built, and the only part an agent is asked to produce.
+    pub fn translation(&self) -> PathBuf {
+        self.root.join(TRANSLATION)
+    }
+
+    /// RESTORE, SCRUB, DIGEST -- the three steps that used to hide inside one `seal`. The restore
+    /// is why no tamper check is needed: the agent may do what it likes to `c_src/`, and the tree
+    /// that is hashed, stored and handed on always holds the corpus's C.
+    pub fn seal(self) -> Result<Tree> {
+        std::fs::remove_dir_all(self.root.join(C_SRC)).or_else(|e| {
+            (e.kind() == std::io::ErrorKind::NotFound)
+                .then_some(())
+                .ok_or(e)
+        })?;
+        Self::lay_out(&self.root, &self.corpus_c)?;
+        scrub(&self.root)?;
+        Ok(Tree {
+            digest: digest_tree(&self.root)?,
+            at: self.root,
+            _scratch: Some(self._scratch),
+        })
+    }
+}
+
+/// Rewrite per-run absolute paths to a stable token, so a digest of agent output does not change
+/// every run. Must precede any digest: the scratch directory name is random.
+fn scrub(root: &Path) -> Result<()> {
+    let base = crate::io::workdir::base()?;
+    // Read as UTF-8, so a non-UTF-8 path cannot occur in one of these files and there is nothing to
+    // rewrite -- whereas its lossy form (U+FFFD per invalid byte) can, and would rewrite text that
+    // is not a path.
+    let needles: Vec<String> = [root, base.as_path()]
+        .into_iter()
+        .filter_map(|p| p.to_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    // The same predicate the digest uses: nothing can be hashed unscrubbed.
+    visit(
+        root,
+        root,
+        false,
+        &|d| d == Disposition::StoreAndHash,
+        &mut |_rel, abs| {
+            let Ok(text) = std::fs::read_to_string(abs) else {
+                return Ok(()); // binary: skip
+            };
+            let mut out = text.clone();
+            for n in &needles {
+                out = out.replace(n.as_str(), "$HARVEST_WORKDIR");
+            }
+            if out != text {
+                std::fs::write(abs, out).with_context(|| format!("scrubbing {}", abs.display()))?;
+            }
+            Ok(())
+        },
+    )
+}
+
+/// A sealed working dir: content-addressed, and not constructible from a path alone.
+///
+/// Yields no path, so nothing runs in one -- [`Self::materialise`] makes a fresh copy. That
+/// unforgeability replaces `SeededBy`: step order is no longer typed, but a tree nothing produced
+/// cannot be fed to a step.
+pub struct Tree {
+    digest: TreeDigest,
+    at: PathBuf,
+    /// Held where the bytes live in scratch; `None` where they live in the store.
+    _scratch: Option<std::sync::Arc<tempfile::TempDir>>,
+}
+
+impl fmt::Debug for Tree {
+    /// The digest, never the location: a `Tree` that could be formatted into a path would be a
+    /// working directory by another name.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Tree({:?})", self.digest)
+    }
+}
+
+impl Tree {
+    pub fn digest(&self) -> &TreeDigest {
+        &self.digest
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the store is wired to this in the next step; the tests here already exercise it"
+    )]
+    /// The store's only door. The bytes must hash to what the entry recorded, or the entry is
+    /// corrupt -- which is the check the whole design rests on, since a `before` that no longer
+    /// reproduces its own name cannot be re-keyed.
+    pub(crate) fn adopt_stored(at: PathBuf, recorded: &TreeDigest) -> Result<Self> {
+        let digest = digest_tree(&at)?;
+        anyhow::ensure!(
+            &digest == recorded,
+            "the stored tree at {} hashes to {digest:?} but its entry records {recorded:?}",
+            at.display()
+        );
+        Ok(Self {
+            digest,
+            at,
+            _scratch: None,
+        })
+    }
+
+    /// A fresh working dir holding this tree's bytes. `corpus_c` is stated rather than remembered
+    /// because a stored tree does not know which corpus it came from.
+    pub fn materialise(&self, corpus_c: &Path) -> Result<WorkDir> {
+        let scratch = std::sync::Arc::new(crate::io::workdir::tempdir("harvest-work-")?);
+        let root = scratch.path().to_path_buf();
+        copy_carrying(&self.at, &root, Carry::FromPreviousPhase, None)?;
+        std::fs::create_dir_all(root.join(TRANSLATION))?;
+        Ok(WorkDir {
+            root,
+            corpus_c: corpus_c.to_path_buf(),
+            _scratch: scratch,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A corpus C reference: two files, one of them a `.bak` that only hashes because
+    /// `is_ignored` exempts everything under `c_src/`.
+    fn corpus() -> (tempfile::TempDir, PathBuf) {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let c = tmp.path().join("test_case");
+        std::fs::create_dir_all(c.join("src")).unwrap();
+        std::fs::write(c.join("src/lib.c"), "int f(void){return 1;}\n").unwrap();
+        std::fs::write(c.join("doc.html.bak"), "reference\n").unwrap();
+        (tmp, c)
+    }
+
+    #[test]
+    fn a_step_hands_the_next_one_the_tree_it_sealed() {
+        // The whole path, with no phase anywhere in it.
+        let (_tmp, c) = corpus();
+        let w = WorkDir::assemble(&c).unwrap();
+        assert!(w.root().join(C_SRC).join("src/lib.c").is_file());
+        assert!(
+            w.translation().is_dir(),
+            "translation must exist, even empty"
+        );
+        std::fs::write(w.translation().join("lib.rs"), "pub fn f() -> i32 { 1 }\n").unwrap();
+
+        let sealed = w.seal().unwrap();
+        let next = sealed.materialise(&c).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(next.translation().join("lib.rs")).unwrap(),
+            "pub fn f() -> i32 { 1 }\n",
+            "the next step must receive the translation the previous one produced"
+        );
+        assert!(
+            next.root().join(C_SRC).join("src/lib.c").is_file(),
+            "and the C beside it"
+        );
+        assert_eq!(
+            next.seal().unwrap().digest(),
+            sealed.digest(),
+            "materialise then seal must round-trip to the same digest"
+        );
+    }
+
+    #[test]
+    fn an_edit_to_the_c_reference_cannot_survive_a_seal() {
+        // Replaces the tamper check: restoring makes a linked-original-C artifact (see `C_SRC`)
+        // unable to persist rather than something to detect.
+        let (_tmp, c) = corpus();
+        let clean = {
+            let w = WorkDir::assemble(&c).unwrap();
+            std::fs::write(w.translation().join("lib.rs"), "x\n").unwrap();
+            w.seal().unwrap().digest().clone()
+        };
+
+        let w = WorkDir::assemble(&c).unwrap();
+        std::fs::write(w.translation().join("lib.rs"), "x\n").unwrap();
+        let victim = w.root().join(C_SRC).join("src/lib.c");
+        std::fs::write(&victim, "int f(void){return 999;}\n").unwrap();
+        std::fs::write(w.root().join(C_SRC).join("extra.c"), "added\n").unwrap();
+        assert_ne!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "int f(void){return 1;}\n",
+            "non-vacuous only if the fixture really tampered"
+        );
+
+        let sealed = w.seal().unwrap();
+        assert_eq!(
+            sealed.digest(),
+            &clean,
+            "a tampered C reference must hash identically to a pristine one"
+        );
+        let after = sealed.materialise(&c).unwrap();
+        assert!(
+            !after.root().join(C_SRC).join("extra.c").exists(),
+            "and the added file must be gone, not merely unhashed"
+        );
+    }
+
+    #[test]
+    fn the_scratch_directory_name_never_reaches_a_digest() {
+        // Unscrubbed, no entry would ever hit: caching would look enabled while never working.
+        let (_tmp, c) = corpus();
+        let seal_one = || {
+            let w = WorkDir::assemble(&c).unwrap();
+            let embedded = format!("// built in {}\n", w.root().display());
+            std::fs::write(w.translation().join("lib.rs"), &embedded).unwrap();
+            (w.seal().unwrap(), embedded)
+        };
+        let (a, text_a) = seal_one();
+        let (b, text_b) = seal_one();
+        assert_ne!(
+            text_a, text_b,
+            "non-vacuous only if the two runs really embedded different paths"
+        );
+        assert_eq!(a.digest(), b.digest());
+    }
+
+    #[test]
+    fn a_stored_tree_that_does_not_hash_to_its_record_is_refused() {
+        // A `before` that no longer reproduces its own name cannot be re-keyed: that is corruption,
+        // and serving it publishes a number from bytes nothing attests.
+        let (_tmp, c) = corpus();
+        let w = WorkDir::assemble(&c).unwrap();
+        std::fs::write(w.translation().join("lib.rs"), "one\n").unwrap();
+        let sealed = w.seal().unwrap();
+        let recorded = sealed.digest().clone();
+
+        let store = crate::io::workdir::test_tempdir().unwrap();
+        let at = store.path().join("before");
+        copy_carrying(&sealed.at, &at, Carry::FromPreviousPhase, None).unwrap();
+        Tree::adopt_stored(at.clone(), &recorded).expect("an intact copy is adoptable");
+
+        std::fs::write(at.join(TRANSLATION).join("lib.rs"), "two\n").unwrap();
+        let err = Tree::adopt_stored(at, &recorded).expect_err("a mutated copy must be refused");
+        assert!(
+            format!("{err:#}").contains("records"),
+            "and must name both digests: {err:#}"
+        );
+    }
 
     #[test]
     fn feed_is_injective_where_nul_separators_are_not() {
