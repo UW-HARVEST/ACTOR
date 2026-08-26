@@ -108,15 +108,31 @@ pub struct Cli {
     pub backend: Backend,
     pub model: ModelId,
     pub cli_version: String,
-    /// Where per-case scratch the agent needs but the tree must not carry goes.
-    pub agent_tmp: std::path::PathBuf,
-    pub settings: std::path::PathBuf,
+    pub repo_root: std::path::PathBuf,
+    pub enforcement: crate::io::sandbox::Enforcement,
 }
 
 impl Execute for Cli {
     fn execute(&self, work: &WorkDir, prompt: &str, log: &Path) -> Result<Ran> {
         let started = Instant::now();
         let cwd = work.translation();
+        // Per INVOCATION, both of them, so three tools running at once cannot share an agent TMPDIR,
+        // a settings file, or -- for opencode, whose `XDG_CONFIG_HOME` this is -- a credential store.
+        // They were resolved from the machine-wide work base, which every tool and every case shared.
+        //
+        // TMPDIR lives in its own scratch rather than inside the working dir: `tmp/` is not on the
+        // digest's ignore list, so agent scratch there would be hashed into the tree.
+        let scratch = crate::io::workdir::tempdir("harvest-agent-")?;
+        let agent_tmp = scratch.path().join("tmp");
+        std::fs::create_dir_all(&agent_tmp)?;
+        // `<work_root>/.claude/settings.json`, and the policy's allow-list is that same work dir --
+        // one field, so the agent is never launched somewhere its own policy denies. `.claude` is
+        // root-anchored ignored, so the file does not reach the digest.
+        let settings = crate::io::sandbox::write_settings(crate::io::sandbox::Policy {
+            repo_root: &self.repo_root,
+            work_root: work.root(),
+            enforcement: self.enforcement,
+        })?;
         let mut command = match &self.backend {
             Backend::Claude => self
                 .session
@@ -124,9 +140,9 @@ impl Execute for Cli {
                     cwd: &cwd,
                     prompt,
                     log,
-                    settings: &self.settings,
+                    settings: &settings,
                     model: &self.model,
-                    agent_tmp: &self.agent_tmp,
+                    agent_tmp: &agent_tmp,
                 }),
             Backend::Codex { region } => {
                 self.session
@@ -140,7 +156,7 @@ impl Execute for Cli {
                         prompt,
                         log,
                         model_arg,
-                        xdg_config_home: &self.agent_tmp,
+                        xdg_config_home: &agent_tmp,
                     })
             }
         };

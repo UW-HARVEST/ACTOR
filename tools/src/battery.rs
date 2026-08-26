@@ -696,6 +696,55 @@ impl Paths {
 
 #[cfg(test)]
 mod tests {
+    /// Three tools running at once must not write to one another's paths.
+    ///
+    /// The output paths are what a parallel sweep would CORRUPT rather than merely slow: two runs
+    /// sharing a results dir interleave their `summary.json`, and two sharing an evaluation tree
+    /// delete each other's crates mid-build. The agent's own scratch is per invocation, resolved
+    /// inside the runner from the work dir it was handed -- it was resolved from the machine-wide
+    /// work base, which every tool and every case shared.
+    #[test]
+    fn no_two_tools_share_an_output_or_evaluation_path() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let paths_for = |tool| {
+            Paths::new(
+                tmp.path(),
+                tool,
+                Variant::Default,
+                Dataset::TestCorpus,
+                Some("some/model-1"),
+                crate::store::Mode::ReadWrite,
+                crate::io::sandbox::Enforcement::AllowUnsandboxed,
+            )
+            .unwrap()
+        };
+        let tools = [Tool::Claude, Tool::Codex, Tool::Kiro, Tool::OpenCode];
+        let results: Vec<_> = tools.iter().map(|t| paths_for(*t).results_dir).collect();
+        let unique: std::collections::BTreeSet<_> = results.iter().collect();
+        assert_eq!(
+            unique.len(),
+            tools.len(),
+            "two tools share a results dir: {results:#?}"
+        );
+        // And an ablation of the SAME tool is a different run, so it needs its own too.
+        let base = paths_for(Tool::Claude).results_dir;
+        let ablated = Paths::new(
+            tmp.path(),
+            Tool::Claude,
+            Variant::NoIter,
+            Dataset::TestCorpus,
+            Some("some/model-1"),
+            crate::store::Mode::ReadWrite,
+            crate::io::sandbox::Enforcement::AllowUnsandboxed,
+        )
+        .unwrap()
+        .results_dir;
+        assert_ne!(
+            base, ablated,
+            "a prompt variant must not share the base run's dir"
+        );
+    }
+
     use super::*;
     use std::fs;
     use std::os::unix::fs as unix_fs;

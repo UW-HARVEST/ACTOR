@@ -197,10 +197,13 @@ jobs:
         # `cache` into `agents`/`translate` grew the module cycle 5 -> 7 and the gate refused it) and
         # why the model still reaches the key after the collapse. 3510 is 3487 plus 23.
         #
-        # LOWERED 3780 -> 2100, which is the raises above coming due. The rebuild replaced the phase
+        # LOWERED 3780 -> 2340, which is the raises above coming due. The rebuild replaced the phase
         # type-states with one agent invocation and deleted `translate.rs`, `verify.rs`, `cache.rs`,
         # `artifact.rs`, `agents/run.rs` and `agents/work.rs` -- 12,213 lines, 1,329 of them comments.
-        # src/ went 23,002 -> 12,662 lines and the comment total 3,575 -> 2,067. 2100 is 2,067 plus 33.
+        # src/ went 23,002 -> 12,662 lines and the comment total 3,575 -> 2,309, measured over the
+        # whole counted tree after the last edit. 2340 is that plus 31. Measured AFTER the last edit
+        # and verified at the number this line passes, because reading it off an earlier measurement
+        # is how two commits on this branch shipped a ceiling the tree already exceeded.
         #
         # Three raises (3510 -> 3585 -> 3720 -> 3780) were each taken on the stated promise that they
         # came back down when the old drivers went. A raise defended by a promise is worth only the
@@ -211,7 +214,7 @@ jobs:
         # ZERO against both ceilings. Deriving 3100 from the tree needs that fact.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 2100 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 2340 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is

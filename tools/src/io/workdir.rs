@@ -175,16 +175,6 @@ impl Roots {
     }
 }
 
-/// Scratch dir handed to the agent as `TMPDIR`: agent-generated test code calls
-/// `std::env::temp_dir()`, which is the `/tmp` tmpfs unless `TMPDIR` is set, and
-/// inside the work root that scratch is on disk and discarded with the case.
-pub fn agent_tmp(work_root: &Path) -> Result<PathBuf> {
-    let dir = work_root.join("tmp");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating agent TMPDIR {}", dir.display()))?;
-    Ok(dir)
-}
-
 /// `ulimit -f` argument capping any single file the agent writes. Backstop for
 /// agent code that hardcodes `/tmp` (30 files in the current corpus do), where
 /// `TMPDIR` cannot help: the write dies with SIGXFSZ, failing one case instead of
@@ -435,14 +425,6 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
             err.contains("cannot/nest"),
             "error should name the offending path, got: {err}"
         );
-    }
-
-    #[test]
-    fn agent_tmp_is_inside_the_work_root() {
-        let tmp = test_tempdir().unwrap();
-        let dir = agent_tmp(tmp.path()).unwrap();
-        assert!(dir.starts_with(tmp.path()));
-        assert!(dir.is_dir());
     }
 
     #[test]

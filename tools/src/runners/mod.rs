@@ -187,13 +187,6 @@ pub fn build(paths: &crate::battery::Paths, role: crate::prompt::Role) -> Result
         )
     })?;
     let secs = ceiling(paths.tool, role, paths.dataset);
-    let work_base = crate::io::workdir::base()?;
-    let agent_tmp = crate::io::workdir::agent_tmp(&work_base)?;
-    let settings = crate::io::sandbox::write_settings(crate::io::sandbox::Policy {
-        repo_root: &paths.repo_root,
-        work_root: &work_base,
-        enforcement: paths.enforcement,
-    })?;
     let (session, backend, program) = match paths.tool {
         Tool::Claude => (
             crate::agents::session::Session::claude(secs),
@@ -242,8 +235,8 @@ pub fn build(paths: &crate::battery::Paths, role: crate::prompt::Role) -> Result
             tool: paths.tool,
             model,
             cli_version: CliVersion::probe(program)?.as_str().to_string(),
-            agent_tmp,
-            settings,
+            repo_root: paths.repo_root.clone(),
+            enforcement: paths.enforcement,
         },
     })
 }
