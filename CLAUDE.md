@@ -61,6 +61,49 @@ serve digest/copy/scrub is not a peer module.
 **Do not add a function that duplicates an existing abstraction.** If the behaviour
 already exists (`Sealed::publish`), route to it instead of hand-rolling a second copy.
 
+### Storage
+
+The target design for the store. Where the code still disagrees, that is debt, not licence:
+`.cache/<SCHEMA>/<phase>/…`, the `failed/` subtree, and keying the toolchain and the recipe
+all predate these rules.
+
+**Git versions the layout; the layout does not version itself.** `SCHEMA` does one job three
+times — hashed into the key, a path level (`.cache/4/`), and a field in `meta.json` — and only
+the field earns it. A version level in every path buys nothing but side-by-side coexistence
+during a migration, which git already gives: 279,505 directory renames landed in one commit,
+re-keyed nothing, and were revertible throughout. Migrate into a fresh tree, keep the old one
+under another name until `reproduce.sh all` is green, then delete it. Keep ONE `format` field
+and refuse loudly on mismatch, so a reader never guesses at a layout it does not understand.
+
+**A phase is a function from a working dir and a prompt to a working dir.** The unit is the
+whole working directory — `c_src/` beside the translation, which may be empty — hashed as one
+tree with its contents uninspected. Verify's input IS translate's output, so the two are not
+different kinds of operation: `phase` is not key material, and there is ONE tree algorithm
+rather than a corpus one and an artifact one. Every tree that appears, as an input or an
+output, is stored once and referenced by hash.
+
+**Key the identity; path the rendering.** The key hashes raw identifiers (`claude`,
+`global.anthropic.claude-opus-5[1m]`); the path uses filesystem-safe slugs
+(`claude/claude-opus-5-1m`). `model_dir_slug` is lossy on purpose, and a lossy rendering used
+as key material is how `openai/gpt-5.4` came to name the directory `oneshot/4`. Renaming a
+directory must never re-key an entry.
+
+**Key only what changes the answer; pin and record the rest.** The toolchain is fixed by
+`rust-toolchain.toml`, so keying it strands every entry on a bump and proves nothing — refuse
+at preflight if the active one differs, and record it. #109 removed `cli` for exactly this.
+
+**Every run pins its model, and a sentinel is not a model.** kiro keyed
+`unpinned:kiro-cli-default` on a comment claiming kiro-cli takes no `--model`; it takes one,
+and because nothing passed it, 0 files under `results/Test-Corpus/kiro/` name a model and
+those rows are unattributable forever. Assert the flag on the command line, not on the
+transcript — a missing pin is invisible after the run.
+
+**One key addresses a set of attempts, so ambiguity is a refusal.** Agents are
+nondeterministic, and dropping `phase`, `toolchain` and `recipe` collapses more runs onto one
+key. A table records the exact output tree it was built from; a replay with no recorded pin
+serves the single completed attempt and REFUSES two. Silently picking one is how a published
+number changes under you.
+
 ### Testing
 
 **A test names a failure, not a function.** If you cannot say what breaks in the world
