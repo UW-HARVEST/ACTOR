@@ -6,10 +6,11 @@
 //! time in the transcript, after the run.
 
 use crate::agents::session::Session;
-use crate::cache::{CliVersion, ModelId};
+use crate::cache::CliVersion;
 use crate::cli::Agent;
 use crate::io::sandbox::Enforcement;
 use crate::io::workdir::Roots;
+use crate::store::ModelId;
 use anyhow::{Context, Result};
 use std::path::Path;
 

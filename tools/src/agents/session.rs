@@ -14,7 +14,7 @@
 //! PATHs already disagree about which `node` is found, and node is what runs claude
 //! and opencode.
 
-use crate::cache::ModelId;
+use crate::store::ModelId;
 use anyhow::Result;
 use std::path::Path;
 use std::process::Command;
@@ -305,7 +305,7 @@ impl Session {
         cwd: &Path,
         prompt: &str,
         log: &Path,
-        model: &crate::cache::ModelId,
+        model: &crate::store::ModelId,
     ) -> Command {
         let mut c = self.shell();
         c.arg(prompt).arg(log).arg(model.as_str()).current_dir(cwd);

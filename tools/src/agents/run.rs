@@ -8,9 +8,10 @@
 use crate::agents::work::IsolatedWorkDir;
 use crate::artifact::{Phase, Publishing, Translate, Verify};
 use crate::cache::{
-    AgentKey, Attempt, CliVersion, Failure, KeyInputs, Mode, ModelId, PromptDigest, RecipeDigest,
-    Resolved, Store, ToolchainId,
+    AgentKey, Attempt, CliVersion, Failure, KeyInputs, Mode, PromptDigest, RecipeDigest, Resolved,
+    Store, ToolchainId,
 };
+use crate::store::ModelId;
 use anyhow::Result;
 use std::path::Path;
 

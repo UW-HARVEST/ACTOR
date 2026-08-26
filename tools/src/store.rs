@@ -23,6 +23,30 @@ pub enum Mode {
     ReplayOnly,
 }
 
+/// The model the agent will actually use. Must be pinned before the run: `--agent
+/// claude` passes no `--model`, so the resolved model appears only in the log's `init`
+/// record, after the fact — and the CLI auto-updates, so an unkeyed model could hand
+/// back output produced by a different one.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ModelId(String);
+
+impl ModelId {
+    pub fn new(s: impl Into<String>) -> Result<Self> {
+        let s = s.into();
+        anyhow::ensure!(!s.trim().is_empty(), "model id must not be empty");
+        // It reaches a `bash -c` command line double-quoted (`[1m]` is a bracket
+        // glob), so refuse anything that could break out of those quotes.
+        anyhow::ensure!(
+            !s.contains('\'') && !s.contains('`') && !s.contains('$') && !s.contains('\n'),
+            "model id contains shell metacharacters: {s}"
+        );
+        Ok(Self(s))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A model id rendered as one path component, losslessly.
 ///
 /// Percent-encoded rather than sanitised: `claude-opus-5[1m]` and `claude-opus-5(1m)` must not
