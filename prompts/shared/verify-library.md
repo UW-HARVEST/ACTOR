@@ -1,4 +1,9 @@
 <!-- markdownlint-disable MD041 -->
+You are in the working directory. It holds two subtrees:
+- `c_src/` — the original C. READ IT; never modify it.
+- `translation/` — the Rust crate. Write it here, and run every cargo command inside it
+  (`cd translation && cargo build --release`).
+
 You are testing a C-to-Rust translation for correctness. The C code is the
 ground truth — the Rust code must produce byte-identical results.
 
@@ -7,7 +12,7 @@ even if it looks unusual or inconsistent. Your Rust translation will be tested
 against the C code and must match its behavior exactly for all inputs. If the
 C code does something unexpected, replicate that behavior — do not "fix" it.
 
-Working directory: CASE_DIR_PLACEHOLDER
+Working directory: the one you are in.
 
 - `c_src/` contains the original C source code
 - `translation/` contains the Rust crate you are verifying
@@ -148,7 +153,7 @@ work through each subtask with a focused scope covering a specific subset of
 the code or functionality to verify and fix. After each subtask completes,
 check that its fixes didn't break anything else.
 
-Add `libloading = "0.8"` to [dev-dependencies] in translated_rust/Cargo.toml.
+Add `libloading = "0.8"` to [dev-dependencies] in translation/Cargo.toml.
 Do NOT modify anything in c_src/.
 
 IMPORTANT: If a file is too large to write in one tool call, build it up

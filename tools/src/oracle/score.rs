@@ -21,9 +21,12 @@ pub enum Covers<'a> {
 }
 
 impl<'a> Covers<'a> {
-    pub fn from_include_regex(regex: Option<&'a str>) -> Self {
-        match regex {
-            Some(regex) => Self::Subset(regex),
+    /// From the run's resolved case filter -- which may have come from `--include-regex` OR from a case
+    /// named in the target. Reading only the flag is what let a `battery/case` run claim a whole-battery
+    /// roster.
+    pub fn of(filter: Option<&'a str>) -> Self {
+        match filter {
+            Some(filter) => Self::Subset(filter),
             None => Self::WholeBattery,
         }
     }

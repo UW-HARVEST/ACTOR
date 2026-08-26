@@ -115,7 +115,10 @@ pub struct Cli {
 impl Execute for Cli {
     fn execute(&self, work: &WorkDir, prompt: &str, log: &Path) -> Result<Ran> {
         let started = Instant::now();
-        let cwd = work.translation();
+        // The WORK ROOT, not the crate: the prompts describe `c_src/` and `translation/` as siblings
+        // and only the root resolves both. Standing in the crate made every `c_src/` reference a path
+        // that does not exist.
+        let cwd = work.root().to_path_buf();
         // Per INVOCATION, both of them, so three tools running at once cannot share an agent TMPDIR,
         // a settings file, or -- for opencode, whose `XDG_CONFIG_HOME` this is -- a credential store.
         // They were resolved from the machine-wide work base, which every tool and every case shared.

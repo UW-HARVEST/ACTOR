@@ -38,6 +38,9 @@ const ROOT_ONLY_IGNORED: &[&str] = &[
 /// it from the digest entirely.
 const ROOT_ONLY_IGNORED_DIRS: &[&str] = &["logs", ".claude"];
 
+/// The crate an agent writes, beside [`C_ORACLE_DIR`]. Here because `is_ignored` needs it.
+pub(crate) const TRANSLATION_DIR: &str = "translation";
+
 /// The C oracle. Nothing under it is ever [`Disposition::Ignore`]:
 /// [`crate::artifact::Scrubbed::seal`] grades a run by comparing this subtree file by file
 /// before and after, so a rule firing inside it hides a change to the reference. 26 real
@@ -70,6 +73,10 @@ pub fn classify(rel: &RelPath, in_build_dir: bool) -> Disposition {
 }
 
 fn is_ignored(p: &Path) -> bool {
+    // The published crate's root is an artifact root too. The scorer writes `result.json` INTO the
+    // crate AFTER the tree is sealed, so anchored at the working-dir root alone the next run published
+    // it into verify's input tree and verify's key moved every run: `1 hit / 1 run` for ever.
+    let p = p.strip_prefix(TRANSLATION_DIR).unwrap_or(p);
     let mut components = p.components().map(|c| c.as_os_str());
     let Some(first) = components.next() else {
         return false;
@@ -108,6 +115,39 @@ mod tests {
             Disposition::Ignore
         );
         assert_eq!(classify(&rel("src/x.rs.bak"), false), Disposition::Ignore);
+    }
+
+    /// The scorer writes `result.json` INTO the published crate after the tree is sealed, so the next
+    /// run carries it into verify's input tree and verify's key moves: a second step that can never
+    /// replay. Measured on `bin2hex_lib` -- two invocations, three input trees.
+    #[test]
+    fn harness_bookkeeping_inside_the_published_crate_is_not_hashed() {
+        for at in [
+            "result.json",
+            "translation/result.json",
+            "translation/harvest_bench_report.json",
+            "translation/logs/verify.log",
+        ] {
+            assert_eq!(
+                classify(&rel(at), false),
+                Disposition::Ignore,
+                "{at} is the harness's own output and must stay outside the digest"
+            );
+        }
+        // ...without swallowing the translation itself: `result.json` deeper down is the translated
+        // program's own file, which is why the rule is anchored at all.
+        for at in [
+            "translation/src/lib.rs",
+            "translation/Cargo.toml",
+            "translation/src/result.json",
+            "translation/src/logs/mod.rs",
+        ] {
+            assert_eq!(
+                classify(&rel(at), false),
+                Disposition::StoreAndHash,
+                "{at} is the agent's work and must be inside the digest"
+            );
+        }
     }
 
     /// The harness writes its bookkeeping at the phase-dir root. The same NAME deeper in

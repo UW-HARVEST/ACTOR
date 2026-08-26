@@ -1,4 +1,9 @@
 <!-- markdownlint-disable MD041 -->
+You are in the working directory. It holds two subtrees:
+- `c_src/` — the original C. READ IT; never modify it.
+- `translation/` — the Rust crate. Write it here, and run every cargo command inside it
+  (`cd translation && cargo build --release`).
+
 You are testing a C-to-Rust translation for correctness. The C code is the
 ground truth — the Rust program must produce byte-identical output for the same
 inputs.
@@ -8,7 +13,7 @@ even if it looks unusual or inconsistent. Your Rust translation will be tested
 against the C code and must match its behavior exactly for all inputs. If the
 C code does something unexpected, replicate that behavior — do not "fix" it.
 
-Working directory: CASE_DIR_PLACEHOLDER
+Working directory: the one you are in.
 
 - `c_src/` contains the original C source code
 - `translation/` contains the Rust crate you are verifying

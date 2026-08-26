@@ -23,23 +23,26 @@ impl InScope {
     pub fn derive(
         bench: &dyn Benchmark,
         paths: &Paths,
-        target: &str,
+        scope: &Scope,
         resolved: &Resolved,
     ) -> Result<(Self, crate::analyse::report::Attested)> {
         let mut attested = crate::analyse::report::Attested::default();
         let mut units = Vec::new();
-        for unit in bench.batteries(paths, target)? {
-            match bench.attests(paths, &unit, resolved) {
+        for unit in scope.units() {
+            // The run's own filter, so "every case" means every case the run COVERS: against the
+            // unfiltered roster a one-case run is out of scope for the cases it never asked for.
+            match bench.attests(paths, unit, scope.filter(), resolved) {
                 Ok(()) => {
-                    attested.insert(paths, &unit);
-                    units.push(unit);
+                    attested.insert(paths, unit);
+                    units.push(unit.clone());
                 }
                 Err(why) => println!("\u{23ed}\u{fe0f}  {unit}: out of scope — {why}"),
             }
         }
         anyhow::ensure!(
             !units.is_empty(),
-            "the store serves no unit of {target} in full, so this run can publish nothing"
+            "the store serves no unit of {} in full, so this run can publish nothing",
+            scope.units().join(", ")
         );
         Ok((Self(units), attested))
     }
@@ -97,7 +100,13 @@ pub trait Benchmark {
     /// May this unit's number be PUBLISHED? Only if EVERY case came from a keyed replay: one case the
     /// store cannot name leaves the number resting on an artifact nothing attests, and counting the
     /// attested subset would be a smaller denominator nobody asked for.
-    fn attests(&self, paths: &Paths, battery: &str, resolved: &Resolved) -> Result<()>;
+    fn attests(
+        &self,
+        paths: &Paths,
+        unit: &str,
+        filter: Option<&str>,
+        resolved: &Resolved,
+    ) -> Result<()>;
     fn test(&self, paths: &Preflighted, target: &str, scoring: &Scoring<'_>) -> Result<()>;
 
     /// Backfills result.json (unsafe/loc/credits); already folded into `test --update`,
@@ -177,28 +186,50 @@ pub(crate) fn parse_target(target: &str) -> (String, Option<String>) {
     }
 }
 
-/// Resolve a target and a flag into the units to run and the one case filter that applies.
-///
-/// One regex, because `battery::discover` applies one and this crate's `regex` has no lookahead to
-/// and two together. Naming a case in the target AND passing the flag is refused rather than resolved
-/// by preferring one: silently dropping either is a four-figure mistake at harvest-bench prices.
-pub fn scope(
-    bench: &dyn Benchmark,
-    paths: &Paths,
-    target: &str,
-    include_regex: Option<&str>,
-) -> Result<(Vec<String>, Option<String>)> {
-    match paths.dataset {
-        Dataset::TestCorpus => {
-            let (unit, from_target) = parse_target(target);
-            let filter = one_filter(from_target, include_regex)?;
-            Ok((bench.batteries(paths, &unit)?, filter))
-        }
-        // Harvest-bench's unit is a project, and nothing below it filters by case.
-        Dataset::HarvestBench => {
-            no_filter_here(include_regex)?;
-            Ok((bench.batteries(paths, target)?, None))
-        }
+/// What one run covers: which units to run, and which of each unit's cases. Resolved ONCE and handed to
+/// the chain, the publishability check and the scorer alike. Derived twice, a single-case run translated
+/// and verified correctly and then scored a battery literally named `B01_organic/bin2hex_lib`, found
+/// nothing, and refused -- after paying for both agents. One regex, because `battery::discover` applies
+/// one, so a case in the target AND the flag is refused.
+pub struct Scope {
+    units: Vec<String>,
+    filter: Option<String>,
+}
+
+impl Scope {
+    pub fn resolve(
+        bench: &dyn Benchmark,
+        paths: &Paths,
+        target: &str,
+        include_regex: Option<&str>,
+    ) -> Result<Self> {
+        let (units, filter) = match paths.dataset {
+            Dataset::TestCorpus => {
+                let (unit, from_target) = parse_target(target);
+                let filter = one_filter(from_target, include_regex)?;
+                (bench.batteries(paths, &unit)?, filter)
+            }
+            // Harvest-bench's unit is a project, and nothing below it filters by case.
+            Dataset::HarvestBench => {
+                no_filter_here(include_regex)?;
+                (bench.batteries(paths, target)?, None)
+            }
+        };
+        Ok(Self { units, filter })
+    }
+
+    pub fn units(&self) -> &[String] {
+        &self.units
+    }
+
+    pub fn filter(&self) -> Option<&str> {
+        self.filter.as_deref()
+    }
+
+    /// Which of a unit's cases the score may claim. From this one value rather than the flag, so a case
+    /// named in the TARGET narrows the roster exactly as `--include-regex` does.
+    pub fn covers(&self) -> oracle::Covers<'_> {
+        oracle::Covers::of(self.filter())
     }
 }
 
@@ -219,9 +250,16 @@ impl Benchmark for TestCorpus {
         resolve_batteries(&paths.corpus_dir, target)
     }
 
-    fn attests(&self, paths: &Paths, battery: &str, resolved: &Resolved) -> Result<()> {
+    fn attests(
+        &self,
+        paths: &Paths,
+        battery: &str,
+        filter: Option<&str>,
+        resolved: &Resolved,
+    ) -> Result<()> {
         let output_dir = paths.output_dir(battery);
-        let cases = battery::all_case_names(&battery::discover(&paths.corpus_dir, battery, None)?);
+        let cases =
+            battery::all_case_names(&battery::discover(&paths.corpus_dir, battery, filter)?);
         let missing = cases
             .iter()
             .filter(|n| !resolved.keys().any(|k| k.starts_with(output_dir.join(n))))
@@ -270,7 +308,13 @@ impl Benchmark for HarvestBench {
             .collect())
     }
 
-    fn attests(&self, paths: &Paths, project: &str, resolved: &Resolved) -> Result<()> {
+    fn attests(
+        &self,
+        paths: &Paths,
+        project: &str,
+        _filter: Option<&str>,
+        resolved: &Resolved,
+    ) -> Result<()> {
         let dir = paths.results_dir.join(project);
         anyhow::ensure!(
             resolved.keys().any(|k| k.starts_with(&dir)),
@@ -330,6 +374,42 @@ mod tests {
             text.contains("001_helloworld$") && text.contains("01[0-9]_"),
             "and the refusal must name both, or the operator cannot tell which to drop: {text}"
         );
+    }
+
+    /// The chain and the scorer must read ONE scope: both agents ran and were cached, then the oracle
+    /// looked for a battery named `B01_organic/bin2hex_lib` and refused, after the money was spent.
+    #[test]
+    fn a_case_named_in_the_target_narrows_the_unit_and_the_score_alike() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let paths = Paths::new(
+            tmp.path(),
+            crate::cli::Tool::Claude,
+            crate::cli::Variant::Default,
+            Dataset::TestCorpus,
+            None,
+            crate::store::Mode::ReadWrite,
+            crate::io::sandbox::Enforcement::AllowUnsandboxed,
+        )
+        .unwrap();
+
+        let one = Scope::resolve(&TestCorpus, &paths, "B01_organic/bin2hex_lib", None).unwrap();
+        assert_eq!(
+            one.units(),
+            ["B01_organic".to_string()],
+            "the unit is the BATTERY; the corpus holds no `B01_organic/bin2hex_lib` battery"
+        );
+        assert_eq!(one.filter(), Some("bin2hex_lib$"));
+        assert_eq!(
+            one.covers(),
+            oracle::Covers::Subset("bin2hex_lib$"),
+            "else the infra gate grades every case the run never asked for"
+        );
+
+        // Non-vacuous: a whole-battery target really does differ on both counts.
+        let whole = Scope::resolve(&TestCorpus, &paths, "B01_organic", None).unwrap();
+        assert_eq!(whole.units(), ["B01_organic".to_string()]);
+        assert_eq!(whole.filter(), None);
+        assert_eq!(whole.covers(), oracle::Covers::WholeBattery);
     }
 
     #[test]

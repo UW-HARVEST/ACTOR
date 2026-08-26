@@ -1,4 +1,9 @@
 <!-- markdownlint-disable MD041 -->
+You are in the working directory. It holds two subtrees:
+- `c_src/` — the original C. READ IT; never modify it.
+- `translation/` — the Rust crate. Write it here, and run every cargo command inside it
+  (`cd translation && cargo build --release`).
+
 Translate the **entire** C library in c_src/ to Rust. The Rust cdylib must
 export the **complete public ABI** of the C library and produce **byte-identical
 output** for the same inputs. Write Cargo.toml and src/ files in the current

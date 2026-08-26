@@ -210,8 +210,8 @@ pub(crate) fn visit(
 /// Siblings, not nested: with the C inside the crate a `build.rs` can CMake-build the original
 /// library and link it, and one published artifact did exactly that -- 881 `objcopy`-renamed symbols
 /// reached by naked-asm `jmp`, full marks at 1,013 lines against another agent's 27,044.
-pub const C_SRC: &str = "c_src";
-pub const TRANSLATION: &str = "translation";
+pub const C_SRC: &str = crate::domain::contents::C_ORACLE_DIR;
+pub const TRANSLATION: &str = crate::domain::contents::TRANSLATION_DIR;
 
 /// A directory an agent may run in.
 ///

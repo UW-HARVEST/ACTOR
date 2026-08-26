@@ -232,22 +232,51 @@ pub fn dir_for(repo_root: &Path, tool: Tool) -> std::path::PathBuf {
     }
 }
 
-/// The text of the prompt for this step, or `None` where the tool reads none.
+const FLAGS: &str = "CMAKE_BUILD_FLAGS";
+
+/// The `-D` flags the corpus builds this case's C with: the second `configurePresets` entry, the first
+/// being a hidden base. Deterministic from the corpus, so it belongs in the prompt hash -- two feature
+/// configurations of one source are two questions, and a prompt naming neither keys both to one entry.
+fn cmake_flags(case_inputs: &Path) -> String {
+    let Ok(text) = std::fs::read_to_string(case_inputs.join("CMakePresets.json")) else {
+        return String::new();
+    };
+    let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return String::new();
+    };
+    let Some(vars) = data
+        .pointer("/configurePresets/1/cacheVariables")
+        .and_then(|v| v.as_object())
+    else {
+        return String::new();
+    };
+    vars.iter()
+        .filter(|(k, _)| *k != "CMAKE_C_STANDARD" && *k != "CMAKE_BUILD_TYPE")
+        .map(|(k, v)| format!("-D{k}={}", v.as_str().unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The text of the prompt for this step, ready to hand an agent, or `None` where the tool reads none.
 ///
-/// A prompt that IS named but missing on disk is an error, never an empty string: an empty prompt
-/// invokes the agent with nothing to do and the result is then recorded as a measurement.
+/// A named prompt missing on disk is an error, never an empty string: an empty prompt invokes the agent
+/// with nothing to do and the result is recorded as a measurement. Substitution happens HERE so a call
+/// site cannot ship a placeholder -- the driver that replaced `verify.rs`'s `Rendering` step read the
+/// file directly and sent `CMAKE_BUILD_FLAGS` verbatim to a paid run. `CASE_DIR_PLACEHOLDER` is gone
+/// rather than substituted: naming the agent's scratch path would make every prompt hash a nonce.
 pub fn read(
     repo_root: &Path,
     tool: Tool,
     variant: Variant,
     role: Role,
     shape: Shape,
+    case_inputs: &Path,
 ) -> Result<Option<String>> {
     let Some(file) = file_for(tool, variant, role, shape) else {
         return Ok(None);
     };
     let own = dir_for(repo_root, tool);
-    Ok(Some(match body(tool, file) {
+    let text = match body(tool, file) {
         Body::OwnDir => read_part(&own.join(file))?,
         // Concatenated with no separator: the body keeps its own trailing newline, so the
         // composition is byte-for-byte what the two files were as one.
@@ -255,7 +284,8 @@ pub fn read(
             read_part(&repo_root.join("prompts/shared").join(file))?
                 + &read_part(&own.join(PROTOCOL_PART))?
         }
-    }))
+    };
+    Ok(Some(text.replace(FLAGS, &cmake_flags(case_inputs))))
 }
 
 #[cfg(test)]
@@ -362,6 +392,55 @@ mod tests {
             }
         }
         assert!(checked > 0, "this rule inspected nothing");
+    }
+
+    #[test]
+    fn no_prompt_reaches_an_agent_with_a_placeholder_left_in_it() {
+        // A paid run was handed the literal `CMAKE_BUILD_FLAGS` as a cmake argument.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("tools/ has a parent")
+            .to_path_buf();
+        let inputs = root.join("test-corpus/Public-Tests/B02_synthetic/macrodepth_add_5");
+        let mut checked = 0;
+        let mut saw_a_substitution = false;
+        for &tool in TOOLS {
+            for &variant in VARIANTS {
+                if supports(tool, variant).is_err() {
+                    continue;
+                }
+                for &shape in SHAPES {
+                    for &role in chain(tool, variant) {
+                        let Some(text) = read(&root, tool, variant, role, shape, &inputs).unwrap()
+                        else {
+                            continue;
+                        };
+                        let raw = file_for(tool, variant, role, shape)
+                            .map(|f| match body(tool, f) {
+                                Body::OwnDir => dir_for(&root, tool).join(f),
+                                Body::Shared => root.join("prompts/shared").join(f),
+                            })
+                            .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+                            .unwrap_or_default();
+                        if raw.contains(FLAGS) {
+                            saw_a_substitution = true;
+                        }
+                        for bad in [FLAGS, "PLACEHOLDER"] {
+                            assert!(
+                                !text.contains(bad),
+                                "{tool:?}/{variant:?}/{role:?}/{shape:?} still contains {bad}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 0, "this rule inspected nothing");
+        assert!(
+            saw_a_substitution,
+            "no prompt on disk carries {FLAGS}, so this proves nothing about substitution"
+        );
     }
 
     #[test]

@@ -50,16 +50,18 @@ impl ModelId {
 
 /// A model id rendered as one path component, losslessly.
 ///
-/// Percent-encoded rather than sanitised: `claude-opus-5[1m]` and `claude-opus-5(1m)` must not
-/// become the same directory, and a bracket in a directory name is a glob to every shell that walks
-/// `results/`. Nothing is stripped -- the vendor and region prefixes are part of the id, and
-/// dropping them is what let two ids collide.
+/// Escaped rather than sanitised: `claude-opus-5[1m]` and `claude-opus-5(1m)` must not become one
+/// directory, and a bracket is a glob to every shell that walks `results/`. Nothing is stripped --
+/// dropping the vendor prefix is what let `openai/gpt-5.4` name a directory `4`. `~` is the escape, NOT
+/// `%`: a percent anywhere in a path makes `rust-lld` fail to open its own output, so with `%5B1m%5D` in
+/// the model level every cdylib case failed to build at grading time and scored 0. The alphabet is
+/// `[A-Za-z0-9._~-]`, and escaping `~` itself keeps it injective.
 pub fn model_dir(model: &str) -> String {
     let mut out = String::with_capacity(model.len());
     for b in model.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => out.push_str(&format!("~{b:02x}")),
         }
     }
     out
@@ -501,12 +503,19 @@ mod tests {
             ids.len(),
             "two model ids share a directory: {dirs:#?}"
         );
+        // Injective is not sufficient: `%` in a path makes `rust-lld` fail to open its own output.
         for d in &dirs {
             assert!(
-                !d.contains('/') && !d.contains('[') && !d.contains(':'),
-                "{d} is not a single safe path component"
+                d.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._~-".contains(&b)),
+                "{d} leaves the alphabet the filesystem, cargo and the linker all accept"
             );
         }
+        // Non-vacuous: one of these ids must need escaping, or the rule above saw only plain ASCII.
+        assert!(
+            dirs.iter().any(|d| d.contains('~')),
+            "no id in this set exercises the escape, so injectivity proves nothing here"
+        );
     }
 
     #[test]

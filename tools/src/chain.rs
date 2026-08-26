@@ -63,7 +63,10 @@ pub fn run_unit(
                     return;
                 };
                 let (name, shape, lib_name) = describe(case, paths, unit);
-                let corpus_case = paths.input_dir(unit).join(&name).join("test_case");
+                // `CMakePresets.json` sits beside `test_case/`, so the prompt's build flags are read
+                // from the parent.
+                let case_inputs = paths.input_dir(unit).join(&name);
+                let corpus_case = case_inputs.join("test_case");
                 let case_dir = paths.case_dir(unit, &name);
                 let outcome = run_case(RunCase {
                     paths,
@@ -72,6 +75,7 @@ pub fn run_unit(
                     name: &name,
                     shape,
                     lib_name: lib_name.as_deref(),
+                    case_inputs: &case_inputs,
                     corpus_case: &corpus_case,
                     case_dir: &case_dir,
                     pool,
@@ -100,6 +104,7 @@ struct RunCase<'a> {
     name: &'a str,
     shape: Shape,
     lib_name: Option<&'a str>,
+    case_inputs: &'a Path,
     corpus_case: &'a Path,
     case_dir: &'a Path,
     pool: &'a crate::agents::Pool,
@@ -124,6 +129,7 @@ fn run_case(c: RunCase<'_>) -> Result<Vec<(PathBuf, Tree)>> {
             c.paths.variant,
             role,
             c.shape,
+            c.case_inputs,
         )?
         .with_context(|| {
             format!(

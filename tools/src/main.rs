@@ -38,7 +38,6 @@ fn main() -> Result<()> {
         } => {
             let dataset = Dataset::detect(target);
             let inner = Dataset::strip_prefix(target);
-            let covers = oracle::Covers::from_include_regex(include_regex.as_deref());
 
             // One thread per tool, each with its own budget: `--parallel 3` over three tools is three
             // in flight PER TOOL. Nothing is shared that a parallel run could corrupt -- each tool has
@@ -65,7 +64,6 @@ fn main() -> Result<()> {
                                 inner,
                                 steps,
                                 include_regex: include_regex.as_deref(),
-                                covers,
                                 parallel: cli.parallel,
                                 mode,
                                 enforcement,
@@ -153,7 +151,6 @@ struct RunTool<'a> {
     inner: &'a str,
     steps: Option<usize>,
     include_regex: Option<&'a str>,
-    covers: oracle::Covers<'a>,
     parallel: usize,
     mode: store::Mode,
     enforcement: harvest_tools::io::sandbox::Enforcement,
@@ -181,18 +178,19 @@ fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
 
     // ONE loop over the units, each running the whole chain. There is no translate pass and no verify
     // pass: a unit's cases go end to end, which is what `run_or_replay` being one function buys.
-    let (units, filter) = benchmark::scope(bench.as_ref(), &paths, r.inner, r.include_regex)?;
+    let scope = benchmark::Scope::resolve(bench.as_ref(), &paths, r.inner, r.include_regex)?;
     let mut resolved = eval::Resolved::new();
-    for unit in &units {
-        let ran = chain::run_unit(&paths, &store, unit, filter.as_deref(), r.steps, &pool)?;
+    for unit in scope.units() {
+        let ran = chain::run_unit(&paths, &store, unit, scope.filter(), r.steps, &pool)?;
         resolved.extend(ran.resolved);
     }
     println!("{} {}", cli::tool_dir(r.tool), store.tally_line());
 
-    let (scope, attested) = benchmark::InScope::derive(bench.as_ref(), &paths, r.inner, &resolved)?;
+    let (publishable, attested) =
+        benchmark::InScope::derive(bench.as_ref(), &paths, &scope, &resolved)?;
     let all_roles = harvest_tools::prompt::chain(r.tool, r.variant);
     let roles = &all_roles[..r.steps.map_or(all_roles.len(), |n| n.min(all_roles.len()))];
-    for unit in scope.units() {
+    for unit in publishable.units() {
         run_test(
             bench.as_ref(),
             &paths,
@@ -202,7 +200,7 @@ fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
                 keep: r.keep,
                 roles,
                 resolved: &resolved,
-                covers: r.covers,
+                covers: scope.covers(),
             },
         )?;
     }
@@ -315,6 +313,7 @@ mod tests {
             &self,
             _paths: &battery::Paths,
             _battery: &str,
+            _filter: Option<&str>,
             _resolved: &harvest_tools::eval::Resolved,
         ) -> Result<()> {
             Ok(())
