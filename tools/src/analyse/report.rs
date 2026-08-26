@@ -48,6 +48,11 @@ struct BatteryRow {
     unsafe_lines: u32,
 }
 
+/// Kiro's PUBLISHED results. Literal, not `AgentKey::dir()`: these rows predate model pinning and 0 of
+/// their files name a model. ONE constant because three places spelled this path, the migration missed
+/// one, and `\CostPOne` vanished from numbers.tex with `macros_used.txt` absent to catch it.
+const KIRO_PUBLISHED: &str = "results/Test-Corpus/kiro/unrecorded";
+
 /// How one run is spelled in the two places that disagree: `label` is what a table's Agent column
 /// prints, `dir` is where its artifacts live. One `String` was both until the store grew a model level.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -69,7 +74,6 @@ impl Run {
 pub struct Attested(std::collections::BTreeSet<(Run, String)>);
 
 impl Attested {
-    /// Takes the KEY, so a caller cannot pair one run's label with another's path.
     pub fn insert(&mut self, agent: &crate::cache::AgentKey, unit: &str) {
         self.0.insert((
             Run {
@@ -181,8 +185,7 @@ pub fn generate(repo_root: &Path, attested: &Attested) -> Result<()> {
     let mut rows: Vec<BatteryRow> = Vec::new();
 
     // Attested-driven like `generate_harvest_bench`: the tree is `<harness>/<model>/<battery>` keyed
-    // and `<baseline>/<battery>` for the docker arms, so no fixed-depth walk reads both and a guessing
-    // one reads a model level as a battery.
+    // and `<baseline>/<battery>` for the docker arms, so no fixed-depth walk reads both.
     for (run, battery) in attested.entries() {
         {
             let agent = run.label();
@@ -417,16 +420,14 @@ pub fn generate(repo_root: &Path, attested: &Attested) -> Result<()> {
     //      that trips no other invariant and is indistinguishable from a genuine
     //      baseline zero. kiro-translate is absent here on purpose: it is the
     //      virtual no-validate agent, covered by the invariant just below.
-    // Literal, not `AgentKey::dir()`: these are the dirs the PUBLISHED rows were built from, and
-    // kiro's predate model pinning -- 0 of its files name a model, so nothing can derive `unrecorded`.
-    for agent in [
-        "kiro/unrecorded",
-        "claude/claude-opus-5-1m",
-        "codex/gpt-5.4",
+    for dir in [
+        KIRO_PUBLISHED,
+        "results/Test-Corpus/claude/claude-opus-5-1m",
+        "results/Test-Corpus/codex/gpt-5.4",
     ] {
         anyhow::ensure!(
-            results_dir.join(agent).is_dir(),
-            "TRACTOR agent-dir invariant failed: results/Test-Corpus/{agent} is missing \
+            repo_root.join(dir).is_dir(),
+            "TRACTOR agent-dir invariant failed: {dir} is missing \
              (a rename would silently emit a 0/338 row). Fix the mapping or restore the dir."
         );
     }
@@ -921,8 +922,7 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
         .map(|r| r.total_loc)
         .sum();
     // (label, results dir, translated-Rust-kLOC denominator)
-    let cost_rows: &[(&str, &str, u32)] =
-        &[("Tractor", "results/Test-Corpus/kiro", tractor_rust_loc)];
+    let cost_rows: &[(&str, &str, u32)] = &[("Tractor", KIRO_PUBLISHED, tractor_rust_loc)];
     for (name, base, rust_loc) in cost_rows {
         let cost = kiro_cost(&repo_root.join(base));
         let credits = cost.credits.as_f64();
@@ -952,7 +952,7 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
             cost.verify_credits.as_f64() / credits * 100.0
         ));
     }
-    let p01 = kiro_cost(&repo_root.join("results/Test-Corpus/kiro/P01_sphincs_plus"));
+    let p01 = kiro_cost(&repo_root.join(KIRO_PUBLISHED).join("P01_sphincs_plus"));
     if p01.credits.as_f64() > 0.0 {
         o.push_str(&format!(
             "\\newcommand{{\\CostPOne}}{{{:.2}}}\n",
