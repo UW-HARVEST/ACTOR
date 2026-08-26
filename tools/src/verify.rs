@@ -1,5 +1,5 @@
 use crate::agents::exit::{clear_agent_exit, observed_exit, record_agent_exit};
-use crate::agents::invocation::{Backend, Invocation, KIRO_UNPINNED_MODEL};
+use crate::agents::invocation::{Backend, Invocation, KIRO_MODEL};
 use crate::agents::run::{run_cached, Outcome, PhaseRun, SkipCheck};
 use crate::agents::session::{ClaudeRun, Session};
 use crate::agents::work::IsolatedWorkDir;
@@ -550,7 +550,7 @@ fn verify_invocation(paths: &Paths, budget: Budget) -> Result<Option<Invocation>
     let inv = match paths.agent {
         Agent::Kiro => Invocation {
             backend: Backend::Kiro,
-            model: ModelId::new(KIRO_UNPINNED_MODEL)?,
+            model: ModelId::new(KIRO_MODEL)?,
             cli: CliVersion::probe("kiro-cli")?,
             session: Session::kiro(budget.secs(KIRO_VERIFY_TIMEOUT_SECS)),
         },
@@ -750,7 +750,7 @@ fn run_verify_agent(
         Backend::Kiro => {
             let status = inv
                 .session
-                .kiro_command(work.root(), prompt, log_path)
+                .kiro_command(work.root(), prompt, log_path, &inv.model)
                 .status()
                 .context("invoking kiro-cli for verification")?;
             record_agent_exit(status);

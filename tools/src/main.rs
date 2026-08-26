@@ -303,7 +303,7 @@ mod tests {
         paths
             .repo_root
             .join(eval::EVAL_DIR)
-            .join(paths.agent_key.as_str())
+            .join(paths.agent_key.dir())
     }
 
     struct Refusing;

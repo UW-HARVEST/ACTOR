@@ -46,21 +46,25 @@ pub fn artifact_root<P: Phase>(artifact: &Published<P>) -> PathBuf {
 
 pub struct Tree {
     root: PathBuf,
+    /// `.eval` itself, so [`Drop`] prunes the harness level without walking out of it.
+    eval_root: PathBuf,
     keep: Keep,
 }
 
 impl Tree {
     pub fn create_empty(paths: &Paths, keep: Keep) -> Result<Self> {
-        let root = paths
-            .repo_root
-            .join(EVAL_DIR)
-            .join(paths.agent_key.as_str());
+        let eval_root = paths.repo_root.join(EVAL_DIR);
+        let root = eval_root.join(paths.agent_key.dir());
         if root.exists() {
             std::fs::remove_dir_all(&root)
                 .with_context(|| format!("emptying {}", root.display()))?;
         }
         std::fs::create_dir_all(&root)?;
-        Ok(Self { root, keep })
+        Ok(Self {
+            root,
+            eval_root,
+            keep,
+        })
     }
 
     pub fn scope(&self, name: &str) -> Result<Scope<'_>> {
@@ -87,6 +91,15 @@ impl Drop for Tree {
             ),
             Keep::Discard => {
                 let _ = std::fs::remove_dir_all(&self.root);
+                // The root is `<harness>/<model>`, so removing it leaves the harness level standing
+                // and `reproduce.sh` refuses that. `remove_dir` only succeeds on an empty directory.
+                let mut dir = self.root.parent();
+                while let Some(d) = dir {
+                    if d == self.eval_root || std::fs::remove_dir(d).is_err() {
+                        break;
+                    }
+                    dir = d.parent();
+                }
             }
         }
     }
@@ -274,6 +287,35 @@ mod tests {
     }
 
     #[test]
+    fn a_discarded_tree_leaves_nothing_at_all_under_eval() {
+        // `remove_dir_all(root)` left the harness level standing the moment the root became
+        // `<harness>/<model>`, so a run that replayed every phase failed its own cleanliness check.
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("results")).unwrap();
+        fs::create_dir_all(tmp.path().join("test-corpus")).unwrap();
+        let paths = paths_at(tmp.path());
+        let eval = tmp.path().join(EVAL_DIR);
+
+        let tree = Tree::create_empty(&paths, Keep::Discard).unwrap();
+        tree.scope("B01").unwrap();
+        assert!(
+            paths.agent_key.dir().contains('/'),
+            "non-vacuous only if the fixture's key really has a model level: {}",
+            paths.agent_key.dir()
+        );
+        assert!(
+            eval.join(paths.agent_key.dir()).is_dir(),
+            "fixture must build it"
+        );
+        drop(tree);
+
+        let left: Vec<PathBuf> = fs::read_dir(&eval)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "left standing under .eval/: {left:?}");
+    }
+
+    #[test]
     fn the_tree_is_created_empty_and_the_crate_in_it_is_no_symlink_into_results() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("results")).unwrap();
@@ -283,7 +325,7 @@ mod tests {
         let planted = tmp
             .path()
             .join(EVAL_DIR)
-            .join(paths.agent_key.as_str())
+            .join(paths.agent_key.dir())
             .join("B01/leftover/translated_rust");
         fs::create_dir_all(&planted).unwrap();
         fs::write(planted.join("Cargo.toml"), "[package]").unwrap();

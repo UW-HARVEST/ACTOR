@@ -10,7 +10,7 @@ use crate::cache::{CliVersion, ModelId};
 use crate::cli::Agent;
 use crate::io::sandbox::Enforcement;
 use crate::io::workdir::Roots;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 
 /// The model every `--agent claude` invocation is pinned to.
@@ -74,10 +74,18 @@ pub fn assert_pins_honoured(log_path: &Path, want: &ModelId, cli: &CliVersion) -
     Ok(())
 }
 
-/// kiro-cli takes no `--model` and reports none in its prose transcript, so no honest
-/// model id exists to key. Named as unpinned rather than filled in with a plausible
-/// one, which is what the claude default used to do.
-pub(crate) const KIRO_UNPINNED_MODEL: &str = "unpinned:kiro-cli-default";
+/// The model every `--agent kiro` invocation is pinned to, passed as `kiro-cli chat --model`.
+///
+/// This was the sentinel `unpinned:kiro-cli-default`, on the belief that kiro-cli takes no `--model`.
+/// It does. So every kiro row published before this pin came from whichever model the picker had last
+/// made active, and nothing under `results/Test-Corpus/kiro/` records which -- 0 of its files name a
+/// model, which is why those results live under `unrecorded/`.
+pub(crate) const KIRO_MODEL: &str = "claude-opus-5";
+
+/// Kimi takes no `--model`: `kimi_translate_case` passes `None` and this is what its Bedrock call
+/// carries. Beside the other model constants, not in `translate`, or `agents -> translate` merges two
+/// module cycles into one of seven.
+pub(crate) const KIMI_MODEL: &str = "moonshotai.kimi-k2.5";
 
 /// Which CLI runs an agentic phase. An enum rather than a `bool` keeps each phase's
 /// invocation `match` exhaustive over the backends that exist, with no second list of agent
@@ -149,6 +157,48 @@ pub(crate) fn codex_model(agent: Agent) -> Option<(&'static str, &'static str)> 
         Agent::CodexGpt56Sol => Some(("openai.gpt-5.6-sol", "us-east-2")),
         _ => None,
     }
+}
+
+/// THE model an agent will be asked for, or `None` where it runs none at all.
+///
+/// One definition, because there were two: `resolve_launch` and `verify_invocation` each carried this
+/// mapping, so a model could differ between an agent's two phases and the key would record the
+/// divergence as two unrelated entries. The pairing test held the BACKEND halves together and said
+/// nothing about the models.
+///
+/// `None` is not "unknown": c2rust transpiles and the docker arms drive their own pipelines, so no
+/// model is asked for. Exhaustive, so a new agent decides rather than inheriting.
+pub(crate) fn resolved_model(agent: Agent, model_flag: Option<&str>) -> Result<Option<ModelId>> {
+    Ok(Some(match agent {
+        Agent::Kiro => ModelId::new(KIRO_MODEL)?,
+        Agent::Claude
+        | Agent::ClaudeCombined
+        | Agent::ClaudeMinimal
+        | Agent::ClaudeNoIter
+        | Agent::ClaudeNoFeatures
+        | Agent::ClaudeNoSubtask
+        | Agent::ClaudeCrossPrompt => claude_model()?,
+        Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::CodexGpt56Sol => ModelId::new(
+            codex_model(agent)
+                .context("codex_model has no entry for a codex variant")?
+                .0,
+        )?,
+        Agent::OpenCode => ModelId::new(
+            crate::agents::opencode::parse_model(model_flag.unwrap_or_default())?.as_arg(),
+        )?,
+        // `--model` is part of oneshot's identity; main.rs rejects it missing.
+        Agent::Oneshot => ModelId::new(
+            model_flag.context("--agent oneshot is driven by --model <provider>/<model-id>")?,
+        )?,
+        // Kimi takes no `--model`: `kimi_translate_case` passes `None` and the id is fixed in
+        // `translate::BEDROCK_MODEL_ID`. Named here rather than left `None`, because "runs no model"
+        // is a different statement from "runs one this table does not surface".
+        Agent::Kimi => ModelId::new(KIMI_MODEL)?,
+        // No model is asked for, so none belongs in a key or a path.
+        Agent::C2rust | Agent::Laertes | Agent::C2SaferRust | Agent::SmartC2Rust => {
+            return Ok(None)
+        }
+    }))
 }
 
 pub fn has_verify_phase(agent: Agent) -> bool {

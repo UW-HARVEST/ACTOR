@@ -114,12 +114,19 @@ where
     let input_tree = work.input_digest().clone();
     // Taken before `work` moves into `compute`.
     let seed = work.seed().clone();
+    // Two reads of one table agree by construction, but a key naming a model the agent did not run
+    // is silent corruption. Checked, not assumed.
+    anyhow::ensure!(
+        agent.model() == Some(model),
+        "the key would record model {:?} while the agent runs {}",
+        agent.model().map(|m| m.as_str()),
+        model.as_str()
+    );
     let inputs = KeyInputs {
         // From the phase itself, never a `&str` the caller passes: a literal that disagreed
         // with the `P` the store writes the entry under would key one phase as another.
         phase: P::DIR,
         agent,
-        model,
         toolchain,
         prompt,
         recipe,
@@ -281,9 +288,14 @@ mod tests {
                 work_base: None,
                 home: None,
             };
+            // Resolved ONCE and shared: the fixture had `claude-opus-5[1m]` beside a key resolving
+            // `global.anthropic.claude-opus-5[1m]`, which `inputs` now refuses.
+            let resolved = crate::agents::invocation::resolved_model(Agent::Claude, None)
+                .unwrap()
+                .expect("claude runs a model");
             Self {
-                agent: AgentKey::new(Agent::Claude, None).unwrap(),
-                model: ModelId::new("claude-opus-5[1m]").unwrap(),
+                agent: AgentKey::new(Agent::Claude, None, Some(resolved.clone())).unwrap(),
+                model: resolved,
                 // Probed from a fake CLI rather than fabricated: `CliVersion` exists to
                 // name a build that was observed.
                 cli: CliVersion::probe(&fake_program(
@@ -309,7 +321,6 @@ mod tests {
             KeyInputs {
                 phase: P::DIR,
                 agent: &self.agent,
-                model: &self.model,
                 toolchain: &self.toolchain,
                 prompt: &self.prompt,
                 recipe: &self.recipe,
@@ -577,7 +588,10 @@ mod tests {
         );
 
         // Non-vacuity: the entry served was the one THIS key names, not whatever was stored.
+        // Both, and consistently: the key reads the model off the agent, and `inputs` refuses a
+        // PhaseRun whose model disagrees with it.
         keys.model = ModelId::new("claude-sonnet-5").unwrap();
+        keys.agent = AgentKey::for_test(keys.agent.as_str(), "claude-sonnet-5").unwrap();
         const OTHER: &str = "pub fn a() { /* another model translated this */ }";
         let (second, ran) = translate_once(&case, &corpus, &log, &keys, &store, OTHER);
         assert!(
@@ -793,10 +807,11 @@ mod tests {
         let filed = store.failures().unwrap();
         assert_eq!(filed.len(), 1, "one failed run, one record: {filed:?}");
         let (phase, who, key, attempt) = &filed[0];
+        let run_dir = keys.agent.dir();
         assert_eq!(
             (phase.as_str(), who.as_str(), attempt.as_str()),
-            (VERIFIED, keys.agent.as_str(), "1"),
-            "filed under the phase and agent that failed, as attempt 1: {filed:?}"
+            (VERIFIED, run_dir.as_str(), "1"),
+            "filed under the phase and RUN that failed, as attempt 1: {filed:?}"
         );
         let kept = f
             .repo

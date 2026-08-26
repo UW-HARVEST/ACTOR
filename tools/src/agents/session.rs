@@ -134,8 +134,10 @@ impl Session {
             agent_env: &[],
             script: String::new(),
         };
+        // `--model` is not optional: kiro-cli's default is whatever the picker last made active, so an
+        // unpinned invocation keys one model and runs another.
         let script = format!(
-            "{} chat --no-interactive --trust-all-tools --agent kiro_plain \"$1\" \
+            "{} chat --no-interactive --trust-all-tools --agent kiro_plain --model \"$3\" \"$1\" \
              < /dev/null 2>&1 | tee \"$2\"",
             s.prefix(),
         );
@@ -298,9 +300,15 @@ impl Session {
         c
     }
 
-    pub fn kiro_command(&self, cwd: &Path, prompt: &str, log: &Path) -> Command {
+    pub fn kiro_command(
+        &self,
+        cwd: &Path,
+        prompt: &str,
+        log: &Path,
+        model: &crate::cache::ModelId,
+    ) -> Command {
         let mut c = self.shell();
-        c.arg(prompt).arg(log).current_dir(cwd);
+        c.arg(prompt).arg(log).arg(model.as_str()).current_dir(cwd);
         c
     }
 
@@ -352,6 +360,8 @@ mod tests {
         vec![
             Session::claude(10_800),
             Session::kiro(2_700),
+            // Was absent, so every rule below silently exempted the backend it was added for.
+            Session::codex(10_800),
             Session::opencode(crate::agents::opencode::Phase::Verify, 10_800),
         ]
     }
@@ -503,6 +513,21 @@ mod tests {
         for s in all() {
             let rest = s.script.replace("< /dev/null", "");
             assert!(!rest.contains('/'), "{}: {rest}", s.program);
+        }
+    }
+
+    #[test]
+    fn no_session_invokes_its_cli_without_pinning_the_model() {
+        // kiro's script carried no model flag while its key recorded one, so every published kiro row
+        // came from whichever model the picker had last made active. A missing pin is invisible after
+        // the run, so it is asserted on the command line rather than on the transcript.
+        for s in all() {
+            assert!(
+                s.script.contains("--model \"$") || s.script.contains("-c model=\"$"),
+                "{} runs unpinned: {}",
+                s.program,
+                s.script
+            );
         }
     }
 

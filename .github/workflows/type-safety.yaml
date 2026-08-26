@@ -189,12 +189,35 @@ jobs:
         # evidence lost. The tree is 14.66% comment against a 20% ratio ceiling, so density is not the
         # thing moving. 3470 is 3434 plus 36. Prune or raise deliberately, never quietly.
         #
+        # RAISED 3470 -> 3510 for the AgentKey/model collapse. `KeyInputs` carried `agent` and `model`
+        # as separate fields, so a caller could pair one run's agent with another run's model and the
+        # key recorded the mismatch as a legitimate entry -- and a fixture already did exactly that,
+        # pairing a claude key resolving `global.anthropic.claude-opus-5[1m]` with the literal
+        # `claude-opus-5[1m]`. The 40 lines document why the resolution is INJECTED (reaching from
+        # `cache` into `agents`/`translate` grew the module cycle 5 -> 7 and the gate refused it) and
+        # why the model still reaches the key after the collapse. 3510 is 3487 plus 23.
+        #
+        # RAISED 3510 -> 3585 for the `<harness>/<model>` store layout, and what the lines buy is three
+        # naming defects that were each invisible on disk. `bare_model_id` stripped "the vendor prefix"
+        # as everything-before-the-first-dot, so `openai/gpt-5.4` slugged to `4` and the directory was
+        # `oneshot/4`; `results_slug` had shipped the same rule. kiro resolved a SENTINEL,
+        # `unpinned:kiro-cli-default`, which the same function cut at the colon into a directory named
+        # `kiro/unpinned`. And kiro's session script carried no `--model` at all while its key recorded
+        # one, so every published kiro row came from whichever model the picker had last made active --
+        # `claude-opus-4.7` when this was found, unrecoverable for the rows already published, because 0
+        # files under `results/Test-Corpus/kiro/` name a model. That is why those results now sit under
+        # `kiro/unrecorded/` rather than being relabelled with a model nobody recorded. The rest
+        # documents why the layout is two levels and why the collapse did not re-key: same bytes, same
+        # order, 279,505 files renamed and not one entry recomputed. 14 lines of duplication were pruned
+        # first -- the vendor-strip story was told twice and is now told once, on the test that names the
+        # failure. 3585 is the tree WITH these self-counting lines in it, 3575, plus 10.
+        #
         # .py is in neither HASH nor SLASH, so the budget does not count itself: this
         # script's own docstring and all 250 lines of tools/test_comment_budget.py cost
         # ZERO against both ceilings. Deriving 3100 from the tree needs that fact.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 3470 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 3585 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is
