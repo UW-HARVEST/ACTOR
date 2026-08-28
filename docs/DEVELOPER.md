@@ -6,7 +6,14 @@ Separate instructions exist for [Evaluation benchmarks and results](#evaluation-
 
 ## Requirements
 
+ACTOR cannot be run in a sandboxed environment on macOS because there are no macOS versions of the
+  dependencies used to sandbox an agent (see below).
+ACTOR can be run in unsandboxed mode with the `--allow-unsandboxed` flag.
+
 - [Rust and the `Cargo` package manager](https://rust-lang.org/tools/install/)
+- For sandboxing:
+  - [`socat`](https://linux.die.net/man/1/socat)
+  - [bubblewrap (`bwrap`)](https://github.com/containers/bubblewrap)
 
 ## Command-line Tools
 
