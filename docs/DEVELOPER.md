@@ -73,6 +73,22 @@ harvest-tools --agent claude --replay-only run all
 harvest-tools --agent kiro run B01_synthetic/001_helloworld
 ```
 
+## FAQs
+
+> I can't delete the `.cache` folder that's generated during translation!
+
+When ACTOR generates a cache,
+  it unsets the write bit.
+Even if you appear to have the permissions to modify a folder that it generates
+  (check with `ls -la`),
+  you may be barred from certain operations.
+
+Run the following command to reset write permissions:
+
+```sh
+% chmod -R u+w <FOLDER_PATH>
+```
+
 ## License
 
 Copyright 2026 HARVEST Developers. See [LICENSE](../LICENSE).
