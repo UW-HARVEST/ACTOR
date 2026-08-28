@@ -37,6 +37,15 @@ One-shot LLM agents require API keys:
 - `--agent kimi`: AWS Bedrock access (account `121913092579` via `ada-auth`)
 - `--agent oneshot`: `OPENROUTER_API_KEY` environment variable
 
+## Configuring Different Models for Claude Code
+
+To run translation with the non-default model for Claude Code ([configured here](../tools/src/agents/invocation.rs)),
+    run the following command:
+
+```sh
+% HARVEST_CLAUDE_MODEL=claude-sonnet-5 harvest-tools --agent claude translate <TARGET>
+```
+
 ## Evaluation Benchmarks and Results
 
 From the root of `ACTOR`, run:
