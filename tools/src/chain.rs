@@ -28,6 +28,9 @@ use std::path::{Path, PathBuf};
 pub struct Ran {
     pub resolved: Resolved,
     pub failures: Vec<String>,
+    /// Cases whose provider declined on content grounds. Scored as failures, counted separately: a
+    /// refusal is a fact about the provider's policy, not about the translation.
+    pub refused: Vec<String>,
 }
 
 /// Run the chain for every case of one unit.
@@ -54,6 +57,7 @@ pub fn run_unit(
     let collected: std::sync::Mutex<Ran> = std::sync::Mutex::new(Ran {
         resolved: Resolved::new(),
         failures: Vec::new(),
+        refused: Vec::new(),
     });
 
     std::thread::scope(|scope| {
@@ -95,7 +99,10 @@ pub fn run_unit(
                 });
                 let mut out = collected.lock().expect("collected results");
                 match outcome {
-                    Ok(published) => out.resolved.extend(published),
+                    Ok(done) => {
+                        out.resolved.extend(done.published);
+                        out.refused.extend(done.refused);
+                    }
                     Err(e) => {
                         println!("  \u{274c} {name}: {e:#}");
                         out.failures.push(name);
@@ -130,12 +137,20 @@ struct RunCase<'a> {
 /// The tree returned by each step is the tree handed to the next. Nothing consults the filesystem to
 /// find the previous step's output: reading `verified/` off disk is what once scored a five-day-old
 /// artifact as this run's.
-fn run_case(c: RunCase<'_>) -> Result<Vec<(PathBuf, Tree)>> {
+/// What one case's chain produced. A struct rather than a tuple of two `Vec`s, which transpose
+/// silently.
+struct CaseOutcome {
+    published: Vec<(PathBuf, Tree)>,
+    refused: Vec<String>,
+}
+
+fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
     let work_base = crate::io::workdir::base()?;
     let mut tree = WorkDir::assemble(c.corpus_case)
         .with_context(|| format!("laying out a working dir for {}", c.name))?
         .seal()?;
     let mut published = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
 
     for &role in c.roles {
         let text = prompt::read(
@@ -172,6 +187,23 @@ fn run_case(c: RunCase<'_>) -> Result<Vec<(PathBuf, Tree)>> {
         };
         let after = match produced {
             Produced::Done { after, .. } => after,
+            // A provider refusal is an ANSWER, not a lost entry. It is terminal and reproducible, so
+            // the case is scored as a failure rather than voiding the whole battery the way a
+            // transport blip does: one codex refusal discarded all 85 of its B01_synthetic cases.
+            // Publishing nothing is what makes it a failure -- the oracle finds `translated_rust/`
+            // with no crate in it, records a build failure, and the denominator stays whole.
+            Produced::DidNotComplete(record)
+                if matches!(record.outcome, crate::store::Outcome::Refused { .. }) =>
+            {
+                println!(
+                    "  \u{1f6ab} {}: {role:?} refused by the provider: {:?}",
+                    c.name, record.outcome
+                );
+                let empty = reseal(&phase_dir, c.corpus_case)?;
+                published.push((phase_dir.clone(), empty));
+                refused.push(format!("{}/{role:?}", c.name));
+                break;
+            }
             Produced::DidNotComplete(record) => {
                 anyhow::bail!(
                     "the {role:?} step did not complete: {:?}",
@@ -203,7 +235,7 @@ fn run_case(c: RunCase<'_>) -> Result<Vec<(PathBuf, Tree)>> {
             published.push((follower_dir, follower_tree));
         }
     }
-    Ok(published)
+    Ok(CaseOutcome { published, refused })
 }
 
 /// Write the step's crate into the results tree. Only the translation: `c_src/` is the pinned corpus

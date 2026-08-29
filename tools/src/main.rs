@@ -180,11 +180,24 @@ fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
     // pass: a unit's cases go end to end, which is what `run_or_replay` being one function buys.
     let scope = benchmark::Scope::resolve(bench.as_ref(), &paths, r.inner, r.include_regex)?;
     let mut resolved = eval::Resolved::new();
+    let mut refused: Vec<String> = Vec::new();
     for unit in scope.units() {
         let ran = chain::run_unit(&paths, &store, unit, scope.filter(), r.steps, &pool)?;
         resolved.extend(ran.resolved);
+        refused.extend(ran.refused);
     }
     println!("{} {}", cli::tool_dir(r.tool), store.tally_line());
+    // Counted where the tally is, so a refusal cannot be read as a translation failure. A
+    // C-to-Rust memory-safety corpus earns these: B01_synthetic alone holds 12 cases named for
+    // buffer overflows, and codex's classifier declined one of them.
+    if !refused.is_empty() {
+        println!(
+            "{} \u{1f6ab} provider refusals: {} ({})",
+            cli::tool_dir(r.tool),
+            refused.len(),
+            refused.join(", ")
+        );
+    }
 
     let (publishable, attested) =
         benchmark::InScope::derive(bench.as_ref(), &paths, &scope, &resolved)?;

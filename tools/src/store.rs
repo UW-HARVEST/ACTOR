@@ -187,8 +187,19 @@ pub struct AgentRecord {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Outcome {
     Completed,
-    Infra { reason: String, detail: String },
-    Unknown { why: String },
+    Infra {
+        reason: String,
+        detail: String,
+    },
+    /// The provider declined on content grounds. The field is `refusal`, not `kind`, because `kind` is
+    /// this enum's own serde tag and the two collide at compile time.
+    Refused {
+        refusal: crate::domain::health::RefusalKind,
+        detail: String,
+    },
+    Unknown {
+        why: String,
+    },
 }
 
 impl From<&crate::domain::health::Health> for Outcome {
@@ -198,6 +209,10 @@ impl From<&crate::domain::health::Health> for Outcome {
             Health::Completed => Outcome::Completed,
             Health::Infra { reason, detail } => Outcome::Infra {
                 reason: reason.clone(),
+                detail: detail.clone(),
+            },
+            Health::Refused { kind, detail } => Outcome::Refused {
+                refusal: kind.clone(),
                 detail: detail.clone(),
             },
             Health::Unknown { why } => Outcome::Unknown { why: why.clone() },

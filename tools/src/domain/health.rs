@@ -61,9 +61,25 @@ pub enum Health {
     /// Did not finish for a reason outside the thing being measured: auth, rate
     /// limiting, transport, or a truncated log.
     Infra { reason: String, detail: String },
+    /// The PROVIDER declined the work on content grounds. Terminal and reproducible, unlike `Infra`:
+    /// the same prompt over the same C is refused again, so a retry cannot help and the case has a
+    /// definitive answer. Separated because one codex refusal on
+    /// `030_mutable_buffer_overlap_extrahard_lib` voided all 85 of its B01_synthetic cases as though a
+    /// network blip had lost an entry -- and a C-to-Rust MEMORY-SAFETY corpus will keep earning these:
+    /// B01_synthetic alone holds 12 cases named for buffer overflows.
+    Refused { kind: RefusalKind, detail: String },
     /// No evidence either way (kiro logs are not stream-json; results predating
     /// this module have no terminal record). Not a failure.
     Unknown { why: String },
+}
+
+/// Why a provider declined. A named enum, not a string, so a second spelling of the same refusal
+/// cannot appear in the counter.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalKind {
+    /// The provider's own safety classifier flagged the request. codex names it in its `message`.
+    HighRiskCyberActivity,
 }
 
 impl Health {
@@ -75,6 +91,15 @@ impl Health {
 
     pub fn is_infra(&self) -> bool {
         matches!(self, Health::Infra { .. })
+    }
+
+    /// A refusal the provider will repeat. NOT `is_infra`: the infra gate exists to stop a transport
+    /// failure being scored as a measurement, and this IS a measurement.
+    pub fn refusal(&self) -> Option<&RefusalKind> {
+        match self {
+            Health::Refused { kind, .. } => Some(kind),
+            _ => None,
+        }
     }
 }
 
@@ -124,6 +149,18 @@ pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
 
 /// The shape `translate::scan_codex_log_for_transient_error` reads, for the same reason: codex exits 0
 /// after Bedrock drops a conversation, so the exit status proves nothing and only this record does.
+/// The provider's own marker for a content refusal, matched in ONE place.
+///
+/// Keyed on the stable documentation URL rather than the prose, which is a marketing string. Shared by
+/// every transcript dialect: a refusal is a fact about the provider, not about the log format.
+fn provider_refusal(message: &str) -> Option<RefusalKind> {
+    let m = message.to_ascii_lowercase();
+    (m.contains("/guides/safety-checks")
+        || m.contains("flagged for potentially high-risk")
+        || m.contains("high-risk cyber activity"))
+    .then_some(RefusalKind::HighRiskCyberActivity)
+}
+
 fn classify_codex_json(tail: &str) -> Health {
     let completed = tail.contains(r#""type":"turn.completed""#);
     let failed = tail.contains(r#""type":"turn.failed""#);
@@ -131,10 +168,14 @@ fn classify_codex_json(tail: &str) -> Health {
         return Health::Completed;
     }
     if failed {
+        let detail =
+            last_str(tail, "message").unwrap_or_else(|| "codex reported turn.failed".into());
+        if let Some(kind) = provider_refusal(&detail) {
+            return Health::Refused { kind, detail };
+        }
         return Health::Infra {
             reason: "turn.failed".into(),
-            detail: last_str(tail, "message")
-                .unwrap_or_else(|| "codex reported turn.failed".into()),
+            detail,
         };
     }
     // Neither: the process died mid-turn, exactly as a truncated stream-json log did.
@@ -237,6 +278,41 @@ fn first_line_of_result(tail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The provider declining on content grounds is a MEASUREMENT, not an infrastructure failure.
+    /// Classified as `Infra`, codex's one refusal on `030_mutable_buffer_overlap_extrahard_lib`
+    /// discarded all 85 of its B01_synthetic cases through `attests`, exactly as a lost entry would.
+    /// The message below is verbatim from that transcript.
+    #[test]
+    fn a_provider_content_refusal_is_not_an_infrastructure_failure() {
+        let tail = concat!(
+            r#"{"type":"turn.failed","error":{"message":"This request has been flagged for "#,
+            r#"potentially high-risk cyber activity. Learn more here: "#,
+            r#"https://platform.openai.com/docs/guides/safety-checks/cybersecurity"}}"#,
+        );
+        let h = classify(tail, LogFormat::CodexJson, Exit::Failure { code: Some(1) });
+        assert_eq!(
+            h.refusal(),
+            Some(&RefusalKind::HighRiskCyberActivity),
+            "got {h:?}"
+        );
+        assert!(
+            !h.is_infra(),
+            "the infra gate stops a transport failure being scored; this must not trip it"
+        );
+        assert!(!h.is_completed(), "and it certainly did not complete");
+
+        // Non-vacuous: an ordinary turn.failed with no refusal marker is still Infra.
+        let plain = classify(
+            r#"{"type":"turn.failed","error":{"message":"upstream connect error"}}"#,
+            LogFormat::CodexJson,
+            Exit::Failure { code: Some(1) },
+        );
+        assert!(
+            plain.is_infra() && plain.refusal().is_none(),
+            "got {plain:?}"
+        );
+    }
 
     /// Verbatim shape of a real credential-expiry terminal record.
     const DEAD: &str = r#"{"type":"system","subtype":"api_retry","attempt":4,"error_status":403}
