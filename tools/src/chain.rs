@@ -62,7 +62,18 @@ pub fn run_unit(
                 let Some(case) = queue.lock().expect("case queue").next() else {
                     return;
                 };
-                let (name, shape, lib_name, followers) = describe(case, paths, unit);
+                // A case the corpus cannot describe is that case's failure, not the run's: the
+                // other workers keep going and this one is reported by name.
+                let described = match describe(case, paths, unit) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let mut out = collected.lock().expect("collected results");
+                        println!("  \u{274c} describing a case of {unit}: {e:#}");
+                        out.failures.push(format!("{unit}/<undescribable>"));
+                        continue;
+                    }
+                };
+                let (name, shape, artifact, followers) = described;
                 // `CMakePresets.json` sits beside `test_case/`, so the prompt's build flags are read
                 // from the parent.
                 let case_inputs = paths.input_dir(unit).join(&name);
@@ -74,7 +85,7 @@ pub fn run_unit(
                     roles,
                     name: &name,
                     shape,
-                    lib_name: lib_name.as_deref(),
+                    artifact: &artifact,
                     case_inputs: &case_inputs,
                     corpus_case: &corpus_case,
                     case_dir: &case_dir,
@@ -105,7 +116,7 @@ struct RunCase<'a> {
     roles: &'a [Role],
     name: &'a str,
     shape: Shape,
-    lib_name: Option<&'a str>,
+    artifact: &'a crate::transform::Artifact,
     case_inputs: &'a Path,
     corpus_case: &'a Path,
     case_dir: &'a Path,
@@ -178,7 +189,7 @@ fn run_case(c: RunCase<'_>) -> Result<Vec<(PathBuf, Tree)>> {
         // Publish, then transform. The transform is deterministic and outside the cache, so the tree
         // the NEXT step keys on is `transform(after)` and not `after` itself.
         publish(&after, &phase_dir, c.corpus_case)?;
-        crate::transform::post_process(&phase_dir, c.shape, c.lib_name.unwrap_or(c.name))?;
+        crate::transform::post_process(&phase_dir, c.artifact)?;
         tree = reseal(&phase_dir, c.corpus_case)?;
         published.push((phase_dir.clone(), tree.clone()));
 
@@ -211,26 +222,53 @@ fn reseal(phase_dir: &Path, corpus_case: &Path) -> Result<Tree> {
     work.seal()
 }
 
-/// Name, shape, lib name, and the followers this case stands for. Dropping the followers here is why
-/// any battery with a shared-source group published nothing: `attests` refuses a unit served in part.
+/// Name, prompt shape, ARTIFACT shape, and the followers this case stands for.
+///
+/// Two separate shapes on purpose. Dropping the followers here is why any battery with a
+/// shared-source group published nothing, and collapsing the two shapes is why every such group lost
+/// its `driver`.
 fn describe(
     case: &Case,
     paths: &Paths,
     unit: &str,
-) -> (String, Shape, Option<String>, Vec<battery::Config>) {
-    match case {
-        Case::Independent(c) => (
-            c.name.clone(),
-            Shape::of(c.is_lib, false),
-            battery::extract_lib_name(&paths.input_dir(unit), &c.name),
-            Vec::new(),
-        ),
-        // One invocation for the real case; its followers are derived by a transform, not re-run.
+) -> Result<(
+    String,
+    Shape,
+    crate::transform::Artifact,
+    Vec<battery::Config>,
+)> {
+    let input_dir = paths.input_dir(unit);
+    Ok(match case {
+        Case::Independent(c) => {
+            let artifact = if c.is_lib {
+                // The case-dir name IS the right lib name where the corpus runner names no other:
+                // `cando2`'s short-form `harness!` resolves `lib<case>.so`.
+                crate::transform::Artifact::Cdylib {
+                    lib_name: battery::extract_lib_name(&input_dir, &c.name)
+                        .unwrap_or_else(|| c.name.clone()),
+                }
+            } else {
+                crate::transform::Artifact::Driver
+            };
+            (
+                c.name.clone(),
+                Shape::of(c.is_lib, false),
+                artifact,
+                Vec::new(),
+            )
+        }
+        // One invocation for the real case; its followers are derived by a transform, not re-run --
+        // and the real case is the TEMPLATE they are derived from, so it keeps both targets.
         Case::SharedSource(g) => (
             g.real_case.clone(),
             Shape::Shared,
-            battery::extract_lib_name(&paths.input_dir(unit), &g.real_case),
+            crate::transform::Artifact::Template {
+                default_features: battery::extract_features_from_path(
+                    &input_dir.join(&g.real_case).join("CMakePresets.json"),
+                )?,
+                needs_driver: !g.real_case.ends_with("_lib"),
+            },
             g.configs.clone(),
         ),
-    }
+    })
 }

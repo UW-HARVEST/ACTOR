@@ -220,11 +220,14 @@ jobs:
         # cases, and the rationale on `ceiling` for why it no longer takes a tool -- kiro's 2_700s verify
         # limit cost it five batteries while its median session was the FASTEST of the three, and under
         # that ceiling claude would have lost 47 of 415 sessions. Delete those and the next operator
-        # restores the per-tool ceiling on the reasoning this run disproved. Pruned first: the two docs
-        # went from 18 lines to 11, and the new test's inline commentary is gone. 2404 is the tree with this
-        # change and these ten SELF-COUNTING lines in it, measured after writing them -- not "plus
-        # epsilon" -- and `--max-ratio 20` against a 16.4% tree still stops sprawl.
-          python3 tools/comment_budget.py --max-comments 2404 --max-ratio 20
+        # restores the per-tool ceiling on the reasoning this run disproved. Third, `transform::Artifact`,
+        # which splits what the ORACLE expects from which prompt a case gets -- collapsing them stripped
+        # `[[bin]] driver` from every shared-source group, killing 48 of P01's 128 cases and all 3
+        # macrodepth ones. Pruned first: the docs went from 18 lines to 11 and the tests' inline
+        # commentary is gone. 2437 is the tree with this change and these twelve SELF-COUNTING lines in
+        # it, measured after writing them -- not "plus epsilon" -- and `--max-ratio 20` against a 16.4%
+        # tree still stops sprawl.
+          python3 tools/comment_budget.py --max-comments 2437 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is

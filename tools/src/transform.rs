@@ -12,7 +12,6 @@
 //! other direction.
 
 use crate::analyse::cargo_toml::{self, CargoToml};
-use crate::prompt::Shape;
 use crate::tree::{Tree, C_SRC, TRANSLATION};
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -22,27 +21,66 @@ use std::path::Path;
 pub const SCORED_CRATE_DIR: &str = "translated_rust";
 pub const VECTORS_DIR: &str = "test_vectors";
 
+/// What the ORACLE expects to find, which is a different question from which prompt the case gets.
+///
+/// `Shape` answers the prompt question and must keep `Shared`; this answers the artifact question.
+/// Collapsing the two is what stripped `[[bin]] name = "driver"` from every shared-source group's
+/// crate: `runtests` picks lib-vs-exec from the case-dir's `_lib` suffix alone, so one group's crate
+/// is graded by BOTH runners and 48 of P01's 128 cases plus all 3 macrodepth cases died on a missing
+/// `driver`.
+pub enum Artifact {
+    /// One cdylib, named by the corpus runner rather than by the agent.
+    Cdylib { lib_name: String },
+    /// The oracle runs `target/release/driver`.
+    Driver,
+    /// A shared-source group's real case: the template every follower is derived from, so it carries
+    /// BOTH targets and keeps the agent's own `crate-type`. Ported from the pre-rewrite
+    /// `translate_one_shared`, which deliberately did not reshape it.
+    Template {
+        default_features: Vec<String>,
+        needs_driver: bool,
+    },
+}
+
 /// Normalise a published crate so the scorer can build it.
 ///
-/// Deterministic from the case: the lib name comes from the corpus runner, not from the agent, and
-/// the `[workspace]` stanza stops cargo absorbing the crate into a parent workspace. Idempotent, so
-/// applying it twice is applying it once.
-pub fn post_process(crate_dir: &Path, shape: Shape, lib_name: &str) -> Result<()> {
+/// Deterministic from the case: the lib name comes from the corpus runner, not the agent, and
+/// `[workspace]` stops cargo absorbing the crate into a parent. Idempotent.
+pub fn post_process(crate_dir: &Path, artifact: &Artifact) -> Result<()> {
     let cargo_path = crate_dir.join("Cargo.toml");
     if !cargo_path.exists() {
         return Ok(());
     }
     let mut cargo = CargoToml::open(&cargo_path)?;
     cargo.add_workspace();
-    match shape {
-        Shape::Library | Shape::Shared => {
+    match artifact {
+        Artifact::Cdylib { lib_name } => {
             cargo.remove_bin();
             cargo.set_lib(lib_name);
             cargo.save()?;
             cargo_toml::strip_for_lib(crate_dir)?;
         }
-        Shape::Executable => {
+        Artifact::Driver => {
             cargo.set_bin_driver();
+            cargo.save()?;
+        }
+        Artifact::Template {
+            default_features,
+            needs_driver,
+        } => {
+            // The real case's OWN configuration. Without it the crate is published under whichever
+            // features the agent defaulted to and graded against another configuration's vectors --
+            // live, P01's real case carried `default = ["haraka","robust","128s"]` against
+            // blake/simple/128f test vectors.
+            let resolved = crate::battery::resolve_features(&cargo_path, default_features)?;
+            if !resolved.is_empty() {
+                cargo.set_default_features(&resolved);
+            }
+            // Never `remove_bin`/`set_lib`/`strip_for_lib` here: not renaming the lib is what keeps
+            // the agent's `crate-type = ["cdylib", "rlib"]`, and the bin needs the rlib to link.
+            if *needs_driver {
+                cargo.set_bin_driver();
+            }
             cargo.save()?;
         }
     }
@@ -186,6 +224,88 @@ mod tests {
 
     /// The follower must be the SAME crate with its own features selected -- and must exist at all,
     /// which is what was missing: `attests` voided B02_synthetic over 2 followers, P01 over 127.
+    /// A shared-source group's real case is the TEMPLATE its followers are derived from, and one crate
+    /// is graded by both runners -- `runtests` picks lib-vs-exec from the case-dir's `_lib` suffix, not
+    /// from anything in the crate. Reshaping it as a library stripped `[[bin]] name = "driver"` and
+    /// `src/main.rs`, so 48 of P01's 128 cases and all 3 macrodepth cases died on a missing `driver`.
+    #[test]
+    fn a_shared_source_template_keeps_both_targets_and_its_own_features() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let dir = tmp.path().join("005_real/translated");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"sphincs_plus\"\nedition = \"2021\"\n\n             [lib]\nname = \"sphincs_plus\"\ncrate-type = [\"cdylib\", \"rlib\"]\n\n             [[bin]]\nname = \"driver\"\npath = \"src/main.rs\"\n\n             [features]\ndefault = [\"haraka\"]\nblake = []\nsimple = []\nharaka = []\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("tests/t.rs"), "#[test] fn t() {}\n").unwrap();
+
+        post_process(
+            &dir,
+            &Artifact::Template {
+                default_features: vec!["blake".into(), "simple".into()],
+                needs_driver: true,
+            },
+        )
+        .unwrap();
+
+        let toml = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+        let doc: toml_edit::DocumentMut = toml.parse().unwrap();
+        assert!(
+            doc.get("bin").is_some(),
+            "the driver bin must survive: {toml}"
+        );
+        assert!(
+            dir.join("src/main.rs").is_file(),
+            "and so must its source -- strip_for_lib deletes it"
+        );
+        let ct: Vec<String> = doc["lib"]["crate-type"]
+            .as_array()
+            .expect("crate-type")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            ct.contains(&"rlib".to_string()),
+            "the bin links the lib, so rlib must survive: {ct:?}"
+        );
+        assert_eq!(
+            doc["lib"]["name"].as_str().unwrap(),
+            "sphincs_plus",
+            "the lib must NOT be renamed to the case dir: `005_real` is not a Rust identifier"
+        );
+        let default: Vec<String> = doc["features"]["default"]
+            .as_array()
+            .expect("default")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            default,
+            vec!["blake".to_string(), "simple".to_string()],
+            "the real case's OWN preset features must be selected, not the agent's default"
+        );
+
+        // Non-vacuous: the Cdylib arm really does strip all of that, which is what was happening.
+        let lib_dir = tmp.path().join("as_lib/translated");
+        crate::tree::copy_plain(&dir, &lib_dir).unwrap();
+        post_process(
+            &lib_dir,
+            &Artifact::Cdylib {
+                lib_name: "renamed".into(),
+            },
+        )
+        .unwrap();
+        let lt: toml_edit::DocumentMut = std::fs::read_to_string(lib_dir.join("Cargo.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(lt.get("bin").is_none() && !lib_dir.join("src/main.rs").exists());
+    }
+
     #[test]
     fn a_follower_is_the_real_crate_rebuilt_under_its_own_features() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
@@ -287,12 +407,18 @@ mod tests {
         let work = tree.materialise(&case.join("test_case")).unwrap();
         let crate_dir = work.translation();
 
-        post_process(&crate_dir, Shape::Library, "pow43_lib").unwrap();
+        let artifact = Artifact::Cdylib {
+            lib_name: "pow43_lib".into(),
+        };
+        post_process(&crate_dir, &artifact).unwrap();
         let once = std::fs::read_to_string(crate_dir.join("Cargo.toml")).unwrap();
         assert!(once.contains("pow43_lib"), "{once}");
         assert!(once.contains("[workspace]"), "{once}");
 
-        post_process(&crate_dir, Shape::Library, "pow43_lib").unwrap();
+        let artifact = Artifact::Cdylib {
+            lib_name: "pow43_lib".into(),
+        };
+        post_process(&crate_dir, &artifact).unwrap();
         let twice = std::fs::read_to_string(crate_dir.join("Cargo.toml")).unwrap();
         assert_eq!(once, twice, "the transform must be idempotent");
     }
