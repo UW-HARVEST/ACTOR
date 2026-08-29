@@ -138,21 +138,22 @@ pub fn log_format(tool: Tool) -> crate::domain::health::LogFormat {
     }
 }
 
-/// A step's wall-clock ceiling.
+/// A step's wall-clock ceiling. Deliberately NOT a function of the tool.
 ///
-/// One table for both roles and both datasets, so a chain's steps cannot be given ceilings that
-/// disagree by accident. harvest-bench projects are whole libraries: `libpng` translate measured
-/// 4.71 h, `mujs` verify 6.5 h and `zstd` verify 4.4 h, which is why theirs is a day and the
-/// test-corpus cases' is hours.
-pub fn ceiling(tool: Tool, role: crate::prompt::Role, dataset: crate::cli::Dataset) -> u64 {
+/// A per-tool ceiling makes the ceiling part of the measurement. kiro was given 2_700s for verify
+/// against the others' 43_200s, and it cost kiro five batteries: not because kiro is slow -- its
+/// median session was the FASTEST of the three at 4.5m, and it tracked codex to p90 -- but because a
+/// 45m limit kills the tail. Under that same ceiling claude would have lost 47 of 415 sessions
+/// (11.3%) and codex 7 of 417, against kiro's 12. Taking `tool` out of the signature is what makes
+/// that unrepresentable rather than a value to keep in agreement.
+///
+/// harvest-bench projects are whole libraries: `libpng` translate measured 4.71 h, `mujs` verify
+/// 6.5 h and `zstd` verify 4.4 h, which is why theirs is a day and the test-corpus cases' is hours.
+pub fn ceiling(role: crate::prompt::Role, dataset: crate::cli::Dataset) -> u64 {
     use crate::cli::Dataset;
     use crate::prompt::Role;
     match (dataset, role) {
         (Dataset::HarvestBench, _) => 86_400,
-        // kiro's own session limits are far shorter than the others', and a ceiling above them only
-        // turns a refusal into a silent truncation.
-        (Dataset::TestCorpus, Role::Translate) if tool == Tool::Kiro => 5_400,
-        (Dataset::TestCorpus, Role::Verify) if tool == Tool::Kiro => 2_700,
         (Dataset::TestCorpus, Role::Translate) => 10_800,
         (Dataset::TestCorpus, Role::Verify) => 43_200,
     }
@@ -195,7 +196,7 @@ pub fn build(paths: &crate::battery::Paths, role: crate::prompt::Role) -> Result
             crate::cli::tool_dir(paths.tool)
         )
     })?;
-    let secs = ceiling(paths.tool, role, paths.dataset);
+    let secs = ceiling(role, paths.dataset);
     let (session, backend, program) = match paths.tool {
         Tool::Claude => (
             crate::agents::session::Session::claude(secs),

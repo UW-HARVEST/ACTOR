@@ -62,7 +62,7 @@ pub fn run_unit(
                 let Some(case) = queue.lock().expect("case queue").next() else {
                     return;
                 };
-                let (name, shape, lib_name) = describe(case, paths, unit);
+                let (name, shape, lib_name, followers) = describe(case, paths, unit);
                 // `CMakePresets.json` sits beside `test_case/`, so the prompt's build flags are read
                 // from the parent.
                 let case_inputs = paths.input_dir(unit).join(&name);
@@ -78,6 +78,8 @@ pub fn run_unit(
                     case_inputs: &case_inputs,
                     corpus_case: &corpus_case,
                     case_dir: &case_dir,
+                    followers: &followers,
+                    unit,
                     pool,
                 });
                 let mut out = collected.lock().expect("collected results");
@@ -107,6 +109,8 @@ struct RunCase<'a> {
     case_inputs: &'a Path,
     corpus_case: &'a Path,
     case_dir: &'a Path,
+    followers: &'a [battery::Config],
+    unit: &'a str,
     pool: &'a crate::agents::Pool,
 }
 
@@ -176,7 +180,17 @@ fn run_case(c: RunCase<'_>) -> Result<Vec<(PathBuf, Tree)>> {
         publish(&after, &phase_dir, c.corpus_case)?;
         crate::transform::post_process(&phase_dir, c.shape, c.lib_name.unwrap_or(c.name))?;
         tree = reseal(&phase_dir, c.corpus_case)?;
-        published.push((phase_dir, tree.clone()));
+        published.push((phase_dir.clone(), tree.clone()));
+
+        // Per step: `attests` is checked per role, so a follower must be served for each one.
+        for cfg in c.followers {
+            let follower_dir = c.paths.case_dir(c.unit, &cfg.name).join(role.dir());
+            crate::transform::propagate_config(&phase_dir, &follower_dir, cfg)
+                .with_context(|| format!("deriving {} from {} for {role:?}", cfg.name, c.name))?;
+            let follower_corpus = c.paths.input_dir(c.unit).join(&cfg.name).join("test_case");
+            let follower_tree = reseal(&follower_dir, &follower_corpus)?;
+            published.push((follower_dir, follower_tree));
+        }
     }
     Ok(published)
 }
@@ -197,19 +211,26 @@ fn reseal(phase_dir: &Path, corpus_case: &Path) -> Result<Tree> {
     work.seal()
 }
 
-/// Name, shape and the lib name the oracle's runner expects, per case.
-fn describe(case: &Case, paths: &Paths, unit: &str) -> (String, Shape, Option<String>) {
+/// Name, shape, lib name, and the followers this case stands for. Dropping the followers here is why
+/// any battery with a shared-source group published nothing: `attests` refuses a unit served in part.
+fn describe(
+    case: &Case,
+    paths: &Paths,
+    unit: &str,
+) -> (String, Shape, Option<String>, Vec<battery::Config>) {
     match case {
         Case::Independent(c) => (
             c.name.clone(),
             Shape::of(c.is_lib, false),
             battery::extract_lib_name(&paths.input_dir(unit), &c.name),
+            Vec::new(),
         ),
         // One invocation for the real case; its followers are derived by a transform, not re-run.
         Case::SharedSource(g) => (
             g.real_case.clone(),
             Shape::Shared,
             battery::extract_lib_name(&paths.input_dir(unit), &g.real_case),
+            g.configs.clone(),
         ),
     }
 }

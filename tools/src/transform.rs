@@ -49,6 +49,54 @@ pub fn post_process(crate_dir: &Path, shape: Shape, lib_name: &str) -> Result<()
     Ok(())
 }
 
+/// Derive a shared-source follower from the crate its group's real case produced: one translation,
+/// rebuilt under each follower's CMake features and graded against its own vectors. Deterministic, so
+/// it stays outside the cache. Without it `attests` voids the battery -- 2 followers cost B02_synthetic
+/// all three tools, and P01_sphincs_plus is 127 of 128 cases.
+pub fn propagate_config(
+    real_dir: &Path,
+    follower_dir: &Path,
+    cfg: &crate::battery::Config,
+) -> Result<()> {
+    anyhow::ensure!(
+        real_dir != follower_dir,
+        "refusing to derive {} onto itself",
+        real_dir.display()
+    );
+    anyhow::ensure!(
+        real_dir.join("Cargo.toml").is_file(),
+        "{} published no crate, so nothing can be derived from it",
+        real_dir.display()
+    );
+    // Replace, not merge: a stale follower would keep files this translation no longer has.
+    if follower_dir.exists() {
+        std::fs::remove_dir_all(follower_dir)
+            .with_context(|| format!("clearing {}", follower_dir.display()))?;
+    }
+    crate::tree::copy_plain(real_dir, follower_dir)
+        .with_context(|| format!("deriving {}", follower_dir.display()))?;
+
+    let cargo_path = follower_dir.join("Cargo.toml");
+    let mut cargo = CargoToml::open(&cargo_path)?;
+    // Only features the crate defines: a CMake variable the agent did not model as a cargo feature
+    // would otherwise fail the build for a reason that is not the translation's fault.
+    let resolved = crate::battery::resolve_features(&cargo_path, &cfg.features)?;
+    if !resolved.is_empty() {
+        cargo.set_default_features(&resolved);
+    }
+    if cfg.is_lib {
+        cargo.remove_bin();
+        if let Some(lib) = &cfg.lib_name {
+            cargo.set_lib(lib);
+        }
+        cargo.save()?;
+        cargo_toml::strip_for_lib(follower_dir)?;
+    } else {
+        cargo.save()?;
+    }
+    Ok(())
+}
+
 /// Assemble the tree the scorer grades: the translation and the corpus's vectors, and **no C**.
 ///
 /// This is the structural fix for linking the original library. `runtests` never reads `c_src/`, so
@@ -134,6 +182,67 @@ mod tests {
         )
         .unwrap();
         w.seal().unwrap()
+    }
+
+    /// The follower must be the SAME crate with its own features selected -- and must exist at all,
+    /// which is what was missing: `attests` voided B02_synthetic over 2 followers, P01 over 127.
+    #[test]
+    fn a_follower_is_the_real_crate_rebuilt_under_its_own_features() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let real = tmp.path().join("macrodepth_add_5/translated");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(
+            real.join("Cargo.toml"),
+            "[package]\nname = \"t\"\nedition = \"2021\"\n\n[features]\ndefault = []\nop_add = []\nop_mul = []\n",
+        )
+        .unwrap();
+        std::fs::write(real.join("src/lib.rs"), "pub fn f() -> i32 { 1 }\n").unwrap();
+
+        let follower = tmp.path().join("macrodepth_mul_4/translated");
+        let cfg = crate::battery::Config {
+            name: "macrodepth_mul_4".into(),
+            features: vec!["op_mul".into(), "op_bogus".into()],
+            is_lib: true,
+            lib_name: Some("macrodepth_mul_4".into()),
+        };
+        propagate_config(&real, &follower, &cfg).unwrap();
+
+        let toml = std::fs::read_to_string(follower.join("Cargo.toml")).unwrap();
+        let doc: toml_edit::DocumentMut = toml.parse().unwrap();
+        let default: Vec<String> = doc["features"]["default"]
+            .as_array()
+            .expect("default feature list")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            default,
+            vec!["op_mul".to_string()],
+            "the follower's feature must be SELECTED as default, and the undefined one dropped"
+        );
+        assert!(
+            toml.contains("macrodepth_mul_4"),
+            "the lib is renamed for the oracle: {toml}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(follower.join("src/lib.rs")).unwrap(),
+            "pub fn f() -> i32 { 1 }\n",
+            "the follower is the SAME translation, not a re-translation"
+        );
+
+        let once = std::fs::read_to_string(follower.join("Cargo.toml")).unwrap();
+        propagate_config(&real, &follower, &cfg).unwrap();
+        assert_eq!(
+            once,
+            std::fs::read_to_string(follower.join("Cargo.toml")).unwrap()
+        );
+
+        let err = propagate_config(&real, &real, &cfg).expect_err("self-derivation must refuse");
+        assert!(format!("{err:#}").contains("onto itself"));
+        assert!(
+            real.join("src/lib.rs").is_file(),
+            "and the real crate survives the refusal"
+        );
     }
 
     #[test]
