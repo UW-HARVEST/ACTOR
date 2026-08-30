@@ -14,7 +14,14 @@
 set -uo pipefail
 
 TARGET="${1:-all}"
-AGENT=claude
+# ALL THREE TOOLS, in ONE invocation, not a loop. Two reasons, and the second is the important one:
+#   - `AGENT=claude` meant CI only ever replayed claude, so no other tool's numbers were checked
+#     against the store at all. `runtests.rs` says so in as many words -- four agents each publish
+#     `0/128` for P01 and nobody noticed, "because `reproduce.sh` replays claude only".
+#   - `tables/` is written ONCE per run from every tool's attestation MERGED. Replaying the tools in
+#     separate runs would have each rewrite `tables/` from its own rows and blank the others', so the
+#     byte-for-byte diff below would compare against whichever tool finished last.
+TOOLS="${TOOLS:-claude,codex,kiro}"
 if [ "$TARGET" = all ]; then LEGS=(all HB); else LEGS=("$TARGET"); fi
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -30,7 +37,7 @@ export HARVEST_CLI_VERSION="${HARVEST_CLI_VERSION:-replay-only: no agent CLI was
 BIN=tools/target/release/harvest-tools
 die() { echo "❌ $*" >&2; exit 1; }
 
-echo "=== reproduce: $AGENT / $TARGET ==="
+echo "=== reproduce: $TOOLS / $TARGET ==="
 rustc --version
 [ -x "$BIN" ] || die "$BIN not built: cargo build --release --locked --manifest-path tools/Cargo.toml"
 
@@ -45,7 +52,7 @@ trap 'rm -f "$log"' EXIT
 for leg in "${LEGS[@]}"; do
   echo
   echo "--- run $leg (--replay-only) ---"
-  "$BIN" --agent "$AGENT" --replay-only run "$leg" 2>&1 | tee -a "$log"
+  "$BIN" --tool "$TOOLS" --replay-only run "$leg" 2>&1 | tee -a "$log"
   [ "${PIPESTATUS[0]}" -eq 0 ] || die "the $leg run failed — the error above says why. Usually either
    'built from X but HEAD is Y' (rebuild), or no stored entry for a key (a prompt, model or toolchain
    moved, so the stored results no longer answer this question)."
@@ -54,6 +61,16 @@ done
 # Belt to `--replay-only`'s braces: trusting exit 0 alone would let a paid run pass as a replay.
 tallies=$(grep -c 'agent invocation(s)' "$log" || true)
 [ "$tallies" -ge 2 ] || die "no cache tally from a phase ($tallies found), so nothing is verified"
+
+# Every tool must have SPOKEN. A bare count cannot tell "all three replayed" from "claude replayed
+# twice": `-ge 2` passed for years while only claude was ever replayed. Each tool prints its own
+# `<tool> cache: N hit / M run` line per leg, so the absence of one is the absence of that tool.
+for tool in ${TOOLS//,/ }; do
+  grep -q "^$tool .*agent invocation(s)" "$log" \
+    || die "$tool produced no cache tally, so its numbers were never checked against the store.
+   Either it is out of scope for every battery (the run says which and why), or the store does not
+   cover it -- and in both cases the published table for $tool rests on nothing this replay verified."
+done
 if grep 'agent invocation(s)' "$log" | grep -qv '0 agent invocation(s)'; then
   grep 'agent invocation(s)' "$log" >&2
   die "an agent was invoked; --replay-only must never reach one"
@@ -97,4 +114,4 @@ else
 fi
 
 echo
-echo "=== reproduced $AGENT / $TARGET from the cache, no agent invoked ==="
+echo "=== reproduced $TOOLS / $TARGET from the cache, no agent invoked ==="

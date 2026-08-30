@@ -263,7 +263,8 @@ fn transcripts(crate_root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 /// result, and it is one four agents already publish. `smartc2rust`, `c2rust`, `c2saferrust` and
 /// `gpt-5.4` each record `0/128` for P01 with `Tested: 0, Failed: 128, Vectors: 0/0` -- the exact
 /// shape the vector form refused, so the code could not re-derive four rows of its own tables.
-/// Nobody noticed because `reproduce.sh` replays claude only.
+/// Nobody noticed because `reproduce.sh` replayed claude only; it now replays every tool, and
+/// refuses if any of them produced no tally.
 ///
 /// The registry class this was written for is now stopped at source by `CARGO_NET_OFFLINE=false`
 /// below, and any table that moves for any reason is caught by `reproduce.sh`'s byte-identical
