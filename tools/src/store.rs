@@ -191,6 +191,10 @@ pub enum Outcome {
         reason: String,
         detail: String,
     },
+    /// The agent used its whole wall-clock ceiling. Scored as a case failure, not as infra.
+    Exhausted {
+        secs: u64,
+    },
     /// The provider declined on content grounds. The field is `refusal`, not `kind`, because `kind` is
     /// this enum's own serde tag and the two collide at compile time.
     Refused {
@@ -211,6 +215,7 @@ impl From<&crate::domain::health::Health> for Outcome {
                 reason: reason.clone(),
                 detail: detail.clone(),
             },
+            Health::Exhausted { secs } => Outcome::Exhausted { secs: *secs },
             Health::Refused { kind, detail } => Outcome::Refused {
                 refusal: kind.clone(),
                 detail: detail.clone(),

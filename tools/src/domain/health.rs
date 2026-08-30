@@ -48,8 +48,13 @@ pub enum Exit {
     Failure {
         code: Option<i32>,
     },
-    /// `timeout` killed the child — it reports 124.
+    /// `timeout` killed the child (it reports 124) and the transcript had gone SILENT well before the
+    /// kill: the agent was hung, so there is no measurement.
     Timeout,
+    /// Killed at the wall clock while still writing. The agent was working and did not converge, which
+    /// is the tool's answer rather than the harness's fault. Only the edge can tell these apart -- it
+    /// takes the transcript's last-write time, which the pure layer never sees.
+    Exhausted,
     Unobserved,
 }
 
@@ -61,6 +66,14 @@ pub enum Health {
     /// Did not finish for a reason outside the thing being measured: auth, rate
     /// limiting, transport, or a truncated log.
     Infra { reason: String, detail: String },
+    /// The agent used its ENTIRE wall-clock ceiling and was killed. Terminal and attributable to the
+    /// tool, so it belongs with `Refused` rather than with `Infra`: the harness gave it the budget and
+    /// it did not finish. Measured -- kiro spent all 43_200s on `001_perlin_noise` fuzzing
+    /// floating-point output, writing to its log until the minute it was killed, still reporting
+    /// "1500 cases, 7 real mismatches". Nothing about that is infrastructure. This only became a
+    /// meaningful signal once the ceiling stopped varying by tool: a kill at kiro's old 2_700s said
+    /// nothing about the tool, a kill at 43_200s says it did not converge.
+    Exhausted { secs: u64 },
     /// The PROVIDER declined the work on content grounds. Terminal and reproducible, unlike `Infra`:
     /// the same prompt over the same C is refused again, so a retry cannot help and the case has a
     /// definitive answer. Separated because one codex refusal on
@@ -101,6 +114,13 @@ impl Health {
             _ => None,
         }
     }
+
+    /// The tool answered, and the answer is "no": it declined, or it spent the whole budget without
+    /// finishing. Either way the case is scored as a failure and the battery still publishes -- unlike
+    /// `Infra`, which means the harness cannot say what the tool would have done.
+    pub fn is_tool_answer_failure(&self) -> bool {
+        matches!(self, Health::Refused { .. } | Health::Exhausted { .. })
+    }
 }
 
 /// Classify a run from its transcript and how the process ended.
@@ -129,6 +149,7 @@ pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
                 reason: "timeout".into(),
                 detail: "the agent was killed at the wall clock".into(),
             },
+            Exit::Exhausted => Health::Exhausted { secs: 0 },
             // The tool ran and failed. That is a RESULT, not an infra failure, and
             // must stay in the denominator — treating it as infra is how a project
             // silently leaves the denominator and inflates the score. There is also
@@ -278,6 +299,30 @@ fn first_line_of_result(tail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wall-clock kill means two different things and the harness must not conflate them. kiro spent
+    /// all 43_200s on `001_perlin_noise`, writing to its log until the minute it was killed, still
+    /// reporting "1500 cases, 7 real mismatches": it was WORKING and did not converge, which is the
+    /// tool's answer. Recorded as `Infra` it voided the battery instead, exactly as a hung agent would.
+    #[test]
+    fn a_kill_while_still_working_is_the_tools_answer_not_an_infra_failure() {
+        let log = "MISMATCH ...\n1500 cases, 7 real mismatches\n";
+        let worked = classify(log, LogFormat::Opaque, Exit::Exhausted);
+        assert!(worked.is_tool_answer_failure(), "got {worked:?}");
+        assert!(
+            !worked.is_infra(),
+            "the infra gate must not fire: the tool was given the budget and used it"
+        );
+        assert!(!worked.is_completed(), "and it did not finish");
+
+        // Non-vacuous: a kill after the transcript went SILENT is still infra, because a hung agent
+        // produced no measurement. Only the edge can tell the two apart, from the log's last write.
+        let hung = classify(log, LogFormat::Opaque, Exit::Timeout);
+        assert!(
+            hung.is_infra() && !hung.is_tool_answer_failure(),
+            "got {hung:?}"
+        );
+    }
 
     /// The provider declining on content grounds is a MEASUREMENT, not an infrastructure failure.
     /// Classified as `Infra`, codex's one refusal on `030_mutable_buffer_overlap_extrahard_lib`

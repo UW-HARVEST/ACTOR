@@ -19,12 +19,37 @@ use std::time::Instant;
 /// architecture gate said so the moment I put it there. `timeout` reports 124, which is a KILL rather
 /// than a failure of the thing being measured -- and because every session pipes through `tee`, a
 /// status of 0 proves nothing on its own; the transcript is the discriminator.
-fn observed(status: std::process::ExitStatus) -> Exit {
+fn observed(status: std::process::ExitStatus, log: &Path) -> Exit {
     match status.code() {
         Some(0) => Exit::Success,
-        Some(124) => Exit::Timeout,
+        // A kill at the wall clock means two different things, and only here can they be told apart.
+        // If the transcript was still growing when the axe fell, the agent was WORKING and did not
+        // converge -- that is the tool's answer and the case is scored as a failure. If it had gone
+        // silent, the agent was hung and there is no measurement. Measured: kiro spent all 43_200s on
+        // `001_perlin_noise` and wrote to its log until the minute it was killed, still reporting
+        // "1500 cases, 7 real mismatches"; classifying that as infrastructure voided the battery.
+        Some(124) => {
+            if wrote_recently(log, SILENT_AFTER) {
+                Exit::Exhausted
+            } else {
+                Exit::Timeout
+            }
+        }
         code => Exit::Failure { code },
     }
+}
+
+/// How long a transcript may be silent before a wall-clock kill reads as a hang rather than as work.
+/// Generous: an agent can legitimately sit in one long build, and calling that a hang would blame the
+/// harness for the tool's failure to finish.
+const SILENT_AFTER: std::time::Duration = std::time::Duration::from_secs(900);
+
+fn wrote_recently(log: &Path, within: std::time::Duration) -> bool {
+    std::fs::metadata(log)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|since| since <= within)
 }
 
 /// Which CLI, and what it needs beyond a working dir and a prompt.
@@ -168,8 +193,11 @@ impl Execute for Cli {
             .with_context(|| format!("invoking the {} CLI", self.backend.name()))?;
         // Classified from the transcript, with the exit only as corroboration: every session pipes
         // through `tee`, so a killed agent reports a clean 0.
-        let health =
-            crate::agent_health::classify_log(log, self.backend.log_format(), observed(status));
+        let health = crate::agent_health::classify_log(
+            log,
+            self.backend.log_format(),
+            observed(status, log),
+        );
         Ok(Ran {
             health,
             wall_secs: started.elapsed().as_secs(),

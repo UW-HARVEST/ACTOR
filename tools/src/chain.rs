@@ -193,10 +193,13 @@ fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
             // Publishing nothing is what makes it a failure -- the oracle finds `translated_rust/`
             // with no crate in it, records a build failure, and the denominator stays whole.
             Produced::DidNotComplete(record)
-                if matches!(record.outcome, crate::store::Outcome::Refused { .. }) =>
+                if matches!(
+                    record.outcome,
+                    crate::store::Outcome::Refused { .. } | crate::store::Outcome::Exhausted { .. }
+                ) =>
             {
                 println!(
-                    "  \u{1f6ab} {}: {role:?} refused by the provider: {:?}",
+                    "  \u{1f6ab} {}: {role:?} answered no: {:?}",
                     c.name, record.outcome
                 );
                 let empty = reseal(&phase_dir, c.corpus_case)?;
