@@ -249,7 +249,7 @@ fn run_test(
         on_failure,
         results_dir: &paths.results_dir,
     };
-    let tree = eval::EvalTree::create_empty(paths, keep)?;
+    let tree = eval::EvalTree::create_empty(paths, target, keep)?;
     bench.test(
         paths,
         target,

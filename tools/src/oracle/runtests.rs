@@ -667,7 +667,7 @@ mod tests {
             fresh.join(Role::Translate.dir()),
             tree_of(&fresh.join("tree")),
         );
-        let tree = EvalTree::create_empty(&paths, Keep::ForPostMortem).unwrap();
+        let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
         let gate = gate_at(&paths);
         let scoring = Scoring {
             roles: crate::prompt::chain(paths.tool, paths.variant),
@@ -747,7 +747,7 @@ mod tests {
             tree_of(&case.join("tree")),
         );
 
-        let tree = EvalTree::create_empty(&paths, Keep::ForPostMortem).unwrap();
+        let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
         let passes = one_case_pass(&paths, &tree, &resolved, Covers::WholeBattery);
         assert_eq!(
             passes.len(),
@@ -873,7 +873,7 @@ mod tests {
             "and no crate for it, or something was scored after all"
         );
 
-        let tree = EvalTree::create_empty(&paths, Keep::ForPostMortem).unwrap();
+        let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
         let err = resolved_nothing(&paths, "B01", &tree)
             .expect_err("a battery that materialised nothing must refuse, not report a score");
         let text = format!("{err:#}");
@@ -896,7 +896,7 @@ mod tests {
             !paths.input_dir("B01").is_dir(),
             "the second fixture holds a complete crate and NO corpus battery"
         );
-        let tree = EvalTree::create_empty(&paths, Keep::ForPostMortem).unwrap();
+        let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
         let err = resolved_nothing(&paths, "B01", &tree)
             .expect_err("an absent corpus is not an agreeing score either");
         assert!(
@@ -957,7 +957,7 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = EvalTree::create_empty(&paths, Keep::ForPostMortem).unwrap();
+        let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
         let passes = one_case_pass(&paths, &tree, &resolved, Covers::Subset("one"));
         write_results(
             &paths,

@@ -44,22 +44,28 @@ pub struct EvalTree {
 }
 
 impl EvalTree {
-    pub fn create_empty(paths: &Paths, keep: Keep) -> Result<Self> {
+    pub fn create_empty(paths: &Paths, target: &str, keep: Keep) -> Result<Self> {
         let eval_root = paths.repo_root.join(EVAL_DIR);
-        // Under the same `<tool>/<model>/<variant>` the results tree uses, so two runs cannot share
-        // an evaluation tree and wipe each other.
-        let root = eval_root.join(
-            paths
-                .results_dir
-                .strip_prefix(
-                    paths
-                        .results_dir
-                        .ancestors()
-                        .nth(3)
-                        .unwrap_or(&paths.results_dir),
-                )
-                .unwrap_or(&paths.results_dir),
-        );
+        // `<tool>/<model>/<variant>/<target>`, and the TARGET level is what lets two batteries of the
+        // SAME tool run at once. Without it the root was the tool level and `remove_dir_all` below
+        // wiped it wholesale, so a second battery deleted the first one's tree mid-score -- which is
+        // why every same-tool leg had to be serialised. `Drop` prunes upward with `remove_dir`, which
+        // fails on a non-empty directory, so a sibling battery's tree stops the prune.
+        let root = eval_root
+            .join(
+                paths
+                    .results_dir
+                    .strip_prefix(
+                        paths
+                            .results_dir
+                            .ancestors()
+                            .nth(3)
+                            .unwrap_or(&paths.results_dir),
+                    )
+                    .unwrap_or(&paths.results_dir),
+            )
+            // A target may name a case (`B01_organic/bin2hex_lib`), which must not become two levels.
+            .join(target.replace('/', "~"));
         if root.exists() {
             std::fs::remove_dir_all(&root)
                 .with_context(|| format!("emptying {}", root.display()))?;
@@ -288,7 +294,7 @@ mod tests {
         let paths = paths_at(tmp.path());
         let eval = tmp.path().join(EVAL_DIR);
 
-        let tree = EvalTree::create_empty(&paths, Keep::Discard).unwrap();
+        let tree = EvalTree::create_empty(&paths, "T", Keep::Discard).unwrap();
         tree.scope("B01").unwrap();
         assert!(
             results_tail(&paths).to_string_lossy().contains('/'),
@@ -314,20 +320,37 @@ mod tests {
         fs::create_dir_all(tmp.path().join("test-corpus")).unwrap();
         let paths = paths_at(tmp.path());
 
+        // Under THIS target: a stale case from an earlier run of the same target must go, or scoring
+        // could read it instead of materialising its own.
         let planted = tmp
             .path()
             .join(EVAL_DIR)
             .join(results_tail(&paths))
-            .join("B01/leftover/translated_rust");
+            .join("T/B01/leftover/translated_rust");
         fs::create_dir_all(&planted).unwrap();
         fs::write(planted.join("Cargo.toml"), "[package]").unwrap();
         assert!(
             planted.join("Cargo.toml").is_file(),
             "fixture must plant it"
         );
+        // Under ANOTHER target: must SURVIVE. This is what lets two batteries of the same tool run at
+        // once; when the root was the tool level, the second battery wiped the first one's tree
+        // mid-score, which is why every same-tool leg had to be serialised.
+        let sibling = tmp
+            .path()
+            .join(EVAL_DIR)
+            .join(results_tail(&paths))
+            .join("OTHER/B02/inflight/translated_rust");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(sibling.join("Cargo.toml"), "[package]").unwrap();
 
-        let tree = EvalTree::create_empty(&paths, Keep::ForPostMortem).unwrap();
+        let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
         assert!(!planted.exists(), "the leftover case must be gone");
+        assert!(
+            sibling.join("Cargo.toml").is_file(),
+            "a concurrent battery's tree must survive: {}",
+            sibling.display()
+        );
 
         let case_dir = paths.case_dir("B01", "001");
         let artifact = published(&case_dir, "fn main() {}");
@@ -362,7 +385,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("results")).unwrap();
         fs::create_dir_all(tmp.path().join("test-corpus")).unwrap();
         let paths = paths_at(tmp.path());
-        let tree = EvalTree::create_empty(&paths, Keep::ForPostMortem).unwrap();
+        let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
         let mut scope = tree.scope("B01").unwrap();
         for case in ["001", "002"] {
             let case_dir = paths.case_dir("B01", case);
@@ -396,7 +419,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("test-corpus")).unwrap();
         let paths = paths_at(tmp.path());
         let root = {
-            let tree = EvalTree::create_empty(&paths, Keep::Discard).unwrap();
+            let tree = EvalTree::create_empty(&paths, "T", Keep::Discard).unwrap();
             let mut scope = tree.scope("B01").unwrap();
             let case_dir = paths.case_dir("B01", "001");
             let artifact = published(&case_dir, "fn main() {}");
