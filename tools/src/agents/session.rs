@@ -39,8 +39,10 @@ pub const AGENT_ENV: &[(&str, &str)] = &[
     ("CLAUDE_CODE_RETRY_WATCHDOG", "1"),
 ];
 
-/// Empty, measured: codex's translate set only `OPENSSL_DIR`, which [`Session::shell`] supplies. Its
-/// retry/auth settings live in `~/.codex/config.toml` -- outside the key, like kiro's `kiro_plain`.
+/// Empty, and NOT because the settings live elsewhere: measured 2026-08-31, codex's `config.toml` holds
+/// 0 retry keys in 17,441 lines and `kiro_plain.json` 0 in 12, and neither CLI documents a retry flag.
+/// [`AGENT_ENV`]'s 20 retries are claude's alone, which is why `chain::run_case` retries a transient
+/// itself, uniformly, instead of leaving resilience to whichever CLI happens to have it.
 const CODEX_AGENT_ENV: &[(&str, &str)] = &[];
 
 const CLAUDE_MAX_TURNS: u32 = 1000;

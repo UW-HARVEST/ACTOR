@@ -38,6 +38,10 @@ pub struct Follower {
     pub case_dir: PathBuf,
 }
 
+/// Attempts per invocation on a transient provider failure, and the backoff. Per HARNESS, not per tool.
+const TRANSIENT_ATTEMPTS: usize = 3;
+const BACKOFF_SECS: u64 = 30;
+
 /// Both datasets spell the C the same way.
 fn corpus_case(case_inputs: &Path) -> PathBuf {
     case_inputs.join("test_case")
@@ -186,12 +190,33 @@ fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
             prompt: &prompt,
             runner: runner.as_runner(),
         };
-        // The permit spans the invocation only. Held across scoring it would serialise a sweep on the
-        // slowest case's build rather than on its agent.
-        let produced = {
-            let _permit = c.pool.acquire();
-            run_or_replay(&invocation, &tree, c.store, &corpus_c, &log)?
-        };
+        // Retried HERE, uniformly, because the CLIs cannot be: only claude's exposes a retry setting,
+        // so resilience to a throttle was a property of the backend. This sweep lost kiro/pcre2 and
+        // claude/libpng to transients, and a lost harvest-bench project is a row that never appears.
+        // The permit spans ONE attempt, so a backoff holds no slot; `run_or_replay` re-runs rather than
+        // serving a non-completed record, so the retry writes over it -- one key, still one entry.
+        let mut produced;
+        let mut attempt = 1;
+        loop {
+            produced = {
+                let _permit = c.pool.acquire();
+                run_or_replay(&invocation, &tree, c.store, &corpus_c, &log)?
+            };
+            let transient =
+                matches!(&produced, Produced::DidNotComplete(r) if r.outcome.is_transient());
+            if !transient || attempt >= TRANSIENT_ATTEMPTS {
+                break;
+            }
+            println!(
+                "  \u{27f3} {}: {role:?} attempt {attempt} of {TRANSIENT_ATTEMPTS} hit a transient \
+                 provider failure, retrying",
+                job.name
+            );
+            std::thread::sleep(std::time::Duration::from_secs(
+                BACKOFF_SECS * attempt as u64,
+            ));
+            attempt += 1;
+        }
         let after = match produced {
             Produced::Done { after, .. } => after,
             // A provider refusal is an ANSWER, not a lost entry. It is terminal and reproducible, so

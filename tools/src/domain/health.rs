@@ -38,10 +38,9 @@ pub enum LogFormat {
 
 /// The harness's LIVE observation of how the agent process ended.
 ///
-/// [`Exit::Unobserved`] is deliberately distinct from [`Exit::Failure`]: it means
-/// nobody watched, not that anything went wrong. An after-the-fact audit recovers
-/// what the run recorded ([`crate::agent_health::recorded_exit`]) and lands here only
-/// when there is no record — it must never manufacture an observation.
+/// [`Exit::Unobserved`] is deliberately distinct from [`Exit::Failure`]: nobody watched, not something
+/// went wrong. An audit recovers what the run recorded and lands here only when there is no record --
+/// it must never manufacture an observation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Exit {
     Success,
@@ -66,20 +65,14 @@ pub enum Health {
     /// Did not finish for a reason outside the thing being measured: auth, rate
     /// limiting, transport, or a truncated log.
     Infra { reason: String, detail: String },
-    /// The agent used its ENTIRE wall-clock ceiling and was killed. Terminal and attributable to the
-    /// tool, so it belongs with `Refused` rather than with `Infra`: the harness gave it the budget and
-    /// it did not finish. Measured -- kiro spent all 43_200s on `001_perlin_noise` fuzzing
-    /// floating-point output, writing to its log until the minute it was killed, still reporting
-    /// "1500 cases, 7 real mismatches". Nothing about that is infrastructure. This only became a
-    /// meaningful signal once the ceiling stopped varying by tool: a kill at kiro's old 2_700s said
-    /// nothing about the tool, a kill at 43_200s says it did not converge.
+    /// The agent used its ENTIRE wall-clock ceiling and was killed: the harness gave it the budget and
+    /// it did not finish, so it belongs with `Refused`, not `Infra`. Measured -- kiro spent all 43_200s
+    /// on `001_perlin_noise` still reporting "1500 cases, 7 real mismatches". Only a meaningful signal
+    /// once the ceiling stopped varying by tool: a kill at kiro's old 2_700s said nothing.
     Exhausted { secs: u64 },
-    /// The PROVIDER declined the work on content grounds. Terminal and reproducible, unlike `Infra`:
-    /// the same prompt over the same C is refused again, so a retry cannot help and the case has a
-    /// definitive answer. Separated because one codex refusal on
-    /// `030_mutable_buffer_overlap_extrahard_lib` voided all 85 of its B01_synthetic cases as though a
-    /// network blip had lost an entry -- and a C-to-Rust MEMORY-SAFETY corpus will keep earning these:
-    /// B01_synthetic alone holds 12 cases named for buffer overflows.
+    /// The PROVIDER declined on content grounds. Terminal and reproducible, unlike `Infra`, so a retry
+    /// cannot help. Separated because one codex refusal voided all 85 of its B01_synthetic cases as
+    /// though a blip had lost an entry -- and that corpus holds 12 cases named for buffer overflows.
     Refused { kind: RefusalKind, detail: String },
     /// No evidence either way (kiro logs are not stream-json; results predating
     /// this module have no terminal record). Not a failure.
@@ -125,16 +118,11 @@ impl Health {
 
 /// Classify a run from its transcript and how the process ended.
 ///
-/// Takes the text, never the path: the caller knows which backend it launched, how the
-/// process ended, and where the transcript is, so all three are its business and the
-/// decision here needs no fixture on disk. [`crate::agent_health::classify_log`] is the
-/// after-the-fact counterpart for auditing a results tree, where the observation is read
-/// back from what the run recorded rather than made live.
-///
-/// For [`LogFormat::StreamJson`] the terminal record is authoritative and `exit` is
-/// deliberately ignored — see the module docs on `SIGXFSZ`: the agent runs under
-/// `ulimit -f`/`-d`, so a test binary killed by a signal fails commands inside a
-/// session that is itself fine, and that is a *result*.
+/// Takes the text, never the path, so the decision needs no fixture on disk;
+/// [`crate::agent_health::classify_log`] is the after-the-fact counterpart for auditing a tree.
+/// For [`LogFormat::StreamJson`] the terminal record is authoritative and `exit` is deliberately
+/// ignored -- see the module docs on `SIGXFSZ`: a test binary killed by a signal fails commands inside
+/// a session that is itself fine, and that is a *result*.
 pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
     match format {
         LogFormat::StreamJson => classify_stream_json(text),
@@ -150,16 +138,21 @@ pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
                 detail: "the agent was killed at the wall clock".into(),
             },
             Exit::Exhausted => Health::Exhausted { secs: 0 },
-            // The tool ran and failed. That is a RESULT, not an infra failure, and
-            // must stay in the denominator — treating it as infra is how a project
-            // silently leaves the denominator and inflates the score. There is also
-            // nothing to seal, so no proof is needed.
-            Exit::Failure { code } => Health::Unknown {
-                why: format!(
-                    "opaque log, agent exited {}",
-                    code.map(|c| c.to_string())
-                        .unwrap_or_else(|| "by signal".into())
-                ),
+            // A tool that ran and failed is a RESULT and stays in the denominator; treating that as
+            // infra inflates the score. The PROVIDER saying "temporarily unavailable" is NOT that, and
+            // `Unknown` made it neither retryable nor visible to the gate.
+            Exit::Failure { code } => match provider_transient(text) {
+                Some(reason) => Health::Infra {
+                    reason: reason.into(),
+                    detail: "the provider reported a transient failure".into(),
+                },
+                None => Health::Unknown {
+                    why: format!(
+                        "opaque log, agent exited {}",
+                        code.map(|c| c.to_string())
+                            .unwrap_or_else(|| "by signal".into())
+                    ),
+                },
             },
             Exit::Unobserved => Health::Unknown {
                 why: "opaque log and no observed exit status".into(),
@@ -168,12 +161,25 @@ pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
     }
 }
 
-/// The shape `translate::scan_codex_log_for_transient_error` reads, for the same reason: codex exits 0
-/// after Bedrock drops a conversation, so the exit status proves nothing and only this record does.
-/// The provider's own marker for a content refusal, matched in ONE place.
-///
-/// Keyed on the stable documentation URL rather than the prose, which is a marketing string. Shared by
-/// every transcript dialect: a refusal is a fact about the provider, not about the log format.
+/// The provider's own "come back later", in ONE place like [`provider_refusal`]. Narrow: a genuine tool
+/// failure must keep classifying `Unknown` rather than being retried.
+pub fn provider_transient(message: &str) -> Option<&'static str> {
+    let m = message.to_ascii_lowercase();
+    if m.contains("temporarily unavailable") {
+        return Some("model_unavailable");
+    }
+    if m.contains("throttl") || m.contains("rate limit") || m.contains("too many requests") {
+        return Some("throttled");
+    }
+    if m.contains("service unavailable") || m.contains("bad gateway") {
+        return Some("service_unavailable");
+    }
+    None
+}
+
+/// The provider's own marker for a content REFUSAL, matched in ONE place. Keyed on the stable
+/// documentation URL rather than the prose, which is a marketing string: a refusal is a fact about the
+/// provider, not about the log format, so every dialect shares this.
 fn provider_refusal(message: &str) -> Option<RefusalKind> {
     let m = message.to_ascii_lowercase();
     (m.contains("/guides/safety-checks")
@@ -293,6 +299,43 @@ fn first_line_of_result(tail: &str) -> String {
             format!(": {one}")
         }
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod transient_tests {
+    use super::*;
+
+    /// kiro's pcre2 ended with `temporarily unavailable` and exit 1, classified `Unknown`, and left
+    /// the table with nothing refusing. A tool that merely failed must still classify `Unknown`.
+    #[test]
+    fn a_provider_transient_is_infra_and_a_tool_failure_is_still_unknown() {
+        let kiro =
+            "Kiro is having trouble responding right now:\n    The model you've selected is \
+                    temporarily unavailable. Please relaunch with '--model <model_id>'.";
+        let h = classify(kiro, LogFormat::Opaque, Exit::Failure { code: Some(1) });
+        assert!(
+            matches!(&h, Health::Infra { reason, .. } if reason == "model_unavailable"),
+            "the provider's own words must be read as infra: {h:?}"
+        );
+        assert!(h.is_infra(), "so the gate can refuse rather than shrug");
+
+        // Non-vacuous: a real failure at the same exit code must NOT become retryable.
+        let real = "error: could not compile `translation` due to 12 previous errors";
+        let h = classify(real, LogFormat::Opaque, Exit::Failure { code: Some(1) });
+        assert!(matches!(h, Health::Unknown { .. }), "{h:?}");
+
+        for (text, want) in [
+            (
+                "Model is temporarily unavailable",
+                Some("model_unavailable"),
+            ),
+            ("ThrottlingException: Too many requests", Some("throttled")),
+            ("503 Service Unavailable", Some("service_unavailable")),
+            ("assertion failed: left == right", None),
+        ] {
+            assert_eq!(provider_transient(text), want, "{text}");
+        }
     }
 }
 

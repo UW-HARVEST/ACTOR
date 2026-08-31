@@ -206,6 +206,21 @@ pub enum Outcome {
     },
 }
 
+impl Outcome {
+    /// Whether another attempt could plausibly succeed. Exhaustive, and NOT a function of the tool:
+    /// only claude's CLI exposes a retry setting, so leaving resilience to the CLIs made the harness's
+    /// tolerance vary by backend. `Refused` is reproducible; `Exhausted` already spent its budget.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Outcome::Infra { .. } => true,
+            Outcome::Completed
+            | Outcome::Exhausted { .. }
+            | Outcome::Refused { .. }
+            | Outcome::Unknown { .. } => false,
+        }
+    }
+}
+
 impl From<&crate::domain::health::Health> for Outcome {
     fn from(h: &crate::domain::health::Health) -> Self {
         use crate::domain::health::Health;
@@ -398,6 +413,39 @@ impl Store {
             "\u{1f5c3}\u{fe0f}  cache: {} hit / {} run ({} agent invocation(s))",
             c.hits, c.invocations, c.invocations
         )
+    }
+}
+
+#[cfg(test)]
+mod attempt_tests {
+    use super::*;
+
+    /// Which outcomes are worth another attempt -- exhaustively, and with no `Tool` in sight. That
+    /// absence is the point; retrying a `Refused` would also buy a reproducible answer twice.
+    #[test]
+    fn only_an_infra_outcome_is_worth_another_attempt() {
+        assert!(Outcome::Infra {
+            reason: "throttled".into(),
+            detail: String::new()
+        }
+        .is_transient());
+
+        for terminal in [
+            Outcome::Completed,
+            Outcome::Exhausted { secs: 43_200 },
+            Outcome::Refused {
+                refusal: crate::domain::health::RefusalKind::HighRiskCyberActivity,
+                detail: String::new(),
+            },
+            Outcome::Unknown {
+                why: "opaque log, agent exited 1".into(),
+            },
+        ] {
+            assert!(
+                !terminal.is_transient(),
+                "{terminal:?} is an answer or a spent budget, not a blip"
+            );
+        }
     }
 }
 
