@@ -6,23 +6,22 @@ on:
   workflow_dispatch:
 
 jobs:
-  # One job PER TOOL, in parallel: each replays BOTH datasets for its own tool. They CAN pass -- no
-  # agent, no credentials, and `--replay-only` makes a miss a refusal. The 7-arm `test all --check`
-  # matrix that was here had not passed once in 100 runs, so every PR merged on `type safety` alone.
+  # One job per TOOL plus one covering all three, in parallel. They CAN pass -- no agent, no credentials,
+  # and `--replay-only` makes a miss a refusal. The 7-arm `test all --check` matrix that was here had not
+  # passed once in 100 runs, so every PR merged on `type safety` alone.
   #
-  # By tool and not by dataset because a tool is what the store either covers or does not:
-  # `reproduce.sh` replayed claude alone for months while four agents published `0/128` for P01. Each
-  # job checks every row it regenerates against the committed table verbatim and the three cover every
-  # row; `TOOLS=claude,codex,kiro tools/reproduce.sh all` is the byte-for-byte release form, because
-  # only a run covering every tool can diff the merged tables.
+  # Split by tool because a tool is what the store either covers or does not: `reproduce.sh` replayed
+  # claude alone for months while four agents published `0/128` for P01. Only the all-three run may DIFF
+  # the tables: `numbers.tex` is named macros covering every tool, so a codex-only run correctly writes
+  # `--` for the others and its output is comparable to nothing without special-casing files.
   reproduce:
-    name: Reproduce ${{ matrix.tool }}'s published numbers from the cache
+    name: Reproduce ${{ matrix.tool }} from the cache
     runs-on: ubuntu-24.04
     strategy:
       # "codex misses the store" and "kiro misses the store" are different findings.
       fail-fast: false
       matrix:
-        tool: [claude, codex, kiro]
+        tool: [claude, codex, kiro, "claude,codex,kiro"]
     steps:
       - uses: actions/checkout@v5
         with:
