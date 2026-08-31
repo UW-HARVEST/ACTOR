@@ -521,7 +521,6 @@ mod corrupt_tests {
 mod terminal_tests {
     use super::*;
 
-    /// A settled answer replays as itself; a lost run still has to be re-run.
     #[test]
     fn a_terminal_answer_is_servable_on_replay_and_a_lost_run_is_not() {
         for settled in [

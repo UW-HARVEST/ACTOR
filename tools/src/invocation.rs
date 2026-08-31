@@ -296,8 +296,7 @@ mod tests {
         assert_eq!(again.digest(), after.digest());
     }
 
-    /// A settled answer replays without paying, and a lost run still refuses. See
-    /// [`crate::store::Outcome::is_terminal_answer`] for what that cost.
+    /// A settled answer replays without paying; a lost run still refuses.
     #[test]
     fn a_stored_terminal_answer_replays_and_a_stored_infra_failure_does_not() {
         let f = fixture();
