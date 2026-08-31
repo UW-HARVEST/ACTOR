@@ -453,7 +453,8 @@ mod tests {
              done\n\
              exit 2"
             ),
-        );
+        )
+        .unwrap();
 
         let refused =
             score_harvest_bench_suite(Path::new(&fake), tmp.path(), Path::new("libx.so"), &report)
@@ -471,17 +472,20 @@ mod tests {
 
     /// Exits 0 and writes `body`, so what follows is decided by the report alone.
     fn runner_writing(dir: &Path, name: &str, body: &str) -> PathBuf {
-        PathBuf::from(crate::io::workdir::fake_program(
-            dir,
-            name,
-            &format!(
-                "while [ $# -gt 0 ]; do\n\
+        PathBuf::from(
+            crate::io::workdir::fake_program(
+                dir,
+                name,
+                &format!(
+                    "while [ $# -gt 0 ]; do\n\
              \x20 case \"$1\" in --json) shift; printf '%s' '{body}' > \"$1\";; esac\n\
              \x20 shift\n\
              done\n\
              exit 0"
-            ),
-        ))
+                ),
+            )
+            .unwrap(),
+        )
     }
 
     /// Every way a report comes back with no judgement, and the ONE way it carries some. A suite whose
@@ -550,7 +554,8 @@ mod tests {
             tmp.path(),
             "runner-unlinkable",
             &format!("cat >&2 <<'STDERR'\n{ld}\nSTDERR\nexit 2"),
-        );
+        )
+        .unwrap();
         let report = tmp.path().join("unlinkable.json");
         let score = score_harvest_bench_suite(
             Path::new(&runner),
@@ -581,7 +586,8 @@ mod tests {
             tmp.path(),
             "runner-broken",
             "echo 'error: cmake configure (suite) failed:\nNo CMAKE_CXX_COMPILER could be found.' >&2\nexit 2",
-        );
+        )
+        .unwrap();
         let err = score_harvest_bench_suite(
             Path::new(&broken),
             tmp.path(),

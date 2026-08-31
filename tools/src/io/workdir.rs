@@ -228,18 +228,19 @@ pub fn test_tempdir() -> Result<tempfile::TempDir> {
 /// output without depending on a real CLI being installed.
 ///
 /// `pub`, not `#[cfg(test)]`, for [`test_tempdir`]'s reason: other test targets link the lib without it.
-pub fn fake_program(dir: &Path, name: &str, body: &str) -> String {
+/// Which also puts it in the lib, where `clippy::panic` applies -- so failures here are RETURNED.
+pub fn fake_program(dir: &Path, name: &str, body: &str) -> Result<String> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let at = dir.join(name);
     // Written, flushed, synced and CLOSED before the mode is set, and only then executed.
     {
-        let mut f = std::fs::File::create(&at).expect("create fake program");
-        f.write_all(format!("#!/usr/bin/env bash\n{body}\n").as_bytes())
-            .expect("write fake program");
-        f.sync_all().expect("sync fake program");
+        let mut f = std::fs::File::create(&at)
+            .with_context(|| format!("creating the fake program {}", at.display()))?;
+        f.write_all(format!("#!/usr/bin/env bash\n{body}\n").as_bytes())?;
+        f.sync_all()?;
     }
-    std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o755))?;
     // Then PROVE it is executable before handing it over. A sibling test thread that forked while
     // this file's descriptor was open leaves the fork holding it, and the exec fails with ETXTBSY (26)
     // -- a SPAWN error, which a caller's `expect_err` cannot tell from the runner failure it is
@@ -248,17 +249,17 @@ pub fn fake_program(dir: &Path, name: &str, body: &str) -> String {
     // they all loop over `$@`.
     for attempt in 0..50 {
         match std::process::Command::new(&at).output() {
-            Ok(_) => return at.to_string_lossy().into_owned(),
+            Ok(_) => return Ok(at.to_string_lossy().into_owned()),
             Err(e) if e.raw_os_error() == Some(26) && attempt < 49 => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Err(e) => panic!(
-                "the fake program at {} cannot be executed: {e}",
-                at.display()
-            ),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("executing the fake program {}", at.display()))
+            }
         }
     }
-    unreachable!("the loop above returns or panics")
+    anyhow::bail!("{} stayed busy for 50 attempts", at.display())
 }
 
 #[cfg(test)]

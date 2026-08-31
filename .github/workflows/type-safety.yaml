@@ -46,6 +46,9 @@ jobs:
           rustup component list --installed | grep -qx 'rust-src' \
             || { echo "::error::rust-src missing; compile-fail expectations need std source"; exit 1; }
 
+      - name: Every workflow parses (each checks the others; a broken one never runs itself)
+        run: python3 tools/check_workflows.py
+
       - name: No hardcoded home paths
         # Ordered ahead of anything that compiles, since it needs no toolchain at all.
         # Scoped to committed `*.sh` and `.github/**`; `tools/src/**` is excluded because
@@ -212,8 +215,6 @@ jobs:
         # .py is in neither HASH nor SLASH, so the budget does not count itself: this
         # script's own docstring and all 250 lines of tools/test_comment_budget.py cost
         # ZERO against both ceilings. Deriving 3100 from the tree needs that fact.
-        run: |
-          python3 tools/test_comment_budget.py
         # RAISED 2380 -> 2394, deliberately, because 2380 was the tree measured EXACTLY -- so no new
         # function could carry a doc comment without breaking it. Two earned their lines here:
         # `propagate_config`, whose absence voided B02_synthetic for all three tools and P01 for all 128
@@ -228,6 +229,7 @@ jobs:
         # it, measured after writing them -- not "plus epsilon" -- and `--max-ratio 20` against a 16.4%
         # tree still stops sprawl.
         run: |
+          python3 tools/test_comment_budget.py
           python3 tools/comment_budget.py --max-comments 2583 --max-ratio 20
 
       - name: Lint

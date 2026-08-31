@@ -27,6 +27,9 @@ jobs:
         with:
           token: ${{ secrets.SUBMODULE_PAT }}
 
+      - name: Every workflow parses (each checks the others; a broken one never runs itself)
+        run: python3 tools/check_workflows.py
+
       # NO --depth=1: a shallow fetch has only the tip, so a submodule pinned elsewhere cannot be
       # checked out and the runner holds a different results tree than the pin names.
       - name: Check out submodules at their pinned commits

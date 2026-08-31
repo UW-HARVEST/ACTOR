@@ -80,8 +80,11 @@ fn main() -> Result<()> {
                 handles
                     .into_iter()
                     .map(|h| {
-                        h.join()
-                            .unwrap_or_else(|_| panic!("a tool's thread panicked"))
+                        h.join().unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!(
+                                "a tool's thread panicked; see its output above"
+                            ))
+                        })
                     })
                     .collect::<Result<Vec<_>>>()
             })?;
@@ -400,7 +403,8 @@ mod tests {
         );
         // The old cmake FIRST, so the check has a named failing input: without it, deleting the
         // check from preflight would turn nothing red. 3.22 is what this class of box ships.
-        harvest_tools::io::workdir::fake_program(&bin, "cmake", "echo 'cmake version 3.22.2'");
+        harvest_tools::io::workdir::fake_program(&bin, "cmake", "echo 'cmake version 3.22.2'")
+            .unwrap();
         let old_cmake = bench
             .preflight(unchecked())
             .err()
@@ -409,7 +413,8 @@ mod tests {
             format!("{old_cmake:#}").contains("cmake 3.22"),
             "and must name it: {old_cmake:#}"
         );
-        harvest_tools::io::workdir::fake_program(&bin, "cmake", "echo 'cmake version 3.28.6'");
+        harvest_tools::io::workdir::fake_program(&bin, "cmake", "echo 'cmake version 3.28.6'")
+            .unwrap();
 
         let paths = bench
             .preflight(unchecked())
