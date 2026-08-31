@@ -6,13 +6,26 @@ on:
   workflow_dispatch:
 
 jobs:
-  # The only job, and it CAN pass: no agent, no credentials, and `--replay-only` makes a miss a
-  # refusal. The 7-arm `test all --check` matrix that was here had not passed once in 100 runs back
-  # past 2026-07-05, so every PR merged on `type safety` alone. It scored phase dirs no key attests,
-  # which is the capability this PR deletes, so there is nothing left for it to run.
+  # One job PER TOOL, in parallel: each replays BOTH datasets for its own tool. The 7-arm
+  # `test all --check` matrix that was here had not passed once in 100 runs back past 2026-07-05, so
+  # every PR merged on `type safety` alone -- it scored phase dirs no key attests, which is the
+  # capability that is now gone. These jobs CAN pass: no agent, no credentials, and `--replay-only`
+  # makes a miss a refusal.
+  #
+  # Split by tool and not by dataset because a tool is what the store either covers or does not:
+  # `reproduce.sh` replayed claude alone for months while four agents published `0/128` for P01. Each
+  # job checks every row it regenerates against the committed table verbatim, and the three cover
+  # every row between them; `TOOLS=claude,codex,kiro tools/reproduce.sh all` is the byte-for-byte form
+  # and stays the release check, because only a run covering every tool can diff the merged tables.
   reproduce:
-    name: Reproduce the published numbers from the cache
+    name: Reproduce ${{ matrix.tool }}'s published numbers from the cache
     runs-on: ubuntu-24.04
+    strategy:
+      # Never fail-fast: "codex misses the store" and "kiro misses the store" are different findings,
+      # and cancelling the others hides the second one behind the first.
+      fail-fast: false
+      matrix:
+        tool: [claude, codex, kiro]
     steps:
       - uses: actions/checkout@v5
         with:
@@ -25,7 +38,7 @@ jobs:
           git config --global url."https://x-access-token:${{ secrets.SUBMODULE_PAT }}@github.com/".insteadOf "https://github.com/"
           git submodule update --init results test-corpus harvest-bench
 
-      - name: Assert the submodules are at their pins
+      - name: Assert every input this run needs is present
         run: |
           fail=0
           for m in results test-corpus harvest-bench; do
@@ -38,6 +51,11 @@ jobs:
           # Not cosmetic: omitting harvest-bench here let the Test-Corpus leg run 19 minutes to completion
           # before the HB leg died on a missing tests/ dir. Refuse at second 0 instead.
           test -d harvest-bench/tests || { echo "::error::harvest-bench/tests is absent, so the HB leg cannot run"; fail=1; }
+          # The gtest suites need CMake >= 3.24. `HarvestBench::preflight` refuses too; this only moves
+          # the refusal ahead of a Test-Corpus leg that would otherwise run first and pass.
+          cm=$(cmake --version | head -1 | grep -oE '[0-9]+(\.[0-9]+)+')
+          printf '%s\n%s\n' 3.24 "$cm" | sort -VC || { echo "::error::cmake $cm is older than 3.24, so no gtest suite would configure"; fail=1; }
+          echo "cmake $cm"
           exit $fail
 
       - name: Set up Rust
@@ -58,9 +76,11 @@ jobs:
       - name: Build the harvest-bench runner
         run: cargo build --release --locked --manifest-path harvest-bench/runner/Cargo.toml
 
-      # One job, no matrix: `run` produces every output from what it resolved, and the scope is what
-      # the store can serve -- so there is no list of batteries here to drift from what is cacheable.
+      # Both legs, one tool. The scope is what the store can serve, so there is no battery list here to
+      # drift from what is cacheable.
       - name: Reproduce
         env:
-          CARGO_BUILD_JOBS: "2"
-        run: ./tools/reproduce.sh all
+          TOOLS: ${{ matrix.tool }}
+        run: |
+          export CARGO_BUILD_JOBS=$(nproc)
+          ./tools/reproduce.sh all
