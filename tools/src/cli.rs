@@ -53,6 +53,11 @@ pub enum Variant {
     NoSubtask,
     /// Shapes deliberately swapped: a library gets the executable prompt (E4).
     CrossPrompt,
+    /// The library prompt with the C-wrapping loophole closed: every exported symbol must be Rust.
+    /// codex answered all seven harvest-bench projects by compiling the C from `build.rs`, so `default`
+    /// measures that and this measures translation. A variant, not an edit to the shared prompt that
+    /// Test-Corpus library cases also read.
+    NoShim,
 }
 
 impl Variant {
@@ -67,6 +72,7 @@ impl Variant {
             Variant::NoFeatures => "no-features",
             Variant::NoSubtask => "no-subtask",
             Variant::CrossPrompt => "cross-prompt",
+            Variant::NoShim => "no-shim",
         }
     }
 }
