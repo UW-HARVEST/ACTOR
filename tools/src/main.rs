@@ -50,6 +50,9 @@ fn main() -> Result<()> {
             let model = cli.model.as_deref();
             let variant = cli.variant;
             let keep = eval::Keep::from_keep_eval_tree_flag(cli.keep_eval_tree);
+            let on_infra_failure = agent_health::OnInfraFailure::from_allow_infra_failures_flag(
+                cli.allow_infra_failures,
+            );
             let attested: Vec<report::Attested> = std::thread::scope(|scope| {
                 let handles: Vec<_> = cli
                     .tool
@@ -69,6 +72,7 @@ fn main() -> Result<()> {
                                 mode,
                                 enforcement,
                                 keep,
+                                on_infra_failure,
                             })
                         })
                     })
@@ -166,6 +170,7 @@ struct RunTool<'a> {
     mode: store::Mode,
     enforcement: harvest_tools::io::sandbox::Enforcement,
     keep: eval::Keep,
+    on_infra_failure: agent_health::OnInfraFailure,
 }
 
 /// One tool, end to end: preflight, run every unit's chain, score, and report what it attested.
@@ -226,7 +231,7 @@ fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
             &paths,
             unit,
             Score {
-                on_failure: agent_health::OnInfraFailure::Refuse,
+                on_failure: r.on_infra_failure,
                 keep: r.keep,
                 roles,
                 resolved: &resolved,

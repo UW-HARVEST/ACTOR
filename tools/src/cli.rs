@@ -150,9 +150,10 @@ pub struct Cli {
 
     /// Max concurrent invocations PER TOOL.
     ///
-    /// Beside `--tool` rather than on `run`, because it is that list's budget: with three tools this
-    /// is three in flight each, nine in total. Only `run` reads it.
-    #[arg(long, default_value_t = 1)]
+    /// Beside `--tool` because it is that list's budget: with three tools this is three in flight
+    /// each, nine in total. `global`, so either position parses -- without it `run HB --parallel 3` is
+    /// a clap error, which is how a sweep launcher died on `unexpected argument`.
+    #[arg(long, global = true, default_value_t = 1)]
     pub parallel: usize,
 
     /// Model id. Required for `--tool oneshot` and `opencode`, where the model IS the
@@ -195,6 +196,14 @@ pub struct Cli {
     /// removed: a tree left standing is one a later run could read instead of materialising its own.
     #[arg(long, global = true)]
     pub keep_eval_tree: bool,
+
+    /// Score the cases that DID run, even though some agent run died for infrastructure reasons.
+    ///
+    /// An infrastructure failure is not a result, so a score refuses by default and the unit goes
+    /// unpublished. The escape hatch for a sweep that lost its credentials hours in; what it lets
+    /// through is announced as unsupported. Two refusal messages named this flag while nothing read it.
+    #[arg(long, global = true)]
+    pub allow_infra_failures: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -339,6 +348,25 @@ mod tests {
         assert_eq!(
             cli.parallel, 3,
             "and the budget is three PER tool, not three shared"
+        );
+
+        // AFTER the subcommand too, where an operator naturally puts a per-run budget.
+        let trailing = Cli::try_parse_from([
+            "harvest-tools",
+            "--tool",
+            "claude",
+            "run",
+            "HB",
+            "--parallel",
+            "3",
+            "--allow-infra-failures",
+        ])
+        .expect("both flags are global, so either position parses");
+        assert_eq!(trailing.parallel, 3);
+        assert!(
+            trailing.allow_infra_failures,
+            "a flag parsed and then discarded is this repo's most repeated defect; two refusal \
+             messages named this one while nothing read it"
         );
         // Repeating the flag is the other spelling of the same thing.
         let repeated = Cli::try_parse_from([

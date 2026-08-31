@@ -84,8 +84,8 @@ impl Enrichment {
 
 /// Backfill `result.json` (unsafe/loc/credits) for the cases NAMED, and no others.
 ///
-/// This was `enrich_test_corpus(paths, battery)`, which harvest-bench called with an EMPTY battery so
-/// its `read_dir` would land a level higher. Taking case dirs removes the coincidence and the walk.
+/// Was `enrich_test_corpus(paths, battery)`, which harvest-bench called with an EMPTY battery so its
+/// `read_dir` landed a level higher. Case dirs remove the coincidence and the walk.
 pub fn enrich_cases(cases: &[&Path]) -> Result<usize> {
     let mut enriched = 0usize;
     for case_dir in cases {

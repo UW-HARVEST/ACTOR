@@ -30,8 +30,8 @@ pub struct Job {
     pub followers: Vec<Follower>,
 }
 
-/// A shared-source follower: this job's ONE translation, rebuilt under another CMake configuration.
-/// Paths stated, not derived: deriving them is how followers came to be dropped entirely.
+/// A shared-source follower: this job's ONE translation under another CMake configuration. Paths
+/// stated, not derived -- deriving them is how followers came to be dropped entirely.
 pub struct Follower {
     pub cfg: battery::Config,
     pub case_inputs: PathBuf,

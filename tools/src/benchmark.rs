@@ -98,7 +98,7 @@ impl std::ops::Deref for Preflighted {
 /// What CMake version the harvest-bench gtest suites need.
 ///
 /// A suite that fails to configure reports an empty verdict list, which printed `Builds: no` against
-/// seven crates that had compiled. It lived in `run_hb_all.sh`'s PATH line -- nowhere `run HB` saw.
+/// seven crates that had compiled. It lived in a shell script's PATH line -- nowhere `run HB` saw.
 const CMAKE_MIN: (u32, u32) = (3, 24);
 
 /// The edge: run the program. [`accept_cmake`] is the judgement, and pure.
