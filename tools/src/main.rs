@@ -202,13 +202,8 @@ fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
                 .map(|jobs| (unit.clone(), jobs))
         })
         .collect::<Result<_>>()?;
-    let mut resolved = eval::Resolved::new();
-    let mut refused: Vec<String> = Vec::new();
-    for (unit, jobs) in &units {
-        let ran = chain::run_unit(&paths, &store, unit, jobs, r.steps, &pool)?;
-        resolved.extend(ran.resolved);
-        refused.extend(ran.refused);
-    }
+    let ran = chain::run_all(&paths, &store, &units, r.steps, &pool)?;
+    let (resolved, refused) = (ran.resolved, ran.refused);
     println!("{} {}", cli::tool_dir(r.tool), store.tally_line());
     // Counted where the tally is, so a refusal cannot be read as a translation failure. A
     // C-to-Rust memory-safety corpus earns these: B01_synthetic alone holds 12 cases named for

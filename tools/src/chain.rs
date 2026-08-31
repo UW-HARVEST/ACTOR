@@ -1,19 +1,11 @@
 //! The pipeline: a chain of agent invocations over every case in scope.
 //!
-//! One driver. This replaces `translate::run_test_corpus`, `verify::run_all`,
+//! One driver. It replaces `translate::run_test_corpus`, `verify::run_all`,
 //! `verify::run_with_semaphore` and BOTH `run_harvest_bench` functions, which existed only because
 //! translate and verify were modelled as different kinds of operation. They are the same function at
-//! different prompts, so there is one loop:
-//!
-//! ```text
-//! tree = assemble(corpus).seal()
-//! for role in prompt::chain(tool, variant):
-//!     tree = run_or_replay(invocation(role), tree)
-//!     publish(tree, role); transform(published)
-//! ```
-//!
-//! `prompt::chain` is the single declaration of chain length. Adding a third step needs no new type,
-//! no new trait method and no new branch anywhere downstream.
+//! different prompts, so there is one loop -- assemble, then per role replay-or-run, publish and
+//! transform. `prompt::chain` is the single declaration of chain length: a third step needs no new
+//! type, no new trait method and no new branch anywhere downstream.
 
 use crate::battery::{self, Paths};
 use crate::eval::Resolved;
@@ -73,60 +65,70 @@ pub struct Ran {
     pub refused: Vec<String>,
 }
 
-/// Run the chain for every case of one unit.
+/// Run the chain for every case of every unit in scope.
 ///
-/// `steps` truncates the chain, which is what the old `translate`/`verify` subcommands were for: a
-/// prefix of one pipeline rather than two pipelines.
-pub fn run_unit(
+/// ONE queue over all of them, not a loop over units each with its own queue: harvest-bench's unit is
+/// a project holding ONE case, so `--parallel 3` ran three workers over a queue of one, seven times
+/// over, and the dataset went one project at a time per tool. Test-Corpus gains the same way at each
+/// battery boundary. `steps` truncates the chain -- a prefix of one pipeline, not two pipelines.
+pub fn run_all(
     paths: &Paths,
     store: &Store,
-    unit: &str,
-    jobs: &[Job],
+    units: &[(String, Vec<Job>)],
     steps: Option<usize>,
     pool: &crate::agents::Pool,
 ) -> Result<Ran> {
     let roles = prompt::chain(paths.tool, paths.variant);
     let roles = &roles[..steps.map_or(roles.len(), |n| n.min(roles.len()))];
 
-    // Concurrent, bounded by the pool's width: the loop here was sequential, so `--parallel` bought
-    // nothing at all -- a permit acquired inside a sequential loop is never contended. Workers pull
-    // from one queue rather than a thread per case, so 338 cases do not become 338 threads.
-    let queue = std::sync::Mutex::new(jobs.iter());
+    let queue: Vec<(&str, &Job)> = units
+        .iter()
+        .flat_map(|(unit, jobs)| jobs.iter().map(move |j| (unit.as_str(), j)))
+        .collect();
     let collected: std::sync::Mutex<Ran> = std::sync::Mutex::new(Ran {
         resolved: Resolved::new(),
         failures: Vec::new(),
         refused: Vec::new(),
     });
 
-    std::thread::scope(|scope| {
-        for _ in 0..pool.width().max(1) {
-            scope.spawn(|| loop {
-                let Some(job) = queue.lock().expect("case queue").next() else {
-                    return;
-                };
-                let outcome = run_case(RunCase {
-                    paths,
-                    store,
-                    roles,
-                    job,
-                    pool,
-                });
-                let mut out = collected.lock().expect("collected results");
-                match outcome {
-                    Ok(done) => {
-                        out.resolved.extend(done.published);
-                        out.refused.extend(done.refused);
-                    }
-                    Err(e) => {
-                        println!("  \u{274c} {unit}/{}: {e:#}", job.name);
-                        out.failures.push(job.name.clone());
-                    }
-                }
-            });
+    in_flight(&queue, pool.width(), |&(unit, job)| {
+        let outcome = run_case(RunCase {
+            paths,
+            store,
+            roles,
+            job,
+            pool,
+        });
+        let mut out = collected.lock().expect("collected results");
+        match outcome {
+            Ok(done) => {
+                out.resolved.extend(done.published);
+                out.refused.extend(done.refused);
+            }
+            Err(e) => {
+                println!("  \u{274c} {unit}/{}: {e:#}", job.name);
+                out.failures.push(job.name.clone());
+            }
         }
     });
 
     Ok(collected.into_inner().expect("collected results"))
+}
+
+/// Apply `f` to every item with at most `width` in flight. Workers PULL from one queue rather than a
+/// thread per item, so 338 cases do not become 338 threads.
+fn in_flight<T: Sync>(items: &[T], width: usize, f: impl Fn(&T) + Sync) {
+    let queue = std::sync::Mutex::new(items.iter());
+    std::thread::scope(|scope| {
+        for _ in 0..width.max(1) {
+            scope.spawn(|| loop {
+                let Some(item) = queue.lock().expect("work queue").next() else {
+                    return;
+                };
+                f(item);
+            });
+        }
+    });
 }
 
 /// The per-case parameters.
@@ -138,18 +140,15 @@ struct RunCase<'a> {
     pool: &'a crate::agents::Pool,
 }
 
-/// One case, all the way along its chain.
-///
-/// The tree returned by each step is the tree handed to the next. Nothing consults the filesystem to
-/// find the previous step's output: reading `verified/` off disk is what once scored a five-day-old
-/// artifact as this run's.
-/// What one case's chain produced. A struct rather than a tuple of two `Vec`s, which transpose
-/// silently.
+/// What one case's chain produced. A struct, not a tuple of two `Vec`s, which transpose silently.
 struct CaseOutcome {
     published: Vec<(PathBuf, Tree)>,
     refused: Vec<String>,
 }
 
+/// One case, all the way along its chain: the tree each step returns is the tree the next is handed.
+/// Nothing consults the filesystem for the previous step's output -- reading `verified/` off disk is
+/// what once scored a five-day-old artifact as this run's.
 fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
     let job = c.job;
     let corpus_c = corpus_case(&job.case_inputs);
@@ -267,4 +266,55 @@ fn reseal(phase_dir: &Path, corpus_case: &Path) -> Result<Tree> {
     let work = WorkDir::assemble(corpus_case)?;
     crate::tree::copy_plain(phase_dir, &work.translation())?;
     work.seal()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    /// Three items and a width of three are really in flight TOGETHER.
+    ///
+    /// No count can see this failure, so it measures the PEAK inside `f`, which sequential execution
+    /// cannot raise above 1 however many items drain. Bounded rather than a barrier: a regression
+    /// fails in a second instead of hanging the suite.
+    #[test]
+    fn items_are_in_flight_together_up_to_the_width() {
+        let items: Vec<usize> = (0..3).collect();
+        let (inside, peak, ran) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        in_flight(&items, 3, |_| {
+            let now = inside.fetch_add(1, SeqCst) + 1;
+            peak.fetch_max(now, SeqCst);
+            for _ in 0..200 {
+                if inside.load(SeqCst) >= 3 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            inside.fetch_sub(1, SeqCst);
+            ran.fetch_add(1, SeqCst);
+        });
+        assert_eq!(
+            peak.load(SeqCst),
+            3,
+            "three workers, three items, one queue"
+        );
+        assert_eq!(
+            ran.load(SeqCst),
+            3,
+            "and every item still runs exactly once"
+        );
+
+        // More items than width still drains: the peak above is what proves concurrency, not this.
+        let many: Vec<usize> = (0..8).collect();
+        let count = AtomicUsize::new(0);
+        in_flight(&many, 3, |_| {
+            count.fetch_add(1, SeqCst);
+        });
+        assert_eq!(count.into_inner(), 8);
+    }
 }

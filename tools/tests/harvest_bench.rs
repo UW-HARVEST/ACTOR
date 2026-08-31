@@ -68,7 +68,8 @@ fn a_harvest_bench_project_reaches_its_agent_and_wants_only_a_stored_entry() {
     assert_eq!(two_steps.len(), 2, "claude runs translate then verify");
 
     let s = store::Store::open(root, Mode::ReplayOnly).unwrap();
-    let ran = chain::run_unit(&paths, &s, project, &jobs, None, &agents::Pool::for_run(1))
+    let units = vec![(project.to_string(), jobs)];
+    let ran = chain::run_all(&paths, &s, &units, None, &agents::Pool::for_run(1))
         .expect("a case the store cannot serve is that CASE's failure, not the run's");
 
     assert_eq!(
