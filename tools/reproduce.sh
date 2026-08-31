@@ -96,9 +96,10 @@ if grep -q 'Tables regenerated' "$log"; then
   done
   if [ "$TABLES" = identical ]; then
     git diff --stat -- $written
+    git diff -U0 -- $written | head -80
     git diff --exit-code -- $written >/dev/null \
-      || die "tables moved: the replayed numbers differ from the committed ones. Inspect the diff
-   above, then commit it deliberately if the new numbers are the ones you mean to publish."
+      || die "tables moved: the replayed numbers differ from the committed ones. The moved lines are
+   above; commit them deliberately only if these are the numbers you mean to publish."
     echo "✅ byte-identical to committed: $(echo $written | tr '\n' ' ')"
         for f in $(git ls-files tables/); do
       echo "$written" | grep -qxF "$f" \
