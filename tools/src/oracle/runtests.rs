@@ -302,6 +302,11 @@ fn hard_failures(text: &str) -> Result<Vec<(String, &'static str)>> {
     Ok(out)
 }
 
+/// Passed EXPLICITLY: upstream's default of 120 makes the score a property of the HOST -- a 2-core CI
+/// runner timed out 88 P01 cases the 48-core sweep box passes, printing 119/128 against a published
+/// 128/128. Nothing on the box moves at 360, so this widens no result; slowness stops reading as failure.
+const CASE_TIMEOUT_SECS: &str = "360";
+
 fn run_runtests(
     paths: &Paths,
     pass: &Pass,
@@ -328,6 +333,8 @@ fn run_runtests(
             &root,
             "--keep-going",
             "--verbose",
+            "--test-timeout",
+            CASE_TIMEOUT_SECS,
             "--junit-xml",
             &report_arg,
         ])

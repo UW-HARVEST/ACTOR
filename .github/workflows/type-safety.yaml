@@ -228,9 +228,15 @@ jobs:
         # commentary is gone. 2583 is the tree with this change and these twelve SELF-COUNTING lines in
         # it, measured after writing them -- not "plus epsilon" -- and `--max-ratio 20` against a 16.4%
         # tree still stops sprawl.
+        #
+        # RAISED 2583 -> 2592, deliberately and by the operator's instruction, for `CASE_TIMEOUT_SECS`.
+        # Upstream runtests defaults `--test-timeout` to 120, which made the published score a property
+        # of the HOST: this runner timed out 88 P01 cases the sweep box passes. A bare `360` would be the
+        # magic constant this file already refuses twice over, and 2583 was the tree measured exactly, so
+        # there was no line to spend. Measured after the edit, not plus epsilon.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 2583 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 2592 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is
