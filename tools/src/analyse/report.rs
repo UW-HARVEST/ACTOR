@@ -51,7 +51,19 @@ struct BatteryRow {
 /// Kiro's PUBLISHED results. Literal, not `AgentKey::dir()`: these rows predate model pinning and 0 of
 /// their files name a model. ONE constant because three places spelled this path, the migration missed
 /// one, and `\CostPOne` vanished from numbers.tex with `macros_used.txt` absent to catch it.
-const KIRO_PUBLISHED: &str = "results/Test-Corpus/kiro/unrecorded";
+/// Where a tool's artifacts live, DERIVED from what the run attested rather than written down.
+///
+/// This replaces three frozen literals -- `kiro/unrecorded`, `claude/claude-opus-5-1m` and
+/// `codex/gpt-5.4` -- which were the layout before `<tool>/<model>` and before kiro was pinned. They
+/// were a second definition of "which agents exist and where", and because the existence invariant
+/// below asserted THOSE names, the `<tool>/<model>` migration -- a legitimate rename -- made table
+/// generation refuse outright. That is why `tables/` was empty.
+fn attested_dir(attested: &Attested, tool: &str) -> Option<String> {
+    attested
+        .entries()
+        .find(|(run, _)| run.label() == tool)
+        .map(|(run, _)| format!("results/Test-Corpus/{}", run.dir))
+}
 
 /// How one run is spelled in the two places that disagree: `label` is what a table's Agent column
 /// prints, `dir` is where its artifacts live. One `String` was both until the store grew a model level.
@@ -369,7 +381,8 @@ pub fn generate(repo_root: &Path, attested: &Attested) -> Result<()> {
     std::fs::write(&tex_path, &tex)?;
     println!("✅ Wrote {}", tex_path.display());
 
-    let numbers = generate_numbers_tex(&rows, repo_root);
+    let kiro_dir = attested_dir(attested, "kiro");
+    let numbers = generate_numbers_tex(&rows, repo_root, kiro_dir.as_deref());
     let numbers_path = tables_dir.join("numbers.tex");
     std::fs::write(&numbers_path, &numbers)?;
     println!("✅ Wrote {}", numbers_path.display());
@@ -441,29 +454,37 @@ pub fn generate(repo_root: &Path, attested: &Attested) -> Result<()> {
         "TRACTOR battery sizes sum to {battery_sum}, expected 338"
     );
 
-    // (1c) A renamed/missing agent dir emits a plausible all-zeros row ("0/338")
-    //      that trips no other invariant and is indistinguishable from a genuine
-    //      baseline zero. kiro-translate is absent here on purpose: it is the
-    //      virtual no-validate agent, covered by the invariant just below.
-    for dir in [
-        KIRO_PUBLISHED,
-        "results/Test-Corpus/claude/claude-opus-5-1m",
-        "results/Test-Corpus/codex/gpt-5.4",
-    ] {
+    // (1c) A renamed/missing agent dir emits a plausible all-zeros row ("0/338") that trips no other
+    //      invariant and is indistinguishable from a genuine baseline zero. The dirs come from the
+    //      ATTESTATION, so the check still fires on a rename between attesting and reading, and it no
+    //      longer names a layout that has since moved on. Naming three literal paths is what made this
+    //      refuse every table after the `<tool>/<model>` migration.
+    for (run, _) in attested.entries() {
+        let dir = results_dir.join(&run.dir);
         anyhow::ensure!(
-            repo_root.join(dir).is_dir(),
-            "TRACTOR agent-dir invariant failed: {dir} is missing \
-             (a rename would silently emit a 0/338 row). Fix the mapping or restore the dir."
+            dir.is_dir(),
+            "TRACTOR agent-dir invariant failed: {} was attested but is missing \
+             (a rename would silently emit a 0/338 row).",
+            dir.display()
         );
     }
     // Without at least one summary_translated.json the pre-verify scoring pass
     // did not run, and the no-validate row would silently read 0/338.
-    anyhow::ensure!(
-        sorted_read_dir(&results_dir.join("kiro/unrecorded")).map(|bats| bats.iter().any(|b|
-            b.path().join("summary_translated.json").is_file())).unwrap_or(false),
-        "no-validate invariant failed: no results/Test-Corpus/kiro/unrecorded/<battery>/summary_translated.json \
-         found (the pre-verify scoring pass did not run; \\ActorKiroNoValidate* would be 0/338)."
-    );
+    // Only when kiro is among the attested tools: a run of claude alone has no pre-verify pass to
+    // check, and demanding one would refuse a table that is honestly narrower.
+    if let Some(kiro) = attested_dir(attested, "kiro") {
+        let kiro = repo_root.join(&kiro);
+        anyhow::ensure!(
+            sorted_read_dir(&kiro)
+                .map(|bats| bats
+                    .iter()
+                    .any(|b| b.path().join("summary_translated.json").is_file()))
+                .unwrap_or(false),
+            "no-validate invariant failed: no {}/<battery>/summary_translated.json found (the \
+             pre-verify scoring pass did not run; \\ActorKiroNoValidate* would be 0/338).",
+            kiro.display()
+        );
+    }
     // (2) P01/P00 must collapse to one distinct source. If symlinks did not
     //     survive checkout (core.symlinks=false materializes them as real dirs),
     //     every config counts and LOC inflates ~120x silently. Skipped when the corpus
@@ -891,7 +912,7 @@ fn kiro_cost(base: &Path) -> KiroCost {
 /// Named constants for result numbers quoted in the prose, so text and tables
 /// cannot disagree. Only numbers derived directly from the committed results
 /// appear here; anything the data does not reproduce is left to the paper text.
-fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
+fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path, kiro_dir: Option<&str>) -> String {
     use std::collections::HashMap;
     let mut total_tests: HashMap<&str, u32> = HashMap::new();
     let mut p01_tests: HashMap<&str, u32> = HashMap::new();
@@ -947,8 +968,12 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
         .map(|r| r.total_loc)
         .sum();
     // (label, results dir, translated-Rust-kLOC denominator)
-    let cost_rows: &[(&str, &str, u32)] = &[("Tractor", KIRO_PUBLISHED, tractor_rust_loc)];
-    for (name, base, rust_loc) in cost_rows {
+    // Only kiro's transcripts carry credits, so only kiro has a cost row -- and its directory is the
+    // attested one, not a literal that the model pin has since moved.
+    let cost_rows: Vec<(&str, &str, u32)> = kiro_dir
+        .map(|d| vec![("Tractor", d, tractor_rust_loc)])
+        .unwrap_or_default();
+    for (name, base, rust_loc) in &cost_rows {
         let cost = kiro_cost(&repo_root.join(base));
         let credits = cost.credits.as_f64();
         if credits <= 0.0 {
@@ -956,7 +981,7 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
         }
         let dollars = cost.credits.to_usd().as_f64();
         let minutes = cost.wall_secs as f64 / 60.0;
-        let kloc = *rust_loc as f64 / 1000.0;
+        let kloc = f64::from(*rust_loc) / 1000.0;
         o.push_str(&format!("\\newcommand{{\\Cost{name}}}{{{:.0}}}\n", dollars));
         o.push_str(&format!(
             "\\newcommand{{\\Cost{name}Minutes}}{{{:.0}}}\n",
@@ -977,8 +1002,8 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
             cost.verify_credits.as_f64() / credits * 100.0
         ));
     }
-    let p01 = kiro_cost(&repo_root.join(KIRO_PUBLISHED).join("P01_sphincs_plus"));
-    if p01.credits.as_f64() > 0.0 {
+    let p01 = kiro_dir.map(|d| kiro_cost(&repo_root.join(d).join("P01_sphincs_plus")));
+    if let Some(p01) = p01.filter(|c| c.credits.as_f64() > 0.0) {
         o.push_str(&format!(
             "\\newcommand{{\\CostPOne}}{{{:.2}}}\n",
             p01.credits.to_usd().as_f64()
@@ -1029,24 +1054,57 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path) -> String {
 }
 
 /// In paper order: ACTOR harness rows first, then transpiler/LLM baselines.
-const TRACTOR_TABLE_ROWS: &[(&str, &str, bool)] = &[
-    // (display label, results dir, is_actor_harness)
-    ("ACTOR (Kiro)", "kiro", true),
-    ("ACTOR (Claude Code)", "claude", true),
-    ("ACTOR (Codex)", "codex-gpt54", true),
-    (
-        "\\makebox[\\knvLength][l]{ACTOR (Kiro, no validate)}",
-        "kiro-translate",
-        true,
-    ),
-    ("C2Rust", "c2rust", false),
-    ("Laertes", "laertes", false),
-    ("C2SaferRust", "c2saferrust", false),
-    ("SmartC2Rust", "smartc2rust", false),
-    ("Kimi K2.5 (query)", "kimi", false),
-    ("GPT-5.4 (query)", "gpt-5.4", false),
-    ("Gemini 3.1 Pro (query)", "gemini-3.1-pro-preview", false),
-];
+/// How a run's own label is spelled in the paper. A NAME, and nothing else.
+///
+/// This is all that survives of `TRACTOR_TABLE_ROWS`, which paired each label with a results
+/// directory and an is-ACTOR flag -- three facts in one literal, and two of them already derivable.
+/// It keyed codex on `codex-gpt54` while `Run::label` produces `codex`, so codex's row was skipped as
+/// "absent" rather than printed; and it doubled as the list of agents that must EXIST, which is why a
+/// legitimate model rename made the whole table refuse.
+fn display_label(run_label: &str) -> String {
+    match run_label {
+        "kiro" => "ACTOR (Kiro)".to_string(),
+        "claude" => "ACTOR (Claude Code)".to_string(),
+        "codex" => "ACTOR (Codex)".to_string(),
+        NO_VALIDATE => "\\makebox[\\knvLength][l]{ACTOR (Kiro, no validate)}".to_string(),
+        "c2rust" => "C2Rust".to_string(),
+        "laertes" => "Laertes".to_string(),
+        "c2saferrust" => "C2SaferRust".to_string(),
+        "smartc2rust" => "SmartC2Rust".to_string(),
+        "kimi" => "Kimi K2.5 (query)".to_string(),
+        // An ablation or a tool with no paper spelling prints its own label rather than vanishing.
+        other => other.to_string(),
+    }
+}
+
+/// The synthetic pre-verify row kiro contributes; see where it is pushed in `generate`.
+const NO_VALIDATE: &str = "kiro-translate";
+
+/// The agent rows to print, in paper order, DERIVED from the rows this run built.
+///
+/// Order is declared (ACTOR harnesses first, then baselines, deterministic within each) but
+/// MEMBERSHIP is not: a tool appears because it produced rows, not because it is on a list. That is
+/// what stops a renamed directory being indistinguishable from a baseline that was never run.
+fn agent_rows(rows: &[BatteryRow]) -> Vec<(String, String, bool)> {
+    let mut agents: Vec<&str> = rows.iter().map(|r| r.agent.as_str()).collect();
+    agents.sort_unstable();
+    agents.dedup();
+    // `is_agentic` is the one definition of "an ACTOR harness"; clap's ValueEnum gives the domain, so
+    // a tool added later is classified without touching this file.
+    let is_actor = |a: &str| {
+        use clap::ValueEnum;
+        a == NO_VALIDATE
+            || crate::cli::Tool::value_variants()
+                .iter()
+                .any(|t| crate::cli::is_agentic(*t) && a.starts_with(crate::cli::tool_dir(*t)))
+    };
+    let mut out: Vec<(String, String, bool)> = agents
+        .iter()
+        .map(|a| (display_label(a), (*a).to_string(), is_actor(a)))
+        .collect();
+    out.sort_by_key(|(_, a, actor)| (!*actor, a.clone()));
+    out
+}
 
 /// In paper order. Each entry is (label on the first agent row, label on the
 /// second, dir): P00/P01 split their name across two rows to match the paper's
@@ -1162,7 +1220,8 @@ fn generate_tractor_tex(rows: &[BatteryRow]) -> String {
 
     for (bi, (bat_line1, bat_line2, bat_dir)) in TRACTOR_BATTERIES.iter().enumerate() {
         // Bold goes to the best Tests among ACTOR harness rows.
-        let best = TRACTOR_TABLE_ROWS
+        let printable = agent_rows(rows);
+        let best = printable
             .iter()
             .filter(|(_, _, actor)| *actor)
             .map(|(_, a, _)| cell(a, bat_dir).tests_pass)
@@ -1170,7 +1229,7 @@ fn generate_tractor_tex(rows: &[BatteryRow]) -> String {
             .unwrap_or(0);
         // The label goes on the first row EMITTED: rows are skipped, so index 0 left blocks bare.
         let mut emitted = 0usize;
-        for (label, agent, _) in TRACTOR_TABLE_ROWS {
+        for (label, agent, _) in &printable {
             let c = cell(agent, bat_dir);
             // A system this run did not resolve is ABSENT, never zeroed: `0/85` reads as "scored
             // zero", which is a claim. Invariant (1c) names that hazard for a missing agent dir.
@@ -1183,6 +1242,7 @@ fn generate_tractor_tex(rows: &[BatteryRow]) -> String {
                 1 => *bat_line2,
                 _ => "",
             };
+            let label = label.as_str();
             emitted += 1;
             let tests = if c.tests_pass == best && best > 0 {
                 format!("\\textbf{{{}/{}}}", c.tests_pass, denom)
@@ -1360,6 +1420,46 @@ mod tests {
     /// A claude-only run attests claude only, and `unwrap_or(0)` answered for everyone else -- so
     /// `numbers.tex` shipped `\ActorKiroTests{0/338}` for an agent whose own committed records say
     /// 325/338, and `\ActorCodexTests{0/338}` against 243/338. A zero is a claim; absence is not.
+    /// Membership is DERIVED, so a tool appears because it produced rows. The frozen list keyed codex
+    /// on `codex-gpt54` while `Run::label` produces `codex`, so codex's row was skipped as "absent"
+    /// even with a full battery of results behind it -- and the same list doubled as the set of
+    /// directories that must exist, which made the `<tool>/<model>` rename refuse every table.
+    #[test]
+    fn a_tool_gets_a_row_because_it_produced_one_not_because_it_is_on_a_list() {
+        let row = |agent: &str| BatteryRow {
+            agent: agent.to_string(),
+            battery: "B01_organic".to_string(),
+            cases_passed: 1,
+            cases_tested: 1,
+            cases_built: 1,
+            vectors_passed: 1,
+            vectors_total: 1,
+            c_loc: 1,
+            total_loc: 1,
+            unsafe_lines: 0,
+        };
+        let got = agent_rows(&[row("codex"), row("claude"), row("kiro"), row("c2rust")]);
+        let keys: Vec<&str> = got.iter().map(|(_, a, _)| a.as_str()).collect();
+        assert!(
+            keys.contains(&"codex"),
+            "codex produced rows and must be printable: {keys:?}"
+        );
+        // ACTOR harnesses first, baselines after -- order declared, membership not.
+        let actor: Vec<bool> = got.iter().map(|(_, _, a)| *a).collect();
+        assert_eq!(actor, vec![true, true, true, false], "{keys:?}");
+        assert_eq!(
+            got[3].0, "C2Rust",
+            "a baseline still gets its paper spelling"
+        );
+        // A tool with NO rows must not appear at all: an absent system is a dash, never a zero.
+        assert!(
+            !agent_rows(&[row("claude")])
+                .iter()
+                .any(|(_, a, _)| a == "kiro"),
+            "kiro produced nothing and must not be listed"
+        );
+    }
+
     #[test]
     fn an_unattested_agent_renders_a_dash_not_a_zero() {
         let mut m: BTreeMap<&str, u32> = BTreeMap::new();
