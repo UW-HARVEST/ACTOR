@@ -58,19 +58,16 @@ pub fn exit_code(metrics_json: &Path) -> Option<i64> {
     read_metrics(metrics_json)?.get("exit_code")?.as_i64()
 }
 
-/// How the agent process ended, as the run itself recorded it. The audit watched nothing, but
-/// the harness did: `agents::exit::merge_agent_exit` wrote what it saw beside the transcript,
-/// and reading it back is the only sight the gate has for a [`LogFormat::Opaque`] backend — a
-/// wall-clock-killed run is `Infra { "timeout" }` and not a result. No record stays
-/// [`Exit::Unobserved`], which is not a failure: the backends that never call
-/// `record_agent_exit` record nothing, and a verdict invented for them is the gate reporting
-/// what nobody observed.
+/// How the agent process ended, as the run itself recorded it beside the transcript: for a
+/// [`LogFormat::Opaque`] backend it is the gate's only sight of a wall-clock kill, which is
+/// `Infra { "timeout" }` and not a result. No record stays [`Exit::Unobserved`] rather than getting a
+/// verdict nobody observed — and since the store records the outcome, nothing writes these any more.
 pub fn recorded_exit(metrics_json: &Path) -> Exit {
     let Some(metrics) = read_metrics(metrics_json) else {
         return Exit::Unobserved;
     };
-    // `merge_agent_exit` writes both keys or neither, and a null `exit_code` is a real
-    // observation of a signal kill — so presence, not parseability, says it was watched.
+    // Both keys are written or neither, and a null `exit_code` is a real observation of a
+    // signal kill — so presence, not parseability, says it was watched.
     let Some(code) = metrics.get("exit_code") else {
         return Exit::Unobserved;
     };
@@ -383,7 +380,7 @@ mod tests {
                 "HB/mujs",
                 r#"{"exit_code":0,"timed_out":false,"success":true,"duration_secs":912}"#,
             ),
-            // A backend that never calls `record_agent_exit` records no exit to read.
+            // A backend that records no exit at all.
             ("HB/zlib", r#"{"success":false,"duration_secs":10800}"#),
         ] {
             std::fs::write(

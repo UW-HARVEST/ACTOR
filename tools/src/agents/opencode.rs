@@ -388,8 +388,7 @@ pub fn invoke(
         ),
     }
 
-    let status = cmd.status().context("invoking opencode")?;
-    crate::agents::exit::record_agent_exit(status);
+    cmd.status().context("invoking opencode")?;
     Ok(())
 }
 

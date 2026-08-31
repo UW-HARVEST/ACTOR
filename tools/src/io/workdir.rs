@@ -226,8 +226,9 @@ pub fn test_tempdir() -> Result<tempfile::TempDir> {
 
 /// A stand-in executable, for tests that must observe how the harness reacts to a program's exit and
 /// output without depending on a real CLI being installed.
-#[cfg(test)]
-pub(crate) fn fake_program(dir: &Path, name: &str, body: &str) -> String {
+///
+/// `pub`, not `#[cfg(test)]`, for [`test_tempdir`]'s reason: other test targets link the lib without it.
+pub fn fake_program(dir: &Path, name: &str, body: &str) -> String {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let at = dir.join(name);

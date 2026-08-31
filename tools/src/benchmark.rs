@@ -6,10 +6,13 @@
 //! prompts, so a dataset had no business having one method per step.
 
 use crate::battery::{self, Paths};
+use crate::chain::{self, Follower, Job};
 use crate::cli::Dataset;
 use crate::eval::Resolved;
 use crate::oracle::{self, Scoring};
-use anyhow::Result;
+use crate::prompt::Shape;
+use crate::transform::Artifact;
+use anyhow::{Context, Result};
 use std::path::Path;
 
 /// Every unit a run may publish, derived ONCE from what the store served. No `Clone`, private field, and
@@ -19,37 +22,64 @@ pub struct InScope(Vec<String>);
 
 impl InScope {
     /// The derivation itself: a unit is publishable only if the store served every case of it
-    /// ([`Benchmark::attests`]). Out-of-scope units are announced by name rather than dropped quietly.
+    /// ([`attests`]). Out-of-scope units are announced by name rather than dropped quietly.
+    ///
+    /// Takes the jobs the CHAIN was handed, not a target to re-derive them from, so "every case"
+    /// means every case the run covers.
     pub fn derive(
-        bench: &dyn Benchmark,
         paths: &Paths,
-        scope: &Scope,
+        units: &[(String, Vec<Job>)],
         resolved: &Resolved,
     ) -> Result<(Self, crate::analyse::report::Attested)> {
         let mut attested = crate::analyse::report::Attested::default();
-        let mut units = Vec::new();
-        for unit in scope.units() {
-            // The run's own filter, so "every case" means every case the run COVERS: against the
-            // unfiltered roster a one-case run is out of scope for the cases it never asked for.
-            match bench.attests(paths, unit, scope.filter(), resolved) {
+        let mut publishable = Vec::new();
+        for (unit, jobs) in units {
+            match attests(jobs, resolved) {
                 Ok(()) => {
                     attested.insert(paths, unit);
-                    units.push(unit.clone());
+                    publishable.push(unit.clone());
                 }
                 Err(why) => println!("\u{23ed}\u{fe0f}  {unit}: out of scope — {why}"),
             }
         }
         anyhow::ensure!(
-            !units.is_empty(),
+            !publishable.is_empty(),
             "the store serves no unit of {} in full, so this run can publish nothing",
-            scope.units().join(", ")
+            units
+                .iter()
+                .map(|(u, _)| u.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
-        Ok((Self(units), attested))
+        Ok((Self(publishable), attested))
     }
 
     pub fn units(&self) -> &[String] {
         &self.0
     }
+}
+
+/// May this unit's number be PUBLISHED? Only if EVERY case came from a keyed replay: one case the
+/// store cannot name leaves the number resting on an artifact nothing attests, and the attested
+/// subset would be a smaller denominator nobody asked for. ONE definition for both datasets, whose
+/// two impls stated this over differently derived lists and could not see an EMPTY list pass.
+fn attests(jobs: &[Job], resolved: &Resolved) -> Result<()> {
+    let dirs = chain::case_dirs(jobs);
+    anyhow::ensure!(
+        !dirs.is_empty(),
+        "it has no case at all, so there is nothing for the store to serve"
+    );
+    let missing = dirs
+        .iter()
+        .filter(|d| !resolved.keys().any(|k| k.starts_with(d)))
+        .count();
+    anyhow::ensure!(
+        missing == 0,
+        "the store serves {} of its {} case(s), {missing} unresolved",
+        dirs.len() - missing,
+        dirs.len()
+    );
+    Ok(())
 }
 
 /// [`Paths`] a dataset's preflight has vouched for. It OWNS them rather than being a free-standing
@@ -63,6 +93,53 @@ impl std::ops::Deref for Preflighted {
     fn deref(&self) -> &Paths {
         &self.0
     }
+}
+
+/// What CMake version the harvest-bench gtest suites need.
+///
+/// A suite that fails to configure reports an empty verdict list, which printed `Builds: no` against
+/// seven crates that had compiled. It lived in `run_hb_all.sh`'s PATH line -- nowhere `run HB` saw.
+const CMAKE_MIN: (u32, u32) = (3, 24);
+
+/// The edge: run the program. [`accept_cmake`] is the judgement, and pure.
+fn require_cmake(min: (u32, u32)) -> Result<()> {
+    let out = std::process::Command::new("cmake")
+        .arg("--version")
+        .output()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cmake is not runnable ({e}), and the gtest suites are configured with it"
+            )
+        })?;
+    accept_cmake(&String::from_utf8_lossy(&out.stdout), min)
+}
+
+fn accept_cmake(version_text: &str, min: (u32, u32)) -> Result<()> {
+    let found = cmake_version(version_text).with_context(|| {
+        format!("`cmake --version` printed no version this can read: {version_text:?}")
+    })?;
+    anyhow::ensure!(
+        found >= min,
+        "cmake {}.{} is too old to configure the harvest-bench gtest suites, which need {}.{}. \
+         Every project would report a failed build for a crate that compiled. Put a newer cmake \
+         first on PATH.",
+        found.0,
+        found.1,
+        min.0,
+        min.1
+    );
+    Ok(())
+}
+
+fn cmake_version(text: &str) -> Option<(u32, u32)> {
+    let digits = text
+        .split_whitespace()
+        .find(|w| w.starts_with(|c: char| c.is_ascii_digit()))?;
+    let mut parts = digits.split('.');
+    Some((
+        parts.next()?.parse().ok()?,
+        parts.next().unwrap_or("0").parse().unwrap_or(0),
+    ))
 }
 
 /// MIT `runtests` needs >= 3.10 and the default `python3` here is 3.9. Lived in `reproduce.sh`, so
@@ -97,21 +174,15 @@ pub trait Benchmark {
     fn name(&self) -> &'static str;
     fn batteries(&self, paths: &Paths, target: &str) -> Result<Vec<String>>;
 
-    /// May this unit's number be PUBLISHED? Only if EVERY case came from a keyed replay: one case the
-    /// store cannot name leaves the number resting on an artifact nothing attests, and counting the
-    /// attested subset would be a smaller denominator nobody asked for.
-    fn attests(
-        &self,
-        paths: &Paths,
-        unit: &str,
-        filter: Option<&str>,
-        resolved: &Resolved,
-    ) -> Result<()>;
-    fn test(&self, paths: &Preflighted, target: &str, scoring: &Scoring<'_>) -> Result<()>;
+    /// Every case of one unit, carrying the layout facts the chain needs.
+    ///
+    /// THE dataset difference, and the one the rewrite left out: a Test-Corpus case lives at
+    /// `Public-Tests/<battery>/<case>` with its vectors beside the C, while a harvest-bench project
+    /// lives at `tests/<name>` and IS its own unit. The chain called `battery::discover` directly, so
+    /// it asked for `tests/Public-Tests/<project>` and every HB run died before its first invocation.
+    fn jobs(&self, paths: &Paths, unit: &str, filter: Option<&str>) -> Result<Vec<Job>>;
 
-    /// Backfills result.json (unsafe/loc/credits); already folded into `test --update`,
-    /// so the `enrich` subcommand only re-runs this step.
-    fn enrich(&self, paths: &Paths, target: &str) -> Result<()>;
+    fn test(&self, paths: &Preflighted, target: &str, scoring: &Scoring<'_>) -> Result<()>;
 }
 
 pub fn for_dataset(d: Dataset) -> Box<dyn Benchmark> {
@@ -250,41 +321,75 @@ impl Benchmark for TestCorpus {
         resolve_batteries(&paths.corpus_dir, target)
     }
 
-    fn attests(
-        &self,
-        paths: &Paths,
-        battery: &str,
-        filter: Option<&str>,
-        resolved: &Resolved,
-    ) -> Result<()> {
-        let output_dir = paths.output_dir(battery);
-        let cases =
-            battery::all_case_names(&battery::discover(&paths.corpus_dir, battery, filter)?);
-        let missing = cases
+    fn jobs(&self, paths: &Paths, battery: &str, filter: Option<&str>) -> Result<Vec<Job>> {
+        let input_dir = paths.input_dir(battery);
+        battery::discover(&paths.corpus_dir, battery, filter)
+            .with_context(|| format!("discovering the cases of {battery}"))?
+            .cases
             .iter()
-            .filter(|n| !resolved.keys().any(|k| k.starts_with(output_dir.join(n))))
-            .count();
-        anyhow::ensure!(
-            missing == 0,
-            "the store serves {} of its {} case(s), {missing} unresolved",
-            cases.len() - missing,
-            cases.len()
-        );
-        Ok(())
+            .map(|case| test_corpus_job(paths, battery, &input_dir, case))
+            .collect()
     }
+
     fn name(&self) -> &'static str {
         "test-corpus"
     }
     fn test(&self, paths: &Preflighted, target: &str, scoring: &Scoring<'_>) -> Result<()> {
         oracle::run_test_corpus(paths, target, scoring)
     }
+}
 
-    fn enrich(&self, paths: &Paths, target: &str) -> Result<()> {
-        for bat in resolve_batteries(&paths.corpus_dir, target)? {
-            oracle::enrich_test_corpus(paths, &bat)?;
-        }
-        Ok(())
-    }
+/// One Test-Corpus case: name, prompt shape, ARTIFACT shape, followers. Was `chain::describe`, where
+/// it made the shared driver Test-Corpus-only. The two shapes stay separate: dropping the followers
+/// is why such a battery published nothing, and collapsing the shapes is why it lost its `driver`.
+fn test_corpus_job(
+    paths: &Paths,
+    battery: &str,
+    input_dir: &Path,
+    case: &battery::Case,
+) -> Result<Job> {
+    Ok(match case {
+        battery::Case::Independent(c) => Job {
+            name: c.name.clone(),
+            case_inputs: input_dir.join(&c.name),
+            case_dir: paths.case_dir(battery, &c.name),
+            shape: Shape::of(c.is_lib, false),
+            artifact: if c.is_lib {
+                // The case-dir name IS the right lib name where the corpus runner names no other:
+                // `cando2`'s short-form `harness!` resolves `lib<case>.so`.
+                Artifact::Cdylib {
+                    lib_name: battery::extract_lib_name(input_dir, &c.name)
+                        .unwrap_or_else(|| c.name.clone()),
+                }
+            } else {
+                Artifact::Driver
+            },
+            followers: Vec::new(),
+        },
+        // One invocation for the real case; its followers are derived by a transform, not re-run --
+        // and the real case is the TEMPLATE they are derived from, so it keeps both targets.
+        battery::Case::SharedSource(g) => Job {
+            name: g.real_case.clone(),
+            case_inputs: input_dir.join(&g.real_case),
+            case_dir: paths.case_dir(battery, &g.real_case),
+            shape: Shape::Shared,
+            artifact: Artifact::Template {
+                default_features: battery::extract_features_from_path(
+                    &input_dir.join(&g.real_case).join("CMakePresets.json"),
+                )?,
+                needs_driver: !g.real_case.ends_with("_lib"),
+            },
+            followers: g
+                .configs
+                .iter()
+                .map(|cfg| Follower {
+                    case_inputs: input_dir.join(&cfg.name),
+                    case_dir: paths.case_dir(battery, &cfg.name),
+                    cfg: cfg.clone(),
+                })
+                .collect(),
+        },
+    })
 }
 
 struct HarvestBench;
@@ -298,6 +403,7 @@ impl Benchmark for HarvestBench {
         );
         // The same function scoring calls, not a second copy of the path.
         crate::oracle::gtest::harvest_bench_runner(&paths.corpus_dir)?;
+        require_cmake(CMAKE_MIN)?;
         Ok(Preflighted(paths))
     }
 
@@ -308,20 +414,24 @@ impl Benchmark for HarvestBench {
             .collect())
     }
 
-    fn attests(
-        &self,
-        paths: &Paths,
-        project: &str,
-        _filter: Option<&str>,
-        resolved: &Resolved,
-    ) -> Result<()> {
-        let dir = paths.results_dir.join(project);
-        anyhow::ensure!(
-            resolved.keys().any(|k| k.starts_with(&dir)),
-            "the store does not serve {project}"
-        );
-        Ok(())
+    /// A project is ONE case and its own unit: no battery level above, no case level below. The
+    /// library shape and the cdylib name are not choices -- the suite links `lib<project>.so` by ABI,
+    /// which is what the pre-rewrite `translate_one_harvest_bench` did by hand.
+    fn jobs(&self, paths: &Paths, project: &str, filter: Option<&str>) -> Result<Vec<Job>> {
+        no_filter_here(filter)?;
+        let p = battery::HarvestBenchProject::resolve(&paths.corpus_dir, project)?;
+        Ok(vec![Job {
+            name: p.name().to_string(),
+            case_inputs: paths.input_dir(project),
+            case_dir: paths.output_dir(project),
+            shape: Shape::Library,
+            artifact: Artifact::Cdylib {
+                lib_name: p.name().to_string(),
+            },
+            followers: Vec::new(),
+        }])
     }
+
     fn name(&self) -> &'static str {
         "harvest-bench"
     }
@@ -329,17 +439,191 @@ impl Benchmark for HarvestBench {
         let projects = resolve_harvest_bench_projects(&paths.corpus_dir, target)?;
         oracle::run_harvest_bench_test(paths, &projects, scoring)
     }
-
-    fn enrich(&self, paths: &Paths, _target: &str) -> Result<()> {
-        // HB results sit per-project directly under results/HarvestBench/<agent>/ with no
-        // battery grouping, which is the shape enrich_test_corpus sees for an empty battery.
-        oracle::enrich_test_corpus(paths, "")
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hb_corpus(root: &Path, project: &str) {
+        let p = root.join("harvest-bench/tests").join(project);
+        std::fs::create_dir_all(p.join("test_case/src")).unwrap();
+        std::fs::write(p.join("test_case/src/lib.c"), "int f(void){return 1;}\n").unwrap();
+        std::fs::create_dir_all(p.join("gtest_suite")).unwrap();
+        std::fs::write(p.join("gtest_suite/CMakeLists.txt"), "# suite\n").unwrap();
+    }
+
+    fn paths_for(root: &Path, dataset: Dataset) -> Paths {
+        Paths::new(
+            root,
+            crate::cli::Tool::Claude,
+            crate::cli::Variant::Default,
+            dataset,
+            None,
+            crate::store::Mode::ReadWrite,
+            crate::io::sandbox::Enforcement::AllowUnsandboxed,
+        )
+        .unwrap()
+    }
+
+    /// What made every harvest-bench run die at second zero for all three tools.
+    #[test]
+    fn a_harvest_bench_project_is_one_case_at_its_own_layout() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        hb_corpus(tmp.path(), "libsodium");
+        let paths = paths_for(tmp.path(), Dataset::HarvestBench);
+
+        let jobs = HarvestBench
+            .jobs(&paths, "libsodium", None)
+            .expect("a project in harvest-bench's own layout must be discoverable");
+
+        assert_eq!(jobs.len(), 1, "a project IS one case");
+        let job = &jobs[0];
+        assert_eq!(job.name, "libsodium");
+        assert!(
+            job.case_inputs.join("test_case").is_dir(),
+            "the C the chain assembles must be inside case_inputs: {}",
+            job.case_inputs.display()
+        );
+        assert_eq!(
+            job.case_dir,
+            paths.output_dir("libsodium"),
+            "and it must publish exactly where the harvest-bench scorer reads"
+        );
+        assert_eq!(
+            job.case_dir.parent(),
+            Some(paths.results_dir.as_path()),
+            "no battery level above it and no case level below it"
+        );
+        assert!(matches!(job.shape, Shape::Library));
+        assert!(
+            matches!(&job.artifact, Artifact::Cdylib { lib_name } if lib_name == "libsodium"),
+            "the suite links lib<project>.so by ABI, so the name comes from the project"
+        );
+        assert!(job.followers.is_empty());
+
+        // Non-vacuous: Test-Corpus discovery really cannot see this corpus.
+        let err = match TestCorpus.jobs(
+            &paths_for(tmp.path(), Dataset::TestCorpus),
+            "libsodium",
+            None,
+        ) {
+            Ok(_) => panic!("the Test-Corpus layout holds no such battery"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("Public-Tests"),
+            "and it fails for exactly the reason HB used to: {err:#}"
+        );
+    }
+
+    /// A number may be published only if the store served every case the run covers -- and a run
+    /// whose artifacts land where the scorer does not look has served none of them.
+    #[test]
+    fn a_unit_attests_only_when_every_case_dir_it_publishes_into_was_served() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        hb_corpus(tmp.path(), "lz4");
+        let paths = paths_for(tmp.path(), Dataset::HarvestBench);
+        let jobs = HarvestBench.jobs(&paths, "lz4", None).unwrap();
+        let tree = || crate::tree::Tree::for_test(tmp.path()).unwrap();
+
+        let empty = Resolved::new();
+        assert!(
+            attests(&jobs, &empty).is_err(),
+            "a store that served nothing must not publish a number"
+        );
+
+        let mut served = Resolved::new();
+        served.insert(
+            jobs[0].case_dir.join(crate::prompt::Role::Translate.dir()),
+            tree(),
+        );
+        attests(&jobs, &served).expect("the dir the chain publishes into must attest it");
+
+        // The scorer's lookup is EXACT, not a prefix: `run_harvest_bench_test` asks
+        // `resolved.get(output_dir(project)/<role>)` and counts a build failure when it misses.
+        let asked_for = paths
+            .output_dir("lz4")
+            .join(crate::prompt::Role::Translate.dir());
+        assert!(
+            served.contains_key(&asked_for),
+            "the scorer must find the very tree the chain published"
+        );
+        let mut nested = Resolved::new();
+        nested.insert(paths.output_dir("lz4").join("lz4/translated"), tree());
+        assert!(
+            !nested.contains_key(&asked_for),
+            "non-vacuous: an extra case level really is invisible to that lookup, even though \
+             `attests`'s prefix test cannot tell"
+        );
+
+        let err = attests(&[], &served).expect_err("an empty unit attests nothing");
+        assert!(format!("{err:#}").contains("no case at all"), "{err:#}");
+    }
+
+    /// See [`CMAKE_MIN`]: on a 3.22 box no suite configures, and `Builds: no` was published against
+    /// seven crates that had compiled.
+    #[test]
+    fn a_cmake_too_old_for_the_gtest_suites_is_refused_before_the_money() {
+        for text in [
+            "cmake version 3.24.0",
+            "cmake version 3.31.1",
+            "cmake 4.0.1",
+        ] {
+            accept_cmake(text, CMAKE_MIN).unwrap_or_else(|e| panic!("{text} must pass: {e:#}"));
+        }
+        let err = accept_cmake("cmake version 3.22.2", CMAKE_MIN)
+            .expect_err("3.22 is the version this box ships and it cannot build a suite");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("3.22") && text.contains("3.24"),
+            "the refusal must name what was found and what is needed: {text}"
+        );
+        // A probe that says nothing is not a pass -- that is the gate going quiet.
+        assert!(accept_cmake("", CMAKE_MIN).is_err());
+        assert!(accept_cmake("cmake version banana", CMAKE_MIN).is_err());
+    }
+
+    /// The Test-Corpus half of the same move: its layout and followers came out of the shared driver,
+    /// so this pins that nothing shifted on the way.
+    #[test]
+    fn a_test_corpus_battery_keeps_its_battery_level_and_its_shared_source_followers() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("tools/ has a parent");
+        let paths = paths_for(root, Dataset::TestCorpus);
+        let jobs = TestCorpus.jobs(&paths, "B02_synthetic", None).unwrap();
+
+        let shared: Vec<&Job> = jobs.iter().filter(|j| !j.followers.is_empty()).collect();
+        assert_eq!(
+            shared.len(),
+            1,
+            "B02_synthetic has exactly one shared-source group (the macrodepth cases)"
+        );
+        let g = shared[0];
+        assert!(matches!(g.shape, Shape::Shared));
+        assert!(
+            matches!(g.artifact, Artifact::Template { .. }),
+            "the real case is the template its followers are derived from"
+        );
+        for f in &g.followers {
+            assert_eq!(
+                f.case_dir.parent().and_then(|p| p.file_name()),
+                Some(std::ffi::OsStr::new("B02_synthetic")),
+                "a Test-Corpus case keeps its battery level: {}",
+                f.case_dir.display()
+            );
+            assert!(f.case_inputs.join("test_case").exists());
+        }
+        // Every case covered once, followers included: the scorer's denominator.
+        assert_eq!(
+            crate::chain::case_dirs(&jobs).len(),
+            battery::all_case_names(
+                &battery::discover(&paths.corpus_dir, "B02_synthetic", None).unwrap()
+            )
+            .len()
+        );
+    }
 
     /// Pinning the mapping itself, not any one caller: nothing tested `--include-regex`, which is how
     /// every impl came to discard it as `_filter`.

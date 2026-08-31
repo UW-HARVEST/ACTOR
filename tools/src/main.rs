@@ -18,6 +18,7 @@ fn main() -> Result<()> {
         } else {
             provenance::OnUnreproducible::Refuse
         })?;
+        harvest_tools::refusal::require_pinned_toolchain()?;
     }
 
     anyhow::ensure!(!cli.tool.is_empty(), "--tool names no tool");
@@ -134,7 +135,17 @@ fn main() -> Result<()> {
                 mode,
                 enforcement,
             )?;
-            benchmark::for_dataset(dataset).enrich(&paths, Dataset::strip_prefix(target))?;
+            // The same door the chain uses, so this backfills what a run publishes -- followers
+            // included, and nothing a `read_dir` happened to find.
+            let bench = benchmark::for_dataset(dataset);
+            let inner = Dataset::strip_prefix(target);
+            let scope = benchmark::Scope::resolve(bench.as_ref(), &paths, inner, None)?;
+            let mut enriched = 0usize;
+            for unit in scope.units() {
+                let jobs = bench.jobs(&paths, unit, scope.filter())?;
+                enriched += oracle::enrich_cases(&chain::case_dirs(&jobs))?;
+            }
+            println!("\u{2705} Enriched {enriched} result.json file(s) under {inner}");
         }
     }
     Ok(())
@@ -179,10 +190,22 @@ fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
     // ONE loop over the units, each running the whole chain. There is no translate pass and no verify
     // pass: a unit's cases go end to end, which is what `run_or_replay` being one function buys.
     let scope = benchmark::Scope::resolve(bench.as_ref(), &paths, r.inner, r.include_regex)?;
+    // Resolved BEFORE the first invocation and reused by the chain, the publishability check and
+    // enrich: an unreadable corpus must refuse before the money, and a case list derived twice is how
+    // a one-case run came to score a battery named `B01_organic/bin2hex_lib` after paying for it.
+    let units: Vec<(String, Vec<chain::Job>)> = scope
+        .units()
+        .iter()
+        .map(|unit| {
+            bench
+                .jobs(&paths, unit, scope.filter())
+                .map(|jobs| (unit.clone(), jobs))
+        })
+        .collect::<Result<_>>()?;
     let mut resolved = eval::Resolved::new();
     let mut refused: Vec<String> = Vec::new();
-    for unit in scope.units() {
-        let ran = chain::run_unit(&paths, &store, unit, scope.filter(), r.steps, &pool)?;
+    for (unit, jobs) in &units {
+        let ran = chain::run_unit(&paths, &store, unit, jobs, r.steps, &pool)?;
         resolved.extend(ran.resolved);
         refused.extend(ran.refused);
     }
@@ -199,8 +222,7 @@ fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
         );
     }
 
-    let (publishable, attested) =
-        benchmark::InScope::derive(bench.as_ref(), &paths, &scope, &resolved)?;
+    let (publishable, attested) = benchmark::InScope::derive(&paths, &units, &resolved)?;
     let all_roles = harvest_tools::prompt::chain(r.tool, r.variant);
     let roles = &all_roles[..r.steps.map_or(all_roles.len(), |n| n.min(all_roles.len()))];
     for unit in publishable.units() {
@@ -316,20 +338,16 @@ mod tests {
             );
             anyhow::bail!("{target}: vectors_passed 393 → 0")
         }
-        fn enrich(&self, _paths: &battery::Paths, _target: &str) -> Result<()> {
-            unreachable!("scoring only")
-        }
         fn batteries(&self, _paths: &battery::Paths, target: &str) -> Result<Vec<String>> {
             Ok(vec![target.to_string()])
         }
-        fn attests(
+        fn jobs(
             &self,
             _paths: &battery::Paths,
-            _battery: &str,
+            _unit: &str,
             _filter: Option<&str>,
-            _resolved: &harvest_tools::eval::Resolved,
-        ) -> Result<()> {
-            Ok(())
+        ) -> Result<Vec<chain::Job>> {
+            unreachable!("scoring only")
         }
     }
 
@@ -367,6 +385,31 @@ mod tests {
         let scorer = tmp.path().join("harvest-bench/runner/target/release");
         std::fs::create_dir_all(&scorer).unwrap();
         std::fs::write(scorer.join("harvest-bench"), "").unwrap();
+        // The HB preflight also demands a cmake new enough to configure a gtest suite. Prepending a
+        // fake is race-free HERE and nowhere else: this test target holds exactly one test. Prepended,
+        // not replaced, so every other program a test spawns still resolves.
+        let bin = tmp.path().join("fakebin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+        // The old cmake FIRST, so the check has a named failing input: without it, deleting the
+        // check from preflight would turn nothing red. 3.22 is what this class of box ships.
+        harvest_tools::io::workdir::fake_program(&bin, "cmake", "echo 'cmake version 3.22.2'");
+        let old_cmake = bench
+            .preflight(unchecked())
+            .err()
+            .expect("a cmake that cannot configure a gtest suite must refuse before the money");
+        assert!(
+            format!("{old_cmake:#}").contains("cmake 3.22"),
+            "and must name it: {old_cmake:#}"
+        );
+        harvest_tools::io::workdir::fake_program(&bin, "cmake", "echo 'cmake version 3.28.6'");
 
         let paths = bench
             .preflight(unchecked())

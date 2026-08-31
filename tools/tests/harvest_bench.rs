@@ -1,7 +1,5 @@
-//! One harvest-bench project, from the corpus to the store lookup.
-//!
-//! Its own test target: the chain's backend reads `HARVEST_CLI_VERSION`, and setting process env is
-//! only race-free where nothing else can observe it, so this file holds exactly ONE test.
+//! One harvest-bench project, from the corpus to the store lookup. Its own test target because the
+//! backend reads `HARVEST_CLI_VERSION`: setting env is race-free only with exactly ONE test here.
 
 use harvest_tools::battery::Paths;
 use harvest_tools::cli::{Dataset, Tool, Variant};
@@ -10,10 +8,9 @@ use harvest_tools::{agents, benchmark, chain, io, prompt, store};
 
 /// A project reaches its agent, and the only thing it is missing is a stored entry.
 ///
-/// `run HB` for claude, codex and kiro each died at second zero with `Battery not found:
-/// harvest-bench/tests/Public-Tests/jansson`. `--replay-only` on an empty store is what makes the
-/// whole path -- discovery, paths, prompt, backend -- testable for free: all of it must work before a
-/// run can get as far as asking for an entry that is not there.
+/// `run HB` died at second zero for all three tools: `Battery not found: .../Public-Tests/jansson`.
+/// `--replay-only` on an empty store tests the whole path for free -- discovery, paths, prompt and
+/// backend all have to work before a run can ask for an entry that is not there.
 #[test]
 fn a_harvest_bench_project_reaches_its_agent_and_wants_only_a_stored_entry() {
     let tmp = io::workdir::test_tempdir().unwrap();

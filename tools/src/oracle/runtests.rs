@@ -166,7 +166,14 @@ fn materialise_role(
         let Some(tree) = scoring.resolved.get(&published) else {
             continue;
         };
-        scope.materialise(&name, tree, &input_dir.join(&name), &published)?;
+        scope.materialise(
+            &name,
+            tree,
+            &crate::transform::Graded::Vectors {
+                corpus_case: input_dir.join(&name),
+            },
+            &published,
+        )?;
         any = true;
     }
     if !any {

@@ -219,8 +219,6 @@ fn read_part(path: &Path) -> Result<String> {
 pub fn dir_for(repo_root: &Path, tool: Tool) -> std::path::PathBuf {
     let prompts = repo_root.join("prompts");
     match tool {
-        // kiro's set is a complete document of its own, kept in its own subdirectory.
-        Tool::Kiro => prompts.join("kiro/test-corpus"),
         // The one-shot calls share a prompt set: neither runs an agentic loop, so neither has a
         // protocol part to differ in.
         Tool::Oneshot | Tool::Kimi => prompts.join("oneshot"),

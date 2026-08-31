@@ -245,7 +245,14 @@ pub fn run_harvest_bench_test(
         });
         match last {
             Some((role, tree)) => {
-                scope.materialise(project.name(), tree, &case_dir, &case_dir.join(role.dir()))?;
+                // The suite is built from `project.gtest_suite()` in the corpus, so the tree needs
+                // the crate and nothing else. This passed `case_dir` -- a RESULTS dir -- as a corpus one.
+                scope.materialise(
+                    project.name(),
+                    tree,
+                    &crate::transform::Graded::AbiSuite,
+                    &case_dir.join(role.dir()),
+                )?;
             }
             None => absent.push(project.name()),
         }

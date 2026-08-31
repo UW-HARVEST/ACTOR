@@ -135,11 +135,11 @@ impl Scope<'_> {
         &mut self,
         name: &str,
         tree: &Tree,
-        corpus_case: &Path,
+        graded: &crate::transform::Graded,
         record_into: &Path,
     ) -> Result<()> {
         let case = self.root.join(name);
-        crate::transform::eval_case(&case, tree, corpus_case)
+        crate::transform::eval_case(&case, tree, graded)
             .with_context(|| format!("assembling {name} for scoring"))?;
         self.cases.push(Case {
             name: name.to_string(),
@@ -274,6 +274,12 @@ mod tests {
         Tree::for_test(case_dir).unwrap()
     }
 
+    fn vectors_of(repo_root: &Path, case: &str) -> crate::transform::Graded {
+        crate::transform::Graded::Vectors {
+            corpus_case: corpus_case(repo_root, "B01", case),
+        }
+    }
+
     fn corpus_case(repo_root: &Path, battery: &str, case: &str) -> PathBuf {
         let dir = repo_root
             .join("test-corpus/Public-Tests")
@@ -356,12 +362,7 @@ mod tests {
         let artifact = published(&case_dir, "fn main() {}");
         let mut scope = tree.scope("B01").unwrap();
         scope
-            .materialise(
-                "001",
-                &artifact,
-                &corpus_case(tmp.path(), "B01", "001"),
-                &case_dir,
-            )
+            .materialise("001", &artifact, &vectors_of(tmp.path(), "001"), &case_dir)
             .unwrap();
         let done = scope.finish().unwrap();
         assert_eq!(done.cases().len(), 1);
@@ -391,12 +392,7 @@ mod tests {
             let case_dir = paths.case_dir("B01", case);
             let artifact = published(&case_dir, "fn main() {}");
             scope
-                .materialise(
-                    case,
-                    &artifact,
-                    &corpus_case(tmp.path(), "B01", case),
-                    &case_dir,
-                )
+                .materialise(case, &artifact, &vectors_of(tmp.path(), case), &case_dir)
                 .unwrap();
         }
         let done = scope.finish().unwrap();
@@ -424,12 +420,7 @@ mod tests {
             let case_dir = paths.case_dir("B01", "001");
             let artifact = published(&case_dir, "fn main() {}");
             scope
-                .materialise(
-                    "001",
-                    &artifact,
-                    &corpus_case(tmp.path(), "B01", "001"),
-                    &case_dir,
-                )
+                .materialise("001", &artifact, &vectors_of(tmp.path(), "001"), &case_dir)
                 .unwrap();
             let done = scope.finish().unwrap();
             let root = done.root().to_path_buf();

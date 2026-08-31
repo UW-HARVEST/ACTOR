@@ -135,31 +135,44 @@ pub fn propagate_config(
     Ok(())
 }
 
-/// Assemble the tree the scorer grades: the translation and the corpus's vectors, and **no C**.
+/// What the oracle needs in the tree BESIDE the crate. A property of the dataset, not of the case.
 ///
-/// This is the structural fix for linking the original library. `runtests` never reads `c_src/`, so
+/// `eval_case` required `test_vectors/` unconditionally, which is a Test-Corpus fact: it would have
+/// refused all seven harvest-bench projects as unscorable, oracle-less.
+pub enum Graded {
+    /// MIT `runtests`: `translated_rust/` + `test_vectors/`, plus the corpus's own `runner/`.
+    Vectors { corpus_case: std::path::PathBuf },
+    /// harvest-bench: the suite links `lib<name>.so` by ABI, so only the crate belongs here.
+    AbiSuite,
+}
+
+/// Assemble the tree the scorer grades: the translation, whatever its oracle needs, and **no C**.
+///
+/// This is the structural fix for linking the original library. Neither oracle reads `c_src/`, so
 /// leaving it out costs the measurement nothing and makes the shortcut fail to build rather than
 /// something to detect: one published artifact CMake-built libsodium out of its own `c_src/`,
 /// `objcopy`-renamed all 881 public symbols and jumped to them from naked asm, scoring full marks at
 /// 1,013 lines against another agent's 27,044. Agents are misaligned; this is a shape, not a policy.
-pub fn eval_case(dest: &Path, tree: &Tree, corpus_case: &Path) -> Result<()> {
+pub fn eval_case(dest: &Path, tree: &Tree, graded: &Graded) -> Result<()> {
     std::fs::create_dir_all(dest)?;
     tree.copy_subtree_into(TRANSLATION, &dest.join(SCORED_CRATE_DIR))
         .with_context(|| format!("assembling {} for scoring", dest.display()))?;
-    let vectors = corpus_case.join(VECTORS_DIR);
-    anyhow::ensure!(
-        vectors.is_dir(),
-        "no {VECTORS_DIR}/ at {} -- the oracle is what grades the translation, so a case without \
-         one cannot be scored and must not be reported as a zero",
-        vectors.display()
-    );
-    crate::tree::copy_plain(&vectors, &dest.join(VECTORS_DIR))?;
-    // The runner drives the vectors against the built crate. From the corpus, like the vectors: it is
-    // the oracle's own harness and an agent never sees it.
-    let runner = corpus_case.join("runner");
-    if runner.is_dir() {
-        crate::tree::copy_plain(&runner, &dest.join("runner"))?;
-        repoint_runner(&dest.join("runner/Cargo.toml"), corpus_case)?;
+    if let Graded::Vectors { corpus_case } = graded {
+        let vectors = corpus_case.join(VECTORS_DIR);
+        anyhow::ensure!(
+            vectors.is_dir(),
+            "no {VECTORS_DIR}/ at {} -- the oracle is what grades the translation, so a case without \
+             one cannot be scored and must not be reported as a zero",
+            vectors.display()
+        );
+        crate::tree::copy_plain(&vectors, &dest.join(VECTORS_DIR))?;
+        // The runner drives the vectors against the built crate. From the corpus, like the vectors:
+        // it is the oracle's own harness and an agent never sees it.
+        let runner = corpus_case.join("runner");
+        if runner.is_dir() {
+            crate::tree::copy_plain(&runner, &dest.join("runner"))?;
+            repoint_runner(&dest.join("runner/Cargo.toml"), corpus_case)?;
+        }
     }
     debug_assert!(
         !dest.join(SCORED_CRATE_DIR).join(C_SRC).exists(),
@@ -373,7 +386,14 @@ mod tests {
         let tree = translated(&case);
         let out = crate::io::workdir::test_tempdir().unwrap();
         let dest = out.path().join("pow43_lib");
-        eval_case(&dest, &tree, &case).unwrap();
+        eval_case(
+            &dest,
+            &tree,
+            &Graded::Vectors {
+                corpus_case: case.clone(),
+            },
+        )
+        .unwrap();
 
         assert!(dest.join(SCORED_CRATE_DIR).join("src/lib.rs").is_file());
         assert!(dest.join(VECTORS_DIR).join("t1.txt").is_file());
@@ -395,9 +415,37 @@ mod tests {
         std::fs::remove_dir_all(case.join(VECTORS_DIR)).unwrap();
         let tree = translated(&case);
         let out = crate::io::workdir::test_tempdir().unwrap();
-        let err = eval_case(&out.path().join("c"), &tree, &case)
-            .expect_err("no vectors means nothing grades it");
+        let err = eval_case(
+            &out.path().join("c"),
+            &tree,
+            &Graded::Vectors { corpus_case: case },
+        )
+        .expect_err("no vectors means nothing grades it");
         assert!(format!("{err:#}").contains(VECTORS_DIR));
+    }
+
+    /// harvest-bench has no `test_vectors/`: its oracle is the suite, which stays in the corpus.
+    /// Requiring them of every dataset is the refusal above, fired on a case missing nothing.
+    #[test]
+    fn the_graded_tree_for_an_abi_suite_is_the_crate_alone() {
+        let (_tmp, case) = corpus();
+        std::fs::remove_dir_all(case.join(VECTORS_DIR)).unwrap();
+        let tree = translated(&case);
+        let out = crate::io::workdir::test_tempdir().unwrap();
+        let dest = out.path().join("libsodium");
+        eval_case(&dest, &tree, &Graded::AbiSuite)
+            .expect("a suite-graded project needs no vectors");
+
+        assert!(dest.join(SCORED_CRATE_DIR).join("src/lib.rs").is_file());
+        assert!(
+            !dest.join(VECTORS_DIR).exists(),
+            "nothing may invent an oracle directory the corpus does not have"
+        );
+        assert!(
+            !dest.join(SCORED_CRATE_DIR).join(C_SRC).exists() && !dest.join(C_SRC).exists(),
+            "and the C must stay out of this tree too -- it is the whole reason libsodium scored \
+             104/104 by jumping to renamed C symbols"
+        );
     }
 
     #[test]

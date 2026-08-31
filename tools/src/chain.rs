@@ -15,7 +15,7 @@
 //! `prompt::chain` is the single declaration of chain length. Adding a third step needs no new type,
 //! no new trait method and no new branch anywhere downstream.
 
-use crate::battery::{self, Case, Paths};
+use crate::battery::{self, Paths};
 use crate::eval::Resolved;
 use crate::invocation::{run_or_replay, Invocation, Produced};
 use crate::prompt::{self, Role, Shape};
@@ -23,6 +23,46 @@ use crate::store::{Prompt, Store};
 use crate::tree::{Tree, WorkDir, TRANSLATION};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+
+/// Everything the chain needs about one case, stated by the dataset that knows its layout. The driver
+/// derived it itself, Test-Corpus-shaped -- see [`crate::benchmark::Benchmark::jobs`].
+pub struct Job {
+    pub name: String,
+    /// The case root: `test_case/` and, for Test-Corpus, `CMakePresets.json` sit directly inside it.
+    pub case_inputs: PathBuf,
+    /// Where each role publishes. Not derivable from `case_inputs`: only one dataset nests.
+    pub case_dir: PathBuf,
+    pub shape: Shape,
+    /// What the ORACLE expects to build -- a different question from the prompt's shape.
+    pub artifact: crate::transform::Artifact,
+    pub followers: Vec<Follower>,
+}
+
+/// A shared-source follower: this job's ONE translation, rebuilt under another CMake configuration.
+/// Paths stated, not derived: deriving them is how followers came to be dropped entirely.
+pub struct Follower {
+    pub cfg: battery::Config,
+    pub case_inputs: PathBuf,
+    pub case_dir: PathBuf,
+}
+
+/// Both datasets spell the C the same way.
+fn corpus_case(case_inputs: &Path) -> PathBuf {
+    case_inputs.join("test_case")
+}
+
+/// Every directory a unit's jobs publish into, FOLLOWERS INCLUDED.
+///
+/// One definition, because "did the store serve this unit" and "which records does enrich backfill"
+/// need the same answer. Leaving followers out of the first voided B02_synthetic and P01 entirely.
+pub fn case_dirs(jobs: &[Job]) -> Vec<&Path> {
+    jobs.iter()
+        .flat_map(|j| {
+            std::iter::once(j.case_dir.as_path())
+                .chain(j.followers.iter().map(|f| f.case_dir.as_path()))
+        })
+        .collect()
+}
 
 /// What one case's chain produced, per role, keyed by the directory it was published into.
 pub struct Ran {
@@ -41,19 +81,17 @@ pub fn run_unit(
     paths: &Paths,
     store: &Store,
     unit: &str,
-    filter: Option<&str>,
+    jobs: &[Job],
     steps: Option<usize>,
     pool: &crate::agents::Pool,
 ) -> Result<Ran> {
-    let discovered = battery::discover(&paths.corpus_dir, unit, filter)
-        .with_context(|| format!("discovering the cases of {unit}"))?;
     let roles = prompt::chain(paths.tool, paths.variant);
     let roles = &roles[..steps.map_or(roles.len(), |n| n.min(roles.len()))];
 
     // Concurrent, bounded by the pool's width: the loop here was sequential, so `--parallel` bought
     // nothing at all -- a permit acquired inside a sequential loop is never contended. Workers pull
     // from one queue rather than a thread per case, so 338 cases do not become 338 threads.
-    let queue = std::sync::Mutex::new(discovered.cases.iter());
+    let queue = std::sync::Mutex::new(jobs.iter());
     let collected: std::sync::Mutex<Ran> = std::sync::Mutex::new(Ran {
         resolved: Resolved::new(),
         failures: Vec::new(),
@@ -63,38 +101,14 @@ pub fn run_unit(
     std::thread::scope(|scope| {
         for _ in 0..pool.width().max(1) {
             scope.spawn(|| loop {
-                let Some(case) = queue.lock().expect("case queue").next() else {
+                let Some(job) = queue.lock().expect("case queue").next() else {
                     return;
                 };
-                // A case the corpus cannot describe is that case's failure, not the run's: the
-                // other workers keep going and this one is reported by name.
-                let described = match describe(case, paths, unit) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        let mut out = collected.lock().expect("collected results");
-                        println!("  \u{274c} describing a case of {unit}: {e:#}");
-                        out.failures.push(format!("{unit}/<undescribable>"));
-                        continue;
-                    }
-                };
-                let (name, shape, artifact, followers) = described;
-                // `CMakePresets.json` sits beside `test_case/`, so the prompt's build flags are read
-                // from the parent.
-                let case_inputs = paths.input_dir(unit).join(&name);
-                let corpus_case = case_inputs.join("test_case");
-                let case_dir = paths.case_dir(unit, &name);
                 let outcome = run_case(RunCase {
                     paths,
                     store,
                     roles,
-                    name: &name,
-                    shape,
-                    artifact: &artifact,
-                    case_inputs: &case_inputs,
-                    corpus_case: &corpus_case,
-                    case_dir: &case_dir,
-                    followers: &followers,
-                    unit,
+                    job,
                     pool,
                 });
                 let mut out = collected.lock().expect("collected results");
@@ -104,8 +118,8 @@ pub fn run_unit(
                         out.refused.extend(done.refused);
                     }
                     Err(e) => {
-                        println!("  \u{274c} {name}: {e:#}");
-                        out.failures.push(name);
+                        println!("  \u{274c} {unit}/{}: {e:#}", job.name);
+                        out.failures.push(job.name.clone());
                     }
                 }
             });
@@ -115,20 +129,12 @@ pub fn run_unit(
     Ok(collected.into_inner().expect("collected results"))
 }
 
-/// The per-case parameters. A struct because half of them are `&Path` and positional arguments of the
-/// same type transpose silently.
+/// The per-case parameters.
 struct RunCase<'a> {
     paths: &'a Paths,
     store: &'a Store,
     roles: &'a [Role],
-    name: &'a str,
-    shape: Shape,
-    artifact: &'a crate::transform::Artifact,
-    case_inputs: &'a Path,
-    corpus_case: &'a Path,
-    case_dir: &'a Path,
-    followers: &'a [battery::Config],
-    unit: &'a str,
+    job: &'a Job,
     pool: &'a crate::agents::Pool,
 }
 
@@ -145,9 +151,11 @@ struct CaseOutcome {
 }
 
 fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
+    let job = c.job;
+    let corpus_c = corpus_case(&job.case_inputs);
     let work_base = crate::io::workdir::base()?;
-    let mut tree = WorkDir::assemble(c.corpus_case)
-        .with_context(|| format!("laying out a working dir for {}", c.name))?
+    let mut tree = WorkDir::assemble(&corpus_c)
+        .with_context(|| format!("laying out a working dir for {}", job.name))?
         .seal()?;
     let mut published = Vec::new();
     let mut refused: Vec<String> = Vec::new();
@@ -158,18 +166,18 @@ fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
             c.paths.tool,
             c.paths.variant,
             role,
-            c.shape,
-            c.case_inputs,
+            job.shape,
+            &job.case_inputs,
         )?
         .with_context(|| {
             format!(
                 "{:?}/{:?} has no {role:?} prompt for a {:?} case, yet the chain schedules one",
-                c.paths.tool, c.paths.variant, c.shape
+                c.paths.tool, c.paths.variant, job.shape
             )
         })?;
         let roots = crate::io::workdir::Roots::resolve(&work_base, &c.paths.repo_root);
         let prompt = Prompt::new(crate::store::normalise(&text, &roots));
-        let phase_dir = c.case_dir.join(role.dir());
+        let phase_dir = job.case_dir.join(role.dir());
         std::fs::create_dir_all(phase_dir.join("logs"))?;
         let log = phase_dir.join("logs").join(role.log());
 
@@ -183,7 +191,7 @@ fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
         // slowest case's build rather than on its agent.
         let produced = {
             let _permit = c.pool.acquire();
-            run_or_replay(&invocation, &tree, c.store, c.corpus_case, &log)?
+            run_or_replay(&invocation, &tree, c.store, &corpus_c, &log)?
         };
         let after = match produced {
             Produced::Done { after, .. } => after,
@@ -200,11 +208,11 @@ fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
             {
                 println!(
                     "  \u{1f6ab} {}: {role:?} answered no: {:?}",
-                    c.name, record.outcome
+                    job.name, record.outcome
                 );
-                let empty = reseal(&phase_dir, c.corpus_case)?;
+                let empty = reseal(&phase_dir, &corpus_c)?;
                 published.push((phase_dir.clone(), empty));
-                refused.push(format!("{}/{role:?}", c.name));
+                refused.push(format!("{}/{role:?}", job.name));
                 break;
             }
             Produced::DidNotComplete(record) => {
@@ -217,24 +225,28 @@ fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
                 "--replay-only: no stored entry for the {role:?} step of {}, so nothing here is \
                  measured. The store does not cover this case at these inputs -- most often because \
                  the prompt or the model moved, and both are key components.",
-                c.name
+                job.name
             ),
         };
 
         // Publish, then transform. The transform is deterministic and outside the cache, so the tree
         // the NEXT step keys on is `transform(after)` and not `after` itself.
-        publish(&after, &phase_dir, c.corpus_case)?;
-        crate::transform::post_process(&phase_dir, c.artifact)?;
-        tree = reseal(&phase_dir, c.corpus_case)?;
+        publish(&after, &phase_dir)?;
+        crate::transform::post_process(&phase_dir, &job.artifact)?;
+        tree = reseal(&phase_dir, &corpus_c)?;
         published.push((phase_dir.clone(), tree.clone()));
 
-        // Per step: `attests` is checked per role, so a follower must be served for each one.
-        for cfg in c.followers {
-            let follower_dir = c.paths.case_dir(c.unit, &cfg.name).join(role.dir());
-            crate::transform::propagate_config(&phase_dir, &follower_dir, cfg)
-                .with_context(|| format!("deriving {} from {} for {role:?}", cfg.name, c.name))?;
-            let follower_corpus = c.paths.input_dir(c.unit).join(&cfg.name).join("test_case");
-            let follower_tree = reseal(&follower_dir, &follower_corpus)?;
+        // Per step: publishability is checked per role, so each must serve its followers.
+        for follower in &job.followers {
+            let follower_dir = follower.case_dir.join(role.dir());
+            crate::transform::propagate_config(&phase_dir, &follower_dir, &follower.cfg)
+                .with_context(|| {
+                    format!(
+                        "deriving {} from {} for {role:?}",
+                        follower.cfg.name, job.name
+                    )
+                })?;
+            let follower_tree = reseal(&follower_dir, &corpus_case(&follower.case_inputs))?;
             published.push((follower_dir, follower_tree));
         }
     }
@@ -244,7 +256,7 @@ fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
 /// Write the step's crate into the results tree. Only the translation: `c_src/` is the pinned corpus
 /// and re-derived wherever a working dir is assembled, so publishing it would store the same bytes
 /// once per case per step.
-fn publish(tree: &Tree, phase_dir: &Path, _corpus_case: &Path) -> Result<()> {
+fn publish(tree: &Tree, phase_dir: &Path) -> Result<()> {
     tree.copy_subtree_into(TRANSLATION, phase_dir)
         .with_context(|| format!("publishing into {}", phase_dir.display()))
 }
@@ -255,55 +267,4 @@ fn reseal(phase_dir: &Path, corpus_case: &Path) -> Result<Tree> {
     let work = WorkDir::assemble(corpus_case)?;
     crate::tree::copy_plain(phase_dir, &work.translation())?;
     work.seal()
-}
-
-/// Name, prompt shape, ARTIFACT shape, and the followers this case stands for.
-///
-/// Two separate shapes on purpose. Dropping the followers here is why any battery with a
-/// shared-source group published nothing, and collapsing the two shapes is why every such group lost
-/// its `driver`.
-fn describe(
-    case: &Case,
-    paths: &Paths,
-    unit: &str,
-) -> Result<(
-    String,
-    Shape,
-    crate::transform::Artifact,
-    Vec<battery::Config>,
-)> {
-    let input_dir = paths.input_dir(unit);
-    Ok(match case {
-        Case::Independent(c) => {
-            let artifact = if c.is_lib {
-                // The case-dir name IS the right lib name where the corpus runner names no other:
-                // `cando2`'s short-form `harness!` resolves `lib<case>.so`.
-                crate::transform::Artifact::Cdylib {
-                    lib_name: battery::extract_lib_name(&input_dir, &c.name)
-                        .unwrap_or_else(|| c.name.clone()),
-                }
-            } else {
-                crate::transform::Artifact::Driver
-            };
-            (
-                c.name.clone(),
-                Shape::of(c.is_lib, false),
-                artifact,
-                Vec::new(),
-            )
-        }
-        // One invocation for the real case; its followers are derived by a transform, not re-run --
-        // and the real case is the TEMPLATE they are derived from, so it keeps both targets.
-        Case::SharedSource(g) => (
-            g.real_case.clone(),
-            Shape::Shared,
-            crate::transform::Artifact::Template {
-                default_features: battery::extract_features_from_path(
-                    &input_dir.join(&g.real_case).join("CMakePresets.json"),
-                )?,
-                needs_driver: !g.real_case.ends_with("_lib"),
-            },
-            g.configs.clone(),
-        ),
-    })
 }

@@ -87,15 +87,6 @@ pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
     Ok(batteries)
 }
 
-pub fn has_shared_source_groups(corpus_dir: &Path, battery_name: &str) -> bool {
-    let dir = corpus_dir.join("Public-Tests").join(battery_name);
-    std::fs::read_dir(&dir).ok().is_some_and(|entries| {
-        entries
-            .filter_map(|e| e.ok())
-            .any(|e| e.path().join("test_case").is_symlink())
-    })
-}
-
 // ── harvest-bench project ──────────────────────────────────────────────
 
 /// `harvest-bench/tests/<name>/` holding a `test_case/` (the C library to
@@ -676,19 +667,20 @@ impl Paths {
         })
     }
 
-    /// Where this tool's own prompt files live.
-    pub fn prompts_dir(&self) -> PathBuf {
-        crate::prompt::dir_for(&self.repo_root, self.tool)
-    }
-
-    pub fn input_dir(&self, battery: &str) -> PathBuf {
-        self.corpus_dir.join("Public-Tests").join(battery)
+    /// Where a unit's cases are read FROM. Dataset-aware: see [`crate::benchmark::Benchmark::jobs`].
+    pub fn input_dir(&self, unit: &str) -> PathBuf {
+        match self.dataset {
+            Dataset::TestCorpus => self.corpus_dir.join("Public-Tests").join(unit),
+            Dataset::HarvestBench => self.corpus_dir.join(unit),
+        }
     }
 
     pub fn output_dir(&self, name: &str) -> PathBuf {
         self.results_dir.join(name)
     }
 
+    /// The Test-Corpus two-level results layout; harvest-bench has no case level and uses
+    /// [`Self::output_dir`], which is what its scorer reads.
     pub fn case_dir(&self, battery: &str, case: &str) -> PathBuf {
         self.results_dir.join(battery).join(case)
     }
