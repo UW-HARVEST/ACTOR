@@ -1,8 +1,9 @@
 //! Which prompt an invocation is handed, and how long a chain the tool runs.
 //!
-//! Two axes, deliberately separate. [`Role`] is which step of the chain this is; [`Shape`] is what the
-//! case is. The old `PromptKind` mixed them, so a verify prompt could not depend on the shape and every
-//! executable case was told to produce a cdylib.
+//! Two axes, deliberately separate. [`Role`] is which step of the chain this is; [`Shape`] is what
+//! the case is. The old `PromptKind` mixed them -- `Library`, `Executable`, `Shared` and `Verify`
+//! were one enum -- so a verify prompt could not depend on the shape and every executable case was
+//! told to produce a cdylib. Splitting them makes that unrepresentable rather than a known bug.
 //!
 //! The chain is declared HERE, by tool and variant, and nowhere else. It used to be stated twice --
 //! `has_verify_phase` and a `Verify => None` arm in the prompt table -- with two tests existing only
@@ -56,20 +57,12 @@ impl Shape {
     }
 }
 
-/// Whether this tool has the prompts a variant needs. Refused rather than fallen back on: reading the
-/// base prompt under an ablation's name would file a result as an experiment that never ran.
+/// Whether this tool has the prompts a variant needs.
+///
+/// The ablations are claude experiments and only claude's prompt directory holds them. Refused rather
+/// than fallen back on: silently reading the base prompt under an ablation's name would file a
+/// result as an experiment that never ran.
 pub fn supports(tool: Tool, variant: Variant) -> Result<()> {
-    // NoShim forks a SHARED body, so it exists for the tools that compose one. Reading kiro's own
-    // document instead would file a shimmed translation as an unshimmable one; `body` decides.
-    if variant == Variant::NoShim {
-        anyhow::ensure!(
-            matches!(body(tool, NO_SHIM_LIBRARY), Body::Shared),
-            "--prompt no-shim forks prompts/shared/{NO_SHIM_LIBRARY}; --tool {} reads a prompt set of \
-             its own with no such fork, so this would measure the unmodified prompt",
-            crate::cli::tool_dir(tool)
-        );
-        return Ok(());
-    }
     anyhow::ensure!(
         variant == Variant::Default || tool == Tool::Claude,
         "--prompt {} is a claude ablation; --tool {} has no such prompt set, and reading its base \
@@ -97,8 +90,7 @@ pub fn chain(tool: Tool, variant: Variant) -> &'static [Role] {
         | Variant::NoFeatures
         | Variant::NoSubtask
         | Variant::CrossPrompt => ONE,
-        // NoShim is the same methodology at a stricter prompt: the same chain, not an ablation's one.
-        Variant::Default | Variant::NoShim => match tool {
+        Variant::Default => match tool {
             Tool::Claude | Tool::Codex | Tool::Kiro | Tool::OpenCode => BOTH,
             // A single-shot API call and the transpilers have one step and no prompt to give a
             // second one to.
@@ -110,9 +102,9 @@ pub fn chain(tool: Tool, variant: Variant) -> &'static [Role] {
 
 /// The one place a prompt file is chosen, relative to the tool's prompt directory.
 ///
-/// `None` means this tool reads no prompt at all -- the transpilers are given none. Returning the NAME
-/// lets a test check the choice against the files on disk, so a renamed prompt fails in CI rather than
-/// reaching a paid run as an empty one.
+/// `None` means this tool reads no prompt for that role at all -- the transpilers are given none.
+/// Returning the NAME rather than the text is what lets a test check the choice against the files on
+/// disk, so a renamed prompt fails in CI instead of reaching a paid run as an empty one.
 pub fn file_for(tool: Tool, variant: Variant, role: Role, shape: Shape) -> Option<&'static str> {
     if let Some(f) = ablation_file(variant, role, shape) {
         return Some(f);
@@ -120,8 +112,6 @@ pub fn file_for(tool: Tool, variant: Variant, role: Role, shape: Shape) -> Optio
     match tool {
         // One arm on purpose: the backend varies, the methodology does not.
         Tool::Kiro | Tool::Claude | Tool::OpenCode | Tool::Codex => Some(match (role, shape) {
-            // Only the library shape differs: wrapping is only worth doing to a whole library.
-            (Role::Translate, Shape::Library) if variant == Variant::NoShim => NO_SHIM_LIBRARY,
             (Role::Translate, Shape::Library) => "translate-library.md",
             (Role::Translate, Shape::Executable) => "translate-executable.md",
             (Role::Translate, Shape::Shared) => "translate-shared.md",
@@ -141,16 +131,17 @@ pub fn file_for(tool: Tool, variant: Variant, role: Role, shape: Shape) -> Optio
     }
 }
 
-/// The ablation forks, under `<tool>/ablations/`. Exhaustive over [`Variant`] so a new one states its
-/// files rather than silently inheriting the base prompts.
+/// The ablation forks, all under `<tool>/ablations/`. Exhaustive over [`Variant`] so a new one has
+/// to state its files rather than silently inherit the base prompts.
 fn ablation_file(variant: Variant, role: Role, shape: Shape) -> Option<&'static str> {
     use Shape::{Executable, Library, Shared};
     if role == Role::Verify {
-        // Every ablation is one step; `chain` decides that, and this is the same fact seen here.
+        // Every ablation is one step; `chain` already says so, and this is the same fact seen from
+        // the prompt table. Both must agree, which is why only one of them decides.
         return None;
     }
     match variant {
-        Variant::Default | Variant::NoShim => None,
+        Variant::Default => None,
         Variant::Combined => Some(match shape {
             Library => "ablations/translate-and-verify-library.md",
             Executable => "ablations/translate-and-verify-executable.md",
@@ -163,7 +154,8 @@ fn ablation_file(variant: Variant, role: Role, shape: Shape) -> Option<&'static 
             Executable => "ablations/translate-no-iter-executable.md",
             Shared => "ablations/translate-no-iter-shared.md",
         }),
-        // E2 and E6 differ only on shared-source cases; their independent cases read the base prompts.
+        // E2 and E6 differ from the base on shared-source cases only, so their independent cases
+        // deliberately read the unmodified prompts.
         Variant::NoFeatures => match shape {
             Shared => Some("ablations/translate-no-features-shared.md"),
             _ => None,
@@ -172,7 +164,8 @@ fn ablation_file(variant: Variant, role: Role, shape: Shape) -> Option<&'static 
             Shared => Some("ablations/translate-no-subtask-shared.md"),
             _ => None,
         },
-        // E4: the mismatch IS the experiment. A shared-source case has no counterpart to swap with.
+        // E4: the mismatch IS the experiment -- a library gets the executable prompt and vice
+        // versa. A shared-source case has no counterpart to swap with.
         Variant::CrossPrompt => Some(match shape {
             Library => "translate-executable.md",
             Executable => "translate-library.md",
@@ -183,9 +176,6 @@ fn ablation_file(variant: Variant, role: Role, shape: Shape) -> Option<&'static 
 
 /// The tool-specific tail of a composed prompt.
 pub const PROTOCOL_PART: &str = "protocol.md";
-
-/// Named once, so [`supports`] and [`file_for`] cannot disagree about which file the variant forks.
-const NO_SHIM_LIBRARY: &str = "translate-library-no-shim.md";
 
 /// Where the file [`file_for`] names lives, and whether the tool's protocol part follows it.
 ///
@@ -232,8 +222,9 @@ pub fn dir_for(repo_root: &Path, tool: Tool) -> std::path::PathBuf {
         // The one-shot calls share a prompt set: neither runs an agentic loop, so neither has a
         // protocol part to differ in.
         Tool::Oneshot | Tool::Kimi => prompts.join("oneshot"),
-        // OpenCode drives Claude models through a different CLI and has always been given claude's
-        // set. Stated rather than left to a fallback: this is the line to change if that stops holding.
+        // OpenCode drives Claude models through a different CLI, and has always been given claude's
+        // set -- including its sub-agent protocol. Stated here rather than left to a fallback: if
+        // OpenCode ever needs its own protocol, this is the line that has to change.
         Tool::OpenCode => prompts.join("claude"),
         _ => prompts.join(crate::cli::tool_dir(tool)),
     }
@@ -319,7 +310,6 @@ mod tests {
         Variant::NoFeatures,
         Variant::NoSubtask,
         Variant::CrossPrompt,
-        Variant::NoShim,
     ];
     const SHAPES: &[Shape] = &[Shape::Library, Shape::Executable, Shape::Shared];
 
@@ -449,43 +439,6 @@ mod tests {
             saw_a_substitution,
             "no prompt on disk carries {FLAGS}, so this proves nothing about substitution"
         );
-    }
-
-    /// The strict prompt reaches the tools that can read it, runs BOTH steps, and is refused by those
-    /// whose prompt set has no fork of it. It must not be an ablation: those run a one-step chain, and
-    /// a translation with no verify step is not comparable to the numbers it is measured against.
-    #[test]
-    fn the_strict_library_prompt_is_a_full_chain_for_the_tools_that_share_a_body() {
-        for tool in [Tool::Codex, Tool::Claude, Tool::OpenCode] {
-            supports(tool, Variant::NoShim)
-                .unwrap_or_else(|e| panic!("{tool:?} composes the shared body: {e:#}"));
-            assert_eq!(
-                chain(tool, Variant::NoShim),
-                chain(tool, Variant::Default),
-                "{tool:?}: the strict prompt must run the SAME chain as default, or the numbers are \
-                 not comparable"
-            );
-            assert_eq!(
-                file_for(tool, Variant::NoShim, Role::Translate, Shape::Library),
-                Some(NO_SHIM_LIBRARY),
-                "{tool:?} must read the strict library prompt"
-            );
-            for (role, shape) in [
-                (Role::Translate, Shape::Executable),
-                (Role::Translate, Shape::Shared),
-                (Role::Verify, Shape::Library),
-            ] {
-                assert_eq!(
-                    file_for(tool, Variant::NoShim, role, shape),
-                    file_for(tool, Variant::Default, role, shape),
-                    "{tool:?}/{role:?}/{shape:?} must be the unmodified prompt"
-                );
-            }
-        }
-        let err = supports(Tool::Kiro, Variant::NoShim).expect_err(
-            "reading kiro's base prompt would file a shimmed run as an unshimmable one",
-        );
-        assert!(format!("{err:#}").contains(NO_SHIM_LIBRARY));
     }
 
     #[test]
