@@ -113,6 +113,10 @@ pub fn run_or_replay(
         }
         // Above the execution, which is where the money is: refusing instead IS the mode.
         if store.mode() == Mode::ReplayOnly {
+            // A TERMINAL answer replays as itself; `Infra`/`Unknown` have nothing to serve.
+            if let Some(record) = store.terminal_record(key)? {
+                return Ok(Produced::DidNotComplete(record));
+            }
             return Ok(Produced::Unavailable);
         }
     }
@@ -182,6 +186,14 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 health: || Health::Completed,
                 writes,
+            }
+        }
+
+        fn exhausted() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                health: || Health::Exhausted { secs: 43_200 },
+                writes: "partial\n",
             }
         }
 
@@ -282,6 +294,53 @@ mod tests {
         assert!(replayed, "and must say so");
         assert_eq!(exec.calls(), 1, "the agent must NOT have run again");
         assert_eq!(again.digest(), after.digest());
+    }
+
+    /// A settled answer replays without paying, and a lost run still refuses. See
+    /// [`crate::store::Outcome::is_terminal_answer`] for what that cost.
+    #[test]
+    fn a_stored_terminal_answer_replays_and_a_stored_infra_failure_does_not() {
+        let f = fixture();
+        let m = model();
+        let prompt = Prompt::new("translate");
+
+        for (exec, servable) in [(Fake::exhausted(), true), (Fake::failing(), false)] {
+            let store = Store::open(f._repo.path(), Mode::ReadWrite).unwrap();
+            let inv = Invocation {
+                tool: "kiro",
+                prompt: &prompt,
+                runner: Runner::Agent {
+                    model: &m,
+                    exec: &exec,
+                },
+            };
+            let first = run_or_replay(&inv, &f.first, &store, &f.corpus_c, &f.log).unwrap();
+            assert!(
+                matches!(first, Produced::DidNotComplete(_)),
+                "the fixture must not complete"
+            );
+            assert_eq!(exec.calls(), 1);
+
+            // Same key, now under the mode `reproduce.sh` uses: nothing may be paid for.
+            let replay = Store::open(f._repo.path(), Mode::ReplayOnly).unwrap();
+            let again = run_or_replay(&inv, &f.first, &replay, &f.corpus_c, &f.log).unwrap();
+            assert_eq!(exec.calls(), 1, "a replay must never invoke the agent");
+            if servable {
+                let Produced::DidNotComplete(record) = again else {
+                    panic!("a terminal answer must replay as itself")
+                };
+                assert!(matches!(
+                    record.outcome,
+                    crate::store::Outcome::Exhausted { .. }
+                ));
+            } else {
+                assert!(
+                    matches!(again, Produced::Unavailable),
+                    "a lost run has no measurement to serve"
+                );
+            }
+            std::fs::remove_dir_all(f._repo.path().join("results/.cache")).ok();
+        }
     }
 
     #[test]

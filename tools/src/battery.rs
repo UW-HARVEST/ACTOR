@@ -690,11 +690,10 @@ impl Paths {
 mod tests {
     /// Three tools running at once must not write to one another's paths.
     ///
-    /// The output paths are what a parallel sweep would CORRUPT rather than merely slow: two runs
-    /// sharing a results dir interleave their `summary.json`, and two sharing an evaluation tree
-    /// delete each other's crates mid-build. The agent's own scratch is per invocation, resolved
-    /// inside the runner from the work dir it was handed -- it was resolved from the machine-wide
-    /// work base, which every tool and every case shared.
+    /// These are what a parallel sweep would CORRUPT rather than merely slow: two runs sharing a
+    /// results dir interleave their `summary.json`, and two sharing an evaluation tree delete each
+    /// other's crates mid-build. The agent's scratch is per invocation now, resolved in the runner from
+    /// the work dir it was handed, not from the machine-wide base every case once shared.
     #[test]
     fn no_two_tools_share_an_output_or_evaluation_path() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();

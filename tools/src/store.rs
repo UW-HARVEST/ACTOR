@@ -210,6 +210,19 @@ impl Outcome {
     /// Whether another attempt could plausibly succeed. Exhaustive, and NOT a function of the tool:
     /// only claude's CLI exposes a retry setting, so leaving resilience to the CLIs made the harness's
     /// tolerance vary by backend. `Refused` is reproducible; `Exhausted` already spent its budget.
+    /// Whether this outcome is the TOOL'S OWN answer, settled and unchangeable by a re-run, so a
+    /// replay may serve it. `lookup` serves only `Completed`, right for `Infra` (no measurement) and
+    /// wrong for these two, which this codebase already calls "terminal and reproducible, unlike
+    /// `Infra`": declining them made a definitive answer unreplayable and, since `attests` is
+    /// all-or-nothing, took the battery with it -- kiro's B01_synthetic served 83 of 85, and re-running
+    /// one costs a 12-hour session that exhausts again.
+    pub fn is_terminal_answer(&self) -> bool {
+        match self {
+            Outcome::Refused { .. } | Outcome::Exhausted { .. } => true,
+            Outcome::Completed | Outcome::Infra { .. } | Outcome::Unknown { .. } => false,
+        }
+    }
+
     pub fn is_transient(&self) -> bool {
         match self {
             Outcome::Infra { .. } => true,
@@ -374,6 +387,17 @@ impl Store {
     ///
     /// A walk over ordinary entries, not a second tree: a failure is an entry with a non-`Completed`
     /// outcome, which is what removed the `failed/` subtree and the second walker that read it.
+    /// The stored record at this key when [`Outcome::is_terminal_answer`] holds.
+    pub fn terminal_record(&self, key: &Key<'_>) -> Result<Option<AgentRecord>> {
+        let record_path = key.entry_dir(&self.root).join("agent.json");
+        if !record_path.is_file() {
+            return Ok(None);
+        }
+        let record: AgentRecord = serde_json::from_str(&std::fs::read_to_string(&record_path)?)
+            .with_context(|| format!("reading {}", record_path.display()))?;
+        Ok(record.outcome.is_terminal_answer().then_some(record))
+    }
+
     pub fn failures(&self) -> Result<Vec<(String, Outcome)>> {
         fn walk(dir: &Path, out: &mut Vec<(String, Outcome)>) -> Result<()> {
             let record = dir.join("agent.json");
@@ -413,6 +437,42 @@ impl Store {
             "\u{1f5c3}\u{fe0f}  cache: {} hit / {} run ({} agent invocation(s))",
             c.hits, c.invocations, c.invocations
         )
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    /// A settled answer replays as itself; a lost run still has to be re-run.
+    #[test]
+    fn a_terminal_answer_is_servable_on_replay_and_a_lost_run_is_not() {
+        for settled in [
+            Outcome::Exhausted { secs: 43_200 },
+            Outcome::Refused {
+                refusal: crate::domain::health::RefusalKind::HighRiskCyberActivity,
+                detail: String::new(),
+            },
+        ] {
+            assert!(settled.is_terminal_answer(), "{settled:?} cannot change");
+            assert!(!settled.is_transient(), "and must not be retried either");
+        }
+        for lost in [
+            Outcome::Infra {
+                reason: "timeout".into(),
+                detail: String::new(),
+            },
+            Outcome::Unknown {
+                why: "opaque log".into(),
+            },
+        ] {
+            assert!(
+                !lost.is_terminal_answer(),
+                "{lost:?} has no measurement to serve, so a replay must still refuse it"
+            );
+        }
+        // `Completed` is served by `lookup` and must not be reachable by this door as well.
+        assert!(!Outcome::Completed.is_terminal_answer());
     }
 }
 

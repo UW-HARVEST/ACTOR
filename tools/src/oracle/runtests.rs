@@ -261,22 +261,17 @@ fn transcripts(crate_root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     )
 }
 
-/// Cases discovered but NOT ONE of them reaching any verdict: the oracle never ran, whatever it
-/// printed. All 128 of P01's crates once failed to build on a runner whose registry lacked their
-/// dependency, and the pass reported `0/128` and regenerated `tables/` from it -- caught only by
-/// `git diff`.
+/// Cases discovered but NOT ONE reaching a verdict: the oracle never ran, whatever it printed. All
+/// 128 of P01's crates once failed to build on a runner whose registry lacked their dependency, and
+/// the pass reported `0/128` and regenerated `tables/` from it -- caught only by `git diff`.
 ///
-/// Keyed on cases, not vectors, and that correction matters: "every crate failed to build" IS a
-/// result, and it is one four agents already publish. `smartc2rust`, `c2rust`, `c2saferrust` and
-/// `gpt-5.4` each record `0/128` for P01 with `Tested: 0, Failed: 128, Vectors: 0/0` -- the exact
-/// shape the vector form refused, so the code could not re-derive four rows of its own tables.
-/// Nobody noticed because `reproduce.sh` replayed claude only; it now replays every tool, and
-/// refuses if any of them produced no tally.
-///
-/// The registry class this was written for is now stopped at source by `CARGO_NET_OFFLINE=false`
-/// below, and any table that moves for any reason is caught by `reproduce.sh`'s byte-identical
-/// diff. What remains here is the one signal counts can honestly carry: a battery where the oracle
-/// judged nothing at all, not one where it judged everything a failure.
+/// Keyed on cases, not vectors, and that matters: "every crate failed to build" IS a result, and one
+/// four agents already publish -- `smartc2rust`, `c2rust`, `c2saferrust` and `gpt-5.4` each record
+/// `0/128` for P01 as `Tested: 0, Failed: 128, Vectors: 0/0`, the exact shape the vector form refused,
+/// so the code could not re-derive four rows of its own tables. Nobody noticed because `reproduce.sh`
+/// replayed claude only; it now replays every tool and refuses if one produced no tally. The registry
+/// class is stopped at source by `CARGO_NET_OFFLINE=false` below, and a table that moves for any reason
+/// is caught by the byte-identical diff. What remains is the one signal counts can honestly carry.
 fn measured_nothing(cases_discovered: usize, cases_tested: usize, cases_failed: usize) -> bool {
     cases_discovered > 0 && cases_tested + cases_failed == 0
 }
@@ -284,12 +279,10 @@ fn measured_nothing(cases_discovered: usize, cases_tested: usize, cases_failed: 
 /// The cases runtests failed OUTRIGHT, with the reason, from its text alone.
 ///
 /// Pure and separately testable because the shape LIST is where the bug was: only `Build failed` and
-/// `Test failed (` were matched, so `Execution failed` -- a case whose binary never ran -- stayed out
-/// of `failed_cases`, and `cases_passed = discovered - failed.len()` counted it as a PASS. 76 such
-/// cases sit in the committed logs across 10 agents, every one scored as passing;
-/// `claude-cross-prompt` alone holds 56 of them against a published 63/210. It stayed hidden because
-/// the one battery where EVERY case took this shape was refused by `measured_nothing` instead, so the
-/// parser gap surfaced as a different error.
+/// `Test failed (` matched, so `Execution failed` -- a binary that never ran -- stayed out of
+/// `failed_cases` and `discovered - failed.len()` counted it a PASS. 76 such cases sit in the committed
+/// logs across 10 agents, `claude-cross-prompt` alone holding 56 against a published 63/210. Hidden
+/// because the one battery where EVERY case took this shape was refused by `measured_nothing` instead.
 fn hard_failures(text: &str) -> Result<Vec<(String, &'static str)>> {
     let shapes = [
         (Regex::new(r"^- (\S+): Build failed")?, "build failed"),
