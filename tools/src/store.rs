@@ -79,11 +79,9 @@ fn digest_dir(d: &str) -> String {
 /// look enabled while never working.
 pub fn normalise(text: &str, roots: &Roots) -> String {
     let mut out = text.to_string();
-    // `to_str`, never `to_string_lossy`: lossy mapping sends every invalid byte to
-    // U+FFFD, so two different roots can produce the same substitution string and two
-    // different prompts the same digest — a false cache *hit*, the one failure mode
-    // this key exists to prevent. Skipping a non-UTF-8 root instead leaves the literal
-    // path in the normalised text, which can only cost a miss.
+    // `to_str`, never `to_string_lossy`: lossy mapping sends every invalid byte to U+FFFD, so two
+    // roots can produce the same substitution and two prompts the same digest -- a false cache *hit*,
+    // the one failure mode this key exists to prevent. Skipping a non-UTF-8 root can only cost a miss.
     let mut subs: Vec<(&str, &str)> = [
         (Some(roots.work.as_path()), "$WORK"),
         (Some(roots.repo.as_path()), "$REPO"),
@@ -107,11 +105,9 @@ pub fn normalise(text: &str, roots: &Roots) -> String {
     out
 }
 
-/// The prompt as the key names it: the FINAL text, after substitution and path normalisation.
-///
-/// Carries the text beside the hash because the text is stored in the entry -- a change to how
-/// prompts are normalised then becomes a re-key rather than a cache wipe, since every entry holds
-/// the bytes its hash was taken over.
+/// The prompt as the key names it: the FINAL text, after substitution and path normalisation. The text
+/// rides beside the hash because the entry stores it, so a change to normalisation is a re-key rather
+/// than a cache wipe -- every entry holds the bytes its hash was taken over.
 pub struct Prompt {
     text: String,
     hash: String,
@@ -207,15 +203,11 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// Whether another attempt could plausibly succeed. Exhaustive, and NOT a function of the tool:
-    /// only claude's CLI exposes a retry setting, so leaving resilience to the CLIs made the harness's
-    /// tolerance vary by backend. `Refused` is reproducible; `Exhausted` already spent its budget.
-    /// Whether this outcome is the TOOL'S OWN answer, settled and unchangeable by a re-run, so a
-    /// replay may serve it. `lookup` serves only `Completed`, right for `Infra` (no measurement) and
-    /// wrong for these two, which this codebase already calls "terminal and reproducible, unlike
-    /// `Infra`": declining them made a definitive answer unreplayable and, since `attests` is
-    /// all-or-nothing, took the battery with it -- kiro's B01_synthetic served 83 of 85, and re-running
-    /// one costs a 12-hour session that exhausts again.
+    /// The TOOL'S OWN answer, settled and unchangeable by a re-run, so a replay may serve it.
+    /// `lookup` serves only `Completed` -- right for `Infra`, which has no measurement, and wrong for
+    /// these two, which this codebase calls "terminal and reproducible, unlike `Infra`": declining them
+    /// made a definitive answer unreplayable and, `attests` being all-or-nothing, took the battery too.
+    /// kiro's B01_synthetic served 83 of 85, and re-running one exhausts another 12-hour session.
     pub fn is_terminal_answer(&self) -> bool {
         match self {
             Outcome::Refused { .. } | Outcome::Exhausted { .. } => true,
@@ -223,6 +215,9 @@ impl Outcome {
         }
     }
 
+    /// Whether another attempt could plausibly succeed. NOT a function of the tool: only claude's CLI
+    /// exposes a retry setting, so leaving resilience to the CLIs made the harness's tolerance vary by
+    /// backend. `Refused` is reproducible; `Exhausted` already spent its budget.
     pub fn is_transient(&self) -> bool {
         match self {
             Outcome::Infra { .. } => true,
@@ -309,7 +304,17 @@ impl Store {
                 record_path.display()
             );
         };
-        let after = Tree::adopt_stored(dir.join("after"), recorded)?;
+        // An entry that no longer reproduces its recorded digest is CORRUPT, and the mode decides:
+        // `ReadWrite` treats it as a miss and re-pays, which is the design's own remedy; aborting the
+        // case wedged it for ever once a digest RULE changed under it. `ReplayOnly` still errors.
+        let after = match Tree::adopt_stored(dir.join("after"), recorded) {
+            Ok(after) => after,
+            Err(e) if self.mode == Mode::ReadWrite => {
+                eprintln!("  cache: discarding a corrupt entry and re-running it: {e:#}");
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
         self.count(|c| c.hits += 1);
         Ok(Some(Stored { after, record }))
     }
@@ -381,13 +386,7 @@ impl Store {
         Ok((entries, bytes))
     }
 
-    /// Every entry whose run did not complete, as `(entry path AS TEXT, outcome)`.
-    ///
-    /// Text, not a `PathBuf`: a caller holding a path can run a command in the store.
-    ///
-    /// A walk over ordinary entries, not a second tree: a failure is an entry with a non-`Completed`
-    /// outcome, which is what removed the `failed/` subtree and the second walker that read it.
-    /// The stored record at this key when [`Outcome::is_terminal_answer`] holds.
+    /// The record here when [`Outcome::is_terminal_answer`] holds.
     pub fn terminal_record(&self, key: &Key<'_>) -> Result<Option<AgentRecord>> {
         let record_path = key.entry_dir(&self.root).join("agent.json");
         if !record_path.is_file() {
@@ -398,6 +397,9 @@ impl Store {
         Ok(record.outcome.is_terminal_answer().then_some(record))
     }
 
+    /// Every entry whose run did not complete, as `(entry path AS TEXT, outcome)`. Text, not a
+    /// `PathBuf`: a caller holding a path can run a command in the store. A walk over ordinary entries
+    /// rather than a second tree -- which is what removed the `failed/` subtree and its walker.
     pub fn failures(&self) -> Result<Vec<(String, Outcome)>> {
         fn walk(dir: &Path, out: &mut Vec<(String, Outcome)>) -> Result<()> {
             let record = dir.join("agent.json");
@@ -437,6 +439,81 @@ impl Store {
             "\u{1f5c3}\u{fe0f}  cache: {} hit / {} run ({} agent invocation(s))",
             c.hits, c.invocations, c.invocations
         )
+    }
+}
+
+#[cfg(test)]
+mod corrupt_tests {
+    use super::*;
+
+    /// A corrupt entry is a MISS when the run may pay and an error when it may not. claude's macrodepth
+    /// verify was hashed under the rule that included `target-cfg`; once that changed, `lookup` returning
+    /// the error ABORTED the case rather than re-running it, so the battery could never heal.
+    #[test]
+    fn a_corrupt_entry_is_re_run_when_paying_is_allowed_and_refused_when_it_is_not() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let corpus = tmp.path().join("test_case");
+        std::fs::create_dir_all(&corpus).unwrap();
+        std::fs::write(corpus.join("lib.c"), "int f(void);\n").unwrap();
+        let before = crate::tree::WorkDir::assemble(&corpus)
+            .unwrap()
+            .seal()
+            .unwrap();
+
+        let model = ModelId::new("global.anthropic.claude-opus-5[1m]").unwrap();
+        let prompt = Prompt::new("verify");
+        let key = Key {
+            tool: "claude",
+            model: model.as_str(),
+            before: before.digest(),
+            prompt: &prompt,
+        };
+
+        let store = Store::open(tmp.path(), Mode::ReadWrite).unwrap();
+        let w = crate::tree::WorkDir::assemble(&corpus).unwrap();
+        std::fs::write(w.translation().join("lib.rs"), "pub fn f() {}\n").unwrap();
+        let after = w.seal().unwrap();
+        let record = AgentRecord {
+            outcome: Outcome::Completed,
+            output_tree: Some(after.digest().as_str().to_string()),
+            wall_secs: 1,
+            cost_usd: None,
+            cli: "fake".into(),
+        };
+        store
+            .write(&key, &before, Some(&after), &record, None)
+            .unwrap();
+        assert!(
+            store.lookup(&key).unwrap().is_some(),
+            "fixture: an intact entry must serve, or the corruption proves nothing"
+        );
+
+        // Now make the stored bytes disagree with the recorded digest.
+        let cache = tmp.path().join("results/.cache");
+        let at = key
+            .entry_dir(&cache)
+            .join("after")
+            .join(crate::tree::TRANSLATION)
+            .join("lib.rs");
+        let mut perms = std::fs::metadata(&at).unwrap().permissions();
+        #[allow(
+            clippy::permissions_set_readonly_false,
+            reason = "the point of the test is to tamper with a stored tree, which is read-only"
+        )]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&at, perms).unwrap();
+        std::fs::write(&at, "pub fn f() { /* edited after the fact */ }\n").unwrap();
+
+        assert!(
+            store.lookup(&key).unwrap().is_none(),
+            "ReadWrite must treat it as a miss so the run replaces it"
+        );
+        let replay = Store::open(tmp.path(), Mode::ReplayOnly).unwrap();
+        let err = match replay.lookup(&key) {
+            Ok(_) => panic!("ReplayOnly cannot pay, so it must refuse rather than serve or shrug"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("records"), "{err:#}");
     }
 }
 
