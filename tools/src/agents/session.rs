@@ -52,6 +52,19 @@ pub struct Caps {
     pub data_kb: u64,
 }
 
+impl Caps {
+    /// The SAME caps for every backend. They used to be `Option<Caps>`, `Some` for claude and `None`
+    /// for codex, kiro and opencode -- so three of four agents ran with no file-size limit at all, and
+    /// kiro wrote a 9.3 GB transcript for one case. Not a `tee` inheritance problem as first supposed:
+    /// `tee` is in the same pipeline and inherits fine, the limit was simply never set. A resource cap
+    /// that varies by tool is the same defect as a wall-clock ceiling that varies by tool, and the
+    /// same answer applies -- make it unrepresentable rather than keep four values in agreement.
+    pub const UNIFORM: Self = Self {
+        fsize_blocks: crate::io::workdir::AGENT_FSIZE_BLOCKS,
+        data_kb: crate::io::workdir::AGENT_DATA_KB,
+    };
+}
+
 /// One agentic session: the CLI, its wall-clock cap, the flags that shape how it
 /// behaves, and the exact shell script that applies them.
 ///
@@ -63,7 +76,7 @@ pub struct Session {
     timeout_secs: u64,
     max_turns: Option<u32>,
     permission_mode: Option<&'static str>,
-    caps: Option<Caps>,
+    caps: Caps,
     /// Agent definition passed as `--agents`; empty for the CLIs that take none.
     agents_json: &'static str,
     agent_env: &'static [(&'static str, &'static str)],
@@ -77,10 +90,7 @@ impl Session {
             timeout_secs,
             max_turns: Some(CLAUDE_MAX_TURNS),
             permission_mode: Some(CLAUDE_PERMISSION_MODE),
-            caps: Some(Caps {
-                fsize_blocks: crate::io::workdir::AGENT_FSIZE_BLOCKS,
-                data_kb: crate::io::workdir::AGENT_DATA_KB,
-            }),
+            caps: Caps::UNIFORM,
             agents_json: CLAUDE_PLAIN_AGENT_JSON,
             agent_env: AGENT_ENV,
             script: String::new(),
@@ -106,7 +116,7 @@ impl Session {
             timeout_secs,
             max_turns: None,
             permission_mode: None,
-            caps: None,
+            caps: Caps::UNIFORM,
             agents_json: "",
             agent_env: CODEX_AGENT_ENV,
             script: String::new(),
@@ -129,7 +139,7 @@ impl Session {
             timeout_secs,
             max_turns: None,
             permission_mode: None,
-            caps: None,
+            caps: Caps::UNIFORM,
             agents_json: "",
             agent_env: &[],
             script: String::new(),
@@ -152,7 +162,7 @@ impl Session {
             timeout_secs,
             max_turns: None,
             permission_mode: None,
-            caps: None,
+            caps: Caps::UNIFORM,
             agents_json: "",
             agent_env: &[],
             script: String::new(),
@@ -167,10 +177,8 @@ impl Session {
     }
 
     fn prefix(&self) -> String {
-        let ulimit = match self.caps {
-            Some(c) => format!("ulimit -f {} -d {}; ", c.fsize_blocks, c.data_kb),
-            None => String::new(),
-        };
+        let c = self.caps;
+        let ulimit = format!("ulimit -f {} -d {}; ", c.fsize_blocks, c.data_kb);
         // `set -o pipefail` on every backend: without it the pipeline's status is
         // tee's, so `timeout`'s 124 never reaches `record_agent_exit` and a killed
         // session is recorded as a clean exit.
@@ -204,9 +212,10 @@ impl Session {
         if let Some(m) = self.permission_mode {
             out += &format!(" permission_mode={m}");
         }
-        if let Some(c) = self.caps {
-            out += &format!(" fsize_blocks={} data_kb={}", c.fsize_blocks, c.data_kb);
-        }
+        out += &format!(
+            " fsize_blocks={} data_kb={}",
+            self.caps.fsize_blocks, self.caps.data_kb
+        );
         out += &format!(" agents={}", self.agents_json);
         // Sorted, so a reordering of the constant is not a different recipe.
         let mut env: Vec<_> = self.agent_env.to_vec();
@@ -231,9 +240,12 @@ impl Session {
         if let Some(m) = self.permission_mode {
             want.push(format!("--permission-mode {m}"));
         }
-        if let Some(c) = self.caps {
-            want.push(format!("ulimit -f {} -d {}", c.fsize_blocks, c.data_kb));
-        }
+        // Unconditional: `assert_declares` is what catches a script whose text drifted from the
+        // fields, and while caps were optional this check simply did not run for three of four agents.
+        want.push(format!(
+            "ulimit -f {} -d {}",
+            self.caps.fsize_blocks, self.caps.data_kb
+        ));
         for w in &want {
             anyhow::ensure!(
                 self.script.contains(w.as_str()),
@@ -441,6 +453,41 @@ mod tests {
             shape_with_env(&[("A", "1"), ("B", "2")]),
             shape_with_env(&[("B", "2"), ("A", "1")]),
         );
+    }
+
+    /// A resource cap that varies by tool is the defect a per-tool wall-clock ceiling already was.
+    /// `caps` was `Option<Caps>`: `Some` for claude, `None` for codex, kiro and opencode -- so three of
+    /// four agents ran with no file-size limit, and kiro wrote a 9.3 GB transcript for one case of
+    /// B01_synthetic before anyone looked.
+    #[test]
+    fn every_backend_caps_its_agent_the_same_way() {
+        let sessions = [
+            ("claude", Session::claude(60)),
+            ("codex", Session::codex(60)),
+            ("kiro", Session::kiro(60)),
+            (
+                "opencode",
+                Session::opencode(crate::agents::opencode::Phase::Verify, 60),
+            ),
+        ];
+        let want = format!(
+            "ulimit -f {} -d {}",
+            crate::io::workdir::AGENT_FSIZE_BLOCKS,
+            crate::io::workdir::AGENT_DATA_KB
+        );
+        for (name, s) in &sessions {
+            // `assert_declares` compares the script text against the fields, so it refuses exactly
+            // when the cap is absent from the script -- which is what never ran for three of four.
+            assert!(
+                s.shape()
+                    .contains(&crate::io::workdir::AGENT_FSIZE_BLOCKS.to_string()),
+                "{name} declares no file-size cap in its shape, so nothing bounds what it writes"
+            );
+            assert!(
+                s.assert_declares().is_ok(),
+                "{name} script does not apply {want:?}"
+            );
+        }
     }
 
     #[test]

@@ -63,7 +63,18 @@ pub fn classify(rel: &RelPath, in_build_dir: bool) -> Disposition {
             // Bytes, not `to_string_lossy`: a lossy name maps every invalid byte to U+FFFD,
             // so two different directories can compare equal here and be classified alike.
             let s = c.as_os_str().as_encoded_bytes();
-            BUILD_DIRS.iter().any(|d| d.as_bytes() == s) || s.starts_with(b"cbuild")
+            // `target-`, HYPHEN INCLUDED. An agent that called its build directory `target-cfg` had
+            // 163k paths of build output STORED AND HASHED, because `target` matched only exactly.
+            // Build output carries absolute per-run paths, so a tree holding it cannot key the same on
+            // another machine -- and `propagate_config` copied it into all 127 P01 followers.
+            //
+            // The hyphen is what keeps this from over-reaching: `classify` runs on every `read_dir`
+            // entry, files included, so a bare `target` prefix also swallowed `src/targets.rs` and
+            // `include/target.h`. A cargo build dir varies by hyphenated suffix; a Rust module path
+            // cannot contain a hyphen at all.
+            BUILD_DIRS.iter().any(|d| d.as_bytes() == s)
+                || s.starts_with(b"target-")
+                || s.starts_with(b"cbuild")
         })
     {
         return Disposition::BuildOutput;
@@ -115,6 +126,37 @@ mod tests {
             Disposition::Ignore
         );
         assert_eq!(classify(&rel("src/x.rs.bak"), false), Disposition::Ignore);
+    }
+
+    /// An agent picks its own build-directory names, and an exact-match list cannot keep up. One
+    /// called it `target-cfg`: 163k paths of build output were stored AND HASHED into the trees, and
+    /// because build output carries absolute per-run paths, every tree holding it keys differently on
+    /// another machine. It also rode into all 127 P01 followers via `propagate_config`.
+    #[test]
+    fn an_agents_build_directory_is_build_output_whatever_suffix_it_uses() {
+        for at in [
+            "target/debug/deps/x.o",
+            "target-cfg/debug/deps/symbols-ee8e5db53eac8eab",
+            "target-release/x",
+            "cbuild/x.o",
+            "cbuild-ninja/x.o",
+            "translation/target-cfg/debug/build/x",
+        ] {
+            assert_eq!(
+                classify(&rel(at), false),
+                Disposition::BuildOutput,
+                "{at} is build output and must be neither carried nor hashed"
+            );
+        }
+        // ...without swallowing source that merely starts the same way. `targets.rs` is a source file
+        // and `target_map/` could be a module; only a path COMPONENT named target* is a build dir.
+        for at in ["src/targets.rs", "src/lib.rs", "include/target.h"] {
+            assert_eq!(
+                classify(&rel(at), false),
+                Disposition::StoreAndHash,
+                "{at} is the agent's work"
+            );
+        }
     }
 
     /// The scorer writes `result.json` INTO the published crate after the tree is sealed, so the next
