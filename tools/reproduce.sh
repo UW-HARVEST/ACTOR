@@ -85,9 +85,10 @@ echo "✅ .eval/ is empty"
 
 echo
 echo "--- did anything move? ---"
-# Which tables THIS run regenerated, from what it SAID it wrote: `git diff` alone cannot tell
-# "regenerated the same bytes" from "never regenerated".
-written=$(grep -o "Wrote $(pwd)/tables/[^ ]*" "$log" | sed "s|Wrote $(pwd)/||" | sort -u)
+# Which tables THIS run wrote, from what it SAID: `git diff` cannot tell "same bytes" from "never ran".
+# Relative to `tables/`, never $(pwd): the binary prints /local/home/... and `pwd` the same directory as
+# /home/..., through a symlinked home -- so a $(pwd) anchor matched nothing and could only ever fail.
+written=$(grep -o "Wrote .*/tables/[^ ]*" "$log" | sed "s|.*/tables/|tables/|" | sort -u)
 if grep -q 'Tables regenerated' "$log"; then
   [ -n "$written" ] || die "the run reported table regeneration but named no file it wrote"
   for f in $written; do
@@ -100,8 +101,7 @@ if grep -q 'Tables regenerated' "$log"; then
       || die "tables moved: the replayed numbers differ from the committed ones. Inspect the diff
    above, then commit it deliberately if the new numbers are the ones you mean to publish."
     echo "✅ byte-identical to committed: $(echo $written | tr '\n' ' ')"
-    # Every committed table must have been REGENERATED, not merely left alone.
-    for f in $(git ls-files tables/); do
+        for f in $(git ls-files tables/); do
       echo "$written" | grep -qxF "$f" \
         || die "$f is committed but this run did not write it: either table generation was skipped, or
    nothing produces that file any more."
