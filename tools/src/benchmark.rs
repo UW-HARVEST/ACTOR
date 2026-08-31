@@ -584,22 +584,51 @@ mod tests {
         assert!(accept_cmake("cmake version banana", CMAKE_MIN).is_err());
     }
 
-    /// The Test-Corpus half of the same move: its layout and followers came out of the shared driver,
-    /// so this pins that nothing shifted on the way.
+    fn tc_corpus(root: &Path, battery: &str) {
+        let b = root.join("test-corpus/Public-Tests").join(battery);
+        let case = |name: &str| {
+            let d = b.join(name);
+            std::fs::create_dir_all(d.join("test_vectors")).unwrap();
+            d
+        };
+        for independent in ["alpha_lib", "beta"] {
+            let d = case(independent);
+            std::fs::create_dir_all(d.join("test_case")).unwrap();
+            std::fs::write(d.join("test_case/lib.c"), "int f(void){return 1;}\n").unwrap();
+        }
+        let real = case("macrodepth_add_5");
+        std::fs::create_dir_all(real.join("test_case")).unwrap();
+        std::fs::write(real.join("test_case/lib.c"), "int g(void){return 2;}\n").unwrap();
+        for follower in ["macrodepth_add_10", "macrodepth_add_20"] {
+            std::os::unix::fs::symlink(real.join("test_case"), case(follower).join("test_case"))
+                .unwrap();
+        }
+    }
+
+    /// The Test-Corpus half of the same move: layout and followers came out of the shared driver. On a
+    /// FIXTURE, because the real submodule is absent from the fork-safe checkout CI runs this in.
     #[test]
     fn a_test_corpus_battery_keeps_its_battery_level_and_its_shared_source_followers() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("tools/ has a parent");
-        let paths = paths_for(root, Dataset::TestCorpus);
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        tc_corpus(tmp.path(), "B02_synthetic");
+        let paths = paths_for(tmp.path(), Dataset::TestCorpus);
+        assert!(
+            paths
+                .input_dir("B02_synthetic")
+                .join("macrodepth_add_10/test_case")
+                .is_symlink(),
+            "without the symlink there is no group to find and this test proves nothing"
+        );
         let jobs = TestCorpus.jobs(&paths, "B02_synthetic", None).unwrap();
+        assert_eq!(jobs.len(), 3, "two independent cases and one shared group");
 
         let shared: Vec<&Job> = jobs.iter().filter(|j| !j.followers.is_empty()).collect();
         assert_eq!(
             shared.len(),
             1,
-            "B02_synthetic has exactly one shared-source group (the macrodepth cases)"
+            "the macrodepth cases are one shared-source group"
         );
+        assert_eq!(shared[0].followers.len(), 2);
         let g = shared[0];
         assert!(matches!(g.shape, Shape::Shared));
         assert!(
