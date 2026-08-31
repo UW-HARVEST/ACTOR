@@ -23,6 +23,8 @@ enum ProjectScore {
         tests_ok: usize,
         tests_failed: usize,
         tests_skipped: usize,
+        /// PRINT-ONLY: inside `record()` this would rewrite every published result.json.
+        failing: Vec<String>,
     },
 }
 
@@ -48,6 +50,7 @@ impl ProjectScore {
                 tests_ok,
                 tests_failed,
                 tests_skipped,
+                ..
             } => HarvestBenchResult {
                 tests_ok: *tests_ok,
                 tests_failed: *tests_failed,
@@ -65,6 +68,10 @@ struct Verdict {
     passed: bool,
     #[serde(default)]
     skipped: bool,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    failure: String,
 }
 
 /// The published record; `passed` defers to `crate::domain::outcome` so the column means one thing.
@@ -215,6 +222,7 @@ fn score_harvest_bench_suite(
         .with_context(|| format!("{} holds a verdict this cannot read", report_json.display()))?;
 
     let (mut tests_ok, mut tests_failed, mut tests_skipped) = (0usize, 0usize, 0usize);
+    let mut failing = Vec::new();
     for v in &verdicts {
         if v.skipped {
             tests_skipped += 1;
@@ -222,6 +230,12 @@ fn score_harvest_bench_suite(
             tests_ok += 1;
         } else {
             tests_failed += 1;
+            let why = v.failure.lines().next().unwrap_or_default();
+            failing.push(if why.is_empty() {
+                v.name.clone()
+            } else {
+                format!("{} ({why})", v.name)
+            });
         }
     }
 
@@ -238,6 +252,7 @@ fn score_harvest_bench_suite(
         tests_ok,
         tests_failed,
         tests_skipped,
+        failing,
     })
 }
 
@@ -346,9 +361,21 @@ pub fn run_harvest_bench_test(
                 r.tests_ok, r.tests_skipped
             );
         } else if r.tests_failed > 0 {
+            let failing = match &score {
+                ProjectScore::Measured { failing, .. } => failing.clone(),
+                _ => Vec::new(),
+            };
             println!(
-                "  ⚠️  {name}: {} ok, {} FAILED, {} skipped",
-                r.tests_ok, r.tests_failed, r.tests_skipped
+                "  ⚠️  {name}: {} ok, {} FAILED, {} skipped (e.g. {})",
+                r.tests_ok,
+                r.tests_failed,
+                r.tests_skipped,
+                failing
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
             );
         } else if let Some(missing) = &r.missing_symbols {
             unlinkable += 1;
@@ -527,7 +554,7 @@ mod tests {
         let runner = runner_writing(
             tmp.path(),
             "runner-real",
-            r#"{"run":{"verdicts":[{"passed":true,"skipped":false},{"passed":false,"skipped":false},{"passed":false,"skipped":true}]}}"#,
+            r#"{"run":{"verdicts":[{"passed":true,"skipped":false},{"passed":false,"skipped":false,"name":"Sodium.pad","failure":"expected 3 got 4\nand a second line"},{"passed":false,"skipped":true}]}}"#,
         );
         let scored = score_harvest_bench_suite(&runner, tmp.path(), Path::new("libx.so"), &report)
             .expect("one pass and one failure IS a measurement");
@@ -537,6 +564,10 @@ mod tests {
             (1, 1, 1, true),
             "a skip is counted apart from a judgement, and a measured suite records build_ok"
         );
+        let ProjectScore::Measured { failing, .. } = &scored else {
+            panic!("a measured suite is Measured")
+        };
+        assert_eq!(failing, &["Sodium.pad (expected 3 got 4)".to_string()]);
     }
 
     /// A suite that will not LINK is the translation's failure, not the harness's. kiro's zstd compiled
@@ -615,6 +646,7 @@ mod tests {
                 tests_ok: 0,
                 tests_failed: 3,
                 tests_skipped: 0,
+                failing: vec!["Sodium.pad".into()],
             }
             .record()
             .build_ok,
