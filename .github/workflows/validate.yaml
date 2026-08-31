@@ -5,6 +5,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: validate-translations-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # One job per TOOL plus one covering all three, in parallel. They CAN pass -- no agent, no credentials,
   # and `--replay-only` makes a miss a refusal. The 7-arm `test all --check` matrix that was here had not
