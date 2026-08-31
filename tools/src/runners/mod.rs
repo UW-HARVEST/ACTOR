@@ -40,7 +40,7 @@ pub struct CliVersion(String);
 
 /// States the build when the CLI is not installed — replaying a stored cache without
 /// one. The build must still be NAMED, so the key stays as specific as before, and
-/// [`crate::agents::invocation::assert_pins_honoured`] still checks it against what the
+/// `assert_pins_honoured` still checks it against what the
 /// transcript reports.
 pub const ENV_CLI_VERSION: &str = "HARVEST_CLI_VERSION";
 

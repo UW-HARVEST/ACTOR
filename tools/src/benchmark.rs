@@ -22,7 +22,7 @@ pub struct InScope(Vec<String>);
 
 impl InScope {
     /// The derivation itself: a unit is publishable only if the store served every case of it
-    /// ([`attests`]). Out-of-scope units are announced by name rather than dropped quietly.
+    /// (`attests`). Out-of-scope units are announced by name rather than dropped quietly.
     ///
     /// Takes the jobs the CHAIN was handed, not a target to re-derive them from, so "every case"
     /// means every case the run covers.

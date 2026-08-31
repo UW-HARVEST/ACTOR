@@ -1,15 +1,14 @@
 //! How an agent CLI is invoked: one builder per backend, shared by translate and
 //! verify.
 //!
-//! The script text is rendered from the same value [`crate::cache::Recipe`] hashes, so
-//! the recipe recorded beside a cached artifact cannot describe a command that did not
-//! run. It used to: the recipe named claude's 10800s / 1000-turn / bypassPermissions
-//! invocation for every backend, including kiro runs that really ran `timeout 2700`
+//! The script is rendered from the fields below rather than typed as text, so a session cannot
+//! describe a command that did not run. It used to: one recipe named claude's 10800s / 1000-turn /
+//! bypassPermissions invocation for every backend, including kiro runs that really ran `timeout 2700`
 //! with no turn limit and none of [`AGENT_ENV`].
 //!
 //! Every session runs under `bash -c`, never `bash -lc`. A login shell re-resolves
 //! PATH from the profile, while the key names what *harvest-tools itself* resolved —
-//! [`crate::cache::ToolchainId`] from `rustc`, [`crate::cache::CliVersion`] from
+//! the pinned toolchain from `rustc`, [`crate::runners::CliVersion`] from
 //! `<program> --version`, both spawned without a shell. On this machine those two
 //! PATHs already disagree about which `node` is found, and node is what runs claude
 //! and opencode.
@@ -26,7 +25,7 @@ pub const CLAUDE_PLAIN_AGENT_JSON: &str = r#"{"claude_plain":{"description":"Bar
 /// Agent-runtime settings that materially change how a session behaves.
 ///
 /// They belong here, not in the shell driver as bare `export`s, so
-/// [`crate::cache::Recipe`] hashes them by construction: otherwise two sweeps with
+/// the session hashes them by construction: otherwise two sweeps with
 /// different retry policy would share a cache entry.
 pub const AGENT_ENV: &[(&str, &str)] = &[
     // A single request may legitimately run this long on a large project; the

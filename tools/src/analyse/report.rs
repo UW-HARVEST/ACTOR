@@ -101,7 +101,7 @@ impl Run {
 }
 
 /// The (run, unit) pairs a run RESOLVED, and so the only ones a table may report: `report` used
-/// to walk `results/` and publish whatever it found, which by [`crate::eval::Source`]'s measurement
+/// to walk `results/` and publish whatever it found, which by `eval::Source`'s measurement
 /// was ~95% unattested. A set built BY the run cannot name a pair the run did not resolve.
 #[derive(Debug, Default)]
 pub struct Attested(std::collections::BTreeSet<(Run, String)>);

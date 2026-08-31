@@ -161,7 +161,7 @@ pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
     }
 }
 
-/// The provider's own "come back later", in ONE place like [`provider_refusal`]. Narrow: a genuine tool
+/// The provider's own "come back later", in ONE place like `provider_refusal`. Narrow: a genuine tool
 /// failure must keep classifying `Unknown` rather than being retried.
 pub fn provider_transient(message: &str) -> Option<&'static str> {
     let m = message.to_ascii_lowercase();

@@ -1,8 +1,8 @@
 //! THE traversal of a tree, and the digest taken over it.
 //!
-//! Hashing and copying both route through [`visit`], so a file that travels is a file that is
+//! Hashing and copying both route through `visit`, so a file that travels is a file that is
 //! hashed: a copy omitting a hashed file would store a tree unable to re-derive its own digest,
-//! and every cache read of it would fail validation. Split out of [`crate::artifact`], which owned
+//! and every cache read of it would fail validation. Split out of `artifact`, which owned
 //! this only because it also owned the phase type-states.
 
 use crate::domain::contents::{classify, Disposition};

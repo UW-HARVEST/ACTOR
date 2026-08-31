@@ -14,7 +14,7 @@ const TAIL_BYTES: u64 = 16 * 1024;
 
 /// Classify a run after the fact, from its transcript and the exit it recorded.
 ///
-/// `format` is a parameter and never assumed: [`crate::cli::Agent::log_format`] is the ONE
+/// `format` is a parameter and never assumed: [`crate::runners::log_format`] is the ONE
 /// table, and hardcoding [`LogFormat::StreamJson`] here read every prose or docker
 /// transcript as a stream-json log missing its terminal record — `Infra { "truncated" }` for
 /// a run that was perfectly healthy, which is the misclassification [`LogFormat`] exists to

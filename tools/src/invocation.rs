@@ -32,7 +32,7 @@ pub struct Ran {
 /// How an invocation executes, and whether the store may name it.
 ///
 /// The model lives in the `Agent` arm, so a `Baseline` has nothing to key on and
-/// [`Invocation::key`] cannot produce one for it: storing an unkeyed run is unrepresentable rather
+/// `Invocation::key` cannot produce one for it: storing an unkeyed run is unrepresentable rather
 /// than something a caller must remember not to do. Only agentic runs are worth memoising -- a
 /// transpiler is deterministic, and a docker baseline is cheap next to an iterating agent.
 pub enum Runner<'a> {

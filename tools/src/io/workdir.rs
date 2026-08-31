@@ -132,7 +132,7 @@ pub fn tempdir(prefix: &str) -> Result<tempfile::TempDir> {
         .with_context(|| format!("creating {prefix}* scratch dir in {}", base.display()))
 }
 
-/// Every machine-specific root [`crate::cache::normalise`] rewrites to a stable token.
+/// Every machine-specific root [`crate::store::normalise`] rewrites to a stable token.
 ///
 /// One named struct rather than four paths in a row: they are all the same type, and a
 /// transposed root is a wrong cache key — silently, since the digest is still a digest.

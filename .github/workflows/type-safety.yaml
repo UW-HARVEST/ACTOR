@@ -227,6 +227,7 @@ jobs:
         # commentary is gone. 2583 is the tree with this change and these twelve SELF-COUNTING lines in
         # it, measured after writing them -- not "plus epsilon" -- and `--max-ratio 20` against a 16.4%
         # tree still stops sprawl.
+        run: |
           python3 tools/comment_budget.py --max-comments 2583 --max-ratio 20
 
       - name: Lint
