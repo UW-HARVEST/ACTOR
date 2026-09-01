@@ -179,9 +179,8 @@ pub const PROTOCOL_PART: &str = "protocol.md";
 
 /// Where the file [`file_for`] names lives, and whether the tool's protocol part follows it.
 ///
-/// `Shared` holds the methodology ONCE, in `prompts/shared/`, composed with
-/// `<tool>/protocol.md`: claude and codex differ only in that tail, so two full copies meant the
-/// next edit to the shared 270 lines had to land twice and would drift.
+/// `Shared` holds the methodology ONCE in `prompts/shared/` + `<tool>/protocol.md`. kiro's own copy
+/// was HALF the length on 3 of 6 files, missing SCOPE and COMPLETION GATE; its zstd lost 79 symbols.
 enum Body {
     Shared,
     OwnDir,
@@ -193,9 +192,9 @@ fn body(tool: Tool, file: &str) -> Body {
         return Body::OwnDir;
     }
     match tool {
-        Tool::Claude | Tool::OpenCode | Tool::Codex => Body::Shared,
-        Tool::Kiro
-        | Tool::Kimi
+        Tool::Claude | Tool::OpenCode | Tool::Codex | Tool::Kiro => Body::Shared,
+        // No agentic loop, so no protocol tail to differ in.
+        Tool::Kimi
         | Tool::Oneshot
         | Tool::C2rust
         | Tool::Laertes
