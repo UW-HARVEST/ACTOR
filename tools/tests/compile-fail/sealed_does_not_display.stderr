@@ -1,9 +1,0 @@
-error[E0277]: `Sealed<harvest_tools::artifact::Translate>` doesn't implement `std::fmt::Display`
- --> tests/compile-fail/sealed_does_not_display.rs:9:15
-  |
-9 |     println!("{sealed}");
-  |               ^^^^^^^^ `Sealed<harvest_tools::artifact::Translate>` cannot be formatted with the default formatter
-  |
-  = help: the trait `std::fmt::Display` is not implemented for `Sealed<harvest_tools::artifact::Translate>`
-  = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
-  = note: this error originates in the macro `$crate::format_args_nl` which comes from the expansion of the macro `println` (in Nightly builds, run with -Z macro-backtrace for more info)

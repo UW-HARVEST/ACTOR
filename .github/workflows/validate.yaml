@@ -5,27 +5,43 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: validate-translations-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  # The only job, and it CAN pass: no agent, no credentials, and `--replay-only` makes a miss a
-  # refusal. The 7-arm `test all --check` matrix that was here had not passed once in 100 runs back
-  # past 2026-07-05, so every PR merged on `type safety` alone. It scored phase dirs no key attests,
-  # which is the capability this PR deletes, so there is nothing left for it to run.
+  # One job per TOOL plus one covering all three, in parallel. They CAN pass -- no agent, no credentials,
+  # and `--replay-only` makes a miss a refusal. The 7-arm `test all --check` matrix that was here had not
+  # passed once in 100 runs, so every PR merged on `type safety` alone.
+  #
+  # Split by tool because a tool is what the store either covers or does not: `reproduce.sh` replayed
+  # claude alone for months while four agents published `0/128` for P01. Only the all-three run may DIFF
+  # the tables: `numbers.tex` is named macros covering every tool, so a codex-only run correctly writes
+  # `--` for the others and its output is comparable to nothing without special-casing files.
   reproduce:
-    name: Reproduce the published numbers from the cache
+    name: Reproduce ${{ matrix.tool }} from the cache
     runs-on: ubuntu-24.04
+    strategy:
+      # "codex misses the store" and "kiro misses the store" are different findings.
+      fail-fast: false
+      matrix:
+        tool: [claude, codex, kiro, "claude,codex,kiro"]
     steps:
       - uses: actions/checkout@v5
         with:
           token: ${{ secrets.SUBMODULE_PAT }}
 
-      # NO --depth=1: a shallow fetch produces only the tip, so a submodule pinned elsewhere cannot
-      # be checked out and the runner holds a different results tree than the pin names.
+      - name: Every workflow parses (each checks the others; a broken one never runs itself)
+        run: python3 tools/check_workflows.py
+
+      # NO --depth=1: a shallow fetch has only the tip, so a submodule pinned elsewhere cannot be
+      # checked out and the runner holds a different results tree than the pin names.
       - name: Check out submodules at their pinned commits
         run: |
           git config --global url."https://x-access-token:${{ secrets.SUBMODULE_PAT }}@github.com/".insteadOf "https://github.com/"
           git submodule update --init results test-corpus harvest-bench
 
-      - name: Assert the submodules are at their pins
+      - name: Assert every input this run needs is present
         run: |
           fail=0
           for m in results test-corpus harvest-bench; do
@@ -38,6 +54,11 @@ jobs:
           # Not cosmetic: omitting harvest-bench here let the Test-Corpus leg run 19 minutes to completion
           # before the HB leg died on a missing tests/ dir. Refuse at second 0 instead.
           test -d harvest-bench/tests || { echo "::error::harvest-bench/tests is absent, so the HB leg cannot run"; fail=1; }
+          # The gtest suites need CMake >= 3.24. `HarvestBench::preflight` refuses too; this moves the
+          # refusal ahead of a Test-Corpus leg that would otherwise run first and pass.
+          cm=$(cmake --version | head -1 | grep -oE '[0-9]+(\.[0-9]+)+')
+          printf '%s\n%s\n' 3.24 "$cm" | sort -VC || { echo "::error::cmake $cm is older than 3.24, so no gtest suite would configure"; fail=1; }
+          echo "cmake $cm"
           exit $fail
 
       - name: Set up Rust
@@ -53,14 +74,14 @@ jobs:
       - name: Build harvest-tools
         run: cargo build --release --locked --manifest-path tools/Cargo.toml
 
-      # Scoring the HB leg shells out to this; it is a separate crate inside the submodule, so building
-      # harvest-tools does not produce it.
+      # Scoring the HB leg shells out to this; a separate crate inside the submodule.
       - name: Build the harvest-bench runner
         run: cargo build --release --locked --manifest-path harvest-bench/runner/Cargo.toml
 
-      # One job, no matrix: `run` produces every output from what it resolved, and the scope is what
-      # the store can serve -- so there is no list of batteries here to drift from what is cacheable.
+      # Both legs, one tool. No battery list here to drift from what the store can serve.
       - name: Reproduce
         env:
-          CARGO_BUILD_JOBS: "2"
-        run: ./tools/reproduce.sh all
+          TOOLS: ${{ matrix.tool }}
+        run: |
+          export CARGO_BUILD_JOBS=$(nproc)
+          ./tools/reproduce.sh all

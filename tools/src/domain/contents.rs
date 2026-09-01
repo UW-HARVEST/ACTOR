@@ -1,33 +1,6 @@
 use crate::domain::relpath::RelPath;
 use std::path::Path;
 
-/// What a copy carries, named by **purpose** rather than by exclusion list: a caller
-/// names the purpose and cannot name the exclusions, so the list used to write a cache
-/// entry and the one used to overlay a results tree cannot drift apart.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Carry {
-    /// Into an agent's work tree. `logs/` travels, because that is what the verify agent
-    /// has always been able to see and narrowing it would silently change the experiment.
-    /// Build output does not, unlike the earlier top-level-name filter: cmake refuses a
-    /// cache whose `CMAKE_CACHEFILE_DIR` no longer matches, and a nested
-    /// `c_src/build/CMakeCache.txt` naming a dead scratch dir could only break a build
-    /// the agent attempted there.
-    IntoWorkTree,
-    /// Out of a sealed artifact — into the cache store, and out of the store into the
-    /// results tree. ONE variant for both, deliberately: a replay re-assembles from the
-    /// stored copy, so anything the store dropped becomes a hit/miss difference. It must
-    /// exclude nothing [`classify`] hashes, or a stored copy cannot re-derive the digest
-    /// recorded beside it and every cache read fails validation — a cache that looks
-    /// enabled and never hits. Re-carrying `c_src` over the copy seeded from the previous
-    /// phase therefore rewrites the same bytes: [`crate::artifact::Scrubbed::seal`] refuses
-    /// an artifact whose C oracle differs from the one the agent was given, other than by
-    /// what building it produced, which seal deletes before it hashes anything.
-    FromArtifact,
-    /// Seeding a tree from the preceding phase. `logs/` stays behind: it is harness
-    /// output, and the current phase's own log is being written live.
-    FromPreviousPhase,
-}
-
 /// What a file contributes to. The agent's build output is legitimately its work, but it
 /// is regenerable, 9x the bytes (4,536 MB vs 500 MB over `results/`), and where per-run
 /// paths get baked in — so it is neither carried nor hashed.
@@ -65,6 +38,9 @@ const ROOT_ONLY_IGNORED: &[&str] = &[
 /// it from the digest entirely.
 const ROOT_ONLY_IGNORED_DIRS: &[&str] = &["logs", ".claude"];
 
+/// The crate an agent writes, beside [`C_ORACLE_DIR`]. Here because `is_ignored` needs it.
+pub(crate) const TRANSLATION_DIR: &str = "translation";
+
 /// The C oracle. Nothing under it is ever [`Disposition::Ignore`]:
 /// [`crate::artifact::Scrubbed::seal`] grades a run by comparing this subtree file by file
 /// before and after, so a rule firing inside it hides a change to the reference. 26 real
@@ -87,7 +63,18 @@ pub fn classify(rel: &RelPath, in_build_dir: bool) -> Disposition {
             // Bytes, not `to_string_lossy`: a lossy name maps every invalid byte to U+FFFD,
             // so two different directories can compare equal here and be classified alike.
             let s = c.as_os_str().as_encoded_bytes();
-            BUILD_DIRS.iter().any(|d| d.as_bytes() == s) || s.starts_with(b"cbuild")
+            // `target-`, HYPHEN INCLUDED. An agent that called its build directory `target-cfg` had
+            // 163k paths of build output STORED AND HASHED, because `target` matched only exactly.
+            // Build output carries absolute per-run paths, so a tree holding it cannot key the same on
+            // another machine -- and `propagate_config` copied it into all 127 P01 followers.
+            //
+            // The hyphen is what keeps this from over-reaching: `classify` runs on every `read_dir`
+            // entry, files included, so a bare `target` prefix also swallowed `src/targets.rs` and
+            // `include/target.h`. A cargo build dir varies by hyphenated suffix; a Rust module path
+            // cannot contain a hyphen at all.
+            BUILD_DIRS.iter().any(|d| d.as_bytes() == s)
+                || s.starts_with(b"target-")
+                || s.starts_with(b"cbuild")
         })
     {
         return Disposition::BuildOutput;
@@ -97,6 +84,10 @@ pub fn classify(rel: &RelPath, in_build_dir: bool) -> Disposition {
 }
 
 fn is_ignored(p: &Path) -> bool {
+    // The published crate's root is an artifact root too. The scorer writes `result.json` INTO the
+    // crate AFTER the tree is sealed, so anchored at the working-dir root alone the next run published
+    // it into verify's input tree and verify's key moved every run: `1 hit / 1 run` for ever.
+    let p = p.strip_prefix(TRANSLATION_DIR).unwrap_or(p);
     let mut components = p.components().map(|c| c.as_os_str());
     let Some(first) = components.next() else {
         return false;
@@ -135,6 +126,70 @@ mod tests {
             Disposition::Ignore
         );
         assert_eq!(classify(&rel("src/x.rs.bak"), false), Disposition::Ignore);
+    }
+
+    /// An agent picks its own build-directory names, and an exact-match list cannot keep up. One
+    /// called it `target-cfg`: 163k paths of build output were stored AND HASHED into the trees, and
+    /// because build output carries absolute per-run paths, every tree holding it keys differently on
+    /// another machine. It also rode into all 127 P01 followers via `propagate_config`.
+    #[test]
+    fn an_agents_build_directory_is_build_output_whatever_suffix_it_uses() {
+        for at in [
+            "target/debug/deps/x.o",
+            "target-cfg/debug/deps/symbols-ee8e5db53eac8eab",
+            "target-release/x",
+            "cbuild/x.o",
+            "cbuild-ninja/x.o",
+            "translation/target-cfg/debug/build/x",
+        ] {
+            assert_eq!(
+                classify(&rel(at), false),
+                Disposition::BuildOutput,
+                "{at} is build output and must be neither carried nor hashed"
+            );
+        }
+        // ...without swallowing source that merely starts the same way. `targets.rs` is a source file
+        // and `target_map/` could be a module; only a path COMPONENT named target* is a build dir.
+        for at in ["src/targets.rs", "src/lib.rs", "include/target.h"] {
+            assert_eq!(
+                classify(&rel(at), false),
+                Disposition::StoreAndHash,
+                "{at} is the agent's work"
+            );
+        }
+    }
+
+    /// The scorer writes `result.json` INTO the published crate after the tree is sealed, so the next
+    /// run carries it into verify's input tree and verify's key moves: a second step that can never
+    /// replay. Measured on `bin2hex_lib` -- two invocations, three input trees.
+    #[test]
+    fn harness_bookkeeping_inside_the_published_crate_is_not_hashed() {
+        for at in [
+            "result.json",
+            "translation/result.json",
+            "translation/harvest_bench_report.json",
+            "translation/logs/verify.log",
+        ] {
+            assert_eq!(
+                classify(&rel(at), false),
+                Disposition::Ignore,
+                "{at} is the harness's own output and must stay outside the digest"
+            );
+        }
+        // ...without swallowing the translation itself: `result.json` deeper down is the translated
+        // program's own file, which is why the rule is anchored at all.
+        for at in [
+            "translation/src/lib.rs",
+            "translation/Cargo.toml",
+            "translation/src/result.json",
+            "translation/src/logs/mod.rs",
+        ] {
+            assert_eq!(
+                classify(&rel(at), false),
+                Disposition::StoreAndHash,
+                "{at} is the agent's work and must be inside the digest"
+            );
+        }
     }
 
     /// The harness writes its bookkeeping at the phase-dir root. The same NAME deeper in

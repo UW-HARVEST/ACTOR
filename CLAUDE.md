@@ -61,6 +61,149 @@ serve digest/copy/scrub is not a peer module.
 **Do not add a function that duplicates an existing abstraction.** If the behaviour
 already exists (`Sealed::publish`), route to it instead of hand-rolling a second copy.
 
+### Storage
+
+The target design for the store. Where the code still disagrees, that is debt, not licence:
+`.cache/<SCHEMA>/<phase>/…`, the `failed/` subtree, keying the toolchain and the recipe, the oracle
+tamper check, and a graded tree that carries the C all predate these rules.
+
+**Git versions the layout; the layout does not version itself.** `SCHEMA` does one job three
+times — hashed into the key, a path level (`.cache/4/`), and a field in `meta.json` — and only the
+field earns it. A version level in every path buys nothing but side-by-side coexistence during a
+migration, which git already gives: 279,505 directory renames landed in one commit, re-keyed
+nothing, and were revertible throughout. Migrate into a fresh tree, keep the old one under another
+name until `reproduce.sh all` is green, then delete it. Keep ONE `format` field and refuse loudly
+on mismatch, so a reader never guesses at a layout it does not understand.
+
+The same applies to `KEY_ALGORITHM`, `TREE_ALGORITHM`, `ORACLE_TREE_ALGORITHM` and
+`PROMPT_ALGORITHM` — version strings hashed into their own digests. They are redundant on their own
+terms: change which components a key covers, or their order, and every key changes anyway, because
+the components are length-prefixed and hashed in sequence. A tag would only earn its place if the
+formula's meaning could change while the hash stayed equal. Delete them.
+
+**The unit is an AGENT INVOCATION, and a pipeline is a chain of them.** One function,
+`run_or_replay(working_dir, prompt) -> working_dir`, and nothing in it knows where in the chain it
+sits. There is no such thing as a translate entry or a verify entry — there are invocations, each
+with its own cache entry, differing only in the working dir handed in and the prompt. So `phase` is
+not key material, `SeedAt` has no reason to exist, there is ONE tree algorithm rather than a corpus
+one and an artifact one, and adding a third step to the chain requires no new concept.
+
+```
+W0 = assemble(corpus)                       c_src/ + empty translation/
+W1 = run_or_replay(W0, prompt_1)   ← entry   then transform(W1)
+W2 = run_or_replay(W1, prompt_2)   ← entry   then transform(W2)
+Wn = run_or_replay(W(n-1), prompt_n)         … same function every time
+```
+
+What we run today happens to be a chain of two, with `prompt_1` translating and `prompt_2`
+verifying. That is a fact about the prompts, not about the machinery.
+
+**Every working dir has one shape.** `c_src/` beside the translation, hashed as one tree with its
+contents uninspected. The first in a chain differs only in that its translation is empty — not in
+kind, not in layout, not in how it is hashed. Every change happens inside the working dir.
+
+**Two kinds of edge, and only one is cached.** An AGENT RUN is nondeterministic and expensive, so
+it is keyed on `tool ‖ model ‖ before_hash ‖ prompt_hash` and stored. A HARNESS
+TRANSFORM is deterministic and cheap, so it is recomputed and never cached — and it must stay
+OUTSIDE the cache, or harness logic is baked into the agent's artifact and changing it invalidates
+runs that are still good. `post_process_independent` is one of these: it renames `[lib]` to the
+corpus runner's name and appends `[workspace]`, so the NEXT invocation's `before` is
+`transform(previous after)` and not the previous `after` itself. Measured: 216 of 216 paired entries
+differ, and `agents/run.rs` records 0 of 84 matching from the other direction.
+
+**The graded tree contains no C.** `runtests`' own discovery needs exactly `<case>/translated_rust/`
+and `<case>/test_vectors/` and reads nothing else, so the eval tree is assembled from the
+translation and the corpus vectors alone. An artifact that tries to link the original C then fails
+to build at grading time, because there is no C there to link. Agents are misaligned; this is not
+a policy to enforce per agent but a shape that makes the shortcut unrepresentable. One published
+artifact CMake-built the original library, `objcopy`-renamed all 881 public symbols and jumped to
+them from naked asm, and scored full marks at 1,013 lines against another agent's 27,044.
+
+**Restore rather than detect.** `c_src` is the pinned corpus, so a working dir is always assembled
+with the corpus's copy and the agent's edits to it are discarded before hashing — which is why
+tampering cannot persist and a tamper check is unnecessary. Nothing in the grading path reads the C
+anyway: `runtests.rust` scores the Rust against static `test_vectors/`, so the check protected
+provenance only, and a restore protects it better and covers the next invocation too. Restoring is about
+what is ASSEMBLED; it does not license storing less than was hashed.
+
+**Store the preimage of every hash.** An entry keeps the exact bytes that were hashed — the whole
+`before` working dir, the whole `after`, the raw prompt text — even where they duplicate the corpus.
+This is the single property that keeps the design changeable: alter the ignore rules, the path
+prefix, the digest algorithm or the definition of a tree, and every key is recomputable from stored
+bytes with no agent re-run. It is the only reason re-keying was possible when the store gained a
+model level, and it is the cheapest insurance available — storage costs nothing next to a sweep,
+which costs $625 and twelve hours. Derive nothing that a hash was taken over.
+
+**Key the identity; path the rendering.** The key hashes raw identifiers (`claude`,
+`global.anthropic.claude-opus-5[1m]`); the path uses filesystem-safe slugs
+(`claude/claude-opus-5-1m`). `model_dir_slug` is lossy on purpose, and a lossy rendering used as
+key material is how `openai/gpt-5.4` came to name the directory `oneshot/4`. Renaming a directory
+must never re-key an entry.
+
+**Key only what changes the answer; pin and record the rest.** The toolchain is fixed by
+`rust-toolchain.toml`, so keying it strands every entry on a bump and proves nothing — refuse at
+preflight if the active one differs, and record it. #109 removed `cli` for exactly this.
+
+**Every run pins its model, and a sentinel is not a model.** kiro keyed `unpinned:kiro-cli-default`
+on a comment claiming kiro-cli takes no `--model`; it takes one, and because nothing passed it, 0
+files under `results/Test-Corpus/kiro/` name a model and those rows are unattributable forever.
+Assert the flag on the command line, not on the transcript — a missing pin is invisible after the
+run.
+
+**One key, one entry. Several attempts must not be representable.** The cache is a function: a key
+maps to one value, so a table's numbers follow from the key alone and reproducibility is structural
+rather than a selection rule to get right. There is no attempt level, no pin to record, no tie to
+break. An entry whose `outcome` is not `completed` does not satisfy a lookup — it is a record, and a
+re-run replaces it.
+
+**Both trees raw, and one record beside them.** The path already carries tool, model, before-tree
+and prompt, so recording those again is the redundancy this replaces. What is NOT redundant is the
+trees: `before` and `after` are stored whole, as hashed.
+
+```
+key = sha256(tool ‖ model ‖ before_hash ‖ prompt_hash)
+
+.cache/<tool>/<model>/<before_hash>/
+    before/                      the raw working dir that hashes to <before_hash>
+    <prompt_hash>/
+        prompt.json              {digest, text}
+        after/                   the raw working dir the agent left
+        agent.json               {outcome, output_tree, wall_secs, cost_usd, cli}
+        run.log                  the transcript
+```
+
+`before/` is stored once and shared by every prompt beneath it. Nothing else is recorded: not the
+ACTOR commit, not the toolchain. Neither can influence the entry, because the cached function is
+`(before, prompt) -> after` with both inputs content-hashed and every harness transform outside the
+cache. `output_tree` stays, not as bookkeeping but as an integrity check on the `after/` beside it —
+the same reason a `before/` that no longer reproduces its own directory name is a corrupt entry.
+
+`<tool>` is the spelling `--agent` accepts (`claude`, `codex`, `kiro`), so the path cannot drift
+from the CLI surface. Today's function is called `harness_dir`, which collides with `harness`
+meaning the ACTOR commit everywhere else; it is the TOOL level and should say so.
+
+`outcome` is CLASSIFIED from the transcript, never the exit code: every session pipes through
+`tee`, so a killed agent reported a clean 0 until `set -o pipefail` was asserted. `output_tree` is
+not optional — it is what makes a corrupted `after/` detectable rather than silently served. Keep
+`run.log`, because `agent.json` is derived from it: outcome, cost and the model-pin check all read
+it, so dropping it makes the record unverifiable and un-rederivable.
+
+**What used to be `seal` is four steps, not one.** CLASSIFY the transcript, RESTORE `c_src` from
+the corpus, SCRUB absolute paths to a token, DIGEST. Only the last is `seal`'s remaining job.
+`scrub` must stay ahead of the digest or every key carries a per-run nonce; and with failures
+stored like anything else, the `Completed` capability token has nothing left to guard — the outcome
+is a field, and the lookup is what declines to serve an entry that is not `completed`.
+
+None of the above was found by looking for bugs. It came out of writing down what one case does from
+corpus to table, and the specification is what made the defects visible: a lossy slug naming
+`oneshot/4`; a sentinel naming `kiro/unpinned`; kiro invoked with no `--model` at all, making every
+published kiro row unattributable; an entry whose `output_tree` described a tree nothing downstream
+used, in 216 of 216 pairs; `\CostPOne` silently dropped from the paper when a path moved under it;
+`.eval/` failing its own cleanliness check after a fully green replay; codex missing from the session
+test table, so both rules there exempted the backend they were added for; and an artifact that
+`objcopy`-renamed 881 symbols out of the original C library and scored full marks by jumping to
+them. Structure is not tidiness. It is the only thing that made any of those visible.
+
 ### Testing
 
 **A test names a failure, not a function.** If you cannot say what breaks in the world

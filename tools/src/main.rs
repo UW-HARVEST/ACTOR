@@ -1,115 +1,98 @@
 use anyhow::Result;
 // Never re-declare these with `mod` here; see the note in lib.rs.
-use harvest_tools::agents::opencode;
 use harvest_tools::analyse::report;
 use harvest_tools::cli::{Cli, Command, Dataset};
 use harvest_tools::eval;
-use harvest_tools::{agent_health, battery, benchmark, cache, cli, oracle, provenance};
+use harvest_tools::{agent_health, battery, benchmark, chain, cli, oracle, provenance, store};
 
 fn main() -> Result<()> {
     let cli = Cli::parse_args();
     let repo_root = find_repo_root()?;
-    let agent = cli.agent;
-    let model = cli.model.as_deref();
-    let cache = cli.cache_mode();
+    let mode = cli.cache_mode();
 
-    // Before, not after, a run that can take hours: a binary that does not match the
-    // checkout cannot produce an attributable measurement.
+    // Before, not after, a run that can take hours: a binary that does not match the checkout cannot
+    // produce an attributable measurement.
     if cli.command.produces_artifacts() {
         provenance::require_reproducible(if cli.allow_dirty {
             provenance::OnUnreproducible::WarnAndStamp
         } else {
             provenance::OnUnreproducible::Refuse
         })?;
+        harvest_tools::refusal::require_pinned_toolchain()?;
     }
 
-    // Only these two take a model id at runtime; every other agent has its model fixed
-    // by the variant, so a `--model` there would be silently ignored.
-    let model_driven = matches!(agent, cli::Agent::Oneshot | cli::Agent::OpenCode);
-    if model_driven && model.is_none() {
-        anyhow::bail!(
-            "--model is required with --agent {}\n  \
-             oneshot:  --model openai/gpt-5.4\n  \
-             opencode: --model amazon-bedrock/us.anthropic.claude-sonnet-5",
-            if agent == cli::Agent::Oneshot {
-                "oneshot"
-            } else {
-                "opencode"
-            },
-        );
+    anyhow::ensure!(!cli.tool.is_empty(), "--tool names no tool");
+    // Refused before any work: an ablation on a tool with no ablation prompts would otherwise read
+    // the base prompt and file the result as an experiment that never ran.
+    for &tool in &cli.tool {
+        harvest_tools::prompt::supports(tool, cli.variant)?;
     }
-    if !model_driven && model.is_some() {
-        anyhow::bail!("--model is only valid with --agent oneshot or --agent opencode");
-    }
-    // Fail at startup rather than deep inside a multi-hour agent run.
-    if agent == cli::Agent::OpenCode {
-        opencode::parse_model(model.unwrap_or_default())?;
-    }
+
+    let enforcement =
+        harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(cli.allow_unsandboxed);
 
     match cli.command {
         Command::Run {
             ref target,
-            no_verify,
-            include_regex,
-            parallel,
+            steps,
+            ref include_regex,
         } => {
-            // The run's ONE budget; a phase cannot mint a second (see `agents::Pool`).
-            let pool = harvest_tools::agents::Pool::for_run(parallel);
             let dataset = Dataset::detect(target);
-            let bench = benchmark::for_dataset(dataset);
-            // Before the first agent: every binary, interpreter and corpus dir the phases below reach for.
-            let paths = bench.preflight(battery::Paths::new(
-                &repo_root,
-                agent,
-                dataset,
-                model,
-                cache,
-                harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
-                    cli.allow_unsandboxed,
-                ),
-            )?)?;
             let inner = Dataset::strip_prefix(target);
 
-            let translations = bench.translate(&paths, inner, include_regex.as_deref(), &pool)?;
+            // One thread per tool, each with its own budget: `--parallel 3` over three tools is three
+            // in flight PER TOOL. Nothing is shared that a parallel run could corrupt -- each tool has
+            // its own results tree, evaluation tree and store prefix
+            // (`battery::tests::no_two_tools_share_an_output_or_evaluation_path`).
+            // Borrowed once outside the closures: `move` on a `PathBuf` or an `Option<String>` would
+            // take it from the enclosing scope, which still needs both after the join.
+            let root = repo_root.as_path();
+            let model = cli.model.as_deref();
+            let variant = cli.variant;
+            let keep = eval::Keep::from_keep_eval_tree_flag(cli.keep_eval_tree);
+            let on_infra_failure = agent_health::OnInfraFailure::from_allow_infra_failures_flag(
+                cli.allow_infra_failures,
+            );
+            let attested: Vec<report::Attested> = std::thread::scope(|scope| {
+                let handles: Vec<_> = cli
+                    .tool
+                    .iter()
+                    .map(|&tool| {
+                        scope.spawn(move || {
+                            run_tool(RunTool {
+                                repo_root: root,
+                                tool,
+                                variant,
+                                model,
+                                dataset,
+                                inner,
+                                steps,
+                                include_regex: include_regex.as_deref(),
+                                parallel: cli.parallel,
+                                mode,
+                                enforcement,
+                                keep,
+                                on_infra_failure,
+                            })
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!(
+                                "a tool's thread panicked; see its output above"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
 
-            // `InScope` cannot be built a unit at a time, which is what starved `verify` below.
-            let (scope, attested) =
-                benchmark::InScope::derive(bench.as_ref(), &paths, inner, &translations)?;
-
-            // Verify gets the WHOLE scope in ONE call; scoring stays per unit, each with its own scope.
-            let verifications = if !no_verify && bench.verifies(agent) {
-                bench.verify(
-                    &paths,
-                    &scope,
-                    include_regex.as_deref(),
-                    false,
-                    &pool,
-                    &translations,
-                )?
-            } else {
-                harvest_tools::verify::Verifications::new()
-            };
-            for battery in scope.units() {
-                run_test(
-                    bench.as_ref(),
-                    &paths,
-                    battery,
-                    Score {
-                        on_failure: agent_health::OnInfraFailure::Refuse,
-                        keep: eval::Keep::from_keep_eval_tree_flag(cli.keep_eval_tree),
-                        source: eval::Source {
-                            translate: &translations,
-                            verify: &verifications,
-                        },
-                        covers: oracle::Covers::from_include_regex(include_regex.as_deref()),
-                    },
-                )?;
-            }
-
-            // Written ONCE from the whole scope: per battery it would erase every other battery's
-            // rows, which is `Covers::Subset`'s rule one level up. A partial target writes none, and
-            // each dataset writes only ITS tables -- the two are earned by separate runs, so folding
-            // them together would have a Test-Corpus run blank every harvest-bench row it never saw.
+            // Written ONCE, from every tool's attestation merged. Per tool it would rewrite `tables/`
+            // from that tool's rows alone and blank the others' -- which is what one run per tool did.
+            // Each dataset still writes only ITS tables: the two are earned by separate runs, so
+            // folding them together would have a Test-Corpus run blank every harvest-bench row.
             let whole_scope = include_regex.is_none()
                 && inner
                     == match dataset {
@@ -117,142 +100,162 @@ fn main() -> Result<()> {
                         Dataset::HarvestBench => "HB",
                     };
             if whole_scope {
+                let merged =
+                    attested
+                        .into_iter()
+                        .fold(report::Attested::default(), |mut acc, a| {
+                            acc.absorb(a);
+                            acc
+                        });
                 match dataset {
-                    Dataset::TestCorpus => report::generate(&repo_root, &attested)?,
-                    Dataset::HarvestBench => report::generate_harvest_bench(&repo_root, &attested)?,
+                    Dataset::TestCorpus => report::generate(&repo_root, &merged)?,
+                    Dataset::HarvestBench => report::generate_harvest_bench(&repo_root, &merged)?,
                 }
-                println!("📊 Tables regenerated (tables/)");
+                println!("\u{1f4ca} Tables regenerated (tables/)");
             }
         }
-        Command::Translate {
-            ref target,
-            include_regex,
-            parallel,
-        } => {
-            let pool = harvest_tools::agents::Pool::for_run(parallel);
-            let dataset = Dataset::detect(target);
-            let bench = benchmark::for_dataset(dataset);
-            let paths = bench.preflight(battery::Paths::new(
-                &repo_root,
-                agent,
-                dataset,
-                model,
-                cache,
-                harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
-                    cli.allow_unsandboxed,
-                ),
-            )?)?;
-            let inner = Dataset::strip_prefix(target);
-            bench.translate(&paths, inner, include_regex.as_deref(), &pool)?;
-        }
-        Command::Verify {
-            ref target,
-            include_regex,
-            force,
-            parallel,
-        } => {
-            let pool = harvest_tools::agents::Pool::for_run(parallel);
-            let dataset = Dataset::detect(target);
-            let bench = benchmark::for_dataset(dataset);
-            let paths = bench.preflight(battery::Paths::new(
-                &repo_root,
-                agent,
-                dataset,
-                model,
-                cli::honouring(cache, cli::Reuse::from_force_flag(force)),
-                harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
-                    cli.allow_unsandboxed,
-                ),
-            )?)?;
-            let inner = Dataset::strip_prefix(target);
-            // At startup, not per case: this agent has no C-as-oracle verify phase, and
-            // the sweep would otherwise print a ✅ per case for a phase that never ran.
-            anyhow::ensure!(
-                bench.verifies(agent),
-                "--agent {} has no separate C-as-oracle verify phase, so there is nothing \
-                 to verify. Its `translated/` result is what gets scored (`test`).",
-                format!("{agent:?}").to_lowercase(),
-            );
-            // Verify is seeded from a translation THIS RUN resolved, so translations are resolved first —
-            // through `cli::seeding`, a store that may only REPLAY. A command named `verify` must not pay
-            // the translate agent or replace what it checks, and `--force` reaches verify and nothing else.
-            let seeds = bench.preflight(battery::Paths::new(
-                &repo_root,
-                agent,
-                dataset,
-                model,
-                cli::seeding(cache)?,
-                harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
-                    cli.allow_unsandboxed,
-                ),
-            )?)?;
-            let translations = bench.translate(&seeds, inner, include_regex.as_deref(), &pool)?;
-            let (scope, _) =
-                benchmark::InScope::derive(bench.as_ref(), &paths, inner, &translations)?;
-            bench.verify(
-                &paths,
-                &scope,
-                include_regex.as_deref(),
-                force,
-                &pool,
-                &translations,
-            )?;
-        }
         Command::Cache { action } => match action {
+            cli::CacheAction::Failures => {
+                let failures = store::Store::open(&repo_root, mode)?.failures()?;
+                println!("{} recorded failure(s):", failures.len());
+                for (at, outcome) in &failures {
+                    println!("  {outcome:?}  {at}");
+                }
+            }
             cli::CacheAction::Stats => {
-                // Bypass, not the operator's --cache: `stats` must never create an entry.
-                let store = cache::Store::open(&repo_root, cache::Mode::Bypass)?;
-                let (entries, bytes) = store.stats()?;
+                let (entries, bytes) = store::Store::open(&repo_root, mode)?.stats()?;
                 println!(
                     "{entries} entries, {:.1} MB at {}/results/.cache",
                     bytes as f64 / 1_048_576.0,
                     repo_root.display()
                 );
             }
-            cli::CacheAction::Failures => {
-                let store = cache::Store::open(&repo_root, cache::Mode::Bypass)?;
-                let failures = store.failures()?;
-                println!(
-                    "{} recorded failure(s) under {}/results/.cache/{}/{}",
-                    failures.len(),
-                    repo_root.display(),
-                    cache::SCHEMA,
-                    cache::FAILED
-                );
-                for (phase, agent, key, attempt) in &failures {
-                    println!("  {phase:<10} {agent:<12} {key}  attempt {attempt}");
-                }
-            }
         },
         Command::Enrich { ref target } => {
             let dataset = Dataset::detect(target);
             let paths = battery::Paths::new(
                 &repo_root,
-                agent,
+                cli.tool[0],
+                cli.variant,
                 dataset,
-                model,
-                cache,
-                harvest_tools::io::sandbox::Enforcement::from_allow_unsandboxed_flag(
-                    cli.allow_unsandboxed,
-                ),
+                cli.model.as_deref(),
+                mode,
+                enforcement,
             )?;
+            // The same door the chain uses, so this backfills what a run publishes -- followers
+            // included, and nothing a `read_dir` happened to find.
+            let bench = benchmark::for_dataset(dataset);
             let inner = Dataset::strip_prefix(target);
-            benchmark::for_dataset(dataset).enrich(&paths, inner)?;
+            let scope = benchmark::Scope::resolve(bench.as_ref(), &paths, inner, None)?;
+            let mut enriched = 0usize;
+            for unit in scope.units() {
+                let jobs = bench.jobs(&paths, unit, scope.filter())?;
+                enriched += oracle::enrich_cases(&chain::case_dirs(&jobs))?;
+            }
+            println!("\u{2705} Enriched {enriched} result.json file(s) under {inner}");
         }
     }
     Ok(())
 }
 
+/// Everything one tool's run needs. A struct because half of these are `&str`/`Option<&str>` and
+/// positional arguments of the same type transpose silently.
+struct RunTool<'a> {
+    repo_root: &'a std::path::Path,
+    tool: cli::Tool,
+    variant: cli::Variant,
+    model: Option<&'a str>,
+    dataset: Dataset,
+    inner: &'a str,
+    steps: Option<usize>,
+    include_regex: Option<&'a str>,
+    parallel: usize,
+    mode: store::Mode,
+    enforcement: harvest_tools::io::sandbox::Enforcement,
+    keep: eval::Keep,
+    on_infra_failure: agent_health::OnInfraFailure,
+}
+
+/// One tool, end to end: preflight, run every unit's chain, score, and report what it attested.
+///
+/// Returns the attestation rather than writing tables, so the caller can merge every tool's rows into
+/// one `tables/` write instead of having each tool clobber the last.
+fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
+    // This tool's ONE budget; a step cannot mint a second (see `agents::Pool`).
+    let pool = harvest_tools::agents::Pool::for_run(r.parallel);
+    let bench = benchmark::for_dataset(r.dataset);
+    let paths = bench.preflight(battery::Paths::new(
+        r.repo_root,
+        r.tool,
+        r.variant,
+        r.dataset,
+        r.model,
+        r.mode,
+        r.enforcement,
+    )?)?;
+    let store = store::Store::open(r.repo_root, r.mode)?;
+
+    // ONE loop over the units, each running the whole chain. There is no translate pass and no verify
+    // pass: a unit's cases go end to end, which is what `run_or_replay` being one function buys.
+    let scope = benchmark::Scope::resolve(bench.as_ref(), &paths, r.inner, r.include_regex)?;
+    // Resolved BEFORE the first invocation and reused by the chain, the publishability check and
+    // enrich: an unreadable corpus must refuse before the money, and a case list derived twice is how
+    // a one-case run came to score a battery named `B01_organic/bin2hex_lib` after paying for it.
+    let units: Vec<(String, Vec<chain::Job>)> = scope
+        .units()
+        .iter()
+        .map(|unit| {
+            bench
+                .jobs(&paths, unit, scope.filter())
+                .map(|jobs| (unit.clone(), jobs))
+        })
+        .collect::<Result<_>>()?;
+    let ran = chain::run_all(&paths, &store, &units, r.steps, &pool)?;
+    let (resolved, refused) = (ran.resolved, ran.refused);
+    println!("{} {}", cli::tool_dir(r.tool), store.tally_line());
+    // Counted where the tally is, so a refusal cannot be read as a translation failure. A
+    // C-to-Rust memory-safety corpus earns these: B01_synthetic alone holds 12 cases named for
+    // buffer overflows, and codex's classifier declined one of them.
+    if !refused.is_empty() {
+        println!(
+            "{} \u{1f6ab} provider refusals: {} ({})",
+            cli::tool_dir(r.tool),
+            refused.len(),
+            refused.join(", ")
+        );
+    }
+
+    let (publishable, attested) = benchmark::InScope::derive(&paths, &units, &resolved)?;
+    let all_roles = harvest_tools::prompt::chain(r.tool, r.variant);
+    let roles = &all_roles[..r.steps.map_or(all_roles.len(), |n| n.min(all_roles.len()))];
+    for unit in publishable.units() {
+        run_test(
+            bench.as_ref(),
+            &paths,
+            unit,
+            Score {
+                on_failure: r.on_infra_failure,
+                keep: r.keep,
+                roles,
+                resolved: &resolved,
+                covers: scope.covers(),
+            },
+        )?;
+    }
+    Ok(attested)
+}
+
 struct Score<'a> {
     on_failure: agent_health::OnInfraFailure,
     keep: eval::Keep,
-    source: eval::Source<'a>,
+    roles: &'a [harvest_tools::prompt::Role],
+    resolved: &'a eval::Resolved,
     covers: oracle::Covers<'a>,
 }
 
-/// A score REFUSES rather than reporting a verdict, so the only way out is `?` — which unwinds, running
-/// the [`eval::Tree`] `Drop` that removes the tree. The `--check` mode this replaced ended in
-/// `process::exit`, which runs no destructor and once left the whole tree standing.
+/// A score REFUSES rather than reporting a verdict, so the only way out is `?` -- which unwinds,
+/// running the [`eval::EvalTree`] `Drop` that removes the tree. The `--check` mode this replaced ended
+/// in `process::exit`, which runs no destructor and once left the whole tree standing.
 fn run_test(
     bench: &dyn benchmark::Benchmark,
     paths: &benchmark::Preflighted,
@@ -262,20 +265,22 @@ fn run_test(
     let Score {
         on_failure,
         keep,
-        source,
+        roles,
+        resolved,
         covers,
     } = score;
     let gate = agent_health::Gate {
-        format: paths.agent.log_format(),
+        format: harvest_tools::runners::log_format(paths.tool),
         on_failure,
         results_dir: &paths.results_dir,
     };
-    let tree = eval::Tree::create_empty(paths, keep)?;
+    let tree = eval::EvalTree::create_empty(paths, target, keep)?;
     bench.test(
         paths,
         target,
         &oracle::Scoring {
-            source,
+            roles,
+            resolved,
             tree: &tree,
             gate: &gate,
             covers,
@@ -300,10 +305,18 @@ mod tests {
     use super::*;
 
     fn eval_root(paths: &battery::Paths) -> std::path::PathBuf {
-        paths
-            .repo_root
-            .join(eval::EVAL_DIR)
-            .join(paths.agent_key.dir())
+        paths.repo_root.join(eval::EVAL_DIR).join(
+            paths
+                .results_dir
+                .strip_prefix(
+                    paths
+                        .results_dir
+                        .ancestors()
+                        .nth(3)
+                        .unwrap_or(&paths.results_dir),
+                )
+                .unwrap_or(&paths.results_dir),
+        )
     }
 
     struct Refusing;
@@ -314,18 +327,6 @@ mod tests {
         }
         fn name(&self) -> &'static str {
             "refusing"
-        }
-        fn verifies(&self, _agent: cli::Agent) -> bool {
-            false
-        }
-        fn translate(
-            &self,
-            _paths: &benchmark::Preflighted,
-            _target: &str,
-            _filter: Option<&str>,
-            _pool: &harvest_tools::agents::Pool,
-        ) -> Result<harvest_tools::translate::Translations> {
-            unreachable!("scoring only")
         }
         fn test(
             &self,
@@ -340,19 +341,16 @@ mod tests {
             );
             anyhow::bail!("{target}: vectors_passed 393 → 0")
         }
-        fn enrich(&self, _paths: &battery::Paths, _target: &str) -> Result<()> {
-            unreachable!("scoring only")
-        }
         fn batteries(&self, _paths: &battery::Paths, target: &str) -> Result<Vec<String>> {
             Ok(vec![target.to_string()])
         }
-        fn attests(
+        fn jobs(
             &self,
             _paths: &battery::Paths,
-            _battery: &str,
-            _resolved: &harvest_tools::translate::Translations,
-        ) -> Result<()> {
-            Ok(())
+            _unit: &str,
+            _filter: Option<&str>,
+        ) -> Result<Vec<chain::Job>> {
+            unreachable!("scoring only")
         }
     }
 
@@ -365,10 +363,11 @@ mod tests {
         let unchecked = || {
             battery::Paths::new(
                 tmp.path(),
-                cli::Agent::C2rust,
+                cli::Tool::C2rust,
+                cli::Variant::Default,
                 Dataset::HarvestBench,
                 None,
-                cache::Mode::Bypass,
+                store::Mode::ReadWrite,
                 harvest_tools::io::sandbox::Enforcement::AllowUnsandboxed,
             )
             .unwrap()
@@ -389,12 +388,38 @@ mod tests {
         let scorer = tmp.path().join("harvest-bench/runner/target/release");
         std::fs::create_dir_all(&scorer).unwrap();
         std::fs::write(scorer.join("harvest-bench"), "").unwrap();
+        // The HB preflight also demands a cmake new enough to configure a gtest suite. Prepending a
+        // fake is race-free HERE and nowhere else: this test target holds exactly one test. Prepended,
+        // not replaced, so every other program a test spawns still resolves.
+        let bin = tmp.path().join("fakebin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+        // The old cmake FIRST, so the check has a named failing input: without it, deleting the
+        // check from preflight would turn nothing red. 3.22 is what this class of box ships.
+        harvest_tools::io::workdir::fake_program(&bin, "cmake", "echo 'cmake version 3.22.2'")
+            .unwrap();
+        let old_cmake = bench
+            .preflight(unchecked())
+            .err()
+            .expect("a cmake that cannot configure a gtest suite must refuse before the money");
+        assert!(
+            format!("{old_cmake:#}").contains("cmake 3.22"),
+            "and must name it: {old_cmake:#}"
+        );
+        harvest_tools::io::workdir::fake_program(&bin, "cmake", "echo 'cmake version 3.28.6'")
+            .unwrap();
 
         let paths = bench
             .preflight(unchecked())
             .expect("every input is present now");
-        let translations = harvest_tools::translate::Translations::new();
-        let verifications = harvest_tools::verify::Verifications::new();
+        let resolved = eval::Resolved::new();
 
         let refused = run_test(
             &Refusing,
@@ -403,10 +428,8 @@ mod tests {
             Score {
                 on_failure: agent_health::OnInfraFailure::Refuse,
                 keep: eval::Keep::Discard,
-                source: eval::Source {
-                    translate: &translations,
-                    verify: &verifications,
-                },
+                roles: &[harvest_tools::prompt::Role::Translate],
+                resolved: &resolved,
                 covers: oracle::Covers::WholeBattery,
             },
         );

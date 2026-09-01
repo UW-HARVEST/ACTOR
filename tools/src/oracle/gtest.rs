@@ -1,7 +1,6 @@
 use super::{openssl_dir, Enrichment, Scoring};
-use crate::artifact::{Phase, Translate};
 use crate::battery::Paths;
-use crate::eval::Source;
+use crate::prompt::Role;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -9,63 +8,81 @@ use std::process::Command;
 
 // ── harvest-bench testing ──────────────────────────────────────────────
 
-/// What scoring one project concluded. Both variants are statements about the TRANSLATION, the only
-/// thing this dataset publishes, so a broken harness is neither and returns `Err` -- not a third
-/// variant every match site would carry forever. `build_ok: bool` was ONE flag for two unrelated
-/// facts, "the crate produced a cdylib" and "the harness came back", so when a CMake keyword needing
-/// 3.24 met a 3.22 box the table printed `Builds: \textbf{no}` against seven crates that compiled.
+/// What scoring one project concluded. Every variant is a statement about the TRANSLATION, so a broken
+/// harness is none of them and returns `Err`. `build_ok: bool` was ONE flag for two unrelated facts --
+/// "produced a cdylib" and "the harness came back" -- so a 3.24 keyword on a 3.22 box printed
+/// `Builds: \textbf{no}` against seven crates that compiled.
 #[derive(Debug)]
 enum ProjectScore {
     /// No cdylib. This is what the published `Builds` column means, and all it means.
     CrateDidNotBuild,
+    /// A cdylib the suite could not LINK against: the translation does not export the ABI. Neither of
+    /// the others -- it DID produce a cdylib, yet nothing was measured.
+    AbiIncomplete { missing: Vec<String> },
     Measured {
         tests_ok: usize,
         tests_failed: usize,
         tests_skipped: usize,
+        /// PRINT-ONLY: inside `record()` this would rewrite every published result.json.
+        failing: Vec<String>,
     },
 }
 
 impl ProjectScore {
-    /// Infallible BECAUSE a harness failure never gets this far: there is no score to project.
+    /// Infallible BECAUSE a harness failure never gets this far.
     fn record(&self) -> HarvestBenchResult {
-        match *self {
+        match self {
             Self::CrateDidNotBuild => HarvestBenchResult {
                 tests_ok: 0,
                 tests_failed: 0,
                 tests_skipped: 0,
                 build_ok: false,
+                missing_symbols: None,
+            },
+            Self::AbiIncomplete { missing } => HarvestBenchResult {
+                tests_ok: 0,
+                tests_failed: 0,
+                tests_skipped: 0,
+                build_ok: true,
+                missing_symbols: Some(missing.clone()),
             },
             Self::Measured {
                 tests_ok,
                 tests_failed,
                 tests_skipped,
+                ..
             } => HarvestBenchResult {
-                tests_ok,
-                tests_failed,
-                tests_skipped,
+                tests_ok: *tests_ok,
+                tests_failed: *tests_failed,
+                tests_skipped: *tests_skipped,
                 build_ok: true,
+                missing_symbols: None,
             },
         }
     }
 }
 
-/// A struct, not `get("passed").unwrap_or(false)`: that counted a verdict with no `passed` field as a
-/// FAILED test, inventing a result out of a malformed report.
+/// A struct, not `get("passed").unwrap_or(false)`: that counted a `passed`-less verdict as a FAILURE.
 #[derive(Deserialize)]
 struct Verdict {
     passed: bool,
     #[serde(default)]
     skipped: bool,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    failure: String,
 }
 
-/// The published record. `passed` defers to the canonical project pass rule in
-/// `crate::domain::outcome`, so the pass column means the same thing across datasets.
+/// The published record; `passed` defers to `crate::domain::outcome` so the column means one thing.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct HarvestBenchResult {
     tests_ok: usize,
     tests_failed: usize,
     tests_skipped: usize,
     build_ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    missing_symbols: Option<Vec<String>>,
 }
 
 impl HarvestBenchResult {
@@ -113,12 +130,29 @@ fn build_harvest_bench_lib(crate_dir: &Path, name: &str) -> (Option<PathBuf>, St
     }
 }
 
-/// `Err` means the HARNESS did not work, never that the translation scored zero -- the caller batches
-/// these and refuses, exactly as `runtests::measured_nothing` does for Test-Corpus.
+/// The symbols the suite needed and the cdylib did not export; `None` if this is not a link failure.
+/// Keyed on the RUNNER'S OWN step label, so IT says which exit-2 meaning applies -- plus `undefined
+/// reference`, since that step also fails for compiler reasons.
+fn unlinkable_abi(stderr: &str) -> Option<Vec<String>> {
+    if !stderr.contains("cmake build (suite) failed") || !stderr.contains("undefined reference to")
+    {
+        return None;
+    }
+    let mut missing: Vec<String> = stderr
+        .split("undefined reference to `")
+        .skip(1)
+        .filter_map(|rest| rest.split('\'').next())
+        .map(str::to_owned)
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    Some(missing)
+}
+
+/// `Err` means the HARNESS did not work, never that the translation scored zero: the caller refuses.
 ///
-/// Returns a named variant rather than a `(usize, usize, usize)` the caller re-labels: `passed()` is
-/// `tests_ok > 0 && tests_failed == 0`, so transposing the failed and skipped counts turns a project
-/// with failures and no skips into a PASS.
+/// A named variant rather than a `(usize, usize, usize)` the caller re-labels: transposing the failed
+/// and skipped counts turns a project with failures and no skips into a PASS.
 fn score_harvest_bench_suite(
     runner: &Path,
     suite_dir: &Path,
@@ -131,9 +165,8 @@ fn score_harvest_bench_suite(
         .unwrap_or(Path::new("."))
         .join("gtest_build");
 
-    // The runner only writes the report once the suite ran, so a rerun that dies
-    // earlier leaves the PREVIOUS run's file in place and the code below would score
-    // it as this run's result.
+    // The runner writes the report only once the suite ran, so a rerun that dies earlier would leave
+    // the PREVIOUS run's file to be scored as this one's.
     if report_json.exists() {
         std::fs::remove_file(report_json)
             .with_context(|| format!("removing the stale report {}", report_json.display()))?;
@@ -149,10 +182,13 @@ fn score_harvest_bench_suite(
         .context("invoking harvest-bench runner")?;
 
     // The runner exits 0 when every test passed and 1 when some failed; both are results and both
-    // write the report. Any other status (2 = its own error, or a signal) means it failed before
-    // scoring, so there is no measurement to report either way.
+    // write the report. Exit 2 is the runner returning `Err`: its own failure, OR `cmake build (suite)`
+    // failing to LINK against the translated cdylib -- which is the TRANSLATION's, so it is scored.
     if !matches!(out.status.code(), Some(0 | 1)) {
         let err = String::from_utf8_lossy(&out.stderr);
+        if let Some(missing) = unlinkable_abi(&err) {
+            return Ok(ProjectScore::AbiIncomplete { missing });
+        }
         let tail: Vec<&str> = err.lines().rev().take(20).collect();
         anyhow::bail!(
             "the harvest-bench runner exited {} on suite {}, so the HARNESS failed and this project \
@@ -163,8 +199,8 @@ fn score_harvest_bench_suite(
         );
     }
 
-    // Exiting 0 or 1 is the runner PROMISING it wrote a report; each broken promise below says which
-    // one broke, because none of them is the translation's fault.
+    // Exiting 0 or 1 PROMISES a report; each broken promise below names itself, none being the
+    // translation's fault.
     let data = std::fs::read_to_string(report_json).with_context(|| {
         format!(
             "the runner exited {:?} promising a report at {}, and wrote none",
@@ -186,6 +222,7 @@ fn score_harvest_bench_suite(
         .with_context(|| format!("{} holds a verdict this cannot read", report_json.display()))?;
 
     let (mut tests_ok, mut tests_failed, mut tests_skipped) = (0usize, 0usize, 0usize);
+    let mut failing = Vec::new();
     for v in &verdicts {
         if v.skipped {
             tests_skipped += 1;
@@ -193,11 +230,17 @@ fn score_harvest_bench_suite(
             tests_ok += 1;
         } else {
             tests_failed += 1;
+            let why = v.failure.lines().next().unwrap_or_default();
+            failing.push(if why.is_empty() {
+                v.name.clone()
+            } else {
+                format!("{} ({why})", v.name)
+            });
         }
     }
 
-    // `runtests::measured_nothing`'s rule, for the same reason: a skip is not a judgement, so
-    // `passed + failed == 0` measured NOTHING however many verdicts came back.
+    // `runtests::measured_nothing`'s rule: a skip is not a judgement, so `passed + failed == 0`
+    // measured NOTHING however many verdicts came back.
     anyhow::ensure!(
         tests_ok + tests_failed > 0,
         "the suite for {} returned {} verdict(s) and judged NONE of them ({tests_skipped} skipped), \
@@ -209,6 +252,7 @@ fn score_harvest_bench_suite(
         tests_ok,
         tests_failed,
         tests_skipped,
+        failing,
     })
 }
 
@@ -219,11 +263,8 @@ pub fn run_harvest_bench_test(
 ) -> Result<()> {
     let runner = harvest_bench_runner(&paths.corpus_dir)?;
 
-    // Verify's artifact where the run resolved one, else translate's — from the values, not a stat.
-    let Source { translate, verify } = scoring.source;
-
-    // Every project REQUESTED, not only those that resolved a crate: a run that died on `api_error`
-    // publishes nothing, so grading the resolved set grades the one set with no infra failure in it.
+    // Every project REQUESTED, not only those that resolved a crate: grading the resolved set grades
+    // the one set with no infra failure in it.
     scoring.gate.grade(
         &projects
             .iter()
@@ -238,12 +279,26 @@ pub fn run_harvest_bench_test(
     let mut absent: Vec<&str> = Vec::new();
     for project in projects {
         let case_dir = paths.output_dir(project.name());
-        if let Some(v) = verify.get(&case_dir) {
-            scope.materialise(project.name(), v, &case_dir)?;
-        } else if let Some(t) = translate.get(&case_dir) {
-            scope.materialise(project.name(), t, &case_dir)?;
-        } else {
-            absent.push(project.name());
+        // The LAST role the chain RESOLVED, not whichever phase dir a stat happens to find: that is
+        // what let a five-day-old `verified/` be scored as this run's.
+        let last = scoring.roles.iter().rev().find_map(|r| {
+            scoring
+                .resolved
+                .get(&case_dir.join(r.dir()))
+                .map(|t| (*r, t))
+        });
+        match last {
+            Some((role, tree)) => {
+                // The suite is built from `project.gtest_suite()` in the corpus, so the tree needs
+                // the crate and nothing else. This passed `case_dir` -- a RESULTS dir -- as a corpus one.
+                scope.materialise(
+                    project.name(),
+                    tree,
+                    &crate::transform::Graded::AbiSuite,
+                    &case_dir.join(role.dir()),
+                )?;
+            }
+            None => absent.push(project.name()),
         }
     }
     let materialised = scope.finish()?;
@@ -251,6 +306,7 @@ pub fn run_harvest_bench_test(
     let mut results: std::collections::BTreeMap<String, HarvestBenchResult> = Default::default();
     let mut passed = 0usize;
     let mut build_failed = 0usize;
+    let mut unlinkable = 0usize;
     let mut recorded = 0usize;
 
     // Refused together below: several failing for the SAME reason is the signal that says "environment",
@@ -305,15 +361,35 @@ pub fn run_harvest_bench_test(
                 r.tests_ok, r.tests_skipped
             );
         } else if r.tests_failed > 0 {
+            let failing = match &score {
+                ProjectScore::Measured { failing, .. } => failing.clone(),
+                _ => Vec::new(),
+            };
             println!(
-                "  ⚠️  {name}: {} ok, {} FAILED, {} skipped",
-                r.tests_ok, r.tests_failed, r.tests_skipped
+                "  ⚠️  {name}: {} ok, {} FAILED, {} skipped (e.g. {})",
+                r.tests_ok,
+                r.tests_failed,
+                r.tests_skipped,
+                failing
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        } else if let Some(missing) = &r.missing_symbols {
+            unlinkable += 1;
+            println!(
+                "  ⚠️  {name}: cdylib built, but the suite cannot link it — {} symbol(s) not exported \
+                 (e.g. {})",
+                missing.len(),
+                missing.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
             );
         }
 
         {
             let mut json = serde_json::to_value(&r)?;
-            let tlog = crate_dir.join("logs").join(Translate::LOG);
+            let tlog = crate_dir.join("logs").join(Role::Translate.log());
             Enrichment::compute(&crate_dir.join("src"), &[("translate", &tlog)])
                 .merge_into(&mut json);
             std::fs::write(
@@ -346,7 +422,11 @@ pub fn run_harvest_bench_test(
          published for a 7-project dataset",
         projects.len()
     );
-    println!("\nharvest-bench: {passed}/{total} projects pass ({build_failed} build failures)");
+    print!("\nharvest-bench: {passed}/{total} projects pass ({build_failed} build failure(s)");
+    if unlinkable > 0 {
+        print!(", {unlinkable} compiled but exported an incomplete ABI");
+    }
+    println!(")");
 
     println!("📝 result.json written for {recorded} of {total} projects");
     Ok(())
@@ -390,7 +470,7 @@ mod tests {
     fn a_runner_that_errors_is_not_scored_from_the_file_it_left() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         let report = tmp.path().join("harvest_bench_report.json");
-        let fake = crate::cache::fake_program(
+        let fake = crate::io::workdir::fake_program(
             tmp.path(),
             "fake-runner",
             &format!(
@@ -400,7 +480,8 @@ mod tests {
              done\n\
              exit 2"
             ),
-        );
+        )
+        .unwrap();
 
         let refused =
             score_harvest_bench_suite(Path::new(&fake), tmp.path(), Path::new("libx.so"), &report)
@@ -418,17 +499,20 @@ mod tests {
 
     /// Exits 0 and writes `body`, so what follows is decided by the report alone.
     fn runner_writing(dir: &Path, name: &str, body: &str) -> PathBuf {
-        PathBuf::from(crate::cache::fake_program(
-            dir,
-            name,
-            &format!(
-                "while [ $# -gt 0 ]; do\n\
+        PathBuf::from(
+            crate::io::workdir::fake_program(
+                dir,
+                name,
+                &format!(
+                    "while [ $# -gt 0 ]; do\n\
              \x20 case \"$1\" in --json) shift; printf '%s' '{body}' > \"$1\";; esac\n\
              \x20 shift\n\
              done\n\
              exit 0"
-            ),
-        ))
+                ),
+            )
+            .unwrap(),
+        )
     }
 
     /// Every way a report comes back with no judgement, and the ONE way it carries some. A suite whose
@@ -470,7 +554,7 @@ mod tests {
         let runner = runner_writing(
             tmp.path(),
             "runner-real",
-            r#"{"run":{"verdicts":[{"passed":true,"skipped":false},{"passed":false,"skipped":false},{"passed":false,"skipped":true}]}}"#,
+            r#"{"run":{"verdicts":[{"passed":true,"skipped":false},{"passed":false,"skipped":false,"name":"Sodium.pad","failure":"expected 3 got 4\nand a second line"},{"passed":false,"skipped":true}]}}"#,
         );
         let scored = score_harvest_bench_suite(&runner, tmp.path(), Path::new("libx.so"), &report)
             .expect("one pass and one failure IS a measurement");
@@ -480,6 +564,69 @@ mod tests {
             (1, 1, 1, true),
             "a skip is counted apart from a judgement, and a measured suite records build_ok"
         );
+        let ProjectScore::Measured { failing, .. } = &scored else {
+            panic!("a measured suite is Measured")
+        };
+        assert_eq!(failing, &["Sodium.pad (expected 3 got 4)".to_string()]);
+    }
+
+    /// A suite that will not LINK is the translation's failure, not the harness's. kiro's zstd compiled
+    /// to a cdylib missing `ZSTD_flushStream` and four more; as a harness failure that ONE project
+    /// refused its whole tool's run, five passing projects and every tool's merged tables with it.
+    #[test]
+    fn a_suite_that_cannot_link_the_cdylib_is_the_translations_failure_not_the_harness() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let ld = "error: cmake build (suite) failed:\n\
+             /usr/bin/ld: glue_small.c:(.text+0x3fc): undefined reference to `ZSTD_flushStream'\n\
+             /usr/bin/ld: glue_dicts.c:(.text+0x14): undefined reference to `ZSTD_createCDict'\n\
+             /usr/bin/ld: glue_dicts.c:(.text+0x40): undefined reference to `ZSTD_createCDict'\n\
+             collect2: error: ld returned 1 exit status";
+        let runner = crate::io::workdir::fake_program(
+            tmp.path(),
+            "runner-unlinkable",
+            &format!("cat >&2 <<'STDERR'\n{ld}\nSTDERR\nexit 2"),
+        )
+        .unwrap();
+        let report = tmp.path().join("unlinkable.json");
+        let score = score_harvest_bench_suite(
+            Path::new(&runner),
+            tmp.path(),
+            Path::new("libzstd.so"),
+            &report,
+        )
+        .expect("an unlinkable ABI is a score, not a refusal");
+        let ProjectScore::AbiIncomplete { missing } = &score else {
+            panic!("expected AbiIncomplete, got {score:?}")
+        };
+        assert_eq!(
+            missing,
+            &[
+                "ZSTD_createCDict".to_string(),
+                "ZSTD_flushStream".to_string()
+            ],
+            "every missing symbol once, so the record names what to translate next"
+        );
+        let r = score.record();
+        assert!(
+            r.build_ok && r.tests_ok == 0 && r.tests_failed == 0 && !r.passed(),
+            "the crate DID compile, and nothing was measured: {r:?}"
+        );
+
+        // Non-vacuous: exit 2 for the runner's OWN failure still refuses.
+        let broken = crate::io::workdir::fake_program(
+            tmp.path(),
+            "runner-broken",
+            "echo 'error: cmake configure (suite) failed:\nNo CMAKE_CXX_COMPILER could be found.' >&2\nexit 2",
+        )
+        .unwrap();
+        let err = score_harvest_bench_suite(
+            Path::new(&broken),
+            tmp.path(),
+            Path::new("libzstd.so"),
+            &tmp.path().join("broken.json"),
+        )
+        .expect_err("a runner that could not configure has measured nothing");
+        assert!(format!("{err:#}").contains("HARNESS failed"));
     }
 
     /// The published `Builds` column reads this field, so it must mean the crate compiled and nothing else.
@@ -487,10 +634,19 @@ mod tests {
     fn only_a_crate_that_produced_no_cdylib_records_a_failed_build() {
         assert!(!ProjectScore::CrateDidNotBuild.record().build_ok);
         assert!(
+            ProjectScore::AbiIncomplete {
+                missing: vec!["ZSTD_flushStream".into()]
+            }
+            .record()
+            .build_ok,
+            "a linker complaint is not the compiler's: this crate produced a cdylib"
+        );
+        assert!(
             ProjectScore::Measured {
                 tests_ok: 0,
                 tests_failed: 3,
                 tests_skipped: 0,
+                failing: vec!["Sodium.pad".into()],
             }
             .record()
             .build_ok,

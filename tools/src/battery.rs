@@ -1,4 +1,4 @@
-use crate::cli::{Agent, Dataset};
+use crate::cli::{Dataset, Tool, Variant};
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::collections::HashMap;
@@ -85,15 +85,6 @@ pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
         .collect();
     batteries.sort();
     Ok(batteries)
-}
-
-pub fn has_shared_source_groups(corpus_dir: &Path, battery_name: &str) -> bool {
-    let dir = corpus_dir.join("Public-Tests").join(battery_name);
-    std::fs::read_dir(&dir).ok().is_some_and(|entries| {
-        entries
-            .filter_map(|e| e.ok())
-            .any(|e| e.path().join("test_case").is_symlink())
-    })
 }
 
 // ── harvest-bench project ──────────────────────────────────────────────
@@ -610,25 +601,23 @@ fn parse_duration(s: &str) -> u64 {
 }
 
 pub struct Paths {
-    /// The ACTUAL repository root, not a dataset/agent dir: `crate::io::sandbox`'s
-    /// deny list must cover the corpus (the graded oracle), not just a results
-    /// subdirectory.
+    /// The ACTUAL repository root, not a dataset or tool dir: `crate::io::sandbox`'s deny list must
+    /// cover the corpus (the graded oracle), not just a results subdirectory.
     pub repo_root: PathBuf,
     pub corpus_dir: PathBuf,
     pub results_dir: PathBuf,
-    pub prompts_dir: PathBuf,
-    pub agent: Agent,
-    /// KEPT, not merely used to derive the dirs above: a phase's wall-clock ceiling depends on it, and
+    pub tool: Tool,
+    /// Which prompt set. A `Variant` rather than six extra `Tool`s: same program, same model, only
+    /// the text differs, and the key separates those by prompt hash already.
+    pub variant: Variant,
+    /// KEPT, not merely used to derive the dirs above: a step's wall-clock ceiling depends on it, and
     /// recovering it from `results_dir`'s spelling would be a string where a type belongs.
     pub dataset: Dataset,
-    /// How this run is spelled in the results tree, the cache key and the recorded
-    /// provenance — one value, so the three cannot disagree.
-    pub agent_key: crate::cache::AgentKey,
-    pub model: Option<String>,
-    /// A required parameter of `new` rather than a default, so the compiler names
-    /// every construction site that would otherwise silently get read-write
-    /// caching.
-    pub cache_mode: crate::cache::Mode,
+    /// What the agent will be asked for. `None` only where a backend runs no model.
+    pub model: Option<crate::store::ModelId>,
+    /// A required parameter of `new` rather than a default, so the compiler names every construction
+    /// site that would otherwise silently get read-write caching.
+    pub cache_mode: crate::store::Mode,
     /// Whether the operator accepted running without an enforceable sandbox.
     pub enforcement: crate::io::sandbox::Enforcement,
 }
@@ -636,77 +625,62 @@ pub struct Paths {
 impl Paths {
     pub fn new(
         repo_root: &Path,
-        agent: Agent,
+        tool: Tool,
+        variant: Variant,
         dataset: Dataset,
         model: Option<&str>,
-        cache_mode: crate::cache::Mode,
+        cache_mode: crate::store::Mode,
         enforcement: crate::io::sandbox::Enforcement,
     ) -> Result<Self> {
-        // The same value the cache key and every `"agent"` field use: a second table
-        // here is what let 208 result files record an agent name no `--agent` value
-        // spells, under a `codex-gpt55/` directory.
-        let agent_key = crate::cache::AgentKey::new(
-            agent,
-            model,
-            crate::agents::invocation::resolved_model(agent, model)?,
-        )?;
-        let (corpus_dir, results_dir) = match dataset {
+        let model = crate::runners::resolve_model(tool, model)?;
+        let (corpus_dir, results_root) = match dataset {
             Dataset::TestCorpus => (
                 repo_root.join("test-corpus"),
-                repo_root.join("results/Test-Corpus").join(agent_key.dir()),
+                repo_root.join("results/Test-Corpus"),
             ),
             Dataset::HarvestBench => (
                 repo_root.join("harvest-bench/tests"),
-                repo_root.join("results/HarvestBench").join(agent_key.dir()),
+                repo_root.join("results/HarvestBench"),
             ),
         };
-        let prompts_dir = match agent {
-            // Codex's own set: `prompts/claude/*.md` carry a sub-agent protocol built on Claude
-            // Code's Task tool, so every codex run so far was told to use a tool it cannot call.
-            Agent::CodexGpt56Sol => repo_root.join("prompts/codex"),
-            Agent::Claude
-            | Agent::ClaudeCombined
-            | Agent::ClaudeMinimal
-            | Agent::ClaudeNoIter
-            | Agent::ClaudeNoFeatures
-            | Agent::ClaudeNoSubtask
-            | Agent::ClaudeCrossPrompt
-            | Agent::CodexGpt55
-            | Agent::CodexGpt54
-            | Agent::OpenCode => match dataset {
-                // harvest-bench cases are libraries, which the test-corpus
-                // prompts already dispatch on; no separate prompt set needed.
-                Dataset::TestCorpus | Dataset::HarvestBench => repo_root.join("prompts/claude"),
-            },
-            Agent::Kimi | Agent::Oneshot => repo_root.join("prompts/oneshot"),
-            _ => match dataset {
-                Dataset::TestCorpus | Dataset::HarvestBench => {
-                    repo_root.join("prompts/kiro/test-corpus")
-                }
-            },
-        };
+        // `<tool>/<model>/<variant>`, every level always present. A level that appears only
+        // sometimes is the ragged tree the model level already taught us to avoid -- and without the
+        // variant level, `claude` and `claude --prompt no-iter` would write to the same directory,
+        // being the same tool at the same model.
+        let results_dir = results_root
+            .join(crate::cli::tool_dir(tool))
+            .join(match &model {
+                Some(m) => crate::store::model_dir(m.as_str()),
+                None => "none".to_string(),
+            })
+            .join(variant.dir());
         Ok(Self {
             repo_root: repo_root.to_path_buf(),
             corpus_dir,
             results_dir,
             cache_mode,
             enforcement,
-            prompts_dir,
-            agent,
+            tool,
+            variant,
             dataset,
-            agent_key,
-            model: model.map(String::from),
+            model,
         })
     }
 
-    pub fn input_dir(&self, battery: &str) -> PathBuf {
-        self.corpus_dir.join("Public-Tests").join(battery)
+    /// Where a unit's cases are read FROM. Dataset-aware: see [`crate::benchmark::Benchmark::jobs`].
+    pub fn input_dir(&self, unit: &str) -> PathBuf {
+        match self.dataset {
+            Dataset::TestCorpus => self.corpus_dir.join("Public-Tests").join(unit),
+            Dataset::HarvestBench => self.corpus_dir.join(unit),
+        }
     }
 
     pub fn output_dir(&self, name: &str) -> PathBuf {
         self.results_dir.join(name)
     }
 
+    /// The Test-Corpus two-level results layout; harvest-bench has no case level and uses
+    /// [`Self::output_dir`], which is what its scorer reads.
     pub fn case_dir(&self, battery: &str, case: &str) -> PathBuf {
         self.results_dir.join(battery).join(case)
     }
@@ -714,6 +688,54 @@ impl Paths {
 
 #[cfg(test)]
 mod tests {
+    /// Three tools running at once must not write to one another's paths.
+    ///
+    /// These are what a parallel sweep would CORRUPT rather than merely slow: two runs sharing a
+    /// results dir interleave their `summary.json`, and two sharing an evaluation tree delete each
+    /// other's crates mid-build. The agent's scratch is per invocation now, resolved in the runner from
+    /// the work dir it was handed, not from the machine-wide base every case once shared.
+    #[test]
+    fn no_two_tools_share_an_output_or_evaluation_path() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let paths_for = |tool| {
+            Paths::new(
+                tmp.path(),
+                tool,
+                Variant::Default,
+                Dataset::TestCorpus,
+                Some("some/model-1"),
+                crate::store::Mode::ReadWrite,
+                crate::io::sandbox::Enforcement::AllowUnsandboxed,
+            )
+            .unwrap()
+        };
+        let tools = [Tool::Claude, Tool::Codex, Tool::Kiro, Tool::OpenCode];
+        let results: Vec<_> = tools.iter().map(|t| paths_for(*t).results_dir).collect();
+        let unique: std::collections::BTreeSet<_> = results.iter().collect();
+        assert_eq!(
+            unique.len(),
+            tools.len(),
+            "two tools share a results dir: {results:#?}"
+        );
+        // And an ablation of the SAME tool is a different run, so it needs its own too.
+        let base = paths_for(Tool::Claude).results_dir;
+        let ablated = Paths::new(
+            tmp.path(),
+            Tool::Claude,
+            Variant::NoIter,
+            Dataset::TestCorpus,
+            Some("some/model-1"),
+            crate::store::Mode::ReadWrite,
+            crate::io::sandbox::Enforcement::AllowUnsandboxed,
+        )
+        .unwrap()
+        .results_dir;
+        assert_ne!(
+            base, ablated,
+            "a prompt variant must not share the base run's dir"
+        );
+    }
+
     use super::*;
     use std::fs;
     use std::os::unix::fs as unix_fs;

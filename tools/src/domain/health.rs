@@ -38,35 +38,23 @@ pub enum LogFormat {
 
 /// The harness's LIVE observation of how the agent process ended.
 ///
-/// [`Exit::Unobserved`] is deliberately distinct from [`Exit::Failure`]: it means
-/// nobody watched, not that anything went wrong. An after-the-fact audit recovers
-/// what the run recorded ([`crate::agent_health::recorded_exit`]) and lands here only
-/// when there is no record — it must never manufacture an observation.
+/// [`Exit::Unobserved`] is deliberately distinct from [`Exit::Failure`]: nobody watched, not something
+/// went wrong. An audit recovers what the run recorded and lands here only when there is no record --
+/// it must never manufacture an observation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Exit {
     Success,
     Failure {
         code: Option<i32>,
     },
-    /// `timeout` killed the child — it reports 124.
+    /// `timeout` killed the child (it reports 124) and the transcript had gone SILENT well before the
+    /// kill: the agent was hung, so there is no measurement.
     Timeout,
+    /// Killed at the wall clock while still writing. The agent was working and did not converge, which
+    /// is the tool's answer rather than the harness's fault. Only the edge can tell these apart -- it
+    /// takes the transcript's last-write time, which the pure layer never sees.
+    Exhausted,
     Unobserved,
-}
-
-/// PROOF that an agent invocation ran to completion.
-///
-/// The private unit field makes [`Health::completed`] the only way to obtain one,
-/// so code requiring `&Completed` is unreachable for an infra-failed run as a
-/// compile error, not a forgettable runtime check. See
-/// `crate::artifact::Scrubbed::seal`.
-pub struct Completed(());
-
-impl Completed {
-    /// `#[cfg(test)]` so production code still cannot forge a proof.
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
-        Self(())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,34 +65,64 @@ pub enum Health {
     /// Did not finish for a reason outside the thing being measured: auth, rate
     /// limiting, transport, or a truncated log.
     Infra { reason: String, detail: String },
+    /// The agent used its ENTIRE wall-clock ceiling and was killed: the harness gave it the budget and
+    /// it did not finish, so it belongs with `Refused`, not `Infra`. Measured -- kiro spent all 43_200s
+    /// on `001_perlin_noise` still reporting "1500 cases, 7 real mismatches". Only a meaningful signal
+    /// once the ceiling stopped varying by tool: a kill at kiro's old 2_700s said nothing.
+    Exhausted { secs: u64 },
+    /// The PROVIDER declined on content grounds. Terminal and reproducible, unlike `Infra`, so a retry
+    /// cannot help. Separated because one codex refusal voided all 85 of its B01_synthetic cases as
+    /// though a blip had lost an entry -- and that corpus holds 12 cases named for buffer overflows.
+    Refused { kind: RefusalKind, detail: String },
     /// No evidence either way (kiro logs are not stream-json; results predating
     /// this module have no terminal record). Not a failure.
     Unknown { why: String },
 }
 
+/// Why a provider declined. A named enum, not a string, so a second spelling of the same refusal
+/// cannot appear in the counter.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalKind {
+    /// The provider's own safety classifier flagged the request. codex names it in its `message`.
+    HighRiskCyberActivity,
+}
+
 impl Health {
-    /// The ONLY constructor of [`Completed`].
-    pub fn completed(&self) -> Option<Completed> {
-        matches!(self, Health::Completed).then_some(Completed(()))
+    /// Whether the run finished. Says nothing about whether the translation SUCCEEDED -- that is a
+    /// result, and the scorer's business.
+    pub fn is_completed(&self) -> bool {
+        matches!(self, Health::Completed)
     }
 
     pub fn is_infra(&self) -> bool {
         matches!(self, Health::Infra { .. })
     }
+
+    /// A refusal the provider will repeat. NOT `is_infra`: the infra gate exists to stop a transport
+    /// failure being scored as a measurement, and this IS a measurement.
+    pub fn refusal(&self) -> Option<&RefusalKind> {
+        match self {
+            Health::Refused { kind, .. } => Some(kind),
+            _ => None,
+        }
+    }
+
+    /// The tool answered, and the answer is "no": it declined, or it spent the whole budget without
+    /// finishing. Either way the case is scored as a failure and the battery still publishes -- unlike
+    /// `Infra`, which means the harness cannot say what the tool would have done.
+    pub fn is_tool_answer_failure(&self) -> bool {
+        matches!(self, Health::Refused { .. } | Health::Exhausted { .. })
+    }
 }
 
 /// Classify a run from its transcript and how the process ended.
 ///
-/// Takes the text, never the path: the caller knows which backend it launched, how the
-/// process ended, and where the transcript is, so all three are its business and the
-/// decision here needs no fixture on disk. [`crate::agent_health::classify_log`] is the
-/// after-the-fact counterpart for auditing a results tree, where the observation is read
-/// back from what the run recorded rather than made live.
-///
-/// For [`LogFormat::StreamJson`] the terminal record is authoritative and `exit` is
-/// deliberately ignored — see the module docs on `SIGXFSZ`: the agent runs under
-/// `ulimit -f`/`-d`, so a test binary killed by a signal fails commands inside a
-/// session that is itself fine, and that is a *result*.
+/// Takes the text, never the path, so the decision needs no fixture on disk;
+/// [`crate::agent_health::classify_log`] is the after-the-fact counterpart for auditing a tree.
+/// For [`LogFormat::StreamJson`] the terminal record is authoritative and `exit` is deliberately
+/// ignored -- see the module docs on `SIGXFSZ`: a test binary killed by a signal fails commands inside
+/// a session that is itself fine, and that is a *result*.
 pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
     match format {
         LogFormat::StreamJson => classify_stream_json(text),
@@ -119,16 +137,22 @@ pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
                 reason: "timeout".into(),
                 detail: "the agent was killed at the wall clock".into(),
             },
-            // The tool ran and failed. That is a RESULT, not an infra failure, and
-            // must stay in the denominator — treating it as infra is how a project
-            // silently leaves the denominator and inflates the score. There is also
-            // nothing to seal, so no proof is needed.
-            Exit::Failure { code } => Health::Unknown {
-                why: format!(
-                    "opaque log, agent exited {}",
-                    code.map(|c| c.to_string())
-                        .unwrap_or_else(|| "by signal".into())
-                ),
+            Exit::Exhausted => Health::Exhausted { secs: 0 },
+            // A tool that ran and failed is a RESULT and stays in the denominator; treating that as
+            // infra inflates the score. The PROVIDER saying "temporarily unavailable" is NOT that, and
+            // `Unknown` made it neither retryable nor visible to the gate.
+            Exit::Failure { code } => match provider_transient(text) {
+                Some(reason) => Health::Infra {
+                    reason: reason.into(),
+                    detail: "the provider reported a transient failure".into(),
+                },
+                None => Health::Unknown {
+                    why: format!(
+                        "opaque log, agent exited {}",
+                        code.map(|c| c.to_string())
+                            .unwrap_or_else(|| "by signal".into())
+                    ),
+                },
             },
             Exit::Unobserved => Health::Unknown {
                 why: "opaque log and no observed exit status".into(),
@@ -137,8 +161,33 @@ pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
     }
 }
 
-/// The shape `translate::scan_codex_log_for_transient_error` reads, for the same reason: codex exits 0
-/// after Bedrock drops a conversation, so the exit status proves nothing and only this record does.
+/// The provider's own "come back later", in ONE place like `provider_refusal`. Narrow: a genuine tool
+/// failure must keep classifying `Unknown` rather than being retried.
+pub fn provider_transient(message: &str) -> Option<&'static str> {
+    let m = message.to_ascii_lowercase();
+    if m.contains("temporarily unavailable") {
+        return Some("model_unavailable");
+    }
+    if m.contains("throttl") || m.contains("rate limit") || m.contains("too many requests") {
+        return Some("throttled");
+    }
+    if m.contains("service unavailable") || m.contains("bad gateway") {
+        return Some("service_unavailable");
+    }
+    None
+}
+
+/// The provider's own marker for a content REFUSAL, matched in ONE place. Keyed on the stable
+/// documentation URL rather than the prose, which is a marketing string: a refusal is a fact about the
+/// provider, not about the log format, so every dialect shares this.
+fn provider_refusal(message: &str) -> Option<RefusalKind> {
+    let m = message.to_ascii_lowercase();
+    (m.contains("/guides/safety-checks")
+        || m.contains("flagged for potentially high-risk")
+        || m.contains("high-risk cyber activity"))
+    .then_some(RefusalKind::HighRiskCyberActivity)
+}
+
 fn classify_codex_json(tail: &str) -> Health {
     let completed = tail.contains(r#""type":"turn.completed""#);
     let failed = tail.contains(r#""type":"turn.failed""#);
@@ -146,10 +195,14 @@ fn classify_codex_json(tail: &str) -> Health {
         return Health::Completed;
     }
     if failed {
+        let detail =
+            last_str(tail, "message").unwrap_or_else(|| "codex reported turn.failed".into());
+        if let Some(kind) = provider_refusal(&detail) {
+            return Health::Refused { kind, detail };
+        }
         return Health::Infra {
             reason: "turn.failed".into(),
-            detail: last_str(tail, "message")
-                .unwrap_or_else(|| "codex reported turn.failed".into()),
+            detail,
         };
     }
     // Neither: the process died mid-turn, exactly as a truncated stream-json log did.
@@ -250,8 +303,104 @@ fn first_line_of_result(tail: &str) -> String {
 }
 
 #[cfg(test)]
+mod transient_tests {
+    use super::*;
+
+    /// kiro's pcre2 ended with `temporarily unavailable` and exit 1, classified `Unknown`, and left
+    /// the table with nothing refusing. A tool that merely failed must still classify `Unknown`.
+    #[test]
+    fn a_provider_transient_is_infra_and_a_tool_failure_is_still_unknown() {
+        let kiro =
+            "Kiro is having trouble responding right now:\n    The model you've selected is \
+                    temporarily unavailable. Please relaunch with '--model <model_id>'.";
+        let h = classify(kiro, LogFormat::Opaque, Exit::Failure { code: Some(1) });
+        assert!(
+            matches!(&h, Health::Infra { reason, .. } if reason == "model_unavailable"),
+            "the provider's own words must be read as infra: {h:?}"
+        );
+        assert!(h.is_infra(), "so the gate can refuse rather than shrug");
+
+        // Non-vacuous: a real failure at the same exit code must NOT become retryable.
+        let real = "error: could not compile `translation` due to 12 previous errors";
+        let h = classify(real, LogFormat::Opaque, Exit::Failure { code: Some(1) });
+        assert!(matches!(h, Health::Unknown { .. }), "{h:?}");
+
+        for (text, want) in [
+            (
+                "Model is temporarily unavailable",
+                Some("model_unavailable"),
+            ),
+            ("ThrottlingException: Too many requests", Some("throttled")),
+            ("503 Service Unavailable", Some("service_unavailable")),
+            ("assertion failed: left == right", None),
+        ] {
+            assert_eq!(provider_transient(text), want, "{text}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wall-clock kill means two different things and the harness must not conflate them. kiro spent
+    /// all 43_200s on `001_perlin_noise`, writing to its log until the minute it was killed, still
+    /// reporting "1500 cases, 7 real mismatches": it was WORKING and did not converge, which is the
+    /// tool's answer. Recorded as `Infra` it voided the battery instead, exactly as a hung agent would.
+    #[test]
+    fn a_kill_while_still_working_is_the_tools_answer_not_an_infra_failure() {
+        let log = "MISMATCH ...\n1500 cases, 7 real mismatches\n";
+        let worked = classify(log, LogFormat::Opaque, Exit::Exhausted);
+        assert!(worked.is_tool_answer_failure(), "got {worked:?}");
+        assert!(
+            !worked.is_infra(),
+            "the infra gate must not fire: the tool was given the budget and used it"
+        );
+        assert!(!worked.is_completed(), "and it did not finish");
+
+        // Non-vacuous: a kill after the transcript went SILENT is still infra, because a hung agent
+        // produced no measurement. Only the edge can tell the two apart, from the log's last write.
+        let hung = classify(log, LogFormat::Opaque, Exit::Timeout);
+        assert!(
+            hung.is_infra() && !hung.is_tool_answer_failure(),
+            "got {hung:?}"
+        );
+    }
+
+    /// The provider declining on content grounds is a MEASUREMENT, not an infrastructure failure.
+    /// Classified as `Infra`, codex's one refusal on `030_mutable_buffer_overlap_extrahard_lib`
+    /// discarded all 85 of its B01_synthetic cases through `attests`, exactly as a lost entry would.
+    /// The message below is verbatim from that transcript.
+    #[test]
+    fn a_provider_content_refusal_is_not_an_infrastructure_failure() {
+        let tail = concat!(
+            r#"{"type":"turn.failed","error":{"message":"This request has been flagged for "#,
+            r#"potentially high-risk cyber activity. Learn more here: "#,
+            r#"https://platform.openai.com/docs/guides/safety-checks/cybersecurity"}}"#,
+        );
+        let h = classify(tail, LogFormat::CodexJson, Exit::Failure { code: Some(1) });
+        assert_eq!(
+            h.refusal(),
+            Some(&RefusalKind::HighRiskCyberActivity),
+            "got {h:?}"
+        );
+        assert!(
+            !h.is_infra(),
+            "the infra gate stops a transport failure being scored; this must not trip it"
+        );
+        assert!(!h.is_completed(), "and it certainly did not complete");
+
+        // Non-vacuous: an ordinary turn.failed with no refusal marker is still Infra.
+        let plain = classify(
+            r#"{"type":"turn.failed","error":{"message":"upstream connect error"}}"#,
+            LogFormat::CodexJson,
+            Exit::Failure { code: Some(1) },
+        );
+        assert!(
+            plain.is_infra() && plain.refusal().is_none(),
+            "got {plain:?}"
+        );
+    }
 
     /// Verbatim shape of a real credential-expiry terminal record.
     const DEAD: &str = r#"{"type":"system","subtype":"api_retry","attempt":4,"error_status":403}
@@ -395,17 +544,15 @@ mod tests {
             Health::Completed
         );
         assert!(
-            classify(log, LogFormat::Opaque, Exit::Success)
-                .completed()
-                .is_some(),
-            "the proof seal() needs must be obtainable"
+            classify(log, LogFormat::Opaque, Exit::Success).is_completed(),
+            "an opaque log with a clean exit is the one case that classifies completed"
         );
         // ...and the old path really did refuse it, so this test is not vacuous.
-        assert!(from_log(log).completed().is_none());
+        assert!(!from_log(log).is_completed());
     }
 
     #[test]
-    fn an_opaque_log_is_never_sealed_on_a_failure_or_without_an_observation() {
+    fn an_opaque_log_never_completes_on_a_failure_or_without_an_observation() {
         for exit in [
             Exit::Failure { code: Some(1) },
             Exit::Failure { code: None },
@@ -413,10 +560,8 @@ mod tests {
             Exit::Unobserved,
         ] {
             assert!(
-                classify("error: could not compile\n", LogFormat::Opaque, exit)
-                    .completed()
-                    .is_none(),
-                "must not mint a proof for {exit:?}"
+                !classify("error: could not compile\n", LogFormat::Opaque, exit).is_completed(),
+                "must not classify {exit:?} as completed"
             );
         }
     }

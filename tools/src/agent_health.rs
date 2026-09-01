@@ -14,7 +14,7 @@ const TAIL_BYTES: u64 = 16 * 1024;
 
 /// Classify a run after the fact, from its transcript and the exit it recorded.
 ///
-/// `format` is a parameter and never assumed: [`crate::cli::Agent::log_format`] is the ONE
+/// `format` is a parameter and never assumed: [`crate::runners::log_format`] is the ONE
 /// table, and hardcoding [`LogFormat::StreamJson`] here read every prose or docker
 /// transcript as a stream-json log missing its terminal record — `Infra { "truncated" }` for
 /// a run that was perfectly healthy, which is the misclassification [`LogFormat`] exists to
@@ -23,6 +23,22 @@ const TAIL_BYTES: u64 = 16 * 1024;
 /// `exit` for the mirror-image reason: nothing in an opaque log tells a finished run from a
 /// killed one, so [`classify`] gives the exit the whole burden of proof, and a hardcoded
 /// [`Exit::Unobserved`] left such a backend only `Unknown` — a gate that cannot fire.
+/// What the run cost, read from the transcript.
+///
+/// `None` where the format carries no spend: kiro writes prose, so there is nothing to read, and a
+/// `0.0` there would be a measurement nobody made -- the shape that put `\ActorKiroTests{0/338}` in
+/// print against records saying 325/338.
+pub fn cost_usd(log: &Path, format: LogFormat) -> Option<f64> {
+    if format == LogFormat::Opaque {
+        return None;
+    }
+    let text = read_tail(log).ok()?;
+    text.lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find_map(|r| r["total_cost_usd"].as_f64())
+}
+
 pub fn classify_log(log: &Path, format: LogFormat, exit: Exit) -> Health {
     match read_tail(log) {
         Ok(tail) => classify(&tail, format, exit),
@@ -42,19 +58,16 @@ pub fn exit_code(metrics_json: &Path) -> Option<i64> {
     read_metrics(metrics_json)?.get("exit_code")?.as_i64()
 }
 
-/// How the agent process ended, as the run itself recorded it. The audit watched nothing, but
-/// the harness did: `agents::exit::merge_agent_exit` wrote what it saw beside the transcript,
-/// and reading it back is the only sight the gate has for a [`LogFormat::Opaque`] backend — a
-/// wall-clock-killed run is `Infra { "timeout" }` and not a result. No record stays
-/// [`Exit::Unobserved`], which is not a failure: the backends that never call
-/// `record_agent_exit` record nothing, and a verdict invented for them is the gate reporting
-/// what nobody observed.
+/// How the agent process ended, as the run itself recorded it beside the transcript: for a
+/// [`LogFormat::Opaque`] backend it is the gate's only sight of a wall-clock kill, which is
+/// `Infra { "timeout" }` and not a result. No record stays [`Exit::Unobserved`] rather than getting a
+/// verdict nobody observed — and since the store records the outcome, nothing writes these any more.
 pub fn recorded_exit(metrics_json: &Path) -> Exit {
     let Some(metrics) = read_metrics(metrics_json) else {
         return Exit::Unobserved;
     };
-    // `merge_agent_exit` writes both keys or neither, and a null `exit_code` is a real
-    // observation of a signal kill — so presence, not parseability, says it was watched.
+    // Both keys are written or neither, and a null `exit_code` is a real observation of a
+    // signal kill — so presence, not parseability, says it was watched.
     let Some(code) = metrics.get("exit_code") else {
         return Exit::Unobserved;
     };
@@ -367,7 +380,7 @@ mod tests {
                 "HB/mujs",
                 r#"{"exit_code":0,"timed_out":false,"success":true,"duration_secs":912}"#,
             ),
-            // A backend that never calls `record_agent_exit` records no exit to read.
+            // A backend that records no exit at all.
             ("HB/zlib", r#"{"success":false,"duration_secs":10800}"#),
         ] {
             std::fs::write(

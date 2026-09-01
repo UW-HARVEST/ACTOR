@@ -4,8 +4,8 @@
 //! `(case_root / "translated_rust").resolve() / "target"`, so the symlink this replaces put 666
 //! `target/` dirs inside published phase dirs while both tests asserting `target/` is absent passed.
 
-use crate::artifact::{Phase, Published, Seed};
 use crate::battery::Paths;
+use crate::tree::Tree;
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -29,32 +29,43 @@ impl Keep {
     }
 }
 
-/// What a score is taken from: the artifacts THIS RUN resolved, and nothing else. It was an enum whose
+/// What a score is taken from: the trees THIS RUN resolved, and nothing else. It was an enum whose
 /// `Archive` variant read a phase dir with no key; measured when that went, 16 of 17 published agents
 /// had no cached agent call at all, so ~95% of the numbers rested on artifacts nothing could attest.
-#[derive(Copy, Clone)]
-pub struct Source<'a> {
-    pub translate: &'a crate::translate::Translations,
-    pub verify: &'a crate::verify::Verifications,
-}
+///
+/// Keyed by role name rather than by phase type: a chain of three steps needs no new field.
+pub type Resolved = std::collections::HashMap<PathBuf, Tree>;
 
-pub fn artifact_root<P: Phase>(artifact: &Published<P>) -> PathBuf {
-    match artifact.as_seed() {
-        Seed::FromCorpus(root) | Seed::FromArtifact(root) => root,
-    }
-}
-
-pub struct Tree {
+pub struct EvalTree {
     root: PathBuf,
     /// `.eval` itself, so [`Drop`] prunes the harness level without walking out of it.
     eval_root: PathBuf,
     keep: Keep,
 }
 
-impl Tree {
-    pub fn create_empty(paths: &Paths, keep: Keep) -> Result<Self> {
+impl EvalTree {
+    pub fn create_empty(paths: &Paths, target: &str, keep: Keep) -> Result<Self> {
         let eval_root = paths.repo_root.join(EVAL_DIR);
-        let root = eval_root.join(paths.agent_key.dir());
+        // `<tool>/<model>/<variant>/<target>`, and the TARGET level is what lets two batteries of the
+        // SAME tool run at once. Without it the root was the tool level and `remove_dir_all` below
+        // wiped it wholesale, so a second battery deleted the first one's tree mid-score -- which is
+        // why every same-tool leg had to be serialised. `Drop` prunes upward with `remove_dir`, which
+        // fails on a non-empty directory, so a sibling battery's tree stops the prune.
+        let root = eval_root
+            .join(
+                paths
+                    .results_dir
+                    .strip_prefix(
+                        paths
+                            .results_dir
+                            .ancestors()
+                            .nth(3)
+                            .unwrap_or(&paths.results_dir),
+                    )
+                    .unwrap_or(&paths.results_dir),
+            )
+            // A target may name a case (`B01_organic/bin2hex_lib`), which must not become two levels.
+            .join(target.replace('/', "~"));
         if root.exists() {
             std::fs::remove_dir_all(&root)
                 .with_context(|| format!("emptying {}", root.display()))?;
@@ -82,7 +93,7 @@ impl Tree {
     }
 }
 
-impl Drop for Tree {
+impl Drop for EvalTree {
     fn drop(&mut self) {
         match self.keep {
             Keep::ForPostMortem => println!(
@@ -112,61 +123,29 @@ pub struct Case {
 }
 
 pub struct Scope<'t> {
-    _tree: &'t Tree,
+    _tree: &'t EvalTree,
     root: PathBuf,
     cases: Vec<Case>,
 }
 
 impl Scope<'_> {
-    pub fn materialise<P: Phase>(
+    /// Assemble one case for scoring. `record_into` is where its `result.json` goes -- stated by the
+    /// caller, which published it, rather than recovered from a path inside the tree.
+    pub fn materialise(
         &mut self,
         name: &str,
-        artifact: &Published<P>,
-        corpus_case: &Path,
+        tree: &Tree,
+        graded: &crate::transform::Graded,
+        record_into: &Path,
     ) -> Result<()> {
         let case = self.root.join(name);
-        let from = artifact_root(artifact);
-        artifact
-            .as_seed()
-            .export_into(&case.join(crate::battery::TRANSLATED_RUST))
-            .with_context(|| format!("materialising {name} from {}", from.display()))?;
-
-        for dir in ["test_vectors", "runner"] {
-            let src = corpus_case.join(dir);
-            if src.is_dir() {
-                crate::translate::copy_dir_all(&src, &case.join(dir))?;
-            }
-        }
-        self.repoint_runner_dependency(name, corpus_case)?;
-
+        crate::transform::eval_case(&case, tree, graded)
+            .with_context(|| format!("assembling {name} for scoring"))?;
         self.cases.push(Case {
             name: name.to_string(),
-            record_into: from.clone(),
-            case_dir: from.parent().unwrap_or(&from).to_path_buf(),
+            record_into: record_into.to_path_buf(),
+            case_dir: record_into.parent().unwrap_or(record_into).to_path_buf(),
         });
-        Ok(())
-    }
-
-    /// `cando2` is relative to the corpus layout and this tree sits at another depth.
-    fn repoint_runner_dependency(&self, name: &str, corpus_case: &Path) -> Result<()> {
-        let manifest = self.root.join(name).join("runner/Cargo.toml");
-        if !manifest.is_file() {
-            return Ok(());
-        }
-        let Some(cando2) = corpus_root(corpus_case).map(|r| r.join("tools/cando2")) else {
-            return Ok(());
-        };
-        if !cando2.is_dir() {
-            return Ok(());
-        }
-        let content = std::fs::read_to_string(&manifest)?;
-        std::fs::write(
-            &manifest,
-            content.replace(
-                "path = \"../../../../tools/cando2\"",
-                &format!("path = \"{}\"", cando2.display()),
-            ),
-        )?;
         Ok(())
     }
 
@@ -246,34 +225,59 @@ impl Materialised {
     }
 }
 
-fn corpus_root(corpus_case: &Path) -> Option<PathBuf> {
-    Some(corpus_case.parent()?.parent()?.parent()?.to_path_buf())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifact::Translate;
     use std::fs;
+
+    /// The `<tool>/<model>/<variant>` tail the eval tree mirrors.
+    fn results_tail(paths: &Paths) -> PathBuf {
+        paths
+            .results_dir
+            .strip_prefix(
+                paths
+                    .results_dir
+                    .ancestors()
+                    .nth(3)
+                    .unwrap_or(&paths.results_dir),
+            )
+            .unwrap_or(&paths.results_dir)
+            .to_path_buf()
+    }
 
     fn paths_at(repo_root: &Path) -> Paths {
         Paths::new(
             repo_root,
-            crate::cli::Agent::Claude,
+            crate::cli::Tool::Claude,
+            crate::cli::Variant::Default,
             crate::cli::Dataset::TestCorpus,
             None,
-            crate::cache::Mode::Bypass,
+            crate::store::Mode::ReadWrite,
             crate::io::sandbox::Enforcement::AllowUnsandboxed,
         )
         .unwrap()
     }
 
-    fn published(case_dir: &Path, body: &str) -> Published<Translate> {
-        let dir = case_dir.join("translated");
+    /// A tree shaped like a step's output: `c_src/` beside `translation/`, which is what every
+    /// working dir is.
+    fn published(case_dir: &Path, body: &str) -> Tree {
+        let dir = case_dir.join(crate::tree::TRANSLATION);
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::write(dir.join("Cargo.toml"), "[package]\n[workspace]\n").unwrap();
         fs::write(dir.join("src/main.rs"), body).unwrap();
-        Published::<Translate>::unkeyed_from_phase_dir(case_dir).unwrap()
+        fs::create_dir_all(case_dir.join(crate::tree::C_SRC)).unwrap();
+        fs::write(
+            case_dir.join(crate::tree::C_SRC).join("lib.c"),
+            "int f(void);\n",
+        )
+        .unwrap();
+        Tree::for_test(case_dir).unwrap()
+    }
+
+    fn vectors_of(repo_root: &Path, case: &str) -> crate::transform::Graded {
+        crate::transform::Graded::Vectors {
+            corpus_case: corpus_case(repo_root, "B01", case),
+        }
     }
 
     fn corpus_case(repo_root: &Path, battery: &str, case: &str) -> PathBuf {
@@ -296,15 +300,15 @@ mod tests {
         let paths = paths_at(tmp.path());
         let eval = tmp.path().join(EVAL_DIR);
 
-        let tree = Tree::create_empty(&paths, Keep::Discard).unwrap();
+        let tree = EvalTree::create_empty(&paths, "T", Keep::Discard).unwrap();
         tree.scope("B01").unwrap();
         assert!(
-            paths.agent_key.dir().contains('/'),
+            results_tail(&paths).to_string_lossy().contains('/'),
             "non-vacuous only if the fixture's key really has a model level: {}",
-            paths.agent_key.dir()
+            results_tail(&paths).display()
         );
         assert!(
-            eval.join(paths.agent_key.dir()).is_dir(),
+            eval.join(results_tail(&paths)).is_dir(),
             "fixture must build it"
         );
         drop(tree);
@@ -322,26 +326,43 @@ mod tests {
         fs::create_dir_all(tmp.path().join("test-corpus")).unwrap();
         let paths = paths_at(tmp.path());
 
+        // Under THIS target: a stale case from an earlier run of the same target must go, or scoring
+        // could read it instead of materialising its own.
         let planted = tmp
             .path()
             .join(EVAL_DIR)
-            .join(paths.agent_key.dir())
-            .join("B01/leftover/translated_rust");
+            .join(results_tail(&paths))
+            .join("T/B01/leftover/translated_rust");
         fs::create_dir_all(&planted).unwrap();
         fs::write(planted.join("Cargo.toml"), "[package]").unwrap();
         assert!(
             planted.join("Cargo.toml").is_file(),
             "fixture must plant it"
         );
+        // Under ANOTHER target: must SURVIVE. This is what lets two batteries of the same tool run at
+        // once; when the root was the tool level, the second battery wiped the first one's tree
+        // mid-score, which is why every same-tool leg had to be serialised.
+        let sibling = tmp
+            .path()
+            .join(EVAL_DIR)
+            .join(results_tail(&paths))
+            .join("OTHER/B02/inflight/translated_rust");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(sibling.join("Cargo.toml"), "[package]").unwrap();
 
-        let tree = Tree::create_empty(&paths, Keep::ForPostMortem).unwrap();
+        let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
         assert!(!planted.exists(), "the leftover case must be gone");
+        assert!(
+            sibling.join("Cargo.toml").is_file(),
+            "a concurrent battery's tree must survive: {}",
+            sibling.display()
+        );
 
         let case_dir = paths.case_dir("B01", "001");
         let artifact = published(&case_dir, "fn main() {}");
         let mut scope = tree.scope("B01").unwrap();
         scope
-            .materialise("001", &artifact, &corpus_case(tmp.path(), "B01", "001"))
+            .materialise("001", &artifact, &vectors_of(tmp.path(), "001"), &case_dir)
             .unwrap();
         let done = scope.finish().unwrap();
         assert_eq!(done.cases().len(), 1);
@@ -352,7 +373,8 @@ mod tests {
         assert!(crate_root.join("Cargo.toml").is_file());
         fs::write(crate_root.join("src/main.rs"), "fn main() { /* built */ }").unwrap();
         assert_eq!(
-            fs::read_to_string(case_dir.join("translated/src/main.rs")).unwrap(),
+            fs::read_to_string(case_dir.join(crate::tree::TRANSLATION).join("src/main.rs"))
+                .unwrap(),
             "fn main() {}",
             "the published artifact must be untouched by the scoring build"
         );
@@ -364,12 +386,13 @@ mod tests {
         fs::create_dir_all(tmp.path().join("results")).unwrap();
         fs::create_dir_all(tmp.path().join("test-corpus")).unwrap();
         let paths = paths_at(tmp.path());
-        let tree = Tree::create_empty(&paths, Keep::ForPostMortem).unwrap();
+        let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
         let mut scope = tree.scope("B01").unwrap();
         for case in ["001", "002"] {
-            let artifact = published(&paths.case_dir("B01", case), "fn main() {}");
+            let case_dir = paths.case_dir("B01", case);
+            let artifact = published(&case_dir, "fn main() {}");
             scope
-                .materialise(case, &artifact, &corpus_case(tmp.path(), "B01", case))
+                .materialise(case, &artifact, &vectors_of(tmp.path(), case), &case_dir)
                 .unwrap();
         }
         let done = scope.finish().unwrap();
@@ -392,11 +415,12 @@ mod tests {
         fs::create_dir_all(tmp.path().join("test-corpus")).unwrap();
         let paths = paths_at(tmp.path());
         let root = {
-            let tree = Tree::create_empty(&paths, Keep::Discard).unwrap();
+            let tree = EvalTree::create_empty(&paths, "T", Keep::Discard).unwrap();
             let mut scope = tree.scope("B01").unwrap();
-            let artifact = published(&paths.case_dir("B01", "001"), "fn main() {}");
+            let case_dir = paths.case_dir("B01", "001");
+            let artifact = published(&case_dir, "fn main() {}");
             scope
-                .materialise("001", &artifact, &corpus_case(tmp.path(), "B01", "001"))
+                .materialise("001", &artifact, &vectors_of(tmp.path(), "001"), &case_dir)
                 .unwrap();
             let done = scope.finish().unwrap();
             let root = done.root().to_path_buf();

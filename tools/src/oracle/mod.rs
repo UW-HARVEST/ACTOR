@@ -8,7 +8,6 @@ pub use gtest::run_harvest_bench_test;
 pub use runtests::run_test_corpus;
 pub use score::{Covers, Scoring, Summary};
 
-use crate::battery::Paths;
 use anyhow::Result;
 use std::path::Path;
 
@@ -83,24 +82,17 @@ impl Enrichment {
     }
 }
 
-/// Pure inverse of [`Enrichment::merge_into`]; returns mismatch descriptions.
-/// `agent` gates the "missing meta" check to kiro, the only agent that records
-pub fn enrich_test_corpus(paths: &Paths, battery: &str) -> Result<()> {
-    let output_dir = paths.results_dir.join(battery);
-    if !output_dir.is_dir() {
-        return Ok(());
-    }
+/// Backfill `result.json` (unsafe/loc/credits) for the cases NAMED, and no others.
+///
+/// Was `enrich_test_corpus(paths, battery)`, which harvest-bench called with an EMPTY battery so its
+/// `read_dir` landed a level higher. Case dirs remove the coincidence and the walk.
+pub fn enrich_cases(cases: &[&Path]) -> Result<usize> {
     let mut enriched = 0usize;
-    for entry in std::fs::read_dir(&output_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let case_dir = entry.path();
+    for case_dir in cases {
         // Each phase's result.json is enriched against ITS OWN crate. enrich_file
         // no-ops on absent files, so single-phase cases just skip verified/.
         for phase in [crate::battery::TRANSLATED, crate::battery::VERIFIED] {
-            let pdir = crate::battery::phase_dir(&case_dir, phase);
+            let pdir = crate::battery::phase_dir(case_dir, phase);
             let tlog = pdir.join("logs/translation.log");
             let vlog = pdir.join("logs/verify.log");
             if Enrichment::enrich_file(
@@ -112,8 +104,7 @@ pub fn enrich_test_corpus(paths: &Paths, battery: &str) -> Result<()> {
             }
         }
     }
-    println!("✅ Enriched {enriched} {battery} result.json files");
-    Ok(())
+    Ok(enriched)
 }
 
 #[cfg(test)]
@@ -154,7 +145,7 @@ mod tests {
     }
 
     /// `result.json` is still written back INTO the artifact directory, so it must stay outside the
-    /// digest and every [`crate::domain::contents::Carry`]; the rest lands in [`crate::eval`]'s tree.
+    /// digest and the one traversal policy; the rest lands in [`crate::eval`]'s tree.
     #[test]
     fn every_file_the_scorer_writes_back_is_excluded_from_the_artifact() {
         use crate::domain::contents::{classify, Disposition};

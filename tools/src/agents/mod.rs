@@ -6,12 +6,8 @@
 //! translation module to reach its OWN work tree, and why three of the module cycles ran
 //! through that one file.
 
-pub mod exit;
-pub mod invocation;
 pub mod opencode;
-pub mod run;
 pub mod session;
-pub mod work;
 
 use std::sync::{Condvar, Mutex};
 
@@ -28,6 +24,13 @@ impl Pool {
 
     pub fn acquire(&self) -> SemaphoreGuard<'_> {
         self.0.acquire()
+    }
+
+    /// How many jobs may be in flight. The driver spawns this many workers, so the number of threads
+    /// and the number of permits come from ONE value -- `parallel: usize` re-derived at six sites is
+    /// what gave each call an N-wide pool holding one job.
+    pub fn width(&self) -> usize {
+        self.0.max
     }
 }
 

@@ -1,8 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 pub struct Scoring<'a> {
-    pub source: crate::eval::Source<'a>,
-    pub tree: &'a crate::eval::Tree,
+    /// Which steps this run actually resolved, in order. Data rather than two typed fields, so a
+    /// chain of three needs no third field and no third branch downstream.
+    pub roles: &'a [crate::prompt::Role],
+    /// Every tree this run produced, by the phase dir it was published into.
+    pub resolved: &'a crate::eval::Resolved,
+    pub tree: &'a crate::eval::EvalTree,
     pub gate: &'a crate::agent_health::Gate<'a>,
     pub covers: Covers<'a>,
 }
@@ -17,9 +21,12 @@ pub enum Covers<'a> {
 }
 
 impl<'a> Covers<'a> {
-    pub fn from_include_regex(regex: Option<&'a str>) -> Self {
-        match regex {
-            Some(regex) => Self::Subset(regex),
+    /// From the run's resolved case filter -- which may have come from `--include-regex` OR from a case
+    /// named in the target. Reading only the flag is what let a `battery/case` run claim a whole-battery
+    /// roster.
+    pub fn of(filter: Option<&'a str>) -> Self {
+        match filter {
+            Some(filter) => Self::Subset(filter),
             None => Self::WholeBattery,
         }
     }

@@ -310,9 +310,12 @@ infra gate then correctly **refused to score** and exited 1, so no partial numbe
 pushed once a run completes end to end, and growth plus loss of read-only mode bits on clone
 are both accepted.
 
-Driver: `bash ./run_hb_all.sh` (mode 100755 now, but it is invoked with `bash` in the docs).
-It unsets `RUSTUP_TOOLCHAIN`, preflights cmake ≥3.24 / python ≥3.10 / claude, and puts cmake
-at `$HOME/.local/opt/cmake-3.28.6-linux-x86_64`.
+Driver: `harvest-tools --tool claude,codex,kiro run HB --parallel 3`. `run_hb_all.sh` is gone —
+it was single-tool, named a flag (`--agent`) and a results layout that no longer exist, and every
+refusal it carried now lives in the binary, where every entry point gets it: `RUSTUP_TOOLCHAIN`
+(`refusal::require_pinned_toolchain`), cmake ≥3.24 and python ≥3.10 (`Benchmark::preflight`).
+Still an operator's job: putting a new enough cmake on PATH, e.g.
+`$HOME/.local/opt/cmake-3.28.6-linux-x86_64/bin`, since the system one here is 3.22.
 
 ## Scratch to clean up when convenient
 

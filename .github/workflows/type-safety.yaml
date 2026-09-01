@@ -46,6 +46,9 @@ jobs:
           rustup component list --installed | grep -qx 'rust-src' \
             || { echo "::error::rust-src missing; compile-fail expectations need std source"; exit 1; }
 
+      - name: Every workflow parses (each checks the others; a broken one never runs itself)
+        run: python3 tools/check_workflows.py
+
       - name: No hardcoded home paths
         # Ordered ahead of anything that compiles, since it needs no toolchain at all.
         # Scoped to committed `*.sh` and `.github/**`; `tools/src/**` is excluded because
@@ -197,27 +200,43 @@ jobs:
         # `cache` into `agents`/`translate` grew the module cycle 5 -> 7 and the gate refused it) and
         # why the model still reaches the key after the collapse. 3510 is 3487 plus 23.
         #
-        # RAISED 3510 -> 3585 for the `<harness>/<model>` store layout, and what the lines buy is three
-        # naming defects that were each invisible on disk. `bare_model_id` stripped "the vendor prefix"
-        # as everything-before-the-first-dot, so `openai/gpt-5.4` slugged to `4` and the directory was
-        # `oneshot/4`; `results_slug` had shipped the same rule. kiro resolved a SENTINEL,
-        # `unpinned:kiro-cli-default`, which the same function cut at the colon into a directory named
-        # `kiro/unpinned`. And kiro's session script carried no `--model` at all while its key recorded
-        # one, so every published kiro row came from whichever model the picker had last made active --
-        # `claude-opus-4.7` when this was found, unrecoverable for the rows already published, because 0
-        # files under `results/Test-Corpus/kiro/` name a model. That is why those results now sit under
-        # `kiro/unrecorded/` rather than being relabelled with a model nobody recorded. The rest
-        # documents why the layout is two levels and why the collapse did not re-key: same bytes, same
-        # order, 279,505 files renamed and not one entry recomputed. 14 lines of duplication were pruned
-        # first -- the vendor-strip story was told twice and is now told once, on the test that names the
-        # failure. 3585 is the tree WITH these self-counting lines in it, 3575, plus 10.
+        # LOWERED 3780 -> 2380, which is the raises above coming due. The rebuild replaced the phase
+        # type-states with one agent invocation and deleted `translate.rs`, `verify.rs`, `cache.rs`,
+        # `artifact.rs`, `agents/run.rs` and `agents/work.rs` -- 12,213 lines, 1,329 of them comments.
+        # src/ went 23,002 -> 12,662 lines and the comment total 3,575 -> 2,309, measured over the
+        # whole counted tree after the last edit. 2380 is 2,345 plus 35. Measured AFTER the last edit
+        # and verified at the number this line passes, because reading it off an earlier measurement
+        # is how two commits on this branch shipped a ceiling the tree already exceeded.
+        #
+        # Three raises (3510 -> 3585 -> 3720 -> 3780) were each taken on the stated promise that they
+        # came back down when the old drivers went. A raise defended by a promise is worth only the
+        # record of the promise being kept, so: kept, and this is the record.
         #
         # .py is in neither HASH nor SLASH, so the budget does not count itself: this
         # script's own docstring and all 250 lines of tools/test_comment_budget.py cost
         # ZERO against both ceilings. Deriving 3100 from the tree needs that fact.
+        # RAISED 2380 -> 2394, deliberately, because 2380 was the tree measured EXACTLY -- so no new
+        # function could carry a doc comment without breaking it. Two earned their lines here:
+        # `propagate_config`, whose absence voided B02_synthetic for all three tools and P01 for all 128
+        # cases, and the rationale on `ceiling` for why it no longer takes a tool -- kiro's 2_700s verify
+        # limit cost it five batteries while its median session was the FASTEST of the three, and under
+        # that ceiling claude would have lost 47 of 415 sessions. Delete those and the next operator
+        # restores the per-tool ceiling on the reasoning this run disproved. Third, `transform::Artifact`,
+        # which splits what the ORACLE expects from which prompt a case gets -- collapsing them stripped
+        # `[[bin]] driver` from every shared-source group, killing 48 of P01's 128 cases and all 3
+        # macrodepth ones. Pruned first: the docs went from 18 lines to 11 and the tests' inline
+        # commentary is gone. 2583 is the tree with this change and these twelve SELF-COUNTING lines in
+        # it, measured after writing them -- not "plus epsilon" -- and `--max-ratio 20` against a 16.4%
+        # tree still stops sprawl.
+        #
+        # RAISED 2583 -> 2592, deliberately and by the operator's instruction, for `CASE_TIMEOUT_SECS`.
+        # Upstream runtests defaults `--test-timeout` to 120, which made the published score a property
+        # of the HOST: this runner timed out 88 P01 cases the sweep box passes. A bare `360` would be the
+        # magic constant this file already refuses twice over, and 2583 was the tree measured exactly, so
+        # there was no line to spend. Measured after the edit, not plus epsilon.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 3585 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 2592 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is

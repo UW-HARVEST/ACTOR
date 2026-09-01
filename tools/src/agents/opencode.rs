@@ -112,13 +112,6 @@ pub fn parse_model(s: &str) -> Result<Model> {
     }
 }
 
-/// The Bedrock regional prefix (`us.`/`eu.`/`global.`/`au.`/`jp.`) is routing,
-/// not identity, so the same model in two regions must not produce two results
-/// dirs. Vendor prefix likewise — the agent name already says which harness ran.
-pub fn results_slug(m: &Model) -> String {
-    format!("opencode-{}", crate::cache::bare_model_id(&m.model_id))
-}
-
 // ── Phase ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,8 +388,7 @@ pub fn invoke(
         ),
     }
 
-    let status = cmd.status().context("invoking opencode")?;
-    crate::agents::exit::record_agent_exit(status);
+    cmd.status().context("invoking opencode")?;
     Ok(())
 }
 
@@ -429,24 +421,6 @@ mod tests {
         let m = parse_model("openrouter/deepseek/deepseek-v4-pro:floor").unwrap();
         assert_eq!(m.as_arg(), "openrouter/deepseek/deepseek-v4-pro:floor");
         assert_eq!(m.metadata_id(), "deepseek/deepseek-v4-pro");
-    }
-
-    #[test]
-    fn results_slug_drops_region_and_vendor_prefixes() {
-        // The same model in two regions must NOT produce two results dirs.
-        for region in ["us.", "eu.", "global.", "au.", "jp."] {
-            let m =
-                parse_model(&format!("amazon-bedrock/{region}anthropic.claude-sonnet-5")).unwrap();
-            assert_eq!(
-                results_slug(&m),
-                "opencode-claude-sonnet-5",
-                "region {region}"
-            );
-        }
-        let gpt = parse_model("amazon-bedrock/openai.gpt-5.5").unwrap();
-        assert_eq!(results_slug(&gpt), "opencode-gpt-5.5");
-        let dsk = parse_model("openrouter/deepseek/deepseek-v4-pro").unwrap();
-        assert_eq!(results_slug(&dsk), "opencode-deepseek-v4-pro");
     }
 
     #[test]

@@ -132,7 +132,7 @@ pub fn tempdir(prefix: &str) -> Result<tempfile::TempDir> {
         .with_context(|| format!("creating {prefix}* scratch dir in {}", base.display()))
 }
 
-/// Every machine-specific root [`crate::cache::normalise`] rewrites to a stable token.
+/// Every machine-specific root [`crate::store::normalise`] rewrites to a stable token.
 ///
 /// One named struct rather than four paths in a row: they are all the same type, and a
 /// transposed root is a wrong cache key — silently, since the digest is still a digest.
@@ -173,16 +173,6 @@ impl Roots {
             home: std::env::var_os("HOME").map(PathBuf::from).map(canon),
         }
     }
-}
-
-/// Scratch dir handed to the agent as `TMPDIR`: agent-generated test code calls
-/// `std::env::temp_dir()`, which is the `/tmp` tmpfs unless `TMPDIR` is set, and
-/// inside the work root that scratch is on disk and discarded with the case.
-pub fn agent_tmp(work_root: &Path) -> Result<PathBuf> {
-    let dir = work_root.join("tmp");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating agent TMPDIR {}", dir.display()))?;
-    Ok(dir)
 }
 
 /// `ulimit -f` argument capping any single file the agent writes. Backstop for
@@ -232,6 +222,44 @@ pub fn test_tempdir() -> Result<tempfile::TempDir> {
     tempfile::Builder::new()
         .tempdir_in(&dir)
         .with_context(|| format!("creating a scratch tree in {}", dir.display()))
+}
+
+/// A stand-in executable, for tests that must observe how the harness reacts to a program's exit and
+/// output without depending on a real CLI being installed.
+///
+/// `pub`, not `#[cfg(test)]`, for [`test_tempdir`]'s reason: other test targets link the lib without it.
+/// Which also puts it in the lib, where `clippy::panic` applies -- so failures here are RETURNED.
+pub fn fake_program(dir: &Path, name: &str, body: &str) -> Result<String> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let at = dir.join(name);
+    // Written, flushed, synced and CLOSED before the mode is set, and only then executed.
+    {
+        let mut f = std::fs::File::create(&at)
+            .with_context(|| format!("creating the fake program {}", at.display()))?;
+        f.write_all(format!("#!/usr/bin/env bash\n{body}\n").as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o755))?;
+    // Then PROVE it is executable before handing it over. A sibling test thread that forked while
+    // this file's descriptor was open leaves the fork holding it, and the exec fails with ETXTBSY (26)
+    // -- a SPAWN error, which a caller's `expect_err` cannot tell from the runner failure it is
+    // actually testing. That read as a one-in-three "the fake runner did write a report" from a
+    // fixture that had written one. Probed with no arguments, which every fake here ignores because
+    // they all loop over `$@`.
+    for attempt in 0..50 {
+        match std::process::Command::new(&at).output() {
+            Ok(_) => return Ok(at.to_string_lossy().into_owned()),
+            Err(e) if e.raw_os_error() == Some(26) && attempt < 49 => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("executing the fake program {}", at.display()))
+            }
+        }
+    }
+    anyhow::bail!("{} stayed busy for 50 attempts", at.display())
 }
 
 #[cfg(test)]
@@ -399,14 +427,6 @@ tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
             err.contains("cannot/nest"),
             "error should name the offending path, got: {err}"
         );
-    }
-
-    #[test]
-    fn agent_tmp_is_inside_the_work_root() {
-        let tmp = test_tempdir().unwrap();
-        let dir = agent_tmp(tmp.path()).unwrap();
-        assert!(dir.starts_with(tmp.path()));
-        assert!(dir.is_dir());
     }
 
     #[test]
