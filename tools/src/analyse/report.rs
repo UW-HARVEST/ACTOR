@@ -1019,7 +1019,7 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path, kiro_dir: Option<
     ));
     o.push_str(&format!(
         "\\newcommand{{\\ActorCodexTests}}{{{}}}\n",
-        scored(&total_tests, "codex-gpt54", total_cases)
+        scored(&total_tests, "codex", total_cases)
     ));
     // The paper says "no validate" where the agent dir says `kiro-translate`.
     // The macro name MUST match paper.tex, else it is an undefined control
@@ -1407,6 +1407,44 @@ fn count_c_loc_dir(dir: &Path) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_tool_that_produced_rows_gets_a_number_not_a_dash() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let row = |agent: &str| BatteryRow {
+            agent: agent.to_string(),
+            battery: "B01_organic".to_string(),
+            cases_passed: 7,
+            cases_tested: 7,
+            cases_built: 7,
+            vectors_passed: 1,
+            vectors_total: 1,
+            c_loc: 1,
+            total_loc: 1,
+            unsafe_lines: 0,
+        };
+        let out = generate_numbers_tex(
+            &[row("claude"), row("codex"), row("kiro")],
+            tmp.path(),
+            None,
+        );
+        for name in ["ActorClaudeTests", "ActorCodexTests", "ActorKiroTests"] {
+            let line = out
+                .lines()
+                .find(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("{name} is not emitted at all"));
+            assert!(
+                line.contains("7/7") && !line.contains("--"),
+                "{name} must carry the number its rows prove: {line}"
+            );
+        }
+        let alone = generate_numbers_tex(&[row("claude")], tmp.path(), None);
+        let codex = alone
+            .lines()
+            .find(|l| l.contains("ActorCodexTests"))
+            .expect("the macro is always emitted");
+        assert!(codex.contains("--"), "absent must be a dash: {codex}");
+    }
 
     /// An agent this run did not attest renders `--`, never `0/338`.
     ///
