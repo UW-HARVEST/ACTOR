@@ -253,11 +253,11 @@ fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
             ),
         };
 
-        // Publish, then transform. The transform is deterministic and outside the cache, so the tree
-        // the NEXT step keys on is `transform(after)` and not `after` itself.
+        // Publish for the scorer and for a human, then derive the next step's input from the STORED
+        // artifact -- never by reading the tree we just wrote. Output must not feed the next key.
         publish(&after, &phase_dir)?;
         crate::transform::post_process(&phase_dir, &job.artifact)?;
-        tree = reseal(&phase_dir, &corpus_c)?;
+        tree = next_input(&after, &job.artifact, &corpus_c)?;
         published.push((phase_dir.clone(), tree.clone()));
 
         // Per step: publishability is checked per role, so each must serve its followers.
@@ -285,8 +285,26 @@ fn publish(tree: &Tree, phase_dir: &Path) -> Result<()> {
         .with_context(|| format!("publishing into {}", phase_dir.display()))
 }
 
-/// Re-seal the published-and-transformed crate, so the next step's input tree is exactly what is on
-/// disk after the transform rather than what the agent left.
+/// The next step's input: `transform(stored artifact)`, computed in a scratch dir.
+///
+/// Derived from the STORE, never from the results tree. Reading the published dir back made the key
+/// depend on whatever else happened to sit there -- residue from an earlier sweep, or a file the seal
+/// hashes that `.gitignore` skips. Measured: codex lost all 128 P01_sphincs_plus cases in CI, 332/338
+/// -> 204/338, because its artifact writes `.cargo/config.toml` and `Cargo.lock` and both were ignored,
+/// so a fresh checkout hashed a different tree and the verify entry stopped being servable. A results
+/// tree is OUTPUT; letting it feed the next key makes reproduction depend on filesystem history.
+fn next_input(
+    after: &Tree,
+    artifact: &crate::transform::Artifact,
+    corpus_case: &Path,
+) -> Result<Tree> {
+    let work = after.materialise(corpus_case)?;
+    crate::transform::post_process(&work.translation(), artifact)?;
+    work.seal()
+}
+
+/// Seal what is on disk in `phase_dir`. Only for a REFUSED or EXHAUSTED step, which publishes no
+/// artifact and therefore has no stored tree to derive one from.
 fn reseal(phase_dir: &Path, corpus_case: &Path) -> Result<Tree> {
     let work = WorkDir::assemble(corpus_case)?;
     crate::tree::copy_plain(phase_dir, &work.translation())?;
@@ -297,6 +315,61 @@ fn reseal(phase_dir: &Path, corpus_case: &Path) -> Result<Tree> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    /// A results tree is OUTPUT: residue in it must not move the next step's key.
+    ///
+    /// `reseal` read the published dir back, so any file the seal hashes but `.gitignore` skips changed
+    /// the hash in a fresh checkout. Measured: codex lost all 128 P01_sphincs_plus cases in CI,
+    /// 332/338 -> 204/338, over `.cargo/config.toml` and `Cargo.lock`. Non-vacuity asserts the same
+    /// residue really does move a disk-derived seal, so the fixture carries the trap it claims to.
+    #[test]
+    fn residue_in_the_published_tree_cannot_move_the_next_steps_input() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let corpus_case = tmp.path().join("test_case");
+        std::fs::create_dir_all(&corpus_case).unwrap();
+        std::fs::write(corpus_case.join("lib.c"), "int f(void){return 1;}\n").unwrap();
+
+        let work = WorkDir::assemble(&corpus_case).unwrap();
+        std::fs::create_dir_all(work.translation().join("src")).unwrap();
+        std::fs::write(
+            work.translation().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(work.translation().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let after = work.seal().unwrap();
+
+        let artifact = crate::transform::Artifact::Cdylib {
+            lib_name: "x".to_string(),
+        };
+        let phase_dir = tmp.path().join("published");
+        publish(&after, &phase_dir).unwrap();
+        crate::transform::post_process(&phase_dir, &artifact).unwrap();
+
+        let from_store = next_input(&after, &artifact, &corpus_case).unwrap();
+        let from_disk = reseal(&phase_dir, &corpus_case).unwrap();
+
+        // Exactly the class of file `.gitignore` skipped and the seal hashed.
+        std::fs::create_dir_all(phase_dir.join(".cargo")).unwrap();
+        std::fs::write(
+            phase_dir.join(".cargo/config.toml"),
+            "[net]\noffline = true\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            next_input(&after, &artifact, &corpus_case)
+                .unwrap()
+                .digest(),
+            from_store.digest(),
+            "the next input must be a function of the STORE, not of the results tree"
+        );
+        assert_ne!(
+            reseal(&phase_dir, &corpus_case).unwrap().digest(),
+            from_disk.digest(),
+            "non-vacuity: this residue must really move a disk-derived seal"
+        );
+    }
 
     /// Three items and a width of three are really in flight TOGETHER.
     ///

@@ -234,9 +234,17 @@ jobs:
         # of the HOST: this runner timed out 88 P01 cases the sweep box passes. A bare `360` would be the
         # magic constant this file already refuses twice over, and 2583 was the tree measured exactly, so
         # there was no line to spend. Measured after the edit, not plus epsilon.
+        #
+        # RAISED 2592 -> 2620 for two reproducibility defects that cost real numbers and were each
+        # invisible until documented. (1) A verify step was keyed on the results tree it had just
+        # written, so a file the seal hashes but `.gitignore` skips changed the hash in a fresh
+        # checkout: codex lost all 128 P01 cases in CI, 332/338 -> 204/338. (2) `reproduce.sh` asserted
+        # nothing was PAID FOR but never that everything was MEASURED, so the battery vanished and the
+        # per-tool arm went green. Deleting either explanation to fit a cap would leave the next reader
+        # with a bare `next_input` and no idea why output must not feed a key. Measured after the edit.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 2592 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 2620 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is

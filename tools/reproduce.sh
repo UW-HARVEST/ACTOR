@@ -78,6 +78,18 @@ fi
 echo
 echo "✅ every phase replayed: $tallies tally line(s), all '0 run', all '0 agent invocation(s)'"
 
+# COVERAGE, not just cost. Every check above asks "was anything paid for"; none asks "was everything
+# measured". A battery whose store coverage is incomplete goes OUT OF SCOPE, scores nothing, and emits
+# no tally line -- so `tallies` merely drops and "all 0 run" stays trivially true for the batteries that
+# did score. Measured: codex silently lost all 128 P01_sphincs_plus cases, 332/338 -> 204/338, and its
+# own per-tool arm went green; only the merged arm caught it, and only because it diffs the tables.
+if grep -qE 'out of scope|no stored entry for the' "$log"; then
+  grep -hE 'out of scope|no stored entry for the' "$log" | sed 's/^/   /' | sort -u >&2
+  die "a battery went out of scope, or a step had no stored entry. The store does not cover what the
+   committed tables claim, so those numbers rest on cases this replay never scored."
+fi
+echo "✅ every battery in scope: no case unresolved, no battery skipped"
+
 # PR #116 removes the tree even when the score exits 1; one left standing is one the next run reads.
 [ -z "$(find .eval -mindepth 1 2>/dev/null | head -1)" ] || die ".eval/ still holds files"
 echo "✅ .eval/ is empty"
