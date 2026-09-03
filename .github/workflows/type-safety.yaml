@@ -242,9 +242,18 @@ jobs:
         # nothing was PAID FOR but never that everything was MEASURED, so the battery vanished and the
         # per-tool arm went green. Deleting either explanation to fit a cap would leave the next reader
         # with a bare `next_input` and no idea why output must not feed a key. Measured after the edit.
+        #
+        # RAISED 2620 -> 2653 for `make_readable`, and 2620 was again the tree measured EXACTLY. An
+        # agent left `_ref/data/noperm.txt` at `0o000` to exercise a failing open; the seal could not
+        # read it, errored the case out, and took all 42 of claude's B02_synthetic with it, because a
+        # battery scores nothing unless every case is answered. The quieter half is why the lines are
+        # worth a raise: `scrub` skips unreadable files SILENTLY, so that same file would have carried
+        # a scratch path into the key with no error anywhere. Pruned first -- the function's doc lost a
+        # line and the test's dropped from seven to two, since the incident is told once. 2653 is 2645,
+        # the tree with these nine self-counting lines in it, plus 8. Measured after the edit.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 2620 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 2653 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is

@@ -268,6 +268,7 @@ impl WorkDir {
                 .ok_or(e)
         })?;
         Self::lay_out(&self.root, &self.corpus_c)?;
+        make_readable(&self.root)?;
         scrub(&self.root)?;
         Ok(Tree {
             digest: digest_tree(&self.root)?,
@@ -275,6 +276,50 @@ impl WorkDir {
             _scratch: Some(self._scratch),
         })
     }
+}
+
+/// Widen permissions on what the seal is about to read. Agents leave files unreadable ON PURPOSE --
+/// `static-vars-fpts` left `_ref/data/noperm.txt` at `0o000` to exercise a failing open -- and one
+/// breaks both steps below: `digest_tree` fails the case with EACCES, voiding all 42 of claude's
+/// B02_synthetic, and `scrub` SILENTLY skips what it cannot read, so an unscrubbed scratch path
+/// reaches the digest as a per-run nonce. No key moves: the digest feeds paths and bytes, not modes.
+///
+/// Its own walk, though `visit` is THE traversal elsewhere: `visit` must `read_dir` a directory to
+/// reach what is beneath it, so an unreadable DIRECTORY defeats it before it can emit -- the
+/// condition being repaired. Drift from its pruning is harmless: widening a file the digest ignores
+/// costs nothing, and one this skips is one nothing reads.
+fn make_readable(root: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fn walk(root: &Path, dir: &Path) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Ok(Ok(rel)) = path.strip_prefix(root).map(RelPath::new) else {
+                continue;
+            };
+            if classify(&rel, false) == Disposition::BuildOutput {
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(&path)?;
+            // chmod follows symlinks, so widening one would widen a target outside this tree.
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let is_dir = meta.is_dir();
+            let mode = meta.permissions().mode() & 0o777;
+            // Writable too, not merely readable: `scrub` rewrites the files it finds a path in.
+            let want = mode | if is_dir { 0o700 } else { 0o600 };
+            if want != mode {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(want))
+                    .with_context(|| format!("widening permissions on {}", path.display()))?;
+            }
+            if is_dir {
+                walk(root, &path)?;
+            }
+        }
+        Ok(())
+    }
+    walk(root, root).with_context(|| format!("widening permissions under {}", root.display()))
 }
 
 /// Rewrite per-run absolute paths to a stable token, so a digest of agent output does not change
@@ -436,6 +481,41 @@ mod tests {
         std::fs::write(c.join("src/lib.c"), "int f(void){return 1;}\n").unwrap();
         std::fs::write(c.join("doc.html.bak"), "reference\n").unwrap();
         (tmp, c)
+    }
+
+    /// An agent's own `0o000` fixture must cost it neither its case nor the stability of its key --
+    /// both failures [`make_readable`] names, asserted where each would be observed.
+    #[test]
+    fn an_unreadable_file_the_agent_left_loses_neither_the_case_nor_the_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, c) = corpus();
+        let seal_leaving_noperm = |payload: &str| {
+            let w = WorkDir::assemble(&c).unwrap();
+            std::fs::write(w.translation().join("lib.rs"), "pub fn f() {}\n").unwrap();
+            let at = w.root().join("_ref/data");
+            std::fs::create_dir_all(&at).unwrap();
+            let f = at.join("noperm.txt");
+            std::fs::write(&f, format!("{payload} at {}\n", w.root().display())).unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let sealed = w
+                .seal()
+                .expect("an unreadable fixture must not lose the case");
+            let text = std::fs::read_to_string(sealed.at.join("_ref/data/noperm.txt")).unwrap();
+            (sealed.digest().as_str().to_string(), text)
+        };
+
+        let (first, text) = seal_leaving_noperm("one");
+        assert!(
+            text.contains("$HARVEST_WORKDIR") && !text.contains("/harvest-work-"),
+            "the scrub must have reached it, or its key carries a per-run nonce: {text}"
+        );
+        // Non-vacuity: the file is HASHED, so the two assertions above are about a file that is
+        // really part of the tree rather than one the digest never looked at.
+        let (second, _) = seal_leaving_noperm("two");
+        assert_ne!(
+            first, second,
+            "an unreadable file's bytes must still reach the digest"
+        );
     }
 
     #[test]
