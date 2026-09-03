@@ -1,6 +1,11 @@
 <!-- markdownlint-disable MD041 -->
+You are in the working directory. It holds two subtrees:
+- `c_src/` — the original C. READ IT; never modify it.
+- `translation/` — the Rust crate. Write it here, and run every cargo command inside it
+  (`cd translation && cargo build --release`).
+
 Translate the C code in c_src/ to Rust that produces **byte-identical output** for the same inputs.
-Write Cargo.toml and src/ files in the current directory (NOT in c_src/).
+Write Cargo.toml and src/ files in `translation/` (NOT in c_src/).
 
 You MUST translate ALL C source files — no stubs, no placeholders, no empty
 functions. Every .c file MUST have a complete Rust equivalent. The binary MUST

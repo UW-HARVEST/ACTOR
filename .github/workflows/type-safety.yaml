@@ -1,0 +1,255 @@
+name: type safety
+
+# The compile-fail cases assert invariants enforced by ABSENCE of API (no `AsRef<Path>`,
+# no `path()`, no public constructor), which a refactor deletes silently. No
+# `--all-targets`: `tools/tests/integration.rs` needs the results and test-corpus
+# submodules, which this job omits to stay fork-safe and PAT-free.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: type-safety-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # `.git` must be present (shallow is fine): build.rs stamps HEAD via
+          # `git rev-parse` and a test rejects an "unknown" stamp.
+          submodules: false
+
+      - name: Install the pinned toolchain
+        # rust-toolchain.toml must drive the components, not just the channel: `--profile
+        # minimal` omits rust-src, and without it rustc renders three fewer note lines, so
+        # every compile-fail expectation fails on formatting. RUSTUP_TOOLCHAIN overrides it.
+        run: |
+          echo "RUSTUP_TOOLCHAIN=" >> "$GITHUB_ENV"
+          rustup show active-toolchain
+          rustc --version
+          want=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
+          got=$(rustc --version | cut -d' ' -f2)
+          if [ "$got" != "$want" ]; then
+            echo "::error::pinned $want but rustc is $got — expectations are toolchain-sensitive"
+            exit 1
+          fi
+          rustup component list --installed | grep -qx 'rust-src' \
+            || { echo "::error::rust-src missing; compile-fail expectations need std source"; exit 1; }
+
+      - name: Every workflow parses (each checks the others; a broken one never runs itself)
+        run: python3 tools/check_workflows.py
+
+      - name: No hardcoded home paths
+        # Ordered ahead of anything that compiles, since it needs no toolchain at all.
+        # Scoped to committed `*.sh` and `.github/**`; `tools/src/**` is excluded because
+        # `cache.rs` and `workdir.rs` use absolute home paths as `#[cfg(test)]` fixtures,
+        # where being foreign to the machine running the test is the point.
+        run: python3 tools/check_paths.py
+
+      - name: Formatting
+        # No `--locked`: cargo-fmt reads no lockfile and rejects the flag. Deliberately
+        # ahead of the cache restore -- it needs no dependencies, and the only way to
+        # make it green is to run `cargo fmt`. tools/rustfmt.toml pins the settings so a
+        # toolchain bump cannot reflow the tree and bury a real diff.
+        run: cargo fmt --manifest-path tools/Cargo.toml --check
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools
+          # Dependencies only: `validate.yaml` caches `.` including `tools/target`, and
+          # restoring that would let cargo call harvest-tools fresh and run nothing.
+          cache-targets: false
+
+      # `--locked` on every invocation below: without it cargo silently updates
+      # Cargo.lock to satisfy a semver-compatible release, so CI would stop testing the
+      # dependency set that `validate.yaml` builds the published numbers with.
+      - name: Unit tests (lib + bin)
+        # `--bin harvest-tools` is load-bearing: `report.rs` and `benchmark.rs` are declared
+        # only in main.rs, so a bare `--lib` compiles neither.
+        run: cargo test --locked --manifest-path tools/Cargo.toml --lib --bin harvest-tools
+
+      - name: Compile-fail tests (the type invariants)
+        run: cargo test --locked --manifest-path tools/Cargo.toml --test compile_fail
+
+      - name: Architecture rules
+        # Shape rules over the source, for invariants enforced by ABSENCE. A trybuild
+        # case proves today's code rejects a misuse; only these catch someone ADDING
+        # the impl that makes the misuse compile.
+        run: cargo test --locked --manifest-path tools/Cargo.toml --test architecture
+
+      - name: Docs
+        # No RUSTDOCFLAGS: `warnings = "deny"` in the [lints.rust] table reaches rustdoc
+        # too, so a broken intra-doc link or an unclosed HTML tag is already an error.
+        run: cargo doc --locked --no-deps --manifest-path tools/Cargo.toml
+
+      - name: Comment budget
+        # tokei and scc score `///` and `//!` as code, which reports this repo at 11%
+        # and could never fire -- the bloat is in `//!` module headers. tools/
+        # comment_budget.py lexes string literals and counts doc comments.
+        #
+        # TWO ceilings, because each is blind to exactly what the other catches.
+        #
+        # --max-comments 3200 is primary: an absolute comment-line ceiling since PR 13,
+        # not the `--max 14` whole-tree ratio before it. The ratio was green on a false
+        # measurement -- the raw-string masker matched any `r` before a quote, so 95 of
+        # its 149 matches over tools/src/**.rs were ordinary words like `"a valid
+        # parser")`, and everything to the next quote was blanked: 38 lines of
+        # oracle/mod.rs at one match, the `r"` inside `"/usr"` on line 18, whose span ran
+        # to the next quote 42 lines later. Correcting it moved the base tree from 2291
+        # comment / 16378 counted lines (13.99%, exit 0) to 2383 / 16698 (14.27%, exit 1
+        # at --max 14): 92 comment and 320 counted lines were hidden from the gate, which
+        # was passing by 0.012 points. 15 files carry all of that; the largest is
+        # translate.rs at +15 comment and +41 code lines. The correction is 95 false
+        # matches -> ONE, not -> zero: `roots("/w", "/r")` in cache.rs still opens a
+        # phantom raw string, measured cost 0 counted lines, pinned by
+        # test_comment_budget.py. And a ratio cannot tell "comments were added" from
+        # "code was removed", so it RISES on a deletion -- PR 0 took comments DOWN 1942
+        # -> 1916 and the ratio UP 12.999% -> 13.157%, which is the whole reason 13 -> 14
+        # was needed. An absolute count cannot be tripped by deleting code.
+        #
+        # --max-ratio 20 is the backstop for the one class the count cannot see. Measured
+        # on a copy of this tree with 6,100 code lines deleted and every comment kept: the
+        # comment count did not move at all, the ratio went 14.41% -> 20.11%, exit 1.
+        # Measured now (PR 21): 3097 comment / 21498 counted = 14.41%, so it fires only
+        # once the counted tree shrinks by 6,013 lines (28%) with not one comment removed
+        # -- deliberately loose, unlike the 0.01-point margin `--max 14` was passing by. It
+        # cannot pre-empt the count either: growing comments to 3100 puts the ratio at
+        # 14.42%, so an addition always hits --max-comments first.
+        #
+        # 3100 is a BUDGET FOR A SEQUENCE, not a snapshot plus epsilon, and that is why it
+        # was raised once, deliberately, by the operator. 2560 was derived as "the tree
+        # (2468) plus 3.7% of headroom" on the assumption the tree was near-final. It is
+        # not: PR 14 alone consumed 91 of that 92 lines documenting a compiler-enforced
+        # invariant, PR 12 adds 86 more, and six PRs remain (11, 7c, 8, 15, 16, 10) each
+        # adding the WHY documentation CLAUDE.md demands. A ceiling that forces every one
+        # of them to fight the gate for writing that documentation is measuring the wrong
+        # thing. --max-ratio 20 is what actually stops sprawl, because density cannot be
+        # gamed by adding comments.
+        # THIS IS A DEBT: lower it to the measured total once PR 10 lands. Tracked in
+        # docs/HANDOFF.md's remaining-work table so it cannot be forgotten. Never raise it
+        # again without the same explicit reasoning in this comment.
+        #
+        # RAISED 3100 -> 3150 by PR 23, and here is the reasoning the line above demands.
+        # origin/main measured EXACTLY 3100 of 3100: PR 22 spent the whole budget, leaving a
+        # PR that adds a file no way to document it. PR 23 adds two -- tools/reproduce.sh
+        # (the reproducibility procedure, which must not live only in a workflow) and a
+        # rewritten validate.yaml -- plus two documented functions, and measures 3138 after
+        # trimming its own comments 46 lines. Fitting under 3100 would mean deleting
+        # PRE-EXISTING documentation to make room, which is what PR 21 did to this very
+        # block and what "never work around your own gate" forbids. 3150 is 3138 plus 12,
+        # not a round number: the next PR prunes or raises deliberately, as this one did.
+        #
+        # RAISED 3150 -> 3200 by PR 7c, with the reasoning the line above demands. `main` measured
+        # EXACTLY 3150 of 3150 for the third time running: PR 24 pruned itself to the ceiling and PR 25
+        # deduped five verbatim copies of a `cache.rs` note to fit, so each spent its budget deleting
+        # PRE-EXISTING documentation rather than writing its own -- the thing this block already calls
+        # forbidden. PR 7c adds 224 counted lines and 34 comment lines, 15% against a 13.82% tree, after
+        # compressing its own docs ~45% and deleting the ones removing `SHARED_SOURCE_CACHE` made false.
+        # The operator chose this over deleting the WHY on `Keying::Derived`, on why `publish_derived`
+        # takes its source as proof, and on four mutation-tested invariants. 3200 is 3174 -- the tree
+        # with this PR and these nine lines in it -- plus 26. Same rule as before: prune or raise
+        # deliberately, never quietly, and `--max-ratio 20` remains what actually stops sprawl.
+        #
+        # RAISED 3200 -> 3320 by PR 29, with the reasoning the line above demands -- and this time the
+        # PATTERN is the argument. This was the FOURTH consecutive PR to measure `main` at exactly the
+        # ceiling, because every raise has been "the tree plus epsilon" (26, then 12): a cap pinned to a
+        # snapshot binds on the next PR whatever that PR contains, so it stopped measuring bloat and now
+        # measures arrival order. PR 29 adds ~900 counted lines -- `Pool`, `InScope`, `Preflighted`,
+        # `ProjectScore`, the harvest-bench table generator, two architecture gates, three measured
+        # ceilings -- and 60 comment lines, 6.7% against a 14.35% tree, so it leaves the tree LESS
+        # comment-dense than it found it. That is after pruning 26 of its own: the CMake story was told
+        # five times and is now told once on the type it shaped, and one doc paragraph was a duplicate
+        # left by an earlier shape of `ProjectScore`. What survived is the WHY the operator chose to keep
+        # over the number: why `parallel: usize` was the defect, why a partial `InScope` cannot be built,
+        # why `build_ok: bool` printed `Builds: no` against seven crates that compiled, and the three
+        # MEASURED durations (libpng translate 4.71 h, mujs verify 6.5 h, zstd verify 4.4 h) that are the
+        # only evidence the raised ceilings were earned -- delete those and the next operator inherits a
+        # magic 86400. 3320 is 3293 -- the tree with this PR and these fifteen self-counting lines in it
+        # -- plus 27. Prune or raise deliberately, never quietly; `--max-ratio 20` still stops sprawl.
+        #
+        # RAISED 3320 -> 3470 by the codex-fair-comparison branch, and the reasoning is that every
+        # line of it documents a number that was WRONG IN PRINT. Four defects, each measured rather
+        # than argued: `Execution failed` was one of three runtests failure shapes and the parser
+        # matched two, so 76 cases over 10 agents were scored as PASSES -- `claude-cross-prompt` alone
+        # 56 of them against a published 63/210, an E4 ablation inflated ninefold. `measured_nothing`
+        # asked about vectors not cases, so it refused the exact shape four agents already publish for
+        # P01 and the code could not re-derive four rows of its own tables. `assemble` let an agent's
+        # `logs/verify.log` publish over the harness transcript, turning a 127,649-byte log ending in
+        # `turn.completed` into 1,357 bytes and a successful verify into a refused battery. And
+        # `unwrap_or(0)` printed `\ActorKiroTests{0/338}` for an agent whose records say 325/338.
+        # Delete those and the next reader inherits four magic constants and no way to know any of it
+        # happened -- the numbers are the evidence, and evidence in a commit message nobody greps is
+        # evidence lost. The tree is 14.66% comment against a 20% ratio ceiling, so density is not the
+        # thing moving. 3470 is 3434 plus 36. Prune or raise deliberately, never quietly.
+        #
+        # RAISED 3470 -> 3510 for the AgentKey/model collapse. `KeyInputs` carried `agent` and `model`
+        # as separate fields, so a caller could pair one run's agent with another run's model and the
+        # key recorded the mismatch as a legitimate entry -- and a fixture already did exactly that,
+        # pairing a claude key resolving `global.anthropic.claude-opus-5[1m]` with the literal
+        # `claude-opus-5[1m]`. The 40 lines document why the resolution is INJECTED (reaching from
+        # `cache` into `agents`/`translate` grew the module cycle 5 -> 7 and the gate refused it) and
+        # why the model still reaches the key after the collapse. 3510 is 3487 plus 23.
+        #
+        # LOWERED 3780 -> 2380, which is the raises above coming due. The rebuild replaced the phase
+        # type-states with one agent invocation and deleted `translate.rs`, `verify.rs`, `cache.rs`,
+        # `artifact.rs`, `agents/run.rs` and `agents/work.rs` -- 12,213 lines, 1,329 of them comments.
+        # src/ went 23,002 -> 12,662 lines and the comment total 3,575 -> 2,309, measured over the
+        # whole counted tree after the last edit. 2380 is 2,345 plus 35. Measured AFTER the last edit
+        # and verified at the number this line passes, because reading it off an earlier measurement
+        # is how two commits on this branch shipped a ceiling the tree already exceeded.
+        #
+        # Three raises (3510 -> 3585 -> 3720 -> 3780) were each taken on the stated promise that they
+        # came back down when the old drivers went. A raise defended by a promise is worth only the
+        # record of the promise being kept, so: kept, and this is the record.
+        #
+        # .py is in neither HASH nor SLASH, so the budget does not count itself: this
+        # script's own docstring and all 250 lines of tools/test_comment_budget.py cost
+        # ZERO against both ceilings. Deriving 3100 from the tree needs that fact.
+        # RAISED 2380 -> 2394, deliberately, because 2380 was the tree measured EXACTLY -- so no new
+        # function could carry a doc comment without breaking it. Two earned their lines here:
+        # `propagate_config`, whose absence voided B02_synthetic for all three tools and P01 for all 128
+        # cases, and the rationale on `ceiling` for why it no longer takes a tool -- kiro's 2_700s verify
+        # limit cost it five batteries while its median session was the FASTEST of the three, and under
+        # that ceiling claude would have lost 47 of 415 sessions. Delete those and the next operator
+        # restores the per-tool ceiling on the reasoning this run disproved. Third, `transform::Artifact`,
+        # which splits what the ORACLE expects from which prompt a case gets -- collapsing them stripped
+        # `[[bin]] driver` from every shared-source group, killing 48 of P01's 128 cases and all 3
+        # macrodepth ones. Pruned first: the docs went from 18 lines to 11 and the tests' inline
+        # commentary is gone. 2583 is the tree with this change and these twelve SELF-COUNTING lines in
+        # it, measured after writing them -- not "plus epsilon" -- and `--max-ratio 20` against a 16.4%
+        # tree still stops sprawl.
+        #
+        # RAISED 2583 -> 2592, deliberately and by the operator's instruction, for `CASE_TIMEOUT_SECS`.
+        # Upstream runtests defaults `--test-timeout` to 120, which made the published score a property
+        # of the HOST: this runner timed out 88 P01 cases the sweep box passes. A bare `360` would be the
+        # magic constant this file already refuses twice over, and 2583 was the tree measured exactly, so
+        # there was no line to spend. Measured after the edit, not plus epsilon.
+        run: |
+          python3 tools/test_comment_budget.py
+          python3 tools/comment_budget.py --max-comments 2592 --max-ratio 20
+
+      - name: Lint
+        # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is
+        # scoped to `--lib --bins` because test modules use `panic!` to assert unreachable
+        # branches (cache.rs: the agent is never invoked on a cache hit).
+        run: |
+          cargo clippy --locked --manifest-path tools/Cargo.toml --all-targets
+          cargo clippy --locked --manifest-path tools/Cargo.toml --lib --bins -- -D clippy::panic
+
+      - name: Show the recorded stderr of each invariant
+        if: always()
+        run: |
+          for f in tools/tests/compile-fail/*.stderr; do
+            echo "── $(basename "$f")"
+            head -4 "$f"
+          done

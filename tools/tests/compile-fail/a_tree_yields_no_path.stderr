@@ -1,0 +1,15 @@
+warning: unreachable statement
+ --> tests/compile-fail/a_tree_yields_no_path.rs:5:5
+  |
+4 |     let tree: harvest_tools::tree::Tree = unimplemented!();
+  |                                           ---------------- any code following this expression is unreachable
+5 |     let _where = tree.path();
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+  |
+  = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0599]: no method named `path` found for struct `Tree` in the current scope
+ --> tests/compile-fail/a_tree_yields_no_path.rs:5:23
+  |
+5 |     let _where = tree.path();
+  |                       ^^^^ method not found in `Tree`

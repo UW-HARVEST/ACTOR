@@ -1,53 +1,41 @@
-use crate::cli::{Agent, Dataset};
+use crate::cli::{Dataset, Tool, Variant};
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 // ── Per-case phase directories: ONE source of truth ────────────────────
 //
-// A case's results live in two self-contained PHASE DIRECTORIES, uniform
-// across every dataset:
-//
-//   <case>/translated/   what translation produced (pre-verify). Always present.
-//   <case>/verified/     what the verify phase produced. Present iff verify ran.
-//
-// Each phase dir is fully self-contained: it IS the crate root (src/,
-// Cargo.toml, c_src/), and carries that phase's own `result.json` and
-// `logs/`. Reading a case's "current" score uses [`crate_dir`]: verified/ if
-// it exists, else translated/. This replaces the old asymmetric layout
-// (`translated_rust/` crate + `translated_rust_original/` snapshot + a
-// case-root result.json/logs, plus blind-CRUST's `translate/`+`verify/`).
+// A case's results live in two PHASE DIRECTORIES, uniform across every dataset:
+// `<case>/translated/` and `<case>/verified/`. Each IS a self-contained crate
+// root (src/, Cargo.toml, c_src/) and carries that phase's own `result.json`
+// and `logs/`, so nothing lives at the case root.
 
-/// Pre-verify phase dir: exactly what translation produced. Always present.
+/// Always present: exactly what translation produced.
 pub const TRANSLATED: &str = "translated";
 
-/// Post-verify phase dir: what the verify phase produced. Present iff verify ran.
+/// Present iff the verify phase ran.
 pub const VERIFIED: &str = "verified";
 
-/// The phase dir for `phase` under a case dir (`case_dir/translated` or
-/// `case_dir/verified`).
 pub fn phase_dir(case_dir: &Path, phase: &str) -> PathBuf {
     case_dir.join(phase)
 }
 
-/// The canonical crate/result dir for a case under the reader rule:
-/// `verified/` if it exists, else `translated/`. Every reader that wants "the
-/// current state of this case" (score, LOC, unsafe, crate source) uses this,
-/// so pre- and post-verify cases resolve uniformly.
-pub fn crate_dir(case_dir: &Path) -> PathBuf {
-    let verified = case_dir.join(VERIFIED);
-    if verified.is_dir() { verified } else { case_dir.join(TRANSLATED) }
+/// THE PHASE PREDICATE: did this phase produce a crate? ONE definition, enforced by
+/// `tests/architecture.rs` (A6), because a case falls between two spellings of it.
+/// `verified/` exists as soon as verify writes a log, so the old `is_dir()` said yes
+/// for pcre2 — logs, no crate — while every reader asked for `Cargo.toml` and
+/// `continue`d, taking pcre2 out of the harvest-bench denominator.
+pub fn has_crate(phase_dir: &Path) -> bool {
+    phase_dir.join("Cargo.toml").is_file()
 }
 
-/// The crate-dir name MIT `runtests` hardcodes (`<case>/translated_rust/`,
-/// test-corpus/.../discovery/rust.py) and the neutral name used for the
-/// agent's temp workspace during translate/verify. NOT a storage phase dir —
-/// canonical storage uses [`TRANSLATED`]/[`VERIFIED`]. For runtests scoring a
-/// phase, `<case>/translated_rust` is staged as a symlink to that phase dir.
+/// The crate-dir name MIT `runtests` hardcodes (test-corpus/.../discovery/rust.py), also used for the
+/// agent's temp workspace and for the crate [`crate::eval`] materialises. NOT a storage phase dir, and
+/// no longer a symlink to one — see [`crate::eval`] for what `.resolve()` did with the last symlink.
 pub const TRANSLATED_RUST: &str = "translated_rust";
 
-/// A test case that is independently translated and verified.
 #[derive(Debug, Clone)]
 pub struct IndependentCase {
     pub name: String,
@@ -70,116 +58,40 @@ pub struct SharedSourceGroup {
     pub configs: Vec<Config>,
 }
 
-/// A discovered case — either independent or part of a shared-source group.
 #[derive(Debug, Clone)]
 pub enum Case {
     Independent(IndependentCase),
     SharedSource(SharedSourceGroup),
 }
 
-/// A battery with all its discovered cases.
 #[derive(Debug)]
 pub struct Battery {
     pub name: String,
     pub cases: Vec<Case>,
 }
 
-/// Discover all cases in a battery, resolving symlinks to group shared-source cases.
-/// List all battery names available in the corpus.
 pub fn all_batteries(corpus_dir: &Path) -> Result<Vec<String>> {
     let public_tests = corpus_dir.join("Public-Tests");
-    anyhow::ensure!(public_tests.is_dir(), "Public-Tests not found: {}", public_tests.display());
+    anyhow::ensure!(
+        public_tests.is_dir(),
+        "Public-Tests not found: {}",
+        public_tests.display()
+    );
 
     let mut batteries: Vec<String> = std::fs::read_dir(&public_tests)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     batteries.sort();
     Ok(batteries)
 }
 
-/// Quick check: does this battery contain shared-source groups (symlinked test_case)?
-pub fn has_shared_source_groups(corpus_dir: &Path, battery_name: &str) -> bool {
-    let dir = corpus_dir.join("Public-Tests").join(battery_name);
-    std::fs::read_dir(&dir).ok().map_or(false, |entries| {
-        entries.filter_map(|e| e.ok()).any(|e| e.path().join("test_case").is_symlink())
-    })
-}
-
-// ── CRUST-bench project (validated newtype) ────────────────────────────
-
-/// A validated CRUST project. Can only be constructed through `discover()` or
-/// `validated()`, which enforce the skip list and resolve paths.
-#[derive(Debug, Clone)]
-pub struct CrustProject {
-    name: String,
-    scaffold: PathBuf,
-    c_source: PathBuf,
-}
-
-impl CrustProject {
-    pub fn name(&self) -> &str { &self.name }
-    pub fn scaffold(&self) -> &Path { &self.scaffold }
-    pub fn c_source(&self) -> &Path { &self.c_source }
-
-    /// Discover all valid CRUST projects, applying skip list and optional limit.
-    pub fn discover(datasets_dir: &Path, limit: Option<usize>) -> Result<Vec<Self>> {
-        let rbench = datasets_dir.join("RBench");
-        anyhow::ensure!(rbench.is_dir(), "RBench not found: {}", rbench.display());
-
-        let mut names: Vec<String> = std::fs::read_dir(&rbench)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| !crate::exclusions::is_not_run(n))
-            .collect();
-        names.sort();
-        if let Some(n) = limit { names.truncate(n); }
-
-        names.into_iter()
-            .map(|name| Self::resolve(datasets_dir, name))
-            .collect()
-    }
-
-    /// Validate a single project name against the skip list and resolve paths.
-    pub fn validated(datasets_dir: &Path, name: &str) -> Result<Self> {
-        anyhow::ensure!(
-            !crate::exclusions::is_not_run(name),
-            "{name} is in the CRUST skip list"
-        );
-        Self::resolve(datasets_dir, name.to_string())
-    }
-
-    fn resolve(datasets_dir: &Path, name: String) -> Result<Self> {
-        let scaffold = datasets_dir.join("RBench").join(&name);
-        anyhow::ensure!(scaffold.is_dir(), "RBench scaffold not found: {}", scaffold.display());
-
-        let c_source = Self::find_cbench(datasets_dir, &name)
-            .with_context(|| format!("CBench source not found for {name}"))?;
-
-        Ok(Self { name, scaffold, c_source })
-    }
-
-    fn find_cbench(datasets_dir: &Path, project: &str) -> Option<PathBuf> {
-        let cbench = datasets_dir.join("CBench");
-        for candidate in [
-            project.to_string(),
-            project.replace('_', "-"),
-            project.strip_prefix("proj_").unwrap_or(project).replace('_', "-"),
-        ] {
-            let p = cbench.join(&candidate);
-            if p.is_dir() { return Some(p); }
-        }
-        None
-    }
-}
-
 // ── harvest-bench project ──────────────────────────────────────────────
 
-/// A harvest-bench project: `harvest-bench/tests/<name>/` with a `test_case/`
-/// (the C library the agent translates) and a `gtest_suite/` (the upstream test
-/// suite the runner links against the translated cdylib by ABI).
+/// `harvest-bench/tests/<name>/` holding a `test_case/` (the C library to
+/// translate) and a `gtest_suite/` (the upstream suite the runner links against
+/// the translated cdylib by ABI).
 #[derive(Debug, Clone)]
 pub struct HarvestBenchProject {
     name: String,
@@ -188,42 +100,70 @@ pub struct HarvestBenchProject {
 }
 
 impl HarvestBenchProject {
-    pub fn name(&self) -> &str { &self.name }
-    pub fn test_case(&self) -> &Path { &self.test_case }
-    pub fn gtest_suite(&self) -> &Path { &self.gtest_suite }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn test_case(&self) -> &Path {
+        &self.test_case
+    }
+    pub fn gtest_suite(&self) -> &Path {
+        &self.gtest_suite
+    }
 
     /// Resolve a single named project under `tests_dir` (= harvest-bench/tests).
     pub fn resolve(tests_dir: &Path, name: &str) -> Result<Self> {
         let root = tests_dir.join(name);
         let test_case = root.join("test_case");
         let gtest_suite = root.join("gtest_suite");
-        anyhow::ensure!(test_case.is_dir(), "harvest-bench test_case not found: {}", test_case.display());
-        anyhow::ensure!(gtest_suite.is_dir(), "harvest-bench gtest_suite not found: {}", gtest_suite.display());
-        Ok(Self { name: name.to_string(), test_case, gtest_suite })
+        anyhow::ensure!(
+            test_case.is_dir(),
+            "harvest-bench test_case not found: {}",
+            test_case.display()
+        );
+        anyhow::ensure!(
+            gtest_suite.is_dir(),
+            "harvest-bench gtest_suite not found: {}",
+            gtest_suite.display()
+        );
+        Ok(Self {
+            name: name.to_string(),
+            test_case,
+            gtest_suite,
+        })
     }
 
-    /// Discover all harvest-bench projects under `tests_dir` (dirs with both a
-    /// `test_case/` and a `gtest_suite/`).
     pub fn discover(tests_dir: &Path) -> Result<Vec<Self>> {
-        anyhow::ensure!(tests_dir.is_dir(), "harvest-bench tests dir not found: {} (did you `git submodule update --init`?)", tests_dir.display());
+        anyhow::ensure!(
+            tests_dir.is_dir(),
+            "harvest-bench tests dir not found: {} (did you `git submodule update --init`?)",
+            tests_dir.display()
+        );
         let mut names: Vec<String> = std::fs::read_dir(tests_dir)?
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
-            .filter(|e| e.path().join("test_case").is_dir() && e.path().join("gtest_suite").is_dir())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter(|e| {
+                e.path().join("test_case").is_dir() && e.path().join("gtest_suite").is_dir()
+            })
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        names.into_iter().map(|n| Self::resolve(tests_dir, &n)).collect()
+        names
+            .into_iter()
+            .map(|n| Self::resolve(tests_dir, &n))
+            .collect()
     }
 }
 
 pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> Result<Battery> {
     let input_dir = corpus_dir.join("Public-Tests").join(battery_name);
-    anyhow::ensure!(input_dir.is_dir(), "Battery not found: {}", input_dir.display());
+    anyhow::ensure!(
+        input_dir.is_dir(),
+        "Battery not found: {}",
+        input_dir.display()
+    );
 
-    let filter_re = filter.map(|f| Regex::new(f)).transpose()?;
+    let filter_re = filter.map(Regex::new).transpose()?;
 
-    // Phase 1: scan all cases, resolve symlinks
     let mut symlink_map: HashMap<String, String> = HashMap::new(); // symlinked_name -> real_name
     let mut all_names: Vec<String> = Vec::new();
 
@@ -236,7 +176,7 @@ pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> 
         let name = entry.file_name().to_string_lossy().to_string();
         let test_case_path = entry.path().join("test_case");
 
-        // Must have test_case/ (dir or symlink) and test_vectors/
+        // `exists()`, not `is_dir()`: test_case may be a symlink.
         if !test_case_path.exists() || !entry.path().join("test_vectors").is_dir() {
             continue;
         }
@@ -262,8 +202,6 @@ pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> 
         all_names.push(name);
     }
 
-    // Phase 2: group into Case variants
-    // Collect real_case -> Vec<symlinked configs>
     let mut shared_groups: HashMap<String, Vec<String>> = HashMap::new();
     for (symlinked, real) in &symlink_map {
         shared_groups
@@ -286,7 +224,6 @@ pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> 
         }
 
         if let Some(config_names) = shared_groups.get(name) {
-            // This is the real case of a shared-source group
             let mut configs = Vec::new();
             for cn in config_names {
                 let cfg = build_config(&input_dir, cn)?;
@@ -300,7 +237,6 @@ pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> 
             }));
             handled.insert(name.clone());
         } else {
-            // Independent case
             cases.push(Case::Independent(IndependentCase {
                 name: name.clone(),
                 is_lib: name.ends_with("_lib"),
@@ -327,7 +263,6 @@ fn build_config(input_dir: &Path, name: &str) -> Result<Config> {
     })
 }
 
-/// Extract features from a CMakePresets.json path directly.
 pub fn extract_features_from_path(presets_path: &Path) -> Result<Vec<String>> {
     if !presets_path.exists() {
         return Ok(vec![]);
@@ -357,27 +292,24 @@ pub fn extract_features_from_path(presets_path: &Path) -> Result<Vec<String>> {
     Ok(features)
 }
 
-/// Extract features from CMakePresets.json cache variables.
 fn extract_features(input_dir: &Path, case_name: &str) -> Result<Vec<String>> {
     extract_features_from_path(&input_dir.join(case_name).join("CMakePresets.json"))
 }
 
-/// Extract [lib] name from the test corpus runner/src/main.rs.
+static LIB_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"library:\s*"([^"]+)""#).expect("literal pattern"));
+
 pub fn extract_lib_name(input_dir: &Path, case_name: &str) -> Option<String> {
     let runner_main = input_dir.join(case_name).join("runner/src/main.rs");
     let content = std::fs::read_to_string(&runner_main).ok()?;
-    let re = Regex::new(r#"library:\s*"([^"]+)""#).ok()?;
-    re.captures(&content)
+    LIB_NAME_RE
+        .captures(&content)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
 }
 
-/// Resolve features against actual Cargo.toml feature definitions.
-/// Tries raw names first, then composite names like "sphincs-blake-128f".
-pub fn resolve_features(
-    cargo_toml_path: &Path,
-    raw_features: &[String],
-) -> Result<Vec<String>> {
+/// Raw names first, then composite names like "sphincs-blake-128f".
+pub fn resolve_features(cargo_toml_path: &Path, raw_features: &[String]) -> Result<Vec<String>> {
     let content = std::fs::read_to_string(cargo_toml_path)?;
     let doc: toml_edit::DocumentMut = content.parse()?;
 
@@ -411,7 +343,6 @@ pub fn resolve_features(
     Ok(resolved)
 }
 
-/// Get all case names in a battery (flat list, for iteration).
 pub fn all_case_names(battery: &Battery) -> Vec<String> {
     let mut names = Vec::new();
     for case in &battery.cases {
@@ -428,50 +359,233 @@ pub fn all_case_names(battery: &Battery) -> Vec<String> {
     names
 }
 
-/// Paths helper.
-/// Immutable translation output directory. Created once by translate, never modified after.
-#[derive(Debug, Clone)]
-pub struct TranslateDir(PathBuf);
+/// The Kiro Power add-on rate, and the only bridge between the two money types below.
+const USD_PER_CREDIT: f64 = 0.04;
 
-/// Mutable verify workspace. Can be wiped and recreated from a [`TranslateDir`].
-#[derive(Debug, Clone)]
-pub struct VerifyDir(PathBuf);
+/// LLM API credits consumed by a single agent invocation. The field is private so the
+/// only way to read the number is [`Credits::as_f64`], which cannot be reached by
+/// accident where a dollar amount was meant.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct Credits(f64);
 
-macro_rules! impl_dir_newtype {
-    ($T:ty) => {
-        impl $T {
-            pub fn join(&self, path: impl AsRef<Path>) -> PathBuf { self.0.join(path) }
-            pub fn exists(&self) -> bool { self.0.exists() }
-            pub fn is_dir(&self) -> bool { self.0.is_dir() }
-        }
-        impl AsRef<Path> for $T {
-            fn as_ref(&self) -> &Path { &self.0 }
-        }
-    };
+/// US dollars — deliberately NOT the same type as [`Credits`]. Both end up in the paper's
+/// cost table and they differ by 25x, so a bare `f64` for each makes a 25x error a
+/// type-correct expression.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Usd(f64);
+
+impl Credits {
+    pub fn new(credits: f64) -> Self {
+        Self(credits)
+    }
+
+    pub fn as_f64(self) -> f64 {
+        self.0
+    }
+
+    /// The single place the rate is applied, so no other expression in the crate can
+    /// produce a dollar figure and none can spell a dollar figure as a credit count.
+    pub fn to_usd(self) -> Usd {
+        Usd(self.0 * USD_PER_CREDIT)
+    }
 }
 
-impl_dir_newtype!(TranslateDir);
-impl_dir_newtype!(VerifyDir);
+impl Usd {
+    pub fn as_f64(self) -> f64 {
+        self.0
+    }
+}
 
-/// LLM API credits consumed by a single agent invocation.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
-pub struct Credits(pub f64);
+/// Every field is as the provider reported it; none is derived.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Tokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_creation: u64,
+    pub cache_read: u64,
+}
 
-/// Metadata extracted from an agent run log (kiro-cli / claude).
+/// Provenance for ONE agent CLI invocation. `--agent claude` passes no
+/// `--model`, so the model is whatever the CLI defaulted to at invocation time,
+/// and the CLI auto-updates mid-sweep — it must be recorded per run.
+///
+/// EVERY OPTIONAL FIELD MUST SERIALIZE AS ABSENT WHEN UNKNOWN, never as zero.
+/// kiro-cli reports credits and no dollars; claude the reverse. A
+/// `total_cost_usd: 0.0` on a kiro run is a measurement nobody made, and it
+/// would silently average into a cost table.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AgentRunMeta {
+    // Not Option: existing result.json files carry these, and check_enrichment
+    // requires credits for Agent::Kiro.
     pub credits: Credits,
     pub wall_secs: u64,
+
+    // ── identity ────────────────────────────────────────────────────────────
+    /// Requested model, from the `system`/`init` record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Agent CLI version, from the same record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_version: Option<String>,
+    /// From `modelUsage`. May be a SUPERSET of `model`: `Task` subagents can
+    /// bill a different one, and a verify session spawns many.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models_billed: Vec<String>,
+
+    // ── how it ended ────────────────────────────────────────────────────────
+    /// `completed` | `api_error`. See [`crate::domain::health`]: this is the
+    /// discriminator, and `subtype` reads "success" even on a 403.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_error_status: Option<i64>,
+    /// Process exit status, from the sibling `verification.json` / `translation.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+
+    // ── effort and cost ─────────────────────────────────────────────────────
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_turns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<Tokens>,
 }
 
-/// Parse the last `▸ Credits: X.XX • Time: Xm Xs` line from an agent log.
+/// kiro-cli writes prose; claude writes stream-json. A log in neither format
+/// yields `None` rather than a zero-filled record.
 pub fn extract_agent_meta(log_path: &Path) -> Option<AgentRunMeta> {
-    let data = std::fs::read_to_string(log_path).ok()?;
-    let re = Regex::new(r"Credits:\s*([0-9.]+).*?Time:\s*(.+)").ok()?;
-    let caps = re.captures_iter(&data).last()?;
-    let credits = Credits(caps[1].parse().ok()?);
+    extract_kiro_meta(log_path).or_else(|| extract_stream_json_meta(log_path))
+}
+
+static KIRO_CREDITS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Credits:\s*([0-9.]+).*?Time:\s*(.+)").expect("literal pattern"));
+
+/// Tail-only: the `Credits:` line is last, and this runs once per case over
+/// logs that reach 10+ MB.
+fn extract_kiro_meta(log_path: &Path) -> Option<AgentRunMeta> {
+    let data = crate::agent_health::read_tail(log_path).ok()?;
+    let caps = KIRO_CREDITS_RE.captures_iter(&data).last()?;
+    let credits = Credits::new(caps[1].parse().ok()?);
     let wall_secs = parse_duration(&caps[2]);
-    Some(AgentRunMeta { credits, wall_secs })
+    Some(AgentRunMeta {
+        credits,
+        wall_secs,
+        ..Default::default()
+    })
+}
+
+/// Identity comes from the head `system`/`init` record, cost and effort from the
+/// tail `result` record. Non-JSON lines must be skipped: the harness pipes the
+/// agent through `2>&1 | tee`, so stderr is interleaved and a whole-file parse
+/// dies on the first such line.
+fn extract_stream_json_meta(log_path: &Path) -> Option<AgentRunMeta> {
+    let mut m = AgentRunMeta::default();
+    let mut found = false;
+
+    let head = read_head(log_path).unwrap_or_default();
+    if let Some(init) = find_record(&head, false, |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("system")
+            && v.get("subtype").and_then(|t| t.as_str()) == Some("init")
+    }) {
+        m.model = init
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        m.cli_version = init
+            .get("claude_code_version")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        found = true;
+    }
+
+    let tail = crate::agent_health::read_tail(log_path).unwrap_or_default();
+    if let Some(t) = find_record(&tail, true, |v| {
+        v.get("type").and_then(|x| x.as_str()) == Some("result")
+    }) {
+        found = true;
+        m.terminal_reason = t
+            .get("terminal_reason")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        // Present-but-null on success, so as_i64 yields None rather than 0.
+        m.api_error_status = t.get("api_error_status").and_then(|v| v.as_i64());
+        m.num_turns = t.get("num_turns").and_then(|v| v.as_u64());
+        m.duration_ms = t.get("duration_ms").and_then(|v| v.as_u64());
+        m.total_cost_usd = t.get("total_cost_usd").and_then(|v| v.as_f64());
+        if let Some(mu) = t.get("modelUsage").and_then(|v| v.as_object()) {
+            m.models_billed = mu.keys().cloned().collect();
+            m.models_billed.sort();
+        }
+        if let Some(u) = t.get("usage").and_then(|v| v.as_object()) {
+            let g = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            let tk = Tokens {
+                input: g("input_tokens"),
+                output: g("output_tokens"),
+                cache_creation: g("cache_creation_input_tokens"),
+                cache_read: g("cache_read_input_tokens"),
+            };
+            // All-zero means the provider reported nothing usable.
+            if tk != Tokens::default() {
+                m.tokens = Some(tk);
+            }
+        }
+        if let Some(ms) = m.duration_ms {
+            m.wall_secs = ms / 1000;
+        }
+    }
+
+    // Written beside the log by agents::run::write_phase_metrics.
+    m.exit_code = log_path
+        .parent()
+        .and_then(|logs| logs.parent())
+        .and_then(|phase| {
+            ["verification.json", "translation.json"]
+                .iter()
+                .map(|f| phase.join(f))
+                .find(|p| p.is_file())
+        })
+        .and_then(|p| crate::agent_health::exit_code(&p));
+
+    if found {
+        Some(m)
+    } else {
+        None
+    }
+}
+
+/// First 256 KB. The `init` record is near the top, but a SessionStart hook can
+/// emit several sizeable records ahead of it.
+fn read_head(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let n = f.read(&mut buf)?;
+    buf.truncate(n);
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// First (or, with `last`, final) JSON line satisfying `pred`.
+fn find_record(
+    hay: &str,
+    last: bool,
+    pred: impl Fn(&serde_json::Value) -> bool,
+) -> Option<serde_json::Value> {
+    let parse = |l: &str| serde_json::from_str::<serde_json::Value>(l).ok();
+    if last {
+        hay.lines()
+            .rev()
+            .filter(|l| l.starts_with('{'))
+            .filter_map(parse)
+            .find(|v| pred(v))
+    } else {
+        hay.lines()
+            .filter(|l| l.starts_with('{'))
+            .filter_map(parse)
+            .find(|v| pred(v))
+    }
 }
 
 fn parse_duration(s: &str) -> u64 {
@@ -486,224 +600,87 @@ fn parse_duration(s: &str) -> u64 {
     secs
 }
 
-/// Unsafe usage counts extracted via AST (`syn`).
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct UnsafeCounts {
-    /// `unsafe { ... }` blocks
-    pub blocks: usize,
-    /// `unsafe fn` declarations
-    pub fns: usize,
-    /// `unsafe impl` blocks
-    pub impls: usize,
-    /// Total lines inside unsafe blocks/fns/impls
-    pub lines: usize,
-}
-
-impl UnsafeCounts {
-    pub fn total(&self) -> usize { self.blocks + self.fns + self.impls }
-}
-
-/// Count unsafe constructs in `*.rs` files under `src_dir`, excluding `bin/` and `tests/`.
-pub fn count_unsafe(src_dir: &Path) -> UnsafeCounts {
-    let mut counts = UnsafeCounts::default();
-    let Ok(entries) = std::fs::read_dir(src_dir) else { return counts };
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name();
-            if name == "bin" || name == "tests" { continue; }
-            let sub = count_unsafe(&path);
-            counts.blocks += sub.blocks;
-            counts.fns += sub.fns;
-            counts.impls += sub.impls;
-            counts.lines += sub.lines;
-        } else if path.extension().is_some_and(|x| x == "rs") {
-            let Ok(src) = std::fs::read_to_string(&path) else { continue };
-            let Ok(file) = syn::parse_file(&src) else { continue };
-            let mut v = UnsafeVisitor::default();
-            syn::visit::visit_file(&mut v, &file);
-            counts.blocks += v.blocks;
-            counts.fns += v.fns;
-            counts.impls += v.impls;
-            counts.lines += v.lines;
-        }
-    }
-    counts
-}
-
-/// Lines-of-code counts for translated Rust source.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct LocCounts {
-    /// Total non-blank, non-comment lines in `*.rs` files.
-    pub code: usize,
-}
-
-/// Count lines of code in `*.rs` files under `src_dir`, excluding `bin/` and `tests/`.
-/// Counts non-blank lines that aren't pure `//` comments.
-pub fn count_loc(src_dir: &Path) -> LocCounts {
-    let mut counts = LocCounts::default();
-    let Ok(entries) = std::fs::read_dir(src_dir) else { return counts };
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name();
-            if name == "bin" || name == "tests" { continue; }
-            counts.code += count_loc(&path).code;
-        } else if path.extension().is_some_and(|x| x == "rs") {
-            let Ok(src) = std::fs::read_to_string(&path) else { continue };
-            counts.code += src.lines()
-                .filter(|l| { let t = l.trim(); !t.is_empty() && !t.starts_with("//") })
-                .count();
-        }
-    }
-    counts
-}
-
-#[derive(Default)]
-struct UnsafeVisitor {
-    blocks: usize,
-    fns: usize,
-    impls: usize,
-    lines: usize,
-}
-
-fn span_lines(open: proc_macro2::Span, close: proc_macro2::Span) -> usize {
-    let start = open.start().line;
-    let end = close.end().line;
-    if end >= start { end - start + 1 } else { 1 }
-}
-
-impl<'ast> syn::visit::Visit<'ast> for UnsafeVisitor {
-    fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
-        self.blocks += 1;
-        let b = node.block.brace_token;
-        self.lines += span_lines(b.span.open(), b.span.close());
-        syn::visit::visit_expr_unsafe(self, node);
-    }
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if node.sig.unsafety.is_some() {
-            self.fns += 1;
-            let b = node.block.brace_token;
-            self.lines += span_lines(b.span.open(), b.span.close());
-        }
-        syn::visit::visit_item_fn(self, node);
-    }
-    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if node.sig.unsafety.is_some() {
-            self.fns += 1;
-            let b = node.block.brace_token;
-            self.lines += span_lines(b.span.open(), b.span.close());
-        }
-        syn::visit::visit_impl_item_fn(self, node);
-    }
-    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        if node.unsafety.is_some() {
-            self.impls += 1;
-            let b = node.brace_token;
-            self.lines += span_lines(b.span.open(), b.span.close());
-        }
-        syn::visit::visit_item_impl(self, node);
-    }
-}
-
 pub struct Paths {
+    /// The ACTUAL repository root, not a dataset or tool dir: `crate::io::sandbox`'s deny list must
+    /// cover the corpus (the graded oracle), not just a results subdirectory.
+    pub repo_root: PathBuf,
     pub corpus_dir: PathBuf,
     pub results_dir: PathBuf,
-    pub prompts_dir: PathBuf,
-    pub agent: Agent,
-    pub model: Option<String>,
+    pub tool: Tool,
+    /// Which prompt set. A `Variant` rather than six extra `Tool`s: same program, same model, only
+    /// the text differs, and the key separates those by prompt hash already.
+    pub variant: Variant,
+    /// KEPT, not merely used to derive the dirs above: a step's wall-clock ceiling depends on it, and
+    /// recovering it from `results_dir`'s spelling would be a string where a type belongs.
+    pub dataset: Dataset,
+    /// What the agent will be asked for. `None` only where a backend runs no model.
+    pub model: Option<crate::store::ModelId>,
+    /// A required parameter of `new` rather than a default, so the compiler names every construction
+    /// site that would otherwise silently get read-write caching.
+    pub cache_mode: crate::store::Mode,
+    /// Whether the operator accepted running without an enforceable sandbox.
+    pub enforcement: crate::io::sandbox::Enforcement,
 }
 
 impl Paths {
-    pub fn new(repo_root: &Path, agent: Agent, dataset: Dataset, model: Option<&str>) -> Self {
-        // OpenCode's results dir is derived from --model (like Agent::Oneshot),
-        // so each evaluated model gets its own directory. Owned because the slug
-        // is computed, not a literal; the match below borrows from it.
-        let opencode_slug = matches!(agent, Agent::OpenCode)
-            .then(|| {
-                let m = crate::opencode::parse_model(
-                    model.expect("--model required for --agent opencode (checked in main)"),
-                )
-                .expect("--model already validated in main");
-                crate::opencode::results_slug(&m)
-            })
-            .unwrap_or_default();
-        let agent_name: &str = match agent {
-            Agent::Kiro => "kiro",
-            Agent::Claude => "claude",
-            Agent::ClaudeCombined => "claude-combined",
-            Agent::ClaudeMinimal => "claude-minimal",
-            Agent::ClaudeNoIter => "claude-no-iter",
-            Agent::ClaudeNoFeatures => "claude-no-features",
-            Agent::ClaudeNoSubtask => "claude-no-subtask",
-            Agent::ClaudeCrossPrompt => "claude-cross-prompt",
-            Agent::CodexGpt55 => "codex-gpt55",
-            Agent::CodexGpt54 => "codex-gpt54",
-            Agent::OpenCode => &opencode_slug,
-            Agent::C2rust => "c2rust",
-            Agent::Laertes => "laertes",
-            Agent::C2SaferRust => "c2saferrust",
-            Agent::SmartC2Rust => "smartc2rust",
-            Agent::Kimi => "kimi",
-            Agent::Oneshot => model
-                .and_then(|m| m.rsplit('/').next())
-                .expect("--model required for --agent oneshot"),
-        };
-        let (corpus_dir, results_dir) = match dataset {
+    pub fn new(
+        repo_root: &Path,
+        tool: Tool,
+        variant: Variant,
+        dataset: Dataset,
+        model: Option<&str>,
+        cache_mode: crate::store::Mode,
+        enforcement: crate::io::sandbox::Enforcement,
+    ) -> Result<Self> {
+        let model = crate::runners::resolve_model(tool, model)?;
+        let (corpus_dir, results_root) = match dataset {
             Dataset::TestCorpus => (
                 repo_root.join("test-corpus"),
-                repo_root.join("results/Test-Corpus").join(agent_name),
-            ),
-            Dataset::Crust => (
-                repo_root.join("crust-bench/datasets"),
-                repo_root.join("results/CRUST").join(agent_name),
-            ),
-            Dataset::BlindCrust => (
-                repo_root.join("crust-bench/datasets"),
-                repo_root.join("results/CRUST-blind").join(agent_name),
+                repo_root.join("results/Test-Corpus"),
             ),
             Dataset::HarvestBench => (
                 repo_root.join("harvest-bench/tests"),
-                repo_root.join("results/HarvestBench").join(agent_name),
+                repo_root.join("results/HarvestBench"),
             ),
         };
-        let prompts_dir = match agent {
-            Agent::Claude | Agent::ClaudeCombined | Agent::ClaudeMinimal | Agent::ClaudeNoIter | Agent::ClaudeNoFeatures | Agent::ClaudeNoSubtask | Agent::ClaudeCrossPrompt | Agent::CodexGpt55 | Agent::CodexGpt54 | Agent::OpenCode => match dataset {
-                // harvest-bench cases are libraries; reuse the project-type-
-                // dispatching prompts the test-corpus path uses (they handle the
-                // shared-library / cdylib case).
-                Dataset::TestCorpus | Dataset::HarvestBench => repo_root.join("prompts/claude"),
-                Dataset::Crust | Dataset::BlindCrust => repo_root.join("prompts/claude/crust"),
-            },
-            Agent::Kimi | Agent::Oneshot => repo_root.join("prompts/oneshot"),
-            _ => match dataset {
-                Dataset::TestCorpus | Dataset::HarvestBench => repo_root.join("prompts/kiro/test-corpus"),
-                Dataset::Crust | Dataset::BlindCrust => repo_root.join("prompts/kiro/crust"),
-            },
-        };
-        Self { corpus_dir, results_dir, prompts_dir, agent, model: model.map(String::from) }
+        // `<tool>/<model>/<variant>`, every level always present. A level that appears only
+        // sometimes is the ragged tree the model level already taught us to avoid -- and without the
+        // variant level, `claude` and `claude --prompt no-iter` would write to the same directory,
+        // being the same tool at the same model.
+        let results_dir = results_root
+            .join(crate::cli::tool_dir(tool))
+            .join(match &model {
+                Some(m) => crate::store::model_dir(m.as_str()),
+                None => "none".to_string(),
+            })
+            .join(variant.dir());
+        Ok(Self {
+            repo_root: repo_root.to_path_buf(),
+            corpus_dir,
+            results_dir,
+            cache_mode,
+            enforcement,
+            tool,
+            variant,
+            dataset,
+            model,
+        })
     }
 
-    pub fn input_dir(&self, battery: &str) -> PathBuf {
-        self.corpus_dir.join("Public-Tests").join(battery)
+    /// Where a unit's cases are read FROM. Dataset-aware: see [`crate::benchmark::Benchmark::jobs`].
+    pub fn input_dir(&self, unit: &str) -> PathBuf {
+        match self.dataset {
+            Dataset::TestCorpus => self.corpus_dir.join("Public-Tests").join(unit),
+            Dataset::HarvestBench => self.corpus_dir.join(unit),
+        }
     }
 
     pub fn output_dir(&self, name: &str) -> PathBuf {
         self.results_dir.join(name)
     }
 
-    /// Blind CRUST: immutable translation output. This is the case's
-    /// `translated/` phase dir (the uniform pre-verify location).
-    pub fn translate_dir(&self, name: &str) -> TranslateDir {
-        TranslateDir(self.results_dir.join(name).join(TRANSLATED))
-    }
-
-    /// Blind CRUST: mutable verify workspace (tests + possible src fixes).
-    /// This is the case's `verified/` phase dir.
-    pub fn verify_dir(&self, name: &str) -> VerifyDir {
-        VerifyDir(self.results_dir.join(name).join(VERIFIED))
-    }
-
+    /// The Test-Corpus two-level results layout; harvest-bench has no case level and uses
+    /// [`Self::output_dir`], which is what its scorer reads.
     pub fn case_dir(&self, battery: &str, case: &str) -> PathBuf {
         self.results_dir.join(battery).join(case)
     }
@@ -711,16 +688,63 @@ impl Paths {
 
 #[cfg(test)]
 mod tests {
+    /// Three tools running at once must not write to one another's paths.
+    ///
+    /// These are what a parallel sweep would CORRUPT rather than merely slow: two runs sharing a
+    /// results dir interleave their `summary.json`, and two sharing an evaluation tree delete each
+    /// other's crates mid-build. The agent's scratch is per invocation now, resolved in the runner from
+    /// the work dir it was handed, not from the machine-wide base every case once shared.
+    #[test]
+    fn no_two_tools_share_an_output_or_evaluation_path() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let paths_for = |tool| {
+            Paths::new(
+                tmp.path(),
+                tool,
+                Variant::Default,
+                Dataset::TestCorpus,
+                Some("some/model-1"),
+                crate::store::Mode::ReadWrite,
+                crate::io::sandbox::Enforcement::AllowUnsandboxed,
+            )
+            .unwrap()
+        };
+        let tools = [Tool::Claude, Tool::Codex, Tool::Kiro, Tool::OpenCode];
+        let results: Vec<_> = tools.iter().map(|t| paths_for(*t).results_dir).collect();
+        let unique: std::collections::BTreeSet<_> = results.iter().collect();
+        assert_eq!(
+            unique.len(),
+            tools.len(),
+            "two tools share a results dir: {results:#?}"
+        );
+        // And an ablation of the SAME tool is a different run, so it needs its own too.
+        let base = paths_for(Tool::Claude).results_dir;
+        let ablated = Paths::new(
+            tmp.path(),
+            Tool::Claude,
+            Variant::NoIter,
+            Dataset::TestCorpus,
+            Some("some/model-1"),
+            crate::store::Mode::ReadWrite,
+            crate::io::sandbox::Enforcement::AllowUnsandboxed,
+        )
+        .unwrap()
+        .results_dir;
+        assert_ne!(
+            base, ablated,
+            "a prompt variant must not share the base run's dir"
+        );
+    }
+
     use super::*;
     use std::fs;
     use std::os::unix::fs as unix_fs;
 
-    /// THE BUG: B02_synthetic has 40 independent cases + 2 symlinked (macrodepth).
-    /// Old bash set REAL_CASE globally and skipped ALL non-real cases from verify.
-    /// This test ensures independent cases are NOT grouped with shared-source.
+    /// Regression: the old bash set REAL_CASE globally and so skipped every
+    /// non-real case in a mixed battery (B02_synthetic) from verify.
     #[test]
     fn mixed_battery_separates_independent_and_shared() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let battery = tmp.path().join("Public-Tests/mixed");
 
         for name in ["arity_lib", "strcmp", "cleanup_lib"] {
@@ -762,8 +786,26 @@ mod tests {
     }
 
     #[test]
+    fn a_verified_dir_holding_only_logs_is_not_a_crate() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let case = tmp.path().join("pcre2");
+        fs::create_dir_all(case.join("verified/logs")).unwrap();
+        fs::write(case.join("verified/logs/verify.log"), "transcript").unwrap();
+        fs::write(case.join("verified/verification.json"), "{}").unwrap();
+        fs::create_dir_all(case.join("translated")).unwrap();
+        fs::write(case.join("translated/Cargo.toml"), "[package]").unwrap();
+
+        assert!(
+            case.join("verified").is_dir(),
+            "fixture must retain the trap"
+        );
+        assert!(!has_crate(&case.join("verified")));
+        assert!(has_crate(&case.join("translated")));
+    }
+
+    #[test]
     fn no_symlinks_all_independent() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let battery = tmp.path().join("Public-Tests/simple");
 
         for name in ["case_a", "case_b_lib", "case_c"] {
@@ -781,7 +823,7 @@ mod tests {
 
     #[test]
     fn lib_detection_from_name() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let battery = tmp.path().join("Public-Tests/libtest");
 
         for name in ["foo_lib", "bar", "baz_lib"] {
@@ -793,20 +835,26 @@ mod tests {
         let result = discover(tmp.path(), "libtest", None).unwrap();
         for case in &result.cases {
             if let Case::Independent(c) = case {
-                assert_eq!(c.is_lib, c.name.ends_with("_lib"), "is_lib wrong for {}", c.name);
+                assert_eq!(
+                    c.is_lib,
+                    c.name.ends_with("_lib"),
+                    "is_lib wrong for {}",
+                    c.name
+                );
             }
         }
     }
 
     #[test]
     fn extract_lib_name_from_runner() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let runner = tmp.path().join("mycase/runner/src");
         fs::create_dir_all(&runner).unwrap();
         fs::write(
             runner.join("main.rs"),
             r#"fn main() { let lib = cando2::Library::new(library: "blake", path: "..."); }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = extract_lib_name(tmp.path(), "mycase");
         assert_eq!(result, Some("blake".to_string()));
@@ -814,13 +862,13 @@ mod tests {
 
     #[test]
     fn extract_lib_name_missing_runner() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         assert_eq!(extract_lib_name(tmp.path(), "nonexistent"), None);
     }
 
     #[test]
     fn filter_regex_selects_matching_cases() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
         let battery = tmp.path().join("Public-Tests/filtered");
 
         for name in ["alpha", "beta_lib", "gamma"] {
@@ -837,44 +885,159 @@ mod tests {
             panic!("expected Independent");
         }
     }
+}
 
-    #[test]
-    fn translate_and_verify_dirs_are_distinct_newtypes() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join("crust-bench/datasets")).unwrap();
-        fs::create_dir_all(tmp.path().join("results/CRUST-blind/kiro")).unwrap();
-        fs::create_dir_all(tmp.path().join("prompts/kiro/test-corpus")).unwrap();
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
 
-        let paths = Paths::new(tmp.path(), crate::cli::Agent::Kiro, crate::cli::Dataset::BlindCrust, None);
+    const INIT: &str = r#"{"type":"system","subtype":"init","cwd":"/w","session_id":"s1","tools":["Bash"],"model":"global.anthropic.claude-opus-5[1m]","permissionMode":"bypassPermissions","claude_code_version":"2.1.231.653"}"#;
+    const DONE: &str = r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","api_error_status":null,"duration_ms":1029979,"num_turns":56,"total_cost_usd":4.12094025,"usage":{"input_tokens":669,"output_tokens":40232,"cache_creation_input_tokens":111263,"cache_read_input_tokens":9004512},"modelUsage":{"global.anthropic.claude-opus-5[1m]":{"inputTokens":669}},"session_id":"s1"}"#;
+    const DEAD: &str = r#"{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":403,"duration_ms":4569000,"num_turns":193,"total_cost_usd":90.00792925,"result":"Failed to authenticate. API Error: 403 ... expired"}"#;
 
-        let t = paths.translate_dir("vec");
-        let v = paths.verify_dir("vec");
-
-        assert_ne!(t.as_ref(), v.as_ref());
-        assert!(t.as_ref().ends_with("vec/translated"));
-        assert!(v.as_ref().ends_with("vec/verified"));
-        assert_eq!(t.as_ref().parent(), v.as_ref().parent());
+    fn log(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let logs = dir.join("verified/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let p = logs.join("verify.log");
+        std::fs::write(&p, body).unwrap();
+        p
     }
 
     #[test]
-    fn verify_wipe_preserves_translate() {
-        let tmp = tempfile::tempdir().unwrap();
-        let project = tmp.path().join("myproj");
-        let translate = project.join("translate");
-        let verify = project.join("verify");
+    fn records_the_model_and_cli_version_from_the_init_record() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let p = log(tmp.path(), &format!("{INIT}\n{DONE}\n"));
+        let m = extract_agent_meta(&p).expect("stream-json is recognised");
+        assert_eq!(
+            m.model.as_deref(),
+            Some("global.anthropic.claude-opus-5[1m]")
+        );
+        assert_eq!(m.cli_version.as_deref(), Some("2.1.231.653"));
+    }
 
-        fs::create_dir_all(translate.join("src")).unwrap();
-        fs::write(translate.join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
-        fs::write(translate.join("src/lib.rs"), "pub fn f() {}").unwrap();
+    #[test]
+    fn records_cost_turns_and_tokens_from_the_terminal_record() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let p = log(tmp.path(), &format!("{INIT}\n{DONE}\n"));
+        let m = extract_agent_meta(&p).unwrap();
+        assert_eq!(m.num_turns, Some(56));
+        assert_eq!(m.duration_ms, Some(1029979));
+        assert_eq!(m.wall_secs, 1029, "derived from duration_ms");
+        assert!((m.total_cost_usd.unwrap() - 4.12094025).abs() < 1e-9);
+        let t = m.tokens.expect("token counts present");
+        assert_eq!((t.input, t.output), (669, 40232));
+        assert_eq!((t.cache_creation, t.cache_read), (111263, 9004512));
+    }
 
-        fs::create_dir_all(verify.join("src/bin")).unwrap();
-        fs::write(verify.join("src/bin/test_f.rs"), "#[test] fn t() {}").unwrap();
+    #[test]
+    fn models_billed_comes_from_model_usage_not_the_requested_model() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let two = DONE.replace(
+            r#""modelUsage":{"global.anthropic.claude-opus-5[1m]":{"inputTokens":669}}"#,
+            r#""modelUsage":{"global.anthropic.claude-opus-5[1m]":{"inputTokens":1},"claude-haiku-4-5":{"inputTokens":2}}"#,
+        );
+        let p = log(tmp.path(), &format!("{INIT}\n{two}\n"));
+        let m = extract_agent_meta(&p).unwrap();
+        assert_eq!(
+            m.models_billed,
+            vec!["claude-haiku-4-5", "global.anthropic.claude-opus-5[1m]"]
+        );
+        assert_eq!(
+            m.model.as_deref(),
+            Some("global.anthropic.claude-opus-5[1m]"),
+            "requested stays distinct"
+        );
+    }
 
-        // Wipe verify (simulates --force)
-        fs::remove_dir_all(&verify).unwrap();
+    #[test]
+    fn absent_is_absent_never_zero() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        // Credits and time MUST stay on one line: the regex `.` does not cross a
+        // newline, so a two-line fixture silently fails to match.
+        let p = log(tmp.path(), "▸ Credits: 1.25 • Time: 3m 4s\n");
+        let m = extract_agent_meta(&p).expect("kiro log is recognised");
+        assert_eq!(m.credits.as_f64(), 1.25);
+        assert_eq!(m.wall_secs, 184);
+        assert!(m.total_cost_usd.is_none(), "no dollar cost for kiro");
+        assert!(m.model.is_none());
+        assert!(m.tokens.is_none());
+        let json = serde_json::to_string(&m).unwrap();
+        for k in [
+            "total_cost_usd",
+            "model",
+            "tokens",
+            "num_turns",
+            "exit_code",
+        ] {
+            assert!(
+                !json.contains(k),
+                "{k} must be omitted, not zero-valued: {json}"
+            );
+        }
+    }
 
-        // Translate is untouched
-        assert!(translate.join("Cargo.toml").exists());
-        assert_eq!(fs::read_to_string(translate.join("src/lib.rs")).unwrap(), "pub fn f() {}");
+    #[test]
+    fn api_error_status_null_on_success_is_none_not_zero() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let p = log(tmp.path(), &format!("{INIT}\n{DONE}\n"));
+        let m = extract_agent_meta(&p).unwrap();
+        assert!(
+            m.api_error_status.is_none(),
+            "present-but-null must not become 0"
+        );
+        assert_eq!(m.terminal_reason.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn a_dead_run_records_its_cost_and_its_reason() {
+        // jansson really burned $90 over 193 turns and then died on a 403: the
+        // cost was real, the result was not.
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let p = log(tmp.path(), &format!("{INIT}\n{DEAD}\n"));
+        let m = extract_agent_meta(&p).unwrap();
+        assert_eq!(m.terminal_reason.as_deref(), Some("api_error"));
+        assert_eq!(m.api_error_status, Some(403));
+        assert!((m.total_cost_usd.unwrap() - 90.00792925).abs() < 1e-9);
+        assert_eq!(m.num_turns, Some(193));
+    }
+
+    #[test]
+    fn exit_code_is_read_from_the_sibling_metrics_file() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let p = log(tmp.path(), &format!("{INIT}\n{DEAD}\n"));
+        std::fs::write(
+            tmp.path().join("verified/verification.json"),
+            r#"{"exit_code":1,"success":true,"duration_secs":4569}"#,
+        )
+        .unwrap();
+        let m = extract_agent_meta(&p).unwrap();
+        assert_eq!(
+            m.exit_code,
+            Some(1),
+            "already on disk, previously read by nothing"
+        );
+    }
+
+    #[test]
+    fn interleaved_stderr_does_not_defeat_extraction() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let body = format!("warning: bwrap not installed\n{INIT}\nnote: noise\n{DONE}\n");
+        let p = log(tmp.path(), &body);
+        let m = extract_agent_meta(&p).unwrap();
+        assert_eq!(
+            m.model.as_deref(),
+            Some("global.anthropic.claude-opus-5[1m]")
+        );
+        assert_eq!(m.num_turns, Some(56));
+    }
+
+    #[test]
+    fn a_log_in_neither_format_yields_none() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let p = log(tmp.path(), "just some prose, no credits, no json\n");
+        assert!(
+            extract_agent_meta(&p).is_none(),
+            "must not fabricate a zero record"
+        );
     }
 }

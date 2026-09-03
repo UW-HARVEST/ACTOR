@@ -2,6 +2,7 @@
 name = "harvest-tools"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [lib]
 name = "harvest_tools"
@@ -18,6 +19,7 @@ clap = { version = "4", features = ["derive"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 syn = { version = "2", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 tempfile = "3"
@@ -25,4 +27,25 @@ toml_edit = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
+trybuild = "1"
 
+[build-dependencies]
+vergen-gitcl = { version = "9.1.0", features = ["build", "cargo", "rustc"] }
+
+# Package level, so both crate roots and any newly added target inherit these; a
+# `#![deny]` in one crate root would not.
+[lints.rust]
+warnings = "deny"
+# Allow-by-default, so `warnings` does not reach it.
+unused_extern_crates = "deny"
+
+[lints.clippy]
+# All allow-by-default, so `-D warnings` does not enable them; each must be named.
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+# Without this, one `#[allow]` defeats every lint above. `clippy::allow_attributes`
+# (forcing `#[expect]`) is deliberately not denied: `#[expect]` is unusable for a lint
+# that fires in one target and not another, and an unfulfilled expectation is itself a
+# warning -- an error here. Known hole: neither fires on a trait method declaration.
+allow_attributes_without_reason = "deny"

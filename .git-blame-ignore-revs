@@ -1,0 +1,8 @@
+# Commits that only reformat. GitHub's blame honours this file automatically;
+# locally: git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# The repository squash-merges, so the reformat lands as part of the PR's single
+# commit on main — this names that commit, not the branch commit that authored it.
+#
+# Cheap deterministic CI gates: fmt, cargo doc, --locked, no hardcoded paths (#81)
+c7d83df7baa5971682fa553521e340e144b8ac66

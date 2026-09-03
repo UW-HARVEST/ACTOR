@@ -6,7 +6,14 @@ Separate instructions exist for [Evaluation benchmarks and results](#evaluation-
 
 ## Requirements
 
+ACTOR cannot be run in a sandboxed environment on macOS because there are no macOS versions of the
+  dependencies used to sandbox an agent (see below).
+ACTOR can be run in unsandboxed mode with the `--allow-unsandboxed` flag.
+
 - [Rust and the `Cargo` package manager](https://rust-lang.org/tools/install/)
+- For sandboxing:
+  - [`socat`](https://linux.die.net/man/1/socat)
+  - [bubblewrap (`bwrap`)](https://github.com/containers/bubblewrap)
 
 ## Command-line Tools
 
@@ -30,6 +37,15 @@ One-shot LLM agents require API keys:
 - `--agent kimi`: AWS Bedrock access (account `121913092579` via `ada-auth`)
 - `--agent oneshot`: `OPENROUTER_API_KEY` environment variable
 
+## Configuring Different Models for Claude Code
+
+To run translation with the non-default model for Claude Code ([configured here](../tools/src/agents/invocation.rs)),
+    run the following command:
+
+```sh
+% HARVEST_CLAUDE_MODEL=claude-sonnet-5 harvest-tools --agent claude translate <TARGET>
+```
+
 ## Evaluation Benchmarks and Results
 
 From the root of `ACTOR`, run:
@@ -50,17 +66,27 @@ harvest-tools --agent c2rust translate B02_organic
 # One-shot LLM translation
 harvest-tools --agent oneshot --model openai/gpt-5.4 translate B01_organic
 
-# Test and update stored results
-harvest-tools --agent kiro test all --update
-
-# CI validation (exact-match against stored summary.json)
-harvest-tools --agent kiro test all --check
+# Reproduce the published numbers from the cache: a miss refuses, so this cannot spend money
+harvest-tools --agent claude --replay-only run all
 
 # Single case
 harvest-tools --agent kiro run B01_synthetic/001_helloworld
+```
 
-# Generate result tables
-harvest-tools report
+## FAQs
+
+> I can't delete the `.cache` folder that's generated during translation!
+
+When ACTOR generates a cache,
+  it unsets the write bit.
+Even if you appear to have the permissions to modify a folder that it generates
+  (check with `ls -la`),
+  you may be barred from certain operations.
+
+Run the following command to reset write permissions:
+
+```sh
+% chmod -R u+w <FOLDER_PATH>
 ```
 
 ## License

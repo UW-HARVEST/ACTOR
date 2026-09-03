@@ -5,3 +5,15 @@
 translating-c-to-rust.tgz
 Dockerfile.laertes
 *.res
+
+# trybuild scratch: new .stderr expectations land here for review
+tools/wip/
+
+# Byte-compiled Python (tools/comment_budget.py)
+__pycache__/
+*.pyc
+
+# The evaluation tree (crate::eval): materialised every run and deleted after, so nothing
+# in it is ever committed. Gitignored BEFORE the first run writes to it, or `git status`
+# buries every real change under thousands of untracked files.
+/.eval/

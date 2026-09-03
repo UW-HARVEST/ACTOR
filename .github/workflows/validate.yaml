@@ -3,149 +3,85 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: validate-translations-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  setup:
+  # One job per TOOL plus one covering all three, in parallel. They CAN pass -- no agent, no credentials,
+  # and `--replay-only` makes a miss a refusal. The 7-arm `test all --check` matrix that was here had not
+  # passed once in 100 runs, so every PR merged on `type safety` alone.
+  #
+  # Split by tool because a tool is what the store either covers or does not: `reproduce.sh` replayed
+  # claude alone for months while four agents published `0/128` for P01. Only the all-three run may DIFF
+  # the tables: `numbers.tex` is named macros covering every tool, so a codex-only run correctly writes
+  # `--` for the others and its output is comparable to nothing without special-casing files.
+  reproduce:
+    name: Reproduce ${{ matrix.tool }} from the cache
     runs-on: ubuntu-24.04
+    strategy:
+      # "codex misses the store" and "kiro misses the store" are different findings.
+      fail-fast: false
+      matrix:
+        tool: [claude, codex, kiro, "claude,codex,kiro"]
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
         with:
           token: ${{ secrets.SUBMODULE_PAT }}
 
-      - name: Check out submodules
+      - name: Every workflow parses (each checks the others; a broken one never runs itself)
+        run: python3 tools/check_workflows.py
+
+      # NO --depth=1: a shallow fetch has only the tip, so a submodule pinned elsewhere cannot be
+      # checked out and the runner holds a different results tree than the pin names.
+      - name: Check out submodules at their pinned commits
         run: |
           git config --global url."https://x-access-token:${{ secrets.SUBMODULE_PAT }}@github.com/".insteadOf "https://github.com/"
-          git submodule update --init --depth=1 results test-corpus crust-bench
+          git submodule update --init results test-corpus harvest-bench
 
-      - name: Unzip CRUST-bench datasets
-        run: cd crust-bench/datasets && unzip -q CRUST_bench.zip
+      - name: Assert every input this run needs is present
+        run: |
+          fail=0
+          for m in results test-corpus harvest-bench; do
+            want=$(git ls-tree HEAD "$m" | awk '{print $3}')
+            have=$(git -C "$m" rev-parse HEAD)
+            echo "$m: pinned $want / checked out $have"
+            [ "$want" = "$have" ] || { echo "::error::$m is not at its pin"; fail=1; }
+          done
+          test -d results/.cache || { echo "::error::results/.cache is absent — the pin predates the commit that ships the cache"; fail=1; }
+          # Not cosmetic: omitting harvest-bench here let the Test-Corpus leg run 19 minutes to completion
+          # before the HB leg died on a missing tests/ dir. Refuse at second 0 instead.
+          test -d harvest-bench/tests || { echo "::error::harvest-bench/tests is absent, so the HB leg cannot run"; fail=1; }
+          # The gtest suites need CMake >= 3.24. `HarvestBench::preflight` refuses too; this moves the
+          # refusal ahead of a Test-Corpus leg that would otherwise run first and pass.
+          cm=$(cmake --version | head -1 | grep -oE '[0-9]+(\.[0-9]+)+')
+          printf '%s\n%s\n' 3.24 "$cm" | sort -VC || { echo "::error::cmake $cm is older than 3.24, so no gtest suite would configure"; fail=1; }
+          echo "cmake $cm"
+          exit $fail
 
       - name: Set up Rust
         run: |
           rustup toolchain install 1.94.0 --profile default
-          rustup toolchain install nightly --profile default
           rustup default 1.94.0
-
-      - name: Build harvest-tools
-        run: cargo build --release --manifest-path tools/Cargo.toml
-
-      - name: Cache workspace
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            .
-            !.git
-          key: workspace-${{ github.sha }}
-
-  validate:
-    needs: setup
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: CRUST kiro
-            guard: results/CRUST/kiro
-            cmd: ./tools/target/release/harvest-tools --agent kiro test CRUST --check
-            needs_openssl: true
-            needs_crust: true
-          - name: CRUST-blind kiro
-            guard: results/CRUST-blind/kiro
-            cmd: ./tools/target/release/harvest-tools --agent kiro test CRUST --blind --check
-            needs_openssl: true
-            needs_crust: true
-          - name: Test-Corpus kiro
-            guard: results/Test-Corpus/kiro
-            cmd: ./tools/target/release/harvest-tools --agent kiro test all --check
-            needs_openssl: false
-            needs_crust: false
-          - name: Test-Corpus c2rust
-            guard: results/Test-Corpus/c2rust
-            cmd: ./tools/target/release/harvest-tools --agent c2rust test all --check
-            needs_openssl: false
-            needs_crust: false
-          - name: Test-Corpus claude
-            guard: results/Test-Corpus/claude
-            cmd: ./tools/target/release/harvest-tools --agent claude test all --check
-            needs_openssl: false
-            needs_crust: false
-          - name: Test-Corpus laertes
-            guard: results/Test-Corpus/laertes
-            cmd: ./tools/target/release/harvest-tools --agent laertes test all --check
-            needs_openssl: false
-            needs_crust: false
-          - name: Test-Corpus kimi
-            guard: results/Test-Corpus/kimi
-            cmd: ./tools/target/release/harvest-tools --agent kimi test all --check
-            needs_openssl: false
-            needs_crust: false
-          - name: Test-Corpus gpt-5.4
-            guard: results/Test-Corpus/gpt-5.4
-            cmd: ./tools/target/release/harvest-tools --agent oneshot --model openai/gpt-5.4 test all --check
-            needs_openssl: false
-            needs_crust: false
-          - name: Test-Corpus gemini-3.1-pro-preview
-            guard: results/Test-Corpus/gemini-3.1-pro-preview
-            cmd: ./tools/target/release/harvest-tools --agent oneshot --model google/gemini-3.1-pro-preview test all --check
-            needs_openssl: false
-            needs_crust: false
-    name: ${{ matrix.name }}
-    steps:
-      - name: Restore workspace
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            .
-            !.git
-          key: workspace-${{ github.sha }}
-
-      - name: Set up Rust
-        run: |
-          rustup toolchain install 1.94.0 --profile default
-          rustup toolchain install nightly --profile default
-          rustup default 1.94.0
-
-      - name: Install system dependencies
-        if: matrix.needs_openssl
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev cmake pkg-config
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Validate
+      - name: Build harvest-tools
+        run: cargo build --release --locked --manifest-path tools/Cargo.toml
+
+      # Scoring the HB leg shells out to this; a separate crate inside the submodule.
+      - name: Build the harvest-bench runner
+        run: cargo build --release --locked --manifest-path harvest-bench/runner/Cargo.toml
+
+      # Both legs, one tool. No battery list here to drift from what the store can serve.
+      - name: Reproduce
         env:
-          CARGO_BUILD_JOBS: "2"
+          TOOLS: ${{ matrix.tool }}
         run: |
-          echo "::group::Environment diagnostics"
-          echo "Guard path: ${{ matrix.guard }}"
-          ls -la "${{ matrix.guard }}" 2>/dev/null | head -5 || echo "Guard path does not exist"
-          echo "pkg-config openssl:"
-          pkg-config --modversion openssl 2>&1 || echo "pkg-config not available"
-          echo "openssl version:"
-          openssl version 2>&1 || echo "openssl not found"
-          echo "VaultSync .vsync check:"
-          ls -la results/CRUST/kiro/VaultSync/translated/.vsync 2>/dev/null && echo "WARNING: .vsync exists!" || echo ".vsync not present (good)"
-          echo "c_blind_rsa result.json:"
-          cat results/CRUST/kiro/c_blind_rsa_signatures/translated/result.json 2>/dev/null || echo "not found"
-          echo "VaultSync result.json:"
-          cat results/CRUST/kiro/VaultSync/translated/result.json 2>/dev/null || echo "not found"
-          echo "::endgroup::"
-          if [ -d "${{ matrix.guard }}" ]; then
-            for attempt in 1 2 3; do
-              echo "::group::Attempt $attempt/3"
-              if ${{ matrix.cmd }}; then
-                echo "::endgroup::"
-                exit 0
-              fi
-              echo "::endgroup::"
-              if [ "$attempt" -lt 3 ]; then
-                echo "⚠️ Attempt $attempt failed, retrying (flaky floating-point tests)..."
-                find results -name target -type d -exec rm -rf {} + 2>/dev/null || true
-              fi
-            done
-            echo "❌ Failed after 3 attempts"
-            exit 1
-          fi
+          export CARGO_BUILD_JOBS=$(nproc)
+          ./tools/reproduce.sh all
