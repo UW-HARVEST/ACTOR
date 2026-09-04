@@ -12,6 +12,27 @@ use std::path::{Path, PathBuf};
 /// KB of final prose.
 const TAIL_BYTES: u64 = 16 * 1024;
 
+/// The `init` record is the first line, and it is what proves the model pin.
+const HEAD_BYTES: u64 = 64 * 1024;
+
+/// The largest transcript that is kept whole, and the two halves kept of a larger one.
+///
+/// A transcript is EVIDENCE and the store keeps it, so its size is a property of the repository, not
+/// only of the host. `AGENT_FSIZE_BLOCKS` caps what an agent may write at 4 GiB, which protects the box
+/// -- and protects nothing else: GitHub refuses any file over 100 MB, so ONE runaway log makes the whole
+/// store unpushable, which makes it unbankable, which means no reproducibility check can ever pass
+/// again. Measured when that happened: kiro's `B02_synthetic/tu_linkage` verify wrote **672 MB** on a
+/// synthetic case, and the push was rejected by GitHub's pre-receive hook.
+///
+/// 64 MiB is chosen from the distribution, not picked: over 1,783 stored transcripts the median is
+/// 111 KB, p99 is 2.9 MB and the MAXIMUM is 18.3 MB. So no transcript this corpus has ever produced is
+/// touched, and 64 MiB still leaves a third of GitHub's limit spare.
+///
+/// Head AND tail, because the two things anything reads sit at opposite ends: the `init` record proves
+/// the model pin, and the terminal record carries the outcome and the cost. The elision is written into
+/// the file, with the original size, so a reader is never left to wonder.
+const KEEP_WHOLE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Classify a run after the fact, from its transcript and the exit it recorded.
 ///
 /// `format` is a parameter and never assumed: [`crate::runners::log_format`] is the ONE
@@ -214,9 +235,151 @@ pub(crate) fn read_tail(path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// The first [`HEAD_BYTES`] of a transcript, for the one record that sits at the start.
+///
+/// `assert_pins_honoured` used `read_to_string`, so checking a model pin allocated the WHOLE
+/// transcript -- 672 MB for the runaway that motivated [`KEEP_WHOLE_BYTES`], on a check that only ever
+/// looks at the first line.
+pub(crate) fn read_head(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    std::io::Read::take(f, HEAD_BYTES).read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Bound a transcript to something the store can carry, keeping both ends. Returns whether it elided.
+///
+/// Called once, after the agent exits and BEFORE anything reads the file, so the published copy and the
+/// `run.log` in the entry are the same bytes. See `KEEP_WHOLE_BYTES` for why a host-level `ulimit`
+/// does not cover this.
+pub fn bound_transcript(log: &Path) -> Result<bool> {
+    let len = match std::fs::metadata(log) {
+        Ok(m) => m.len(),
+        // No transcript is a case the classifier already reports; it is not this function's business.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("sizing {}", log.display())),
+    };
+    if len <= KEEP_WHOLE_BYTES {
+        return Ok(false);
+    }
+    let half = KEEP_WHOLE_BYTES / 2;
+    let head = {
+        use std::io::Read;
+        let f = std::fs::File::open(log)?;
+        let mut buf = Vec::new();
+        std::io::Read::take(f, half).read_to_end(&mut buf)?;
+        buf
+    };
+    let tail = {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(log)?;
+        f.seek(SeekFrom::Start(len - half))?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        buf
+    };
+    let marker = format!(
+        "\n\n=== harvest-tools elided {} bytes here: this transcript was {} bytes, above the {} the \
+         store can carry. The first and last {} are kept, which is where the init record and the \
+         terminal record are. ===\n\n",
+        len - KEEP_WHOLE_BYTES,
+        len,
+        KEEP_WHOLE_BYTES,
+        half
+    );
+    let mut out = head;
+    out.extend_from_slice(marker.as_bytes());
+    out.extend_from_slice(&tail);
+    std::fs::write(log, &out).with_context(|| format!("bounding {}", log.display()))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A runaway transcript must not make the store unpushable, and both ends must survive.
+    ///
+    /// `AGENT_FSIZE_BLOCKS` caps what an agent writes at 4 GiB, which protects the HOST and nothing
+    /// else: GitHub refuses any file over 100 MB, so one runaway log makes the whole store unpushable --
+    /// unbankable -- and no reproducibility check can pass again. Measured: kiro's
+    /// `B02_synthetic/tu_linkage` verify wrote 672 MB on a synthetic case and the push was rejected by
+    /// GitHub's pre-receive hook.
+    ///
+    /// The two ends are what anything reads: the `init` record proves the model pin, the terminal record
+    /// carries the outcome and the cost. Non-vacuity: a transcript at the observed maximum (18.3 MB) is
+    /// left byte-identical, so this cannot pass by truncating everything.
+    #[test]
+    fn a_runaway_transcript_is_bounded_at_both_ends_and_a_normal_one_is_untouched() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+
+        // Nothing this corpus has ever produced may be touched: max observed is 18.3 MB.
+        let normal = tmp.path().join("normal.log");
+        let init = r#"{"type":"system","subtype":"init","model":"global.anthropic.claude-opus-5[1m]","claude_code_version":"2.1.235"}"#;
+        let body = format!("{init}\n{}\n{CLEAN}\n", "x".repeat(1024 * 1024));
+        std::fs::write(&normal, &body).unwrap();
+        assert!(
+            !bound_transcript(&normal).unwrap(),
+            "a normal log must not be elided"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&normal).unwrap(),
+            body,
+            "and must be byte-identical"
+        );
+
+        // A runaway: the two records at the ends, megabytes of repetition between them.
+        let runaway = tmp.path().join("runaway.log");
+        let filler = "R".repeat(1024 * 1024);
+        let mut huge = String::with_capacity(70 * 1024 * 1024);
+        huge.push_str(init);
+        huge.push('\n');
+        for _ in 0..70 {
+            huge.push_str(&filler);
+            huge.push('\n');
+        }
+        huge.push_str(CLEAN);
+        huge.push('\n');
+        let was = huge.len();
+        std::fs::write(&runaway, &huge).unwrap();
+        assert!(
+            was > 64 * 1024 * 1024,
+            "the fixture must exceed the cap, or nothing is tested"
+        );
+
+        assert!(
+            bound_transcript(&runaway).unwrap(),
+            "a runaway must be elided"
+        );
+        let after = std::fs::read_to_string(&runaway).unwrap();
+        assert!(
+            (after.len() as u64) < KEEP_WHOLE_BYTES + 1024,
+            "still {} bytes, so the store still cannot carry it",
+            after.len()
+        );
+        assert!(
+            after.contains("elided"),
+            "the elision must say so in the file"
+        );
+        assert!(
+            after.contains(&was.to_string()),
+            "and record the original size"
+        );
+        // The two records anything reads, at opposite ends, both survive.
+        assert!(
+            after.starts_with(init),
+            "the init record proves the model pin"
+        );
+        assert!(
+            classify(
+                &read_tail(&runaway).unwrap(),
+                LogFormat::StreamJson,
+                Exit::Unobserved
+            ) == Health::Completed,
+            "the terminal record must still classify, or the outcome is lost"
+        );
+    }
 
     /// Verbatim shape of a real credential-expiry terminal record.
     const DEAD: &str = r#"{"type":"system","subtype":"api_retry","attempt":4,"error_status":403}

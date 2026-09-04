@@ -122,13 +122,18 @@ pub fn assert_pins_honoured(
     want: &ModelId,
     cli: &CliVersion,
 ) -> Result<PinReport> {
-    let text = match std::fs::read_to_string(log_path) {
+    // The HEAD, not the whole file: the `init` record is the first line, and `read_to_string` here
+    // allocated 672 MB for a runaway transcript on a check that reads one line.
+    let text = match crate::agent_health::read_head(log_path) {
         Ok(t) => t,
         // The health classifier already treats a missing log as a non-completion.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PinReport::NotReported),
-        Err(e) => {
-            return Err(e).with_context(|| format!("reading the transcript {}", log_path.display()))
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(PinReport::NotReported)
         }
+        Err(e) => return Err(e).context("reading the transcript for its model pin"),
     };
     let Some(init) = text
         .lines()
@@ -224,6 +229,15 @@ impl Execute for Cli {
         let status = command
             .status()
             .with_context(|| format!("invoking the {} CLI", self.backend.name()))?;
+        // BEFORE anything reads it, so the published copy and the entry's `run.log` are the same bytes
+        // and neither can exceed what the store is able to carry. See `KEEP_WHOLE_BYTES`.
+        if crate::agent_health::bound_transcript(log)? {
+            println!(
+                "  \u{2702}\u{fe0f}  {}: the transcript was elided to fit the store; see the marker in {}",
+                self.backend.name(),
+                log.display()
+            );
+        }
         // Classified from the transcript, with the exit only as corroboration: every session pipes
         // through `tee`, so a killed agent reports a clean 0.
         let health = crate::agent_health::classify_log(

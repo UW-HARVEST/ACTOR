@@ -309,7 +309,7 @@ jobs:
         # line and the test's dropped from seven to two, since the incident is told once. 2653 is 2645,
         # the tree with these nine self-counting lines in it, plus 8. Measured after the edit.
         #
-        # RAISED 2653 -> 3040, the largest raise this block has ever recorded, for a PR that deleted
+        # RAISED 2653 -> 3090, the largest raise this block has ever recorded, for a PR that deleted
         # 1,218 lines and documented twenty defects. The ratio is what to read here: 18.0% against a 20%
         # ceiling, and `--max-ratio 20` is the gate that "actually stops sprawl, because density cannot be
         # gamed by adding comments". The count rose because the tree SHRANK while the WHY grew.
@@ -331,14 +331,16 @@ jobs:
         # These are the numbers that were WRONG IN PRINT or would have been. A commit message nobody
         # greps is evidence lost -- the same argument the 3320 -> 3470 raise made, and it held.
         #
-        # 3040 is 3026, the tree with this PR and these twenty-five self-counting lines in it, plus 14.
-        # Measured after the last edit -- and re-measured once, because the first number was taken before
-        # six mutation-tested regression tests were added, each of which documents the failure it names.
+        # 3090 is 3074, the tree with this PR and these twenty-six self-counting lines in it, plus 16.
+        # Measured after the last edit -- and re-measured TWICE, because the first number predated six
+        # mutation-tested regression tests and the second predated `KEEP_WHOLE_BYTES`, whose comment is
+        # the measured distribution (1,783 transcripts, median 111 KB, max 18.3 MB) that makes 64 MiB a
+        # derived number rather than a guess.
         # THIS IS A DEBT: the next PR prunes or raises deliberately, and the tree is now small enough
         # that a pass over the oldest blocks should bring it down.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 3040 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 3090 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is
