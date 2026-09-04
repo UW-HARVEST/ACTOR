@@ -254,7 +254,13 @@ pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> 
 fn build_config(input_dir: &Path, name: &str) -> Result<Config> {
     let is_lib = name.ends_with("_lib");
     let lib_name = extract_lib_name(input_dir, name);
-    let features = extract_features(input_dir, name).unwrap_or_default();
+    // `?`, not `unwrap_or_default()`, in a function that already returns `Result`. An empty feature
+    // list is not the same answer as "the presets file would not parse": `resolve_features` then
+    // yields nothing, the `if !resolved.is_empty()` guard skips `set_default_features`, and the
+    // follower keeps the LEADER's features -- built as one configuration and graded against another's
+    // vectors. `extract_features_from_path` already returns `Ok(vec![])` for an ABSENT file, so the
+    // only thing this was hiding was a malformed one.
+    let features = extract_features(input_dir, name)?;
     Ok(Config {
         name: name.to_string(),
         features,

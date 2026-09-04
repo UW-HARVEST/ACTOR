@@ -1743,7 +1743,16 @@ fn only_the_pool_mints_the_runs_concurrency_budget() {
             if path.extension().is_some_and(|e| e == "rs") {
                 let text = std::fs::read_to_string(&path).expect("read");
                 let rel = path.strip_prefix(&src).unwrap().to_path_buf();
-                if text.contains("Semaphore::new(") && rel != Path::new("agents/mod.rs") {
+                // CODE only. This was a bare `contains`, so a doc comment explaining why
+                // `Semaphore::new(0)` deadlocks counted as minting one -- the check could not tell an
+                // offender from an explanation of the offence, and the cheap way out is to reword the
+                // comment, which leaves the next reader to trip over it again.
+                let code: String = text
+                    .lines()
+                    .map(|l| l.split("//").next().unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if code.contains("Semaphore::new(") && rel != Path::new("agents/mod.rs") {
                     offenders.push(rel);
                 }
             }

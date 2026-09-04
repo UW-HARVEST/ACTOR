@@ -44,7 +44,18 @@ pub fn base() -> Result<PathBuf> {
 }
 
 fn resolve() -> Result<PathBuf> {
-    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    // An unreadable mount table cannot silently disable the refusal below. `unwrap_or_default()` made
+    // it empty, `fstype_for` then matched no prefix and returned `None`, and the `if let Some(fstype)`
+    // guard was skipped -- on exactly the hosts this module exists for, since `ENV_ALLOW_TMPFS` is
+    // documented as the escape hatch "for hosts whose only writable filesystem is a tmpfs (some CI)".
+    // Per-case `target/` trees would then be charged to RAM and the cgroup killed with no result
+    // recorded.
+    let mounts = std::fs::read_to_string("/proc/mounts").with_context(|| {
+        format!(
+            "reading /proc/mounts to check whether the scratch base is RAM-backed. Set \
+             {ENV_ALLOW_TMPFS}=1 to run without that check."
+        )
+    })?;
     resolve_from(
         std::env::var_os(ENV_BASE)
             .filter(|v| !v.is_empty())

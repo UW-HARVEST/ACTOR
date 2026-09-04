@@ -109,24 +109,42 @@ pub(crate) fn harvest_bench_runner(corpus_dir: &Path) -> Result<PathBuf> {
 }
 
 /// The gtest suite links `lib<name>.so` by ABI, so the name must match exactly.
-fn build_harvest_bench_lib(crate_dir: &Path, name: &str) -> (Option<PathBuf>, String) {
+/// Build the cdylib the suite links against. `Err` is INFRA, not a failed translation.
+///
+/// It used to return `(Option<PathBuf>, String)` and never inspect `out.status`: the verdict was
+/// `so.is_file()` alone, and a spawn failure returned `(None, "failed to spawn cargo build")`. So a
+/// missing `timeout` or `cargo` on the scoring process's PATH, `timeout`'s own 124 or 127, or a fork
+/// returning EAGAIN under `--parallel` printed "build failed (no cdylib)" and recorded
+/// `CrateDidNotBuild` -> `Builds: no` in `harvest-bench.tex` for all seven projects at once. That is
+/// exactly what a cmake needing 3.24 on a 3.22 box already did once, against seven crates that
+/// compiled perfectly.
+fn build_harvest_bench_lib(crate_dir: &Path, name: &str) -> Result<(Option<PathBuf>, String)> {
     let out = Command::new("timeout")
         .args(["600", "cargo", "build", "--release"])
         .env("OPENSSL_DIR", openssl_dir())
         .env("OPENSSL_NO_VENDOR", "1")
         .current_dir(crate_dir)
-        .output();
-    let Ok(out) = out else {
-        return (None, "failed to spawn cargo build".into());
-    };
+        .output()
+        .context("spawning `cargo build --release` under `timeout`")?;
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     // cargo normalizes `-`→`_` in the cdylib output name.
     let lib_stem = name.replace('-', "_");
     let so = crate_dir.join(format!("target/release/lib{lib_stem}.so"));
     if so.is_file() {
-        (Some(so), stderr)
-    } else {
-        (None, stderr)
+        return Ok((Some(so), stderr));
+    }
+    // 124 is `timeout`'s kill and 127 is "command not found": neither says anything about the
+    // translation, and calling them a build failure attributes an infra fault to the agent.
+    match out.status.code() {
+        Some(124) => anyhow::bail!(
+            "`cargo build` for {name} was killed at the 600s ceiling, so whether the crate builds is \
+             unmeasured -- not `Builds: no`"
+        ),
+        Some(127) => anyhow::bail!(
+            "`timeout` or `cargo` is not on the scoring process's PATH, so no project can be built \
+             here. That is an infrastructure fault, not seven failed translations."
+        ),
+        _ => Ok((None, stderr)),
     }
 }
 
@@ -330,7 +348,7 @@ pub fn run_harvest_bench_test(
         let logs_dir = case.record_into.join("logs");
         std::fs::create_dir_all(&logs_dir)?;
 
-        let (so, build_log) = build_harvest_bench_lib(&crate_dir, name);
+        let (so, build_log) = build_harvest_bench_lib(&crate_dir, name)?;
         std::fs::write(logs_dir.join("test.log"), &build_log)?;
 
         let score = match so {

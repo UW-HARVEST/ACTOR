@@ -369,21 +369,36 @@ fn run_runtests(
     print!("{text}");
     let _ = std::fs::write(paths.output_dir(battery).join("test.log"), &text);
 
-    let extract = |pattern: &str| -> usize {
-        Regex::new(pattern)
-            .ok()
-            .and_then(|re| re.captures(&text))
+    // REFUSES rather than defaulting. `unwrap_or(0)` here published an unparsed line as a measured
+    // zero, and the guard below only protects the CASE counts -- `reconcile` compares case names and
+    // the case denominator, so a zeroed `cases_discovered` fails, while the three VECTOR counts had
+    // nothing checking them at all. A reworded summary line in the vendored test-corpus submodule would
+    // have printed `0/0` vectors and regenerated `tables/` from it.
+    let extract = |label: &str, pattern: &str| -> Result<usize> {
+        let re = Regex::new(pattern).context("the extraction pattern itself is invalid")?;
+        let raw = re
+            .captures(&text)
             .and_then(|c| c.get(1))
-            .and_then(|m| m.as_str().parse().ok())
-            .unwrap_or(0)
+            .with_context(|| {
+                format!(
+                    "runtests printed no `{label}` line, so there is no number to record. Its \
+                     output format moved, or it never got that far; either way a 0 here would be a \
+                     measurement nobody made. The output is in {}.",
+                    paths.output_dir(battery).join("test.log").display()
+                )
+            })?
+            .as_str()
+            .to_string();
+        raw.parse()
+            .with_context(|| format!("`{label}` is `{raw}`, which is not a count"))
     };
 
-    let cases_discovered = extract(r"Test Cases Discovered:\s+(\d+)");
-    let cases_tested = extract(r"Test Cases Tested:\s+(\d+)");
-    let cases_failed = extract(r"Test Cases Failed:\s+(\d+)");
-    let vectors_passed = extract(r"Test Vectors Passed:\s+(\d+)");
-    let vectors_failed = extract(r"Test Vectors Failed:\s+(\d+)");
-    let vectors_skipped = extract(r"Test Vectors Skipped:\s+(\d+)");
+    let cases_discovered = extract("Test Cases Discovered", r"Test Cases Discovered:\s+(\d+)")?;
+    let cases_tested = extract("Test Cases Tested", r"Test Cases Tested:\s+(\d+)")?;
+    let cases_failed = extract("Test Cases Failed", r"Test Cases Failed:\s+(\d+)")?;
+    let vectors_passed = extract("Test Vectors Passed", r"Test Vectors Passed:\s+(\d+)")?;
+    let vectors_failed = extract("Test Vectors Failed", r"Test Vectors Failed:\s+(\d+)")?;
+    let vectors_skipped = extract("Test Vectors Skipped", r"Test Vectors Skipped:\s+(\d+)")?;
 
     anyhow::ensure!(
         !measured_nothing(cases_discovered, cases_tested, cases_failed),
@@ -851,9 +866,9 @@ mod tests {
             case.join(Role::Translate.dir()).join("result.json"),
             paths.output_dir("B01").join(HEADLINE_SUMMARY),
         ] {
-            let doc: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&at).expect(&at.display().to_string()))
-                    .unwrap();
+            let text = fs::read_to_string(&at)
+                .unwrap_or_else(|e| panic!("{} was not written: {e}", at.display()));
+            let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
             assert_eq!(
                 doc["harness"],
                 serde_json::json!("cafe1234-dirty"),

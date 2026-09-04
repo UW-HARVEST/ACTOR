@@ -8,6 +8,22 @@ pub struct UnsafeCounts {
     pub impls: usize,
     /// Total lines inside unsafe blocks/fns/impls.
     pub lines: usize,
+    /// Files `syn` could not parse, so their `unsafe` was NOT counted while `count_loc` -- a separate
+    /// walk that never parses -- still counted every one of their lines.
+    ///
+    /// Recorded rather than swallowed. Without it a crate full of `unsafe` with one unbalanced
+    /// delimiter published `unsafe: {blocks: 0, lines: 0}` against its full LOC, and
+    /// `aggregate_cases` summed that into the paper's Unsafe column as a low percentage. That is not a
+    /// hypothesis about a broken crate: `Enrichment::compute` runs on crates that FAILED TO BUILD, and
+    /// `runtests` records 76 outright build failures across the corpus. A reader can now see the
+    /// denominator is incomplete; `#[serde(default)]` because entries written before this have no
+    /// answer and 0 would assert there were none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unparsed_files: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 pub fn count_unsafe(src_dir: &Path) -> UnsafeCounts {
@@ -27,11 +43,14 @@ pub fn count_unsafe(src_dir: &Path) -> UnsafeCounts {
             counts.fns += sub.fns;
             counts.impls += sub.impls;
             counts.lines += sub.lines;
+            counts.unparsed_files += sub.unparsed_files;
         } else if path.extension().is_some_and(|x| x == "rs") {
             let Ok(src) = std::fs::read_to_string(&path) else {
                 continue;
             };
             let Ok(file) = syn::parse_file(&src) else {
+                // NOT zero unsafe: unknown. See `UnsafeCounts::unparsed_files`.
+                counts.unparsed_files += 1;
                 continue;
             };
             let mut v = UnsafeVisitor::default();

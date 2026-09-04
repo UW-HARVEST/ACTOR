@@ -128,11 +128,15 @@ pub struct Cli {
     /// Beside `--tool` because it is that list's budget: with three tools this is three in flight
     /// each, nine in total. `global`, so either position parses -- without it `run HB --parallel 3` is
     /// a clap error, which is how a sweep launcher died on `unexpected argument`.
-    #[arg(long, global = true, default_value_t = 1)]
-    pub parallel: usize,
+    /// `0` is refused at the flag rather than deadlocking. `Semaphore::new(0)` sets `max = 0`, so
+    /// `Pool::acquire` loops `while 0 >= 0` on a condvar only a guard could notify, and no guard can
+    /// ever exist: the sweep hung silently instead of saying what was wrong.
+    #[arg(long, global = true, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    pub parallel: u16,
 
-    /// Model id. Required for `--tool oneshot` and `opencode`, where the model IS the
-    /// identity; fixed by the tool otherwise.
+    /// Model id. `--tool codex` accepts one to reach the historical models; claude's comes from
+    /// `HARVEST_CLAUDE_MODEL` or its default, and kiro's is fixed. Every tool pins one either way --
+    /// there is no longer any way to run without a model in the key.
     #[arg(long)]
     pub model: Option<String>,
 

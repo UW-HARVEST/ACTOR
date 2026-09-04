@@ -77,7 +77,7 @@ fn main() -> Result<()> {
                                 inner,
                                 steps,
                                 include_regex: include_regex.as_deref(),
-                                parallel: cli.parallel,
+                                parallel: usize::from(cli.parallel),
                                 mode,
                                 enforcement,
                                 keep,
