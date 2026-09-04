@@ -54,7 +54,7 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | claude | 128/128 | 128/128 | 6611 | 4969 | 769 | 15.5% |
 | codex | 128/128 | 128/128 | 6611 | 4685 | 628 | 13.4% |
 | kiro | 128/128 | 128/128 | 6611 | 6772 | 1025 | 15.1% |
-| kiro-translate | 128/128 | 128/128 | 6611 | 6713 | 1014 | 15.1% |
+| kiro-translate | 1/128 | 1/1 | 6611 | 6713 | 1014 | 15.1% |
 
 ## Summary: Cases Passed
 
@@ -65,5 +65,5 @@ Auto-generated from validated `result.json` and `summary.json` files.
 | B02_organic | 43/44 | 42/44 | 42/44 | 43/44 |
 | B02_synthetic | 39/42 | 37/42 | 39/42 | 40/42 |
 | P00_perlin_noise | 1/1 | 1/1 | 1/1 | 1/1 |
-| P01_sphincs_plus | 128/128 | 128/128 | 128/128 | 128/128 |
+| P01_sphincs_plus | 128/128 | 128/128 | 128/128 | 1/128 |
 
