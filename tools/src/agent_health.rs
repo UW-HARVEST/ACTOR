@@ -248,6 +248,17 @@ pub(crate) fn read_head(path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// What replaces the elided middle. Its length is FIXED for a given original size, so
+/// [`bound_transcript`] can subtract it from the budget and leave the result at most the cap.
+fn marker_for(was: u64) -> String {
+    format!(
+        "\n\n=== harvest-tools elided the middle of this transcript: it was {was} bytes, above the {} \
+         the store can carry. Both ends are kept, which is where the init record and the terminal \
+         record are. ===\n\n",
+        KEEP_WHOLE_BYTES
+    )
+}
+
 /// Bound a transcript to something the store can carry, keeping both ends. Returns whether it elided.
 ///
 /// Called once, after the agent exits and BEFORE anything reads the file, so the published copy and the
@@ -263,7 +274,13 @@ pub fn bound_transcript(log: &Path) -> Result<bool> {
     if len <= KEEP_WHOLE_BYTES {
         return Ok(false);
     }
-    let half = KEEP_WHOLE_BYTES / 2;
+    // The marker is part of the budget, so the RESULT is at most the cap and a second call is a no-op.
+    // It was `KEEP_WHOLE_BYTES / 2` per half, which put the output a marker's length OVER the cap --
+    // so every later `cache bound` re-bounded the same file and shaved it again. Observed: the same two
+    // transcripts elided twice, hours apart. A repair that is not idempotent erodes the evidence it is
+    // supposed to preserve, and commits a fresh blob each time it runs.
+    let marker = marker_for(len);
+    let half = (KEEP_WHOLE_BYTES - marker.len() as u64) / 2;
     let head = {
         use std::io::Read;
         let f = std::fs::File::open(log)?;
@@ -279,15 +296,6 @@ pub fn bound_transcript(log: &Path) -> Result<bool> {
         f.read_to_end(&mut buf)?;
         buf
     };
-    let marker = format!(
-        "\n\n=== harvest-tools elided {} bytes here: this transcript was {} bytes, above the {} the \
-         store can carry. The first and last {} are kept, which is where the init record and the \
-         terminal record are. ===\n\n",
-        len - KEEP_WHOLE_BYTES,
-        len,
-        KEEP_WHOLE_BYTES,
-        half
-    );
     let mut out = head;
     out.extend_from_slice(marker.as_bytes());
     out.extend_from_slice(&tail);
