@@ -471,6 +471,52 @@ mod tests {
         );
     }
 
+    /// A step that produced nothing must publish nothing, even where an earlier sweep left a crate.
+    ///
+    /// A refusal is scored as a failure BY PUBLISHING NOTHING: the oracle finds `translated_rust/` with
+    /// no crate in it, records a build failure, and the denominator stays whole. That only holds if the
+    /// phase dir is empty -- and nothing ever cleared one, while `reseal` read it back, so the refusal's
+    /// tree was whatever crate sweep 1 had left and the case was scored on someone else's artifact.
+    /// The tree for such a step is now the FIRST tree of a chain: the corpus's C, an empty translation.
+    #[test]
+    fn a_step_that_published_nothing_does_not_inherit_an_earlier_sweeps_crate() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let corpus_dir = tmp.path().join("test_case");
+        std::fs::create_dir_all(&corpus_dir).unwrap();
+        std::fs::write(corpus_dir.join("lib.c"), "int f(void){return 1;}\n").unwrap();
+        let corpus = Corpus::at(&corpus_dir).unwrap();
+
+        // Sweep 1's output, still on disk.
+        let dir = tmp.path().join("verified");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"stale\"\n").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn from_sweep_one() {}\n").unwrap();
+
+        // What the refused/exhausted arm now does: open (which clears), and seal the corpus alone.
+        let publish = Publish::open(&dir).unwrap();
+        let empty = WorkDir::assemble(&corpus).unwrap().seal().unwrap();
+
+        assert!(
+            !dir.join("Cargo.toml").exists() && !dir.join("src").exists(),
+            "the refusal published sweep 1's crate, so the case is scored on another run's artifact"
+        );
+        assert_eq!(
+            empty.digest(),
+            WorkDir::assemble(&corpus).unwrap().seal().unwrap().digest(),
+            "the tree of a step that produced nothing is a function of the CORPUS alone"
+        );
+        // Non-vacuity: a tree carrying that crate really is a different tree, so the equality above is
+        // not trivially true of every seal.
+        let carrying = WorkDir::assemble(&corpus).unwrap();
+        std::fs::write(carrying.translation().join("lib.rs"), "pub fn x() {}\n").unwrap();
+        assert_ne!(
+            carrying.seal().unwrap().digest(),
+            empty.digest(),
+            "non-vacuity: a published crate must really move the digest"
+        );
+        drop(publish);
+    }
+
     /// The oracle must look for a transcript where the runner writes it, and the eval tree is not
     /// where either lives.
     ///

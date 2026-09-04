@@ -300,6 +300,28 @@ impl Command {
 mod tests {
     use super::*;
 
+    /// `--parallel 0` must be refused BY THE FLAG, not deadlock.
+    ///
+    /// `Semaphore { max: 0 }` makes `Pool::acquire` loop `while 0 >= 0` on a condvar that only a
+    /// `SemaphoreGuard::drop` could notify, and no guard can ever be handed out: the sweep hung
+    /// silently, with `in_flight`'s `width.max(1)` spawning the one worker that then blocked for ever.
+    /// Non-vacuity: 1 and 3 must still parse, or this "passes" by rejecting everything.
+    #[test]
+    fn parallel_zero_is_refused_at_the_flag_rather_than_hanging_a_sweep() {
+        let parse = |v: &str| {
+            Cli::try_parse_from(["harvest-tools", "--parallel", v, "cache", "stats"])
+                .map(|c| c.parallel)
+        };
+        let err = parse("0").expect_err("--parallel 0 must not be accepted");
+        let text = err.to_string();
+        assert!(
+            text.contains('0') || text.to_lowercase().contains("not in"),
+            "the refusal must name the value: {text}"
+        );
+        assert_eq!(parse("1").expect("1 is legal"), 1);
+        assert_eq!(parse("3").expect("3 is legal"), 3);
+    }
+
     /// `--replay-only` is the flag `tools/reproduce.sh` relies on to be unable to spend money, so
     /// the thing under test is the MAPPING from typed flags to store mode -- not a hand-built `Mode`.
     /// Parsed through `clap`, because a hand-built `Cli` would skip the parsing being asserted.

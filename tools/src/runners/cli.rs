@@ -68,7 +68,9 @@ pub enum Backend {
 /// `<work>/.claude/settings.json` sitting unread beside them, so the repo -- the graded oracle's
 /// `test_vectors/` and every sibling agent's translation -- was readable, while `Enforcement::Required`
 /// refused to launch on the grounds that it was not. `require_enforceable` only probes PATH, so it
-/// passed. Now the backend states it and [`crate::io::sandbox::Enforcement`] decides.
+/// passed. Now the backend STATES it, `execute` writes the policy only where it can be applied, and
+/// [`crate::io::sandbox::Sandboxed`] carries the answer into the entry -- so an artifact says which way
+/// it was instead of leaving a reader to assume.
 pub enum Sandboxing {
     /// Reads `--settings <file>`: the policy can be enforced.
     Settings,
@@ -189,8 +191,13 @@ impl Execute for Cli {
         // `<work_root>/.claude/settings.json`, and the policy's allow-list is that same work dir --
         // one field, so the agent is never launched somewhere its own policy denies. `.claude` is
         // root-anchored ignored, so the file does not reach the digest.
-        // Written only for a backend that can be GIVEN it. It used to be written unconditionally and
-        // passed to claude alone, so two of three tools ran with the policy sitting unread beside them.
+        // Written only for a backend that can be GIVEN it, and the answer is RECORDED. It used to be
+        // written unconditionally and passed to claude alone, so two of three tools ran with the policy
+        // sitting unread beside them and nothing said so.
+        let sandboxed = match self.backend.sandboxing() {
+            Sandboxing::Settings => crate::io::sandbox::Sandboxed::Enforced,
+            Sandboxing::Unavailable => crate::io::sandbox::Sandboxed::NotSupportedByBackend,
+        };
         let mut command = match &self.backend {
             Backend::Claude => {
                 let settings = crate::io::sandbox::write_settings(crate::io::sandbox::Policy {
@@ -233,6 +240,53 @@ impl Execute for Cli {
             cost_usd: crate::agent_health::cost_usd(log, self.backend.log_format()),
             cli: self.cli_version.as_str().to_string(),
             pin,
+            sandboxed,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every backend must STATE whether its policy can be applied, and the two that cannot must not be
+    /// recorded as if they could.
+    ///
+    /// Exhaustive over `Backend`, and asserting the MAPPING rather than one hand-built value -- the
+    /// defect this replaces was that `write_settings` ran for all three while only claude was passed the
+    /// path, so codex and kiro ran unconfined with nothing saying so. A new backend has to choose here;
+    /// it cannot inherit claude's answer.
+    #[test]
+    fn every_backend_states_whether_its_sandbox_policy_can_be_applied() {
+        use crate::io::sandbox::Sandboxed;
+        for (backend, want) in [
+            (Backend::Claude, Sandboxed::Enforced),
+            (
+                Backend::Codex {
+                    region: "us-east-2",
+                },
+                Sandboxed::NotSupportedByBackend,
+            ),
+            (Backend::Kiro, Sandboxed::NotSupportedByBackend),
+        ] {
+            // The same derivation `execute` uses, so the test cannot agree with a mapping the run does
+            // not apply.
+            let recorded = match backend.sandboxing() {
+                Sandboxing::Settings => Sandboxed::Enforced,
+                Sandboxing::Unavailable => Sandboxed::NotSupportedByBackend,
+            };
+            assert_eq!(
+                recorded,
+                want,
+                "{} records the wrong answer about its own confinement",
+                backend.name()
+            );
+        }
+        // Non-vacuity: the two answers must be DIFFERENT values, or every assertion above holds for a
+        // mapping that says the same thing about every backend -- which is the bug.
+        assert_ne!(Sandboxed::Enforced, Sandboxed::NotSupportedByBackend);
+        // The default is the cautious one: an entry written before this was recorded has no answer, and
+        // `Enforced` would be a claim nobody checked.
+        assert_eq!(Sandboxed::default(), Sandboxed::NotSupportedByBackend);
     }
 }

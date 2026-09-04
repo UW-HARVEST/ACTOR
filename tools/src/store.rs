@@ -179,6 +179,10 @@ pub struct AgentRecord {
     /// would be the claim this field exists to stop making.
     #[serde(default)]
     pub pin: crate::domain::health::PinReport,
+    /// Whether the agent that produced this entry was confined to its working dir. `default` for the
+    /// same reason: entries written before this was recorded have no answer.
+    #[serde(default)]
+    pub sandboxed: crate::io::sandbox::Sandboxed,
 }
 
 /// Whether the agent ran, CLASSIFIED from the transcript rather than read off an exit code: every
@@ -577,6 +581,7 @@ mod corrupt_tests {
         let after = w.seal().unwrap();
         let record = AgentRecord {
             pin: crate::domain::health::PinReport::Confirmed,
+            sandboxed: crate::io::sandbox::Sandboxed::Enforced,
             outcome: Outcome::Completed,
             output_tree: Some(after.digest().as_str().to_string()),
             wall_secs: 1,
@@ -705,6 +710,7 @@ mod tests {
     fn record(outcome: Outcome, after: Option<&crate::tree::Tree>) -> AgentRecord {
         AgentRecord {
             pin: crate::domain::health::PinReport::Confirmed,
+            sandboxed: crate::io::sandbox::Sandboxed::Enforced,
             outcome,
             output_tree: after.map(|t| t.digest().as_str().to_string()),
             wall_secs: 12,

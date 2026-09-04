@@ -149,6 +149,51 @@ impl<'ast> syn::visit::Visit<'ast> for UnsafeVisitor {
 }
 
 #[cfg(test)]
+mod unparsed_tests {
+    use super::*;
+
+    /// A file `syn` cannot parse is UNMEASURED, not zero-unsafe.
+    ///
+    /// `count_unsafe` skipped it while `count_loc` -- a separate walk that never parses -- counted every
+    /// one of its lines, so a crate full of `unsafe` with one unbalanced delimiter published a low Unsafe
+    /// percentage against its full LOC. Not hypothetical: `Enrichment::compute` runs on crates that
+    /// FAILED TO BUILD, and runtests records 76 build failures across the corpus.
+    #[test]
+    fn an_unparseable_source_file_is_unmeasured_not_zero_unsafe() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("good.rs"),
+            "pub fn a() { unsafe { std::ptr::null::<u8>(); } }\n",
+        )
+        .unwrap();
+
+        let clean = count_unsafe(&src);
+        assert!(clean.blocks > 0, "the fixture must contain unsafe to count");
+        assert_eq!(clean.unparsed_files, 0, "nothing is unparseable yet");
+
+        // The trap: several unsafe blocks plus one unbalanced delimiter.
+        std::fs::write(
+            src.join("broken.rs"),
+            "pub fn b() { unsafe { unsafe { } } // no closing brace\n",
+        )
+        .unwrap();
+        let with_broken = count_unsafe(&src);
+        assert_eq!(
+            with_broken.unparsed_files, 1,
+            "the file syn could not read must be RECORDED, not silently scored as zero unsafe"
+        );
+        // And its lines are still in the LOC denominator, which is why the omission skewed a published
+        // percentage rather than merely dropping a file.
+        assert!(
+            count_loc(&src).code > count_loc(&tmp.path().join("nonexistent")).code,
+            "count_loc must still count the unparseable file's lines"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

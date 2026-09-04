@@ -42,6 +42,29 @@ pub fn require_enforceable() -> Result<()> {
     Ok(())
 }
 
+/// Whether the agent that ran was actually confined, RECORDED in its entry.
+///
+/// The gap this closes: `write_settings` ran for every backend and only claude received the path, so
+/// codex (`--dangerously-bypass-approvals-and-sandbox`) and kiro (`--trust-all-tools`) ran with
+/// `<work>/.claude/settings.json` unread beside them -- the repo readable, including the graded oracle's
+/// `test_vectors/` and every sibling agent's translation -- while `Enforcement::Required` refused to
+/// launch on the grounds that it was not. `require_enforceable` only probes PATH, so it passed.
+///
+/// RECORDED rather than refused, deliberately and by the operator's decision: refusing would make every
+/// codex and kiro run require `--allow-unsandboxed`, and the honest problem with the published rows is
+/// that nobody can tell from the artifact which way it was. Now they can. `Ran` requires one of these,
+/// so a backend cannot return a result without stating it.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Sandboxed {
+    /// The CLI took the policy and `failIfUnavailable` was set, so it could not fail open.
+    Enforced,
+    /// This CLI has no mechanism to accept a filesystem policy. The default, because every entry
+    /// written before this was recorded has no answer and `Enforced` would be a claim nobody checked.
+    #[default]
+    NotSupportedByBackend,
+}
+
 /// Whether the sandbox is enforceable, for the provenance record.
 pub fn is_enforceable() -> bool {
     SANDBOX_BINARIES.iter().all(|b| which(b).is_some())
