@@ -15,8 +15,11 @@ TARGET="${1:-all}"
 # `0/128` for P01 and nobody noticed, "because `reproduce.sh` replays claude only".
 ALL_TOOLS="claude,codex,kiro"
 TOOLS="${TOOLS:-$ALL_TOOLS}"
-# `tables/` is written ONCE per run from every tool's attestation MERGED, so only a run covering every
-# tool can be diffed at all. A subset run proves its own tool replays and leaves the tables alone.
+# `tables/` is written ONCE per run from every tool's attestation MERGED, so a per-tool run cannot be
+# compared against the committed files -- it correctly writes `--` for the tools it did not replay. That
+# is no longer a reason for a fourth all-tools job: `harvest-tools tables` regenerates them from the
+# COMMITTED results in seconds and `type-safety.yaml` diffs them on every push. Here, a run that covers
+# every tool still diffs them, because it has just re-derived every row.
 if [ "$TOOLS" = "$ALL_TOOLS" ]; then TABLES=identical; else TABLES=subset; fi
 if [ "$TARGET" = all ]; then LEGS=(all HB); else LEGS=("$TARGET"); fi
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -566,19 +566,38 @@ fn cases_in_report(xml: &str) -> Result<Vec<String>> {
     Ok(re.captures_iter(xml).map(|c| c[1].to_string()).collect())
 }
 
-/// The commit that produced an artifact, written INTO it.
+/// The commit that produced a record, written INTO it -- and PRESERVED where the record has not moved.
 ///
 /// `provenance::harness_id` existed and was called by nothing but the warning string promising that
-/// artifacts are stamped, so a `--allow-dirty` run's `result.json`, `summary.json` and `tables/*.tex`
-/// were byte-indistinguishable from a clean run's. The key is `harness`, the word this repo uses for
-/// "the ACTOR commit" everywhere else.
-fn stamp(val: &mut serde_json::Value, provenance: &crate::provenance::Provenance) {
-    if let Some(obj) = val.as_object_mut() {
-        obj.insert(
-            "harness".to_string(),
-            serde_json::Value::String(provenance.as_str().to_string()),
-        );
-    }
+/// artifacts are stamped, so a `--allow-dirty` run's `result.json` and `summary.json` were
+/// byte-indistinguishable from a clean run's. The key is `harness`, the word this repo uses for "the
+/// ACTOR commit" everywhere else.
+///
+/// The preservation is what keeps this compatible with the reproducibility check. Byte-identity of a
+/// replay against the committed artifact IS that check, so a field naming the CURRENT commit would make
+/// every later commit's replay differ and the check would have to be weakened to tolerate it. A replay
+/// re-derives the same numbers from the same store, so the record has not moved and neither should its
+/// stamp: it names the code that MEASURED this, which a replay did not change. When any other field
+/// does move, the stamp moves with it -- so a scoring change is attributed to the commit that made it.
+pub(crate) fn stamp(
+    val: &mut serde_json::Value,
+    at: &Path,
+    provenance: &crate::provenance::Provenance,
+) {
+    let Some(obj) = val.as_object_mut() else {
+        return;
+    };
+    let previous = std::fs::read_to_string(at)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|mut old| {
+            let was = old.as_object_mut()?.remove("harness")?;
+            (old.as_object() == Some(&*obj)).then_some(was)
+        });
+    obj.insert(
+        "harness".to_string(),
+        previous.unwrap_or_else(|| serde_json::Value::String(provenance.as_str().to_string())),
+    );
 }
 
 fn write_results(
@@ -601,19 +620,18 @@ fn write_results(
             &[("translate", &tlog), ("verify", &vlog)],
         )
         .merge_into(&mut val);
-        stamp(&mut val, provenance);
+        let at = case.record_into.join("result.json");
+        stamp(&mut val, &at, provenance);
         let json = serde_json::to_string_pretty(&val)?;
-        std::fs::write(case.record_into.join("result.json"), format!("{json}\n"))?;
+        std::fs::write(&at, format!("{json}\n"))?;
     }
     match covers {
         Covers::WholeBattery => {
+            let at = paths.output_dir(&pass.battery).join(pass.record);
             let mut val = serde_json::to_value(summary)?;
-            stamp(&mut val, provenance);
+            stamp(&mut val, &at, provenance);
             let json = serde_json::to_string_pretty(&val)?;
-            std::fs::write(
-                paths.output_dir(&pass.battery).join(pass.record),
-                format!("{json}\n"),
-            )?;
+            std::fs::write(&at, format!("{json}\n"))?;
         }
         // `analyse::report` rebuilds `tables/` from this file, and a subset's count is not the battery's.
         Covers::Subset(regex) => println!(
@@ -876,6 +894,52 @@ mod tests {
                 at.display()
             );
         }
+    }
+
+    /// A replay must not move the stamp, or byte-identity -- the reproducibility check itself -- fails
+    /// on every commit after the one that scored.
+    ///
+    /// The two halves are in tension and this is where they meet: an artifact must record what produced
+    /// it, AND a replay must reproduce the committed artifact byte for byte. A record a replay
+    /// re-derives unchanged was measured by the code already named in it; a record whose numbers MOVE
+    /// was not, and takes the current commit.
+    #[test]
+    fn a_replay_keeps_the_stamp_and_a_changed_record_takes_the_new_one() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let at = tmp.path().join("result.json");
+        let write = |v: &serde_json::Value, p: &crate::provenance::Provenance| {
+            let mut val = v.clone();
+            stamp(&mut val, &at, p);
+            fs::write(&at, serde_json::to_string_pretty(&val).unwrap() + "\n").unwrap();
+            fs::read_to_string(&at).unwrap()
+        };
+        let measured = serde_json::json!({"battery": "B01", "case": "only", "passed": true});
+        let first = write(
+            &measured,
+            &crate::provenance::Provenance::for_test("aaaa111"),
+        );
+        assert!(first.contains("aaaa111"), "a new record names its commit");
+
+        // The same numbers, re-derived by a later commit: nothing measured, nothing moves.
+        let replayed = write(
+            &measured,
+            &crate::provenance::Provenance::for_test("bbbb222"),
+        );
+        assert_eq!(
+            first, replayed,
+            "a replay rewrote the record, so `git diff` can no longer be the reproducibility check"
+        );
+
+        // A number that moved WAS measured by the newer code, and is attributed to it.
+        let changed = serde_json::json!({"battery": "B01", "case": "only", "passed": false});
+        let after = write(
+            &changed,
+            &crate::provenance::Provenance::for_test("bbbb222"),
+        );
+        assert!(
+            after.contains("bbbb222") && !after.contains("aaaa111"),
+            "a changed record must name the commit that changed it: {after}"
+        );
     }
 
     fn stored_1_of_1(paths: &Paths, battery: &str) {

@@ -224,7 +224,16 @@ pub enum Command {
         action: CacheAction,
     },
     /// Backfill result.json with credits + unsafe counts (no tests, no LLM calls)
-    Enrich { target: String },
+    /// Regenerate `tables/` from the COMMITTED results, with no replay and no agent.
+    ///
+    /// The scope is derived by walking `results/` rather than produced by a run, which is what lets the
+    /// reproducibility check have one job per tool instead of one per tool plus a fourth doing all
+    /// three only so it could diff the tables. Runs in seconds, so it can gate every push instead of
+    /// living inside a forty-minute replay.
+    Tables,
+    Enrich {
+        target: String,
+    },
 }
 
 // Execution is now driven by the `Benchmark` trait (see `benchmark.rs`): one
@@ -266,6 +275,9 @@ pub enum CacheAction {
     /// Entries whose run did not complete. Recorded and never served: a failure is an entry with a
     /// non-`Completed` outcome, not a separate tree.
     Failures,
+    /// Re-hash every stored tree against the digest it is filed under. No agent invocations, so a
+    /// reproducibility check can run it on every push.
+    Verify,
 }
 
 impl Command {
@@ -277,7 +289,7 @@ impl Command {
     pub fn produces_artifacts(&self) -> bool {
         match self {
             // Write into results/ or tables/.
-            Command::Run { .. } | Command::Enrich { .. } => true,
+            Command::Run { .. } | Command::Enrich { .. } | Command::Tables => true,
             // Read-only introspection.
             Command::Cache { .. } => false,
         }

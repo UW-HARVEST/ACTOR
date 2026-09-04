@@ -419,16 +419,9 @@ pub fn run_harvest_bench_test(
                 &[("translate", &tlog), ("verify", &vlog)],
             )
             .merge_into(&mut json);
-            if let Some(obj) = json.as_object_mut() {
-                obj.insert(
-                    "harness".to_string(),
-                    serde_json::Value::String(scoring.provenance.as_str().to_string()),
-                );
-            }
-            std::fs::write(
-                case.record_into.join("result.json"),
-                serde_json::to_string_pretty(&json)? + "\n",
-            )?;
+            let at = case.record_into.join("result.json");
+            crate::oracle::runtests::stamp(&mut json, &at, scoring.provenance);
+            std::fs::write(&at, serde_json::to_string_pretty(&json)? + "\n")?;
             recorded += 1;
         }
 

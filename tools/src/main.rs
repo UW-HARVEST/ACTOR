@@ -118,10 +118,8 @@ fn main() -> Result<()> {
                             acc
                         });
                 match dataset {
-                    Dataset::TestCorpus => report::generate(&repo_root, &merged, stamp)?,
-                    Dataset::HarvestBench => {
-                        report::generate_harvest_bench(&repo_root, &merged, stamp)?
-                    }
+                    Dataset::TestCorpus => report::generate(&repo_root, &merged)?,
+                    Dataset::HarvestBench => report::generate_harvest_bench(&repo_root, &merged)?,
                 }
                 println!("\u{1f4ca} Tables regenerated (tables/)");
             }
@@ -134,6 +132,30 @@ fn main() -> Result<()> {
                     println!("  {outcome:?}  {at}");
                 }
             }
+            cli::CacheAction::Verify => {
+                let (checked, corrupt) = store::Store::open(&repo_root, mode)?.verify()?;
+                // A verifier that inspected nothing must not report success: an empty store and a
+                // clean one print the same line otherwise, and CI would go green over neither.
+                anyhow::ensure!(
+                    checked > 0,
+                    "cache verify inspected no stored tree at all, so this proves nothing about \
+                     {}/results/.cache",
+                    repo_root.display()
+                );
+                for line in &corrupt {
+                    eprintln!("  \u{274c} {line}");
+                }
+                anyhow::ensure!(
+                    corrupt.is_empty(),
+                    "{} of {checked} stored tree(s) do not hash to the digest they are filed under. \
+                     An entry whose `before/` no longer reproduces its own directory name is corrupt: \
+                     it is served for ever from bytes the key does not describe. `write` treats that \
+                     directory's existence as proof it is complete, so a sweep killed mid-copy leaves \
+                     one and every later entry beneath it skips the copy.",
+                    corrupt.len()
+                );
+                println!("\u{2705} {checked} stored tree(s) hash to what they are filed under");
+            }
             cli::CacheAction::Stats => {
                 let (entries, bytes) = store::Store::open(&repo_root, mode)?.stats()?;
                 println!(
@@ -143,6 +165,29 @@ fn main() -> Result<()> {
                 );
             }
         },
+        Command::Tables => {
+            // BOTH datasets, from what is committed. Each writes only its own files, so a missing
+            // dataset leaves the other's tables alone rather than blanking them.
+            let tc = report::Attested::test_corpus_from_committed(
+                &repo_root.join("results/Test-Corpus"),
+            )?;
+            let hb = report::Attested::harvest_bench_from_committed(
+                &repo_root.join("results/HarvestBench"),
+            )?;
+            anyhow::ensure!(
+                !tc.is_empty() || !hb.is_empty(),
+                "no committed result names a unit under {}/results, so every table would be written \
+                 from nothing",
+                repo_root.display()
+            );
+            if !tc.is_empty() {
+                report::generate(&repo_root, &tc)?;
+            }
+            if !hb.is_empty() {
+                report::generate_harvest_bench(&repo_root, &hb)?;
+            }
+            println!("\u{1f4ca} Tables regenerated from the committed results (tables/)");
+        }
         Command::Enrich { ref target } => {
             let dataset = Dataset::detect(target);
             let paths = battery::Paths::new(

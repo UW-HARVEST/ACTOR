@@ -125,15 +125,99 @@ impl Attested {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Derive the attestation from what is COMMITTED under `results/<dataset>`, so `tables/` can be
+    /// checked without replaying anything.
+    ///
+    /// This is what lets CI drop its fourth arm. `tables/` is written from every tool's attestation
+    /// MERGED, and an attestation was only ever produced by a RUN -- so a per-tool arm could not diff
+    /// the tables (a codex-only run correctly writes `--` for the others), and a fourth
+    /// `claude,codex,kiro` job existed for no other purpose than to have all three at once. It took
+    /// forty minutes, replayed both datasets a second time, and was the only place `tables/` was
+    /// checked at all. The rows themselves never needed a run: `generate` reads the committed
+    /// `result.json` and `summary.json` files off disk. Only the SCOPE did.
+    ///
+    /// A unit is attested iff its record is present, which is the same predicate `InScope` applies to a
+    /// live run -- there, every case must be served for the battery to publish; here, the record's
+    /// presence IS that having happened. `<tool>/<model>/<variant>/<unit>`, every level required, so a
+    /// stray directory at the wrong depth contributes nothing.
+    /// Test-Corpus: a unit is a BATTERY, and its record is the headline `summary.json` that
+    /// `generate` reads.
+    pub fn test_corpus_from_committed(results_root: &Path) -> Result<Self> {
+        Self::from_committed(results_root, &|unit| unit.join("summary.json").is_file())
+    }
+
+    /// harvest-bench: a unit is a PROJECT, and its record is the `result.json` in whichever phase was
+    /// scored -- the same `scored_phase_dir` `generate_harvest_bench` reads it from.
+    pub fn harvest_bench_from_committed(results_root: &Path) -> Result<Self> {
+        Self::from_committed(results_root, &|unit| {
+            scored_phase_dir(unit).join("result.json").is_file()
+        })
+    }
+
+    fn from_committed(results_root: &Path, has_record: &dyn Fn(&Path) -> bool) -> Result<Self> {
+        let mut out = Self::default();
+        let Some(tools) = dirs_in(results_root)? else {
+            return Ok(out);
+        };
+        for tool in tools {
+            for model in dirs_in(&tool)?.unwrap_or_default() {
+                for variant in dirs_in(&model)?.unwrap_or_default() {
+                    for unit in dirs_in(&variant)?.unwrap_or_default() {
+                        if !has_record(&unit) {
+                            continue;
+                        }
+                        let name =
+                            |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+                        let (Some(t), Some(m), Some(v), Some(u)) =
+                            (name(&tool), name(&model), name(&variant), name(&unit))
+                        else {
+                            continue;
+                        };
+                        let label = if v == crate::cli::Variant::Default.dir() {
+                            t.clone()
+                        } else {
+                            format!("{t}-{v}")
+                        };
+                        out.0.insert((
+                            Run {
+                                label,
+                                dir: format!("{t}/{m}/{v}"),
+                            },
+                            u,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Sub-directories of `dir`, sorted; `None` where `dir` does not exist. `Err` for any other reason, so
+/// an unreadable results tree cannot look like an empty one.
+fn dirs_in(dir: &Path) -> Result<Option<Vec<PathBuf>>> {
+    match sorted_read_dir(dir) {
+        Ok(entries) => Ok(Some(
+            entries
+                .into_iter()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect(),
+        )),
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// One row per upstream C library. Separate from [`generate`] because the datasets are earned by separate
 /// runs and a run writes only what it resolved -- folded in, a Test-Corpus run would blank these rows.
-pub fn generate_harvest_bench(
-    repo_root: &Path,
-    attested: &Attested,
-    provenance: &crate::provenance::Provenance,
-) -> Result<()> {
+pub fn generate_harvest_bench(repo_root: &Path, attested: &Attested) -> Result<()> {
     anyhow::ensure!(
         !attested.is_empty(),
         "refusing to write the harvest-bench table: this run resolved no project"
@@ -143,11 +227,9 @@ pub fn generate_harvest_bench(
     std::fs::create_dir_all(&tables_dir)?;
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "% GENERATED by `harvest-tools run HB` from results/HarvestBench/ at {}. \
-             Do not edit by hand.\n",
-        provenance.as_str()
-    ));
+    out.push_str(
+        "% GENERATED by `harvest-tools run HB` from results/HarvestBench/. Do not edit by hand.\n",
+    );
     out.push_str(
         "% Tool & Project & Builds & Tests & Rust LOC & unsafe. Tests = upstream GoogleTest cases\n         % passing; a build that failed has no tests.\n",
     );
@@ -203,11 +285,12 @@ struct HarvestBenchRow {
     loc: Option<crate::analyse::metrics::LocCounts>,
 }
 
-pub fn generate(
-    repo_root: &Path,
-    attested: &Attested,
-    provenance: &crate::provenance::Provenance,
-) -> Result<()> {
+/// Tables are a RENDERING of records that each carry their own `harness` stamp, so they are not
+/// stamped themselves. A header naming the current commit would make every later commit's regenerated
+/// tables differ from the committed ones -- byte-identity is the reproducibility check, and a field
+/// that changes on every commit destroys it while adding nothing a reader cannot get from the
+/// `result.json` a number came from.
+pub fn generate(repo_root: &Path, attested: &Attested) -> Result<()> {
     anyhow::ensure!(
         !attested.is_empty(),
         "refusing to write tables/: this run resolved nothing, so every row would come from \
@@ -394,7 +477,7 @@ pub fn generate(
         );
     }
 
-    let tex = generate_tractor_tex(&rows, provenance);
+    let tex = generate_tractor_tex(&rows);
     let tex_path = tables_dir.join("tractor.tex");
     std::fs::write(&tex_path, &tex)?;
     println!("✅ Wrote {}", tex_path.display());
@@ -1087,7 +1170,7 @@ fn fmt_k(loc: u32) -> String {
 }
 
 /// tab:tractor body rows only; the table/tabular/caption stays in paper.tex.
-fn generate_tractor_tex(rows: &[BatteryRow], provenance: &crate::provenance::Provenance) -> String {
+fn generate_tractor_tex(rows: &[BatteryRow]) -> String {
     use std::collections::HashMap;
     // (agent dir, battery dir) -> row
     let mut idx: HashMap<(&str, &str), &BatteryRow> = HashMap::new();
@@ -1164,11 +1247,9 @@ fn generate_tractor_tex(rows: &[BatteryRow], provenance: &crate::provenance::Pro
     };
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "% GENERATED by `harvest-tools report` from results/Test-Corpus/ at {}. \
-             Do not edit by hand.\n",
-        provenance.as_str()
-    ));
+    out.push_str(
+        "% GENERATED by `harvest-tools report` from results/Test-Corpus/. Do not edit by hand.\n",
+    );
     out.push_str("% Builds = crate compiles (result.json error != \"build failed\").\n");
     out.push_str("% Tests = cases passing all vectors. Every system is scored over all cases.\n");
 
@@ -1530,12 +1611,8 @@ mod tests {
         attested.insert(&paths, "lz4");
 
         let table = tmp.path().join("tables/harvest-bench.tex");
-        let err = generate_harvest_bench(
-            tmp.path(),
-            &attested,
-            &crate::provenance::Provenance::for_test("deadbeef"),
-        )
-        .expect_err("lz4 is in scope with no record, so the table cannot claim completeness");
+        let err = generate_harvest_bench(tmp.path(), &attested)
+            .expect_err("lz4 is in scope with no record, so the table cannot claim completeness");
         assert!(
             format!("{err:#}").contains("lz4"),
             "and the refusal must name the project it could not report: {err:#}"
@@ -1547,12 +1624,7 @@ mod tests {
 
         // Non-vacuity: the refusal must not be firing for some reason that also blocks the good case.
         record("lz4");
-        generate_harvest_bench(
-            tmp.path(),
-            &attested,
-            &crate::provenance::Provenance::for_test("deadbeef"),
-        )
-        .expect("both records exist now");
+        generate_harvest_bench(tmp.path(), &attested).expect("both records exist now");
         let tex = std::fs::read_to_string(&table).unwrap();
         assert!(
             tex.contains("jansson") && tex.contains("lz4"),
@@ -1600,12 +1672,7 @@ mod tests {
             attested.insert(&paths, "libsodium");
         }
 
-        generate_harvest_bench(
-            tmp.path(),
-            &attested,
-            &crate::provenance::Provenance::for_test("deadbeef"),
-        )
-        .unwrap();
+        generate_harvest_bench(tmp.path(), &attested).unwrap();
         let tex = std::fs::read_to_string(tmp.path().join("tables/harvest-bench.tex")).unwrap();
         let rows: Vec<&str> = tex.lines().filter(|l| l.contains("libsodium")).collect();
         assert_eq!(rows.len(), 3, "one row per run: {tex}");
