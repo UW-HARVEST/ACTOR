@@ -314,9 +314,9 @@ impl Publish {
         Ok(Self(dir.to_path_buf()))
     }
 
-    /// Where the transcript goes. Per role, from the one table that names them.
+    /// Where the transcript goes. From the one definition that names it.
     fn log(&self, role: Role) -> Result<PathBuf> {
-        Ok(self.0.join("logs").join(role.log()))
+        Ok(role.log_in(&self.0))
     }
 
     /// The directory itself, for the `Resolved` map the oracle looks a case up in. Not a licence to
@@ -468,6 +468,54 @@ mod tests {
             moved.seal().unwrap().digest(),
             before_residue.digest(),
             "non-vacuity: this residue must really move a seal taken over it"
+        );
+    }
+
+    /// The oracle must look for a transcript where the runner writes it, and the eval tree is not
+    /// where either lives.
+    ///
+    /// `runtests` and `gtest` both derived the log path from `Materialised::crate_root`, an EVAL-TREE
+    /// path. The eval tree is assembled by `copy_carrying`, which admits only
+    /// `Disposition::StoreAndHash`, and every `*.log` is `Ignore` -- so `translated_rust/logs/` cannot
+    /// exist, `extract_agent_meta` returned `None` (absence, not error), and 316 committed
+    /// `result.json` files carry no cost, no model and no turn count. The second assertion is the
+    /// non-vacuity: it proves the old derivation could never have worked, rather than merely that the
+    /// new one does.
+    #[test]
+    fn the_oracle_reads_a_transcript_where_the_runner_wrote_it_and_never_from_the_eval_tree() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let case_dir = tmp.path().join("B01/case_x");
+
+        for role in [Role::Translate, Role::Verify] {
+            let publish = Publish::open(&case_dir.join(role.dir())).unwrap();
+            let written = publish.log(role).unwrap();
+            std::fs::write(&written, "transcript\n").unwrap();
+            assert_eq!(
+                written,
+                role.transcript_in(&case_dir),
+                "{role:?}: the writer and the reader disagree about where the transcript is"
+            );
+            assert!(written.is_file(), "{role:?}: and it must really be there");
+        }
+
+        // Non-vacuity: a log cannot travel into a tree, so no eval-tree path can ever hold one.
+        let corpus_dir = tmp.path().join("test_case");
+        std::fs::create_dir_all(&corpus_dir).unwrap();
+        std::fs::write(corpus_dir.join("lib.c"), "int f(void);\n").unwrap();
+        let corpus = Corpus::at(&corpus_dir).unwrap();
+        let work = WorkDir::assemble(&corpus).unwrap();
+        std::fs::create_dir_all(work.translation().join("logs")).unwrap();
+        std::fs::write(
+            work.translation().join("logs").join(Role::Verify.log()),
+            "transcript\n",
+        )
+        .unwrap();
+        let sealed = work.seal().unwrap();
+        let elsewhere = tmp.path().join("eval-crate");
+        sealed.copy_subtree_into(TRANSLATION, &elsewhere).unwrap();
+        assert!(
+            !elsewhere.join("logs").exists(),
+            "a transcript reached a tree, so deriving its path from one is not obviously wrong"
         );
     }
 

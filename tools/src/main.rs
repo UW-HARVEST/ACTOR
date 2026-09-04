@@ -12,14 +12,19 @@ fn main() -> Result<()> {
 
     // Before, not after, a run that can take hours: a binary that does not match the checkout cannot
     // produce an attributable measurement.
-    if cli.command.produces_artifacts() {
-        provenance::require_reproducible(if cli.allow_dirty {
+    // `Provenance` is the stamp every artifact carries, and the only way to obtain one is this check.
+    // `Enrich` produces no artifact of its own, so it needs none.
+    let provenance = if cli.command.produces_artifacts() {
+        let p = provenance::require_reproducible(if cli.allow_dirty {
             provenance::OnUnreproducible::WarnAndStamp
         } else {
             provenance::OnUnreproducible::Refuse
         })?;
         harvest_tools::refusal::require_pinned_toolchain()?;
-    }
+        Some(p)
+    } else {
+        None
+    };
 
     anyhow::ensure!(!cli.tool.is_empty(), "--tool names no tool");
     // Refused before any work: an ablation on a tool with no ablation prompts would otherwise read
@@ -53,6 +58,10 @@ fn main() -> Result<()> {
             let on_infra_failure = agent_health::OnInfraFailure::from_allow_infra_failures_flag(
                 cli.allow_infra_failures,
             );
+            // `Run` produces artifacts, so the preflight above yielded a stamp.
+            let stamp = provenance
+                .as_ref()
+                .expect("a Run produces artifacts, so provenance was established above");
             let attested: Vec<report::Attested> = std::thread::scope(|scope| {
                 let handles: Vec<_> = cli
                     .tool
@@ -73,6 +82,7 @@ fn main() -> Result<()> {
                                 enforcement,
                                 keep,
                                 on_infra_failure,
+                                provenance: stamp,
                             })
                         })
                     })
@@ -108,8 +118,10 @@ fn main() -> Result<()> {
                             acc
                         });
                 match dataset {
-                    Dataset::TestCorpus => report::generate(&repo_root, &merged)?,
-                    Dataset::HarvestBench => report::generate_harvest_bench(&repo_root, &merged)?,
+                    Dataset::TestCorpus => report::generate(&repo_root, &merged, stamp)?,
+                    Dataset::HarvestBench => {
+                        report::generate_harvest_bench(&repo_root, &merged, stamp)?
+                    }
                 }
                 println!("\u{1f4ca} Tables regenerated (tables/)");
             }
@@ -174,6 +186,7 @@ struct RunTool<'a> {
     enforcement: harvest_tools::io::sandbox::Enforcement,
     keep: eval::Keep,
     on_infra_failure: agent_health::OnInfraFailure,
+    provenance: &'a provenance::Provenance,
 }
 
 /// One tool, end to end: preflight, run every unit's chain, score, and report what it attested.
@@ -234,6 +247,7 @@ fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
             &paths,
             unit,
             Score {
+                provenance: r.provenance,
                 on_failure: r.on_infra_failure,
                 keep: r.keep,
                 roles,
@@ -246,6 +260,7 @@ fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
 }
 
 struct Score<'a> {
+    provenance: &'a provenance::Provenance,
     on_failure: agent_health::OnInfraFailure,
     keep: eval::Keep,
     roles: &'a [harvest_tools::prompt::Role],
@@ -263,6 +278,7 @@ fn run_test(
     score: Score<'_>,
 ) -> Result<()> {
     let Score {
+        provenance,
         on_failure,
         keep,
         roles,
@@ -284,6 +300,7 @@ fn run_test(
             tree: &tree,
             gate: &gate,
             covers,
+            provenance,
         },
     )
 }
@@ -426,6 +443,12 @@ mod tests {
             &paths,
             "B01",
             Score {
+                // The real check, not a test-only constructor: `WarnAndStamp` never refuses, so this
+                // works in any tree, and `Provenance` keeps exactly one production door.
+                provenance: &provenance::require_reproducible(
+                    provenance::OnUnreproducible::WarnAndStamp,
+                )
+                .expect("--allow-dirty never refuses"),
                 on_failure: agent_health::OnInfraFailure::Refuse,
                 keep: eval::Keep::Discard,
                 roles: &[harvest_tools::prompt::Role::Translate],

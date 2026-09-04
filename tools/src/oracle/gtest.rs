@@ -389,9 +389,24 @@ pub fn run_harvest_bench_test(
 
         {
             let mut json = serde_json::to_value(&r)?;
-            let tlog = crate_dir.join("logs").join(Role::Translate.log());
-            Enrichment::compute(&crate_dir.join("src"), &[("translate", &tlog)])
-                .merge_into(&mut json);
+            // From the CASE dir, and BOTH roles. This read `crate_dir/logs/translation.log`: the wrong
+            // tree (an eval-tree crate can hold no `logs/` -- see `Role::transcript_in`), and the
+            // `translate` key hardcoded onto whichever step ran, so a verify session's credits were
+            // filed under a key `analyse::report` sums separately. kiro's real harvest-bench spend was
+            // dropped outright.
+            let tlog = Role::Translate.transcript_in(&case.case_dir);
+            let vlog = Role::Verify.transcript_in(&case.case_dir);
+            Enrichment::compute(
+                &crate_dir.join("src"),
+                &[("translate", &tlog), ("verify", &vlog)],
+            )
+            .merge_into(&mut json);
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert(
+                    "harness".to_string(),
+                    serde_json::Value::String(scoring.provenance.as_str().to_string()),
+                );
+            }
             std::fs::write(
                 case.record_into.join("result.json"),
                 serde_json::to_string_pretty(&json)? + "\n",

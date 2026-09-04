@@ -36,6 +36,24 @@ impl Role {
             Role::Verify => "verify.log",
         }
     }
+
+    /// This step's transcript inside its own PHASE dir.
+    pub fn log_in(self, phase_dir: &Path) -> std::path::PathBuf {
+        phase_dir.join("logs").join(self.log())
+    }
+
+    /// This step's transcript from the CASE dir, which is one level up.
+    ///
+    /// THE definition, because two readers derived it themselves and both were wrong. `runtests`
+    /// and `gtest` built it from `Materialised::crate_root` -- an EVAL-TREE path -- and the eval tree
+    /// is assembled by `copy_carrying`, which skips `Disposition::Ignore`, and every `*.log` is
+    /// `Ignore`. So `translated_rust/logs/` cannot exist, `extract_agent_meta` returned `None` (absence,
+    /// not error), and every `result.json` was written with no agent metadata at all: no cost, no
+    /// model, no turn count. `gtest` also hardcoded the `translate` key onto a verify log, which
+    /// `analyse::report` sums separately.
+    pub fn transcript_in(self, case_dir: &Path) -> std::path::PathBuf {
+        self.log_in(&case_dir.join(self.dir()))
+    }
 }
 
 /// What the case is. Chosen per case, not per step, so both roles see the same answer.

@@ -202,7 +202,14 @@ fn score_pass(paths: &Paths, pass: &Pass, scoring: &Scoring<'_>) -> Result<()> {
         summary.vectors_passed
     );
 
-    write_results(paths, pass, &summary, &per_case, scoring.covers)
+    write_results(
+        paths,
+        pass,
+        &summary,
+        &per_case,
+        scoring.covers,
+        scoring.provenance,
+    )
 }
 
 /// A record that cannot be read is a MISMATCH, never a pass: a `--check` printing OK having compared
@@ -253,11 +260,15 @@ fn nothing_to_score(paths: &Paths, battery: &str) -> Result<()> {
 }
 
 /// Out of the materialised crate, so a phase that wrote no transcript cannot borrow another's.
-fn transcripts(crate_root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
-    let logs = crate_root.join("logs");
+/// Both steps' transcripts, from the CASE dir in the results tree where the runner tee'd them.
+///
+/// It used to build them from the eval tree's crate root, where no `logs/` can exist -- see
+/// [`Role::transcript_in`]. Measured on the shipped tree: 316 committed `result.json` files carry no
+/// agent metadata as a result.
+fn transcripts(case_dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     (
-        logs.join(Role::Translate.log()),
-        logs.join(Role::Verify.log()),
+        Role::Translate.transcript_in(case_dir),
+        Role::Verify.transcript_in(case_dir),
     )
 }
 
@@ -540,12 +551,28 @@ fn cases_in_report(xml: &str) -> Result<Vec<String>> {
     Ok(re.captures_iter(xml).map(|c| c[1].to_string()).collect())
 }
 
+/// The commit that produced an artifact, written INTO it.
+///
+/// `provenance::harness_id` existed and was called by nothing but the warning string promising that
+/// artifacts are stamped, so a `--allow-dirty` run's `result.json`, `summary.json` and `tables/*.tex`
+/// were byte-indistinguishable from a clean run's. The key is `harness`, the word this repo uses for
+/// "the ACTOR commit" everywhere else.
+fn stamp(val: &mut serde_json::Value, provenance: &crate::provenance::Provenance) {
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert(
+            "harness".to_string(),
+            serde_json::Value::String(provenance.as_str().to_string()),
+        );
+    }
+}
+
 fn write_results(
     paths: &Paths,
     pass: &Pass,
     summary: &Summary,
     per_case: &HashMap<String, serde_json::Value>,
     covers: Covers<'_>,
+    provenance: &crate::provenance::Provenance,
 ) -> Result<()> {
     for case in pass.tree.cases() {
         let Some(data) = per_case.get(&case.name) else {
@@ -553,18 +580,21 @@ fn write_results(
         };
         let mut val = data.clone();
         let crate_root = pass.tree.crate_root(&case.name);
-        let (tlog, vlog) = transcripts(&crate_root);
+        let (tlog, vlog) = transcripts(&case.case_dir);
         Enrichment::compute(
             &crate_root.join("src"),
             &[("translate", &tlog), ("verify", &vlog)],
         )
         .merge_into(&mut val);
+        stamp(&mut val, provenance);
         let json = serde_json::to_string_pretty(&val)?;
         std::fs::write(case.record_into.join("result.json"), format!("{json}\n"))?;
     }
     match covers {
         Covers::WholeBattery => {
-            let json = serde_json::to_string_pretty(summary)?;
+            let mut val = serde_json::to_value(summary)?;
+            stamp(&mut val, provenance);
+            let json = serde_json::to_string_pretty(&val)?;
             std::fs::write(
                 paths.output_dir(&pass.battery).join(pass.record),
                 format!("{json}\n"),
@@ -677,6 +707,7 @@ mod tests {
         let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
         let gate = gate_at(&paths);
         let scoring = Scoring {
+            provenance: &crate::provenance::Provenance::for_test("deadbeef"),
             roles: crate::prompt::chain(paths.variant),
             resolved: &resolved,
             tree: &tree,
@@ -724,6 +755,7 @@ mod tests {
             paths,
             "B01",
             &Scoring {
+                provenance: &crate::provenance::Provenance::for_test("deadbeef"),
                 roles: crate::prompt::chain(paths.variant),
                 resolved,
                 tree,
@@ -770,6 +802,65 @@ mod tests {
             "and its translate score IS the battery headline, which is where the archive files it \
              and where analyse::report reads it"
         );
+    }
+
+    /// Every artifact a score writes names the commit that produced it.
+    ///
+    /// `provenance::harness_id` had ONE caller: the warning string in `require_reproducible` promising
+    /// "Artifacts will be stamped `<sha>-dirty`". Nothing wrote it. So `harvest-tools run all
+    /// --allow-dirty` over an edited `prompts/` tree produced a `result.json` and a `summary.json`
+    /// byte-indistinguishable from a clean run's -- the exact confusion the message claims to prevent.
+    /// `Provenance` is now obtainable only from that check and required by the writers, so the promise
+    /// is kept by the type rather than by the comment.
+    #[test]
+    fn every_artifact_a_score_writes_names_the_commit_that_produced_it() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        corpus_battery(tmp.path(), "B01", &["only"]);
+        let paths = paths_at(
+            tmp.path(),
+            crate::cli::Tool::Claude,
+            crate::cli::Variant::Combined,
+        );
+        let case = paths.case_dir("B01", "only");
+        crate_at(&case.join(Role::Translate.dir()));
+        let mut resolved = crate::eval::Resolved::new();
+        resolved.insert(
+            case.join(Role::Translate.dir()),
+            tree_of(&case.join("tree")),
+        );
+        let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
+        let passes = one_case_pass(&paths, &tree, &resolved, Covers::WholeBattery);
+
+        let per_case: HashMap<String, serde_json::Value> = [(
+            "only".to_string(),
+            serde_json::json!({"battery": "B01", "case": "only", "passed": true}),
+        )]
+        .into_iter()
+        .collect();
+        write_results(
+            &paths,
+            &passes[0],
+            &Summary::default(),
+            &per_case,
+            Covers::WholeBattery,
+            &crate::provenance::Provenance::for_test("cafe1234-dirty"),
+        )
+        .unwrap();
+
+        for at in [
+            case.join(Role::Translate.dir()).join("result.json"),
+            paths.output_dir("B01").join(HEADLINE_SUMMARY),
+        ] {
+            let doc: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&at).expect(&at.display().to_string()))
+                    .unwrap();
+            assert_eq!(
+                doc["harness"],
+                serde_json::json!("cafe1234-dirty"),
+                "{} does not name what produced it",
+                at.display()
+            );
+        }
     }
 
     fn stored_1_of_1(paths: &Paths, battery: &str) {
@@ -855,6 +946,7 @@ mod tests {
             paths,
             target,
             &Scoring {
+                provenance: &crate::provenance::Provenance::for_test("deadbeef"),
                 roles: crate::prompt::chain(paths.variant),
                 resolved: &resolved,
                 tree,
@@ -978,6 +1070,7 @@ mod tests {
             &subset,
             &HashMap::new(),
             Covers::Subset("one"),
+            &crate::provenance::Provenance::for_test("deadbeef"),
         )
         .unwrap();
         assert_eq!(
@@ -992,6 +1085,7 @@ mod tests {
             &subset,
             &HashMap::new(),
             Covers::WholeBattery,
+            &crate::provenance::Provenance::for_test("deadbeef"),
         )
         .unwrap();
         assert_eq!(
