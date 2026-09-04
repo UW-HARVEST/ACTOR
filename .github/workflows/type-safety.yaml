@@ -2,8 +2,12 @@ name: type safety
 
 # The compile-fail cases assert invariants enforced by ABSENCE of API (no `AsRef<Path>`,
 # no `path()`, no public constructor), which a refactor deletes silently. No
-# `--all-targets`: `tools/tests/integration.rs` needs the results and test-corpus
-# submodules, which this job omits to stay fork-safe and PAT-free.
+# `--all-targets` in `tests`: `tools/tests/integration.rs` needs the results and
+# test-corpus submodules, which THAT job omits to stay fork-safe and PAT-free.
+#
+# The `derived` job does take the PAT, because checking that `tables/` follows from the
+# committed results needs those results. It is separate for that reason: a fork's PR
+# still gets every type and shape gate from `tests`, and only `derived` is skipped.
 
 on:
   pull_request:
