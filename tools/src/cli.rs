@@ -1,11 +1,18 @@
 use clap::Parser;
 /// WHICH program runs an invocation.
 ///
-/// Ten variants, not eighteen. The six `claude-*` ablations were the same tool at a different
+/// Three variants, not eighteen. The six `claude-*` ablations were the same tool at a different
 /// prompt, so they are [`Variant`]s now; the three codex entries were the same tool at a different
 /// model, so they are `--model` values. Neither distinction ever belonged in this enum -- the key
 /// carries tool, model and prompt separately, so encoding two of them in the third could only make
 /// them disagree.
+///
+/// The other seven -- opencode, oneshot, kimi, c2rust, laertes, c2saferrust, smartc2rust -- are gone
+/// because not one of them ever produced a `result.json`, in `Test-Corpus` or in any other tree, while
+/// every match over this enum still had to carry an arm for each. Their cost was not the arms: opencode
+/// had a 551-line module of protections (`external_directory` deny, a compaction plugin, a 32k output
+/// cap) whose functions had no non-test caller, so the backend was launched with none of them and the
+/// doc comments said otherwise. A variant nothing runs is a variant nothing checks.
 #[derive(clap::ValueEnum, Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Tool {
     /// Claude Code.
@@ -16,20 +23,6 @@ pub enum Tool {
     /// kiro-cli. Takes `--model` like every other agent -- a comment once claimed otherwise, and
     /// because nothing passed the flag, every kiro row ever published is unattributable.
     Kiro,
-    /// OpenCode CLI; `--model <provider>/<model-id>` chooses the backend model.
-    #[value(name = "opencode", alias = "oc")]
-    OpenCode,
-    /// One-shot LLM call, no agentic loop. `--model` is its identity.
-    Oneshot,
-    /// Kimi via Bedrock, one shot.
-    Kimi,
-    /// c2rust: a transpiler. Deterministic, so nothing is gained by keying it.
-    C2rust,
-    Laertes,
-    #[value(name = "c2saferrust")]
-    C2SaferRust,
-    #[value(name = "smartc2rust")]
-    SmartC2Rust,
 }
 
 /// WHICH prompt an invocation is handed, where a tool has more than one.
@@ -79,25 +72,7 @@ pub fn tool_dir(tool: Tool) -> &'static str {
         Tool::Claude => "claude",
         Tool::Codex => "codex",
         Tool::Kiro => "kiro",
-        Tool::OpenCode => "opencode",
-        Tool::Oneshot => "oneshot",
-        Tool::Kimi => "kimi",
-        Tool::C2rust => "c2rust",
-        Tool::Laertes => "laertes",
-        Tool::C2SaferRust => "c2saferrust",
-        Tool::SmartC2Rust => "smartc2rust",
     }
-}
-
-/// Whether this tool runs an agentic loop, and so whether the store may name its runs.
-///
-/// A transpiler is deterministic and a one-shot call is cheap; neither is worth memoising, and
-/// neither has the iterating session that makes a cache entry valuable.
-pub fn is_agentic(tool: Tool) -> bool {
-    matches!(
-        tool,
-        Tool::Claude | Tool::Codex | Tool::Kiro | Tool::OpenCode
-    )
 }
 
 /// Which benchmark dataset to use.
@@ -153,11 +128,15 @@ pub struct Cli {
     /// Beside `--tool` because it is that list's budget: with three tools this is three in flight
     /// each, nine in total. `global`, so either position parses -- without it `run HB --parallel 3` is
     /// a clap error, which is how a sweep launcher died on `unexpected argument`.
-    #[arg(long, global = true, default_value_t = 1)]
-    pub parallel: usize,
+    /// `0` is refused at the flag rather than deadlocking. `Semaphore::new(0)` sets `max = 0`, so
+    /// `Pool::acquire` loops `while 0 >= 0` on a condvar only a guard could notify, and no guard can
+    /// ever exist: the sweep hung silently instead of saying what was wrong.
+    #[arg(long, global = true, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    pub parallel: u16,
 
-    /// Model id. Required for `--tool oneshot` and `opencode`, where the model IS the
-    /// identity; fixed by the tool otherwise.
+    /// Model id. `--tool codex` accepts one to reach the historical models; claude's comes from
+    /// `HARVEST_CLAUDE_MODEL` or its default, and kiro's is fixed. Every tool pins one either way --
+    /// there is no longer any way to run without a model in the key.
     #[arg(long)]
     pub model: Option<String>,
 
@@ -245,7 +224,16 @@ pub enum Command {
         action: CacheAction,
     },
     /// Backfill result.json with credits + unsafe counts (no tests, no LLM calls)
-    Enrich { target: String },
+    /// Regenerate `tables/` from the COMMITTED results, with no replay and no agent.
+    ///
+    /// The scope is derived by walking `results/` rather than produced by a run, which is what lets the
+    /// reproducibility check have one job per tool instead of one per tool plus a fourth doing all
+    /// three only so it could diff the tables. Runs in seconds, so it can gate every push instead of
+    /// living inside a forty-minute replay.
+    Tables,
+    Enrich {
+        target: String,
+    },
 }
 
 // Execution is now driven by the `Benchmark` trait (see `benchmark.rs`): one
@@ -287,6 +275,16 @@ pub enum CacheAction {
     /// Entries whose run did not complete. Recorded and never served: a failure is an entry with a
     /// non-`Completed` outcome, not a separate tree.
     Failures,
+    /// Re-hash every stored tree against the digest it is filed under. No agent invocations, so a
+    /// reproducibility check can run it on every push.
+    Verify,
+    /// Bound every transcript under `results/` to what the store can carry, keeping both ends.
+    ///
+    /// A repair for logs written before the run applied the bound itself. One runaway log makes the
+    /// whole store unpushable, so it also makes it unbankable -- and the rule lives in ONE function
+    /// (`agent_health::bound_transcript`), which is why this is a subcommand rather than a shell
+    /// one-liner that would be a second copy of it.
+    Bound,
 }
 
 impl Command {
@@ -298,7 +296,7 @@ impl Command {
     pub fn produces_artifacts(&self) -> bool {
         match self {
             // Write into results/ or tables/.
-            Command::Run { .. } | Command::Enrich { .. } => true,
+            Command::Run { .. } | Command::Enrich { .. } | Command::Tables => true,
             // Read-only introspection.
             Command::Cache { .. } => false,
         }
@@ -308,6 +306,28 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--parallel 0` must be refused BY THE FLAG, not deadlock.
+    ///
+    /// `Semaphore { max: 0 }` makes `Pool::acquire` loop `while 0 >= 0` on a condvar that only a
+    /// `SemaphoreGuard::drop` could notify, and no guard can ever be handed out: the sweep hung
+    /// silently, with `in_flight`'s `width.max(1)` spawning the one worker that then blocked for ever.
+    /// Non-vacuity: 1 and 3 must still parse, or this "passes" by rejecting everything.
+    #[test]
+    fn parallel_zero_is_refused_at_the_flag_rather_than_hanging_a_sweep() {
+        let parse = |v: &str| {
+            Cli::try_parse_from(["harvest-tools", "--parallel", v, "cache", "stats"])
+                .map(|c| c.parallel)
+        };
+        let err = parse("0").expect_err("--parallel 0 must not be accepted");
+        let text = err.to_string();
+        assert!(
+            text.contains('0') || text.to_lowercase().contains("not in"),
+            "the refusal must name the value: {text}"
+        );
+        assert_eq!(parse("1").expect("1 is legal"), 1);
+        assert_eq!(parse("3").expect("3 is legal"), 3);
+    }
 
     /// `--replay-only` is the flag `tools/reproduce.sh` relies on to be unable to spend money, so
     /// the thing under test is the MAPPING from typed flags to store mode -- not a hand-built `Mode`.

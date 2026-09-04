@@ -2,8 +2,12 @@ name: type safety
 
 # The compile-fail cases assert invariants enforced by ABSENCE of API (no `AsRef<Path>`,
 # no `path()`, no public constructor), which a refactor deletes silently. No
-# `--all-targets`: `tools/tests/integration.rs` needs the results and test-corpus
-# submodules, which this job omits to stay fork-safe and PAT-free.
+# `--all-targets` in `tests`: `tools/tests/integration.rs` needs the results and
+# test-corpus submodules, which THAT job omits to stay fork-safe and PAT-free.
+#
+# The `derived` job does take the PAT, because checking that `tables/` follows from the
+# committed results needs those results. It is separate for that reason: a fork's PR
+# still gets every type and shape gate from `tests`, and only `derived` is skipped.
 
 on:
   pull_request:
@@ -19,6 +23,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The checks that need the COMMITTED results but no replay, so they run in seconds on every push.
+  #
+  # They live here rather than in `validate-translations` because that workflow is one job per TOOL and
+  # nothing else -- it had a fourth `claude,codex,kiro` arm for forty minutes whose only unique purpose
+  # was to diff `tables/`, since an attestation was only ever produced by a run. `harvest-tools tables`
+  # derives the scope from the results tree instead, so the diff no longer needs a replay to earn it.
+  derived:
+    name: Tables and store integrity (no replay)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.SUBMODULE_PAT }}
+
+      - name: Check out the results submodule at its pin
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.SUBMODULE_PAT }}@github.com/".insteadOf "https://github.com/"
+          git submodule update --init results test-corpus
+          want=$(git ls-tree HEAD results | awk '{print $3}')
+          have=$(git -C results rev-parse HEAD)
+          echo "results: pinned $want / checked out $have"
+          [ "$want" = "$have" ] || { echo "::error::results is not at its pin"; exit 1; }
+          test -d results/.cache || { echo "::error::results/.cache is absent"; exit 1; }
+
+      - name: Install the pinned toolchain
+        run: |
+          echo "RUSTUP_TOOLCHAIN=" >> "$GITHUB_ENV"
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build harvest-tools
+        run: cargo build --release --locked --manifest-path tools/Cargo.toml
+
+      # Every stored tree must hash to the digest it is filed under. `lookup` validates only `after`, and
+      # `write` treats a `before/` directory's mere EXISTENCE as proof it is complete -- so a sweep killed
+      # mid-copy leaves a truncated tree that is then served for ever. No agent, no credentials.
+      - name: Every stored tree hashes to what it is filed under
+        run: ./tools/target/release/harvest-tools cache verify
+
+      # `tables/` must follow from the committed results ALONE. This is the check the deleted fourth
+      # replay arm existed for, at seconds instead of forty minutes -- and it runs on pushes that touch
+      # only the reporting code, which that arm did not.
+      - name: Tables are exactly what the committed results say
+        run: |
+          ./tools/target/release/harvest-tools tables
+          if ! git diff --exit-code -- tables/; then
+            echo "::error::tables/ does not follow from the committed results. Either the reporting code moved without regenerating them, or a result.json changed. The diff above is the disagreement."
+            exit 1
+          fi
+          echo "✅ all $(git ls-files tables/ | wc -l) committed table(s) follow from the committed results"
+
   tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -234,9 +291,56 @@ jobs:
         # of the HOST: this runner timed out 88 P01 cases the sweep box passes. A bare `360` would be the
         # magic constant this file already refuses twice over, and 2583 was the tree measured exactly, so
         # there was no line to spend. Measured after the edit, not plus epsilon.
+        #
+        # RAISED 2592 -> 2620 for two reproducibility defects that cost real numbers and were each
+        # invisible until documented. (1) A verify step was keyed on the results tree it had just
+        # written, so a file the seal hashes but `.gitignore` skips changed the hash in a fresh
+        # checkout: codex lost all 128 P01 cases in CI, 332/338 -> 204/338. (2) `reproduce.sh` asserted
+        # nothing was PAID FOR but never that everything was MEASURED, so the battery vanished and the
+        # per-tool arm went green. Deleting either explanation to fit a cap would leave the next reader
+        # with a bare `next_input` and no idea why output must not feed a key. Measured after the edit.
+        #
+        # RAISED 2620 -> 2653 for `make_readable`, and 2620 was again the tree measured EXACTLY. An
+        # agent left `_ref/data/noperm.txt` at `0o000` to exercise a failing open; the seal could not
+        # read it, errored the case out, and took all 42 of claude's B02_synthetic with it, because a
+        # battery scores nothing unless every case is answered. The quieter half is why the lines are
+        # worth a raise: `scrub` skips unreadable files SILENTLY, so that same file would have carried
+        # a scratch path into the key with no error anywhere. Pruned first -- the function's doc lost a
+        # line and the test's dropped from seven to two, since the incident is told once. 2653 is 2645,
+        # the tree with these nine self-counting lines in it, plus 8. Measured after the edit.
+        #
+        # RAISED 2653 -> 3090, the largest raise this block has ever recorded, for a PR that deleted
+        # 1,218 lines and documented twenty defects. The ratio is what to read here: 18.0% against a 20%
+        # ceiling, and `--max-ratio 20` is the gate that "actually stops sprawl, because density cannot be
+        # gamed by adding comments". The count rose because the tree SHRANK while the WHY grew.
+        #
+        # What the lines buy, and why deleting any of them would cost a number:
+        #   - seven `Tool` variants, one 551-line backend module, `Session::shape`, the Laertes macros,
+        #     `recorded_exit`, `exit_code` and `reseal` are GONE, and each deletion carries the
+        #     measurement that justified it -- "not one ever produced a `result.json`", "`find results
+        #     -name verification.json` returns 0", "no laertes or c2rust record in ANY tree". Delete the
+        #     measurement and the next operator restores the variant.
+        #   - `PinReport`, `Provenance`, `Sandboxing`, `Corpus`, `Publish` and the `Restored -> Readable ->
+        #     Scrubbed` witnesses each exist because a CHECK WAS DEAD or an ORDER was prose. The doc is
+        #     the only place that says which failure the type prevents: a dead `assert_pins_honoured`,
+        #     an unwritten `harness_id`, a sandbox policy two of three backends never read, a seal that
+        #     scrubbed after digesting.
+        #   - nine error sites now handle by kind, and each names what the collapsed value published:
+        #     `0/0` vectors, `Builds: no` against seven crates that compiled, a follower graded against
+        #     another configuration's vectors, a row that vanished from a table that reported success.
+        # These are the numbers that were WRONG IN PRINT or would have been. A commit message nobody
+        # greps is evidence lost -- the same argument the 3320 -> 3470 raise made, and it held.
+        #
+        # 3090 is 3074, the tree with this PR and these twenty-six self-counting lines in it, plus 16.
+        # Measured after the last edit -- and re-measured TWICE, because the first number predated six
+        # mutation-tested regression tests and the second predated `KEEP_WHOLE_BYTES`, whose comment is
+        # the measured distribution (1,783 transcripts, median 111 KB, max 18.3 MB) that makes 64 MiB a
+        # derived number rather than a guess.
+        # THIS IS A DEBT: the next PR prunes or raises deliberately, and the tree is now small enough
+        # that a pass over the oldest blocks should bring it down.
         run: |
           python3 tools/test_comment_budget.py
-          python3 tools/comment_budget.py --max-comments 2592 --max-ratio 20
+          python3 tools/comment_budget.py --max-comments 3090 --max-ratio 20
 
       - name: Lint
         # The [lints] table in tools/Cargo.toml supplies the flags. `clippy::panic` is

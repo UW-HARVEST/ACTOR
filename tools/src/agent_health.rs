@@ -12,6 +12,27 @@ use std::path::{Path, PathBuf};
 /// KB of final prose.
 const TAIL_BYTES: u64 = 16 * 1024;
 
+/// The `init` record is the first line, and it is what proves the model pin.
+const HEAD_BYTES: u64 = 64 * 1024;
+
+/// The largest transcript that is kept whole, and the two halves kept of a larger one.
+///
+/// A transcript is EVIDENCE and the store keeps it, so its size is a property of the repository, not
+/// only of the host. `AGENT_FSIZE_BLOCKS` caps what an agent may write at 4 GiB, which protects the box
+/// -- and protects nothing else: GitHub refuses any file over 100 MB, so ONE runaway log makes the whole
+/// store unpushable, which makes it unbankable, which means no reproducibility check can ever pass
+/// again. Measured when that happened: kiro's `B02_synthetic/tu_linkage` verify wrote **672 MB** on a
+/// synthetic case, and the push was rejected by GitHub's pre-receive hook.
+///
+/// 64 MiB is chosen from the distribution, not picked: over 1,783 stored transcripts the median is
+/// 111 KB, p99 is 2.9 MB and the MAXIMUM is 18.3 MB. So no transcript this corpus has ever produced is
+/// touched, and 64 MiB still leaves a third of GitHub's limit spare.
+///
+/// Head AND tail, because the two things anything reads sit at opposite ends: the `init` record proves
+/// the model pin, and the terminal record carries the outcome and the cost. The elision is written into
+/// the file, with the original size, so a reader is never left to wonder.
+const KEEP_WHOLE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Classify a run after the fact, from its transcript and the exit it recorded.
 ///
 /// `format` is a parameter and never assumed: [`crate::runners::log_format`] is the ONE
@@ -48,49 +69,10 @@ pub fn classify_log(log: &Path, format: LogFormat, exit: Exit) -> Health {
     }
 }
 
-fn read_metrics(metrics_json: &Path) -> Option<serde_json::Value> {
-    serde_json::from_str(&std::fs::read_to_string(metrics_json).ok()?).ok()
-}
-
-/// Report-only detail. Deliberately not a classifier: see the docs on
-/// [`crate::domain::health`] and `SIGXFSZ`.
-pub fn exit_code(metrics_json: &Path) -> Option<i64> {
-    read_metrics(metrics_json)?.get("exit_code")?.as_i64()
-}
-
-/// How the agent process ended, as the run itself recorded it beside the transcript: for a
-/// [`LogFormat::Opaque`] backend it is the gate's only sight of a wall-clock kill, which is
-/// `Infra { "timeout" }` and not a result. No record stays [`Exit::Unobserved`] rather than getting a
-/// verdict nobody observed — and since the store records the outcome, nothing writes these any more.
-pub fn recorded_exit(metrics_json: &Path) -> Exit {
-    let Some(metrics) = read_metrics(metrics_json) else {
-        return Exit::Unobserved;
-    };
-    // Both keys are written or neither, and a null `exit_code` is a real observation of a
-    // signal kill — so presence, not parseability, says it was watched.
-    let Some(code) = metrics.get("exit_code") else {
-        return Exit::Unobserved;
-    };
-    let code = code.as_i64();
-    let timed_out = metrics.get("timed_out").and_then(|t| t.as_bool());
-    // `timeout` exits 124; records written before `timed_out` existed carry only the code.
-    if timed_out == Some(true) || code == Some(124) {
-        return Exit::Timeout;
-    }
-    match code {
-        Some(0) => Exit::Success,
-        Some(c) => Exit::Failure {
-            code: i32::try_from(c).ok(),
-        },
-        None => Exit::Failure { code: None },
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct CaseHealth {
     pub name: String,
     pub health: Health,
-    pub exit_code: Option<i64>,
     pub log: PathBuf,
 }
 
@@ -99,25 +81,32 @@ pub struct Run {
     pub case_dir: PathBuf,
 }
 
-/// Classify each run in the ROSTER, preferring the verify log where both exist. A roster and not a root
-/// to recurse from: `audit(paths.results_dir, ..)` refused B01_synthetic with all 85 cases fresh, for
-/// 27 dead runs in other batteries. One `format`, because a roster is agent-scoped.
+/// Classify each run in the ROSTER from its TRANSCRIPT, preferring the verify log where both exist. A
+/// roster and not a root to recurse from: `audit(paths.results_dir, ..)` refused B01_synthetic with all
+/// 85 cases fresh, for 27 dead runs in other batteries. One `format`, because a roster is agent-scoped.
+///
+/// [`Exit::Unobserved`], stated once and here: this runs AFTER the process is gone, so there is no exit
+/// to observe. It used to read `<phase>/{verification,translation}.json` for one -- files nothing in
+/// this crate has ever written (`find results -name verification.json` returns 0), so every call
+/// already passed `Unobserved` while two functions and a `CaseHealth.exit_code` field maintained the
+/// appearance of a second source of evidence. The authoritative record is the store's
+/// `AgentRecord.outcome`, classified at run time WITH the observed exit; this gate is a backstop over
+/// published transcripts and says so.
 pub fn audit(runs: &[Run], format: LogFormat) -> Vec<CaseHealth> {
     let mut out = Vec::new();
     for run in runs {
         let verify = run.case_dir.join("verified/logs/verify.log");
         let translate = run.case_dir.join("translated/logs/translation.log");
-        let (log, metrics) = if verify.is_file() {
-            (verify, run.case_dir.join("verified/verification.json"))
+        let log = if verify.is_file() {
+            verify
         } else if translate.is_file() {
-            (translate, run.case_dir.join("translated/translation.json"))
+            translate
         } else {
             continue;
         };
         out.push(CaseHealth {
             name: run.name.clone(),
-            health: classify_log(&log, format, recorded_exit(&metrics)),
-            exit_code: exit_code(&metrics),
+            health: classify_log(&log, format, Exit::Unobserved),
             log,
         });
     }
@@ -186,11 +175,7 @@ pub fn describe_infra_failures(audit: &[CaseHealth]) -> Option<String> {
     );
     for c in bad.iter().take(30) {
         if let Health::Infra { detail, .. } = &c.health {
-            let ec = c
-                .exit_code
-                .map(|e| format!(" exit={e}"))
-                .unwrap_or_default();
-            s.push_str(&format!("  {}{ec}\n     {detail}\n", c.name));
+            s.push_str(&format!("  {}\n     {detail}\n", c.name));
         }
     }
     if bad.len() > 30 {
@@ -214,7 +199,6 @@ pub fn record_infra_failures(results_dir: &Path, audit: &[CaseHealth]) -> Result
                 "case": c.name,
                 "reason": reason,
                 "detail": detail,
-                "exit_code": c.exit_code,
                 "log": c.log.to_string_lossy(),
             })
         })
@@ -251,9 +235,159 @@ pub(crate) fn read_tail(path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// The first [`HEAD_BYTES`] of a transcript, for the one record that sits at the start.
+///
+/// `assert_pins_honoured` used `read_to_string`, so checking a model pin allocated the WHOLE
+/// transcript -- 672 MB for the runaway that motivated [`KEEP_WHOLE_BYTES`], on a check that only ever
+/// looks at the first line.
+pub(crate) fn read_head(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    std::io::Read::take(f, HEAD_BYTES).read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// What replaces the elided middle. Its length is FIXED for a given original size, so
+/// [`bound_transcript`] can subtract it from the budget and leave the result at most the cap.
+fn marker_for(was: u64) -> String {
+    format!(
+        "\n\n=== harvest-tools elided the middle of this transcript: it was {was} bytes, above the {} \
+         the store can carry. Both ends are kept, which is where the init record and the terminal \
+         record are. ===\n\n",
+        KEEP_WHOLE_BYTES
+    )
+}
+
+/// Bound a transcript to something the store can carry, keeping both ends. Returns whether it elided.
+///
+/// Called once, after the agent exits and BEFORE anything reads the file, so the published copy and the
+/// `run.log` in the entry are the same bytes. See `KEEP_WHOLE_BYTES` for why a host-level `ulimit`
+/// does not cover this.
+pub fn bound_transcript(log: &Path) -> Result<bool> {
+    let len = match std::fs::metadata(log) {
+        Ok(m) => m.len(),
+        // No transcript is a case the classifier already reports; it is not this function's business.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("sizing {}", log.display())),
+    };
+    if len <= KEEP_WHOLE_BYTES {
+        return Ok(false);
+    }
+    // The marker is part of the budget, so the RESULT is at most the cap and a second call is a no-op.
+    // It was `KEEP_WHOLE_BYTES / 2` per half, which put the output a marker's length OVER the cap --
+    // so every later `cache bound` re-bounded the same file and shaved it again. Observed: the same two
+    // transcripts elided twice, hours apart. A repair that is not idempotent erodes the evidence it is
+    // supposed to preserve, and commits a fresh blob each time it runs.
+    let marker = marker_for(len);
+    let half = (KEEP_WHOLE_BYTES - marker.len() as u64) / 2;
+    let head = {
+        use std::io::Read;
+        let f = std::fs::File::open(log)?;
+        let mut buf = Vec::new();
+        std::io::Read::take(f, half).read_to_end(&mut buf)?;
+        buf
+    };
+    let tail = {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(log)?;
+        f.seek(SeekFrom::Start(len - half))?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        buf
+    };
+    let mut out = head;
+    out.extend_from_slice(marker.as_bytes());
+    out.extend_from_slice(&tail);
+    std::fs::write(log, &out).with_context(|| format!("bounding {}", log.display()))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A runaway transcript must not make the store unpushable, and both ends must survive.
+    ///
+    /// `AGENT_FSIZE_BLOCKS` caps what an agent writes at 4 GiB, which protects the HOST and nothing
+    /// else: GitHub refuses any file over 100 MB, so one runaway log makes the whole store unpushable --
+    /// unbankable -- and no reproducibility check can pass again. Measured: kiro's
+    /// `B02_synthetic/tu_linkage` verify wrote 672 MB on a synthetic case and the push was rejected by
+    /// GitHub's pre-receive hook.
+    ///
+    /// The two ends are what anything reads: the `init` record proves the model pin, the terminal record
+    /// carries the outcome and the cost. Non-vacuity: a transcript at the observed maximum (18.3 MB) is
+    /// left byte-identical, so this cannot pass by truncating everything.
+    #[test]
+    fn a_runaway_transcript_is_bounded_at_both_ends_and_a_normal_one_is_untouched() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+
+        // Nothing this corpus has ever produced may be touched: max observed is 18.3 MB.
+        let normal = tmp.path().join("normal.log");
+        let init = r#"{"type":"system","subtype":"init","model":"global.anthropic.claude-opus-5[1m]","claude_code_version":"2.1.235"}"#;
+        let body = format!("{init}\n{}\n{CLEAN}\n", "x".repeat(1024 * 1024));
+        std::fs::write(&normal, &body).unwrap();
+        assert!(
+            !bound_transcript(&normal).unwrap(),
+            "a normal log must not be elided"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&normal).unwrap(),
+            body,
+            "and must be byte-identical"
+        );
+
+        // A runaway: the two records at the ends, megabytes of repetition between them.
+        let runaway = tmp.path().join("runaway.log");
+        let filler = "R".repeat(1024 * 1024);
+        let mut huge = String::with_capacity(70 * 1024 * 1024);
+        huge.push_str(init);
+        huge.push('\n');
+        for _ in 0..70 {
+            huge.push_str(&filler);
+            huge.push('\n');
+        }
+        huge.push_str(CLEAN);
+        huge.push('\n');
+        let was = huge.len();
+        std::fs::write(&runaway, &huge).unwrap();
+        assert!(
+            was > 64 * 1024 * 1024,
+            "the fixture must exceed the cap, or nothing is tested"
+        );
+
+        assert!(
+            bound_transcript(&runaway).unwrap(),
+            "a runaway must be elided"
+        );
+        let after = std::fs::read_to_string(&runaway).unwrap();
+        assert!(
+            (after.len() as u64) < KEEP_WHOLE_BYTES + 1024,
+            "still {} bytes, so the store still cannot carry it",
+            after.len()
+        );
+        assert!(
+            after.contains("elided"),
+            "the elision must say so in the file"
+        );
+        assert!(
+            after.contains(&was.to_string()),
+            "and record the original size"
+        );
+        // The two records anything reads, at opposite ends, both survive.
+        assert!(
+            after.starts_with(init),
+            "the init record proves the model pin"
+        );
+        assert!(
+            classify(
+                &read_tail(&runaway).unwrap(),
+                LogFormat::StreamJson,
+                Exit::Unobserved
+            ) == Health::Completed,
+            "the terminal record must still classify, or the outcome is lost"
+        );
+    }
 
     /// Verbatim shape of a real credential-expiry terminal record.
     const DEAD: &str = r#"{"type":"system","subtype":"api_retry","attempt":4,"error_status":403}
@@ -302,22 +436,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn audit_reads_exit_code_as_corroboration_only() {
-        let tmp = crate::io::workdir::test_tempdir().unwrap();
-        let case = tmp.path().join("hb/jansson");
-        write(&case, "verified/logs/verify.log", DEAD);
-        std::fs::write(
-            case.join("verified/verification.json"),
-            r#"{"exit_code":1,"success":true,"duration_secs":4569}"#,
-        )
-        .unwrap();
-        let a = audit(&roster(tmp.path(), &["hb/jansson"]), LogFormat::StreamJson);
-        assert_eq!(a[0].exit_code, Some(1));
-        // `success:true` here is the cargo-check gate, NOT agent health.
-        assert!(a[0].health.is_infra());
-    }
-
     /// Making translate's four log paths one function of the phase put the prose and docker
     /// transcripts under `translated/logs/` where the audit finds them. Reading them as
     /// stream-json calls every healthy laertes/c2saferrust/kimi/oneshot run
@@ -358,89 +476,40 @@ mod tests {
     /// `Exit::Unobserved` made `Unknown` their only possible verdict, and both consumers of the
     /// gate filter on `is_infra` — so it could not fire for them at all, no INFRA_FAILURES.json
     /// was written, and a run killed at three hours was scored as a result.
+    /// A wall-clock kill is the SAME outcome whichever backend it happened to.
+    ///
+    /// `Exit::Exhausted` used to be consumed only by the `Opaque` arm, because `classify_stream_json`
+    /// and `classify_codex_json` never received `exit` -- so one `timeout` kill of a session that was
+    /// still writing was `Exhausted` for kiro and `Infra { "truncated" }` for claude and codex.
+    /// `Infra` is transient, so the identical event was retried three times for two backends and
+    /// recorded as a terminal answer for the third. Which backend it was cannot be what decides.
+    ///
+    /// This replaces a test that hand-wrote `<phase>/translation.json` fixtures. Nothing in this crate
+    /// has ever written that file -- `find results -name translation.json` returns 0 -- so it proved
+    /// only that the classifier reads a shape no run produces. `audit` now says in one place that it
+    /// has no exit to observe, and the authoritative record is the store's `AgentRecord.outcome`,
+    /// classified here at run time WITH the exit.
     #[test]
-    fn a_wall_clock_killed_opaque_run_is_an_infra_failure() {
-        let tmp = crate::io::workdir::test_tempdir().unwrap();
-        // One transcript shape for all three cases, so only the recorded exit can tell them
-        // apart — which is the whole claim under test.
-        for case in ["HB/jansson", "HB/mujs", "HB/zlib"] {
-            write(
-                &tmp.path().join(case),
-                "translated/logs/translation.log",
-                KIRO_KILLED,
+    fn a_wall_clock_kill_is_exhausted_for_every_backend_not_just_the_opaque_one() {
+        for format in [
+            LogFormat::StreamJson,
+            LogFormat::CodexJson,
+            LogFormat::Opaque,
+        ] {
+            assert!(
+                matches!(
+                    crate::domain::health::classify(KIRO_KILLED, format, Exit::Exhausted),
+                    Health::Exhausted { .. }
+                ),
+                "{format:?} calls an exhausted session something else"
             );
         }
-        for (case, record) in [
-            // Killed at the wall clock: `timeout` exits 124.
-            (
-                "HB/jansson",
-                r#"{"exit_code":124,"timed_out":true,"success":false,"duration_secs":10800}"#,
-            ),
-            (
-                "HB/mujs",
-                r#"{"exit_code":0,"timed_out":false,"success":true,"duration_secs":912}"#,
-            ),
-            // A backend that records no exit at all.
-            ("HB/zlib", r#"{"success":false,"duration_secs":10800}"#),
-        ] {
-            std::fs::write(
-                tmp.path().join(case).join("translated/translation.json"),
-                record,
-            )
-            .unwrap();
-        }
-
-        let a = audit(
-            &roster(tmp.path(), &["HB/jansson", "HB/mujs", "HB/zlib"]),
-            LogFormat::Opaque,
-        );
-        let health = |name: &str| {
-            a.iter()
-                .find(|c| c.name == name)
-                .unwrap_or_else(|| panic!("{name} not audited"))
-                .health
-                .clone()
-        };
-        match health("HB/jansson") {
-            Health::Infra { reason, detail } => {
-                assert_eq!(reason, "timeout");
-                assert!(detail.contains("wall clock"), "{detail}");
-            }
-            other => panic!("a run killed at the wall clock has no measurement: {other:?}"),
-        }
+        // Non-vacuity: without the observed exit, a truncated transcript is still infra for the two
+        // JSON formats, so the assertion above is about the EXIT and not about the text.
         assert!(
-            !health("HB/mujs").is_infra(),
-            "a run watched to a clean exit has a measurement: {:?}",
-            health("HB/mujs")
-        );
-        assert!(
-            !health("HB/zlib").is_infra(),
-            "an unrecorded exit is no evidence of failure: {:?}",
-            health("HB/zlib")
-        );
-
-        let msg = describe_infra_failures(&a).expect("the gate must fire for an opaque backend");
-        assert!(msg.contains("1 of 3"), "counts: {msg}");
-        assert!(msg.contains("HB/jansson"), "names the case: {msg}");
-        record_infra_failures(tmp.path(), &a).unwrap();
-        let doc: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp.path().join("INFRA_FAILURES.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(doc["infra_failures"], serde_json::json!(1));
-        assert_eq!(doc["cases"][0]["case"], serde_json::json!("HB/jansson"));
-        assert_eq!(doc["cases"][0]["exit_code"], serde_json::json!(124));
-
-        // The fixture is the transcript the hardcoded stream-json reading called
-        // `Infra { "truncated" }`: the killed run is still blocked — now on the evidence rather
-        // than on a misread — and its two healthy neighbours no longer with it.
-        let as_stream_json = audit(
-            &roster(tmp.path(), &["HB/jansson", "HB/mujs", "HB/zlib"]),
-            LogFormat::StreamJson,
-        );
-        assert!(
-            as_stream_json.iter().all(|c| c.health.is_infra()),
-            "fixture must trip the hardcoded classifier, or this proves nothing: {as_stream_json:?}"
+            crate::domain::health::classify(KIRO_KILLED, LogFormat::StreamJson, Exit::Unobserved)
+                .is_infra(),
+            "an unobserved truncated stream-json log must still be infra"
         );
     }
 

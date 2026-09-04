@@ -254,7 +254,13 @@ pub fn discover(corpus_dir: &Path, battery_name: &str, filter: Option<&str>) -> 
 fn build_config(input_dir: &Path, name: &str) -> Result<Config> {
     let is_lib = name.ends_with("_lib");
     let lib_name = extract_lib_name(input_dir, name);
-    let features = extract_features(input_dir, name).unwrap_or_default();
+    // `?`, not `unwrap_or_default()`, in a function that already returns `Result`. An empty feature
+    // list is not the same answer as "the presets file would not parse": `resolve_features` then
+    // yields nothing, the `if !resolved.is_empty()` guard skips `set_default_features`, and the
+    // follower keeps the LEADER's features -- built as one configuration and graded against another's
+    // vectors. `extract_features_from_path` already returns `Ok(vec![])` for an ABSENT file, so the
+    // only thing this was hiding was a malformed one.
+    let features = extract_features(input_dir, name)?;
     Ok(Config {
         name: name.to_string(),
         features,
@@ -439,9 +445,6 @@ pub struct AgentRunMeta {
     pub terminal_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_error_status: Option<i64>,
-    /// Process exit status, from the sibling `verification.json` / `translation.json`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i64>,
 
     // ── effort and cost ─────────────────────────────────────────────────────
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -537,18 +540,6 @@ fn extract_stream_json_meta(log_path: &Path) -> Option<AgentRunMeta> {
         }
     }
 
-    // Written beside the log by agents::run::write_phase_metrics.
-    m.exit_code = log_path
-        .parent()
-        .and_then(|logs| logs.parent())
-        .and_then(|phase| {
-            ["verification.json", "translation.json"]
-                .iter()
-                .map(|f| phase.join(f))
-                .find(|p| p.is_file())
-        })
-        .and_then(|p| crate::agent_health::exit_code(&p));
-
     if found {
         Some(m)
     } else {
@@ -613,8 +604,9 @@ pub struct Paths {
     /// KEPT, not merely used to derive the dirs above: a step's wall-clock ceiling depends on it, and
     /// recovering it from `results_dir`'s spelling would be a string where a type belongs.
     pub dataset: Dataset,
-    /// What the agent will be asked for. `None` only where a backend runs no model.
-    pub model: Option<crate::store::ModelId>,
+    /// What the agent will be asked for. Not `Option`: every remaining tool pins a model, so
+    /// "this run has no model" -- which once named 338 rows `kiro/unpinned` -- cannot be spelled.
+    pub model: crate::store::ModelId,
     /// A required parameter of `new` rather than a default, so the compiler names every construction
     /// site that would otherwise silently get read-write caching.
     pub cache_mode: crate::store::Mode,
@@ -649,10 +641,7 @@ impl Paths {
         // being the same tool at the same model.
         let results_dir = results_root
             .join(crate::cli::tool_dir(tool))
-            .join(match &model {
-                Some(m) => crate::store::model_dir(m.as_str()),
-                None => "none".to_string(),
-            })
+            .join(crate::store::model_dir(model.as_str()))
             .join(variant.dir());
         Ok(Self {
             repo_root: repo_root.to_path_buf(),
@@ -709,7 +698,7 @@ mod tests {
             )
             .unwrap()
         };
-        let tools = [Tool::Claude, Tool::Codex, Tool::Kiro, Tool::OpenCode];
+        let tools = [Tool::Claude, Tool::Codex, Tool::Kiro];
         let results: Vec<_> = tools.iter().map(|t| paths_for(*t).results_dir).collect();
         let unique: std::collections::BTreeSet<_> = results.iter().collect();
         assert_eq!(
@@ -962,13 +951,7 @@ mod provenance_tests {
         assert!(m.model.is_none());
         assert!(m.tokens.is_none());
         let json = serde_json::to_string(&m).unwrap();
-        for k in [
-            "total_cost_usd",
-            "model",
-            "tokens",
-            "num_turns",
-            "exit_code",
-        ] {
+        for k in ["total_cost_usd", "model", "tokens", "num_turns"] {
             assert!(
                 !json.contains(k),
                 "{k} must be omitted, not zero-valued: {json}"
@@ -999,23 +982,6 @@ mod provenance_tests {
         assert_eq!(m.api_error_status, Some(403));
         assert!((m.total_cost_usd.unwrap() - 90.00792925).abs() < 1e-9);
         assert_eq!(m.num_turns, Some(193));
-    }
-
-    #[test]
-    fn exit_code_is_read_from_the_sibling_metrics_file() {
-        let tmp = crate::io::workdir::test_tempdir().unwrap();
-        let p = log(tmp.path(), &format!("{INIT}\n{DEAD}\n"));
-        std::fs::write(
-            tmp.path().join("verified/verification.json"),
-            r#"{"exit_code":1,"success":true,"duration_secs":4569}"#,
-        )
-        .unwrap();
-        let m = extract_agent_meta(&p).unwrap();
-        assert_eq!(
-            m.exit_code,
-            Some(1),
-            "already on disk, previously read by nothing"
-        );
     }
 
     #[test]

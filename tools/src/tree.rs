@@ -49,11 +49,16 @@ pub(crate) fn is_cmake_build_dir(dir: &Path) -> bool {
 
 /// Deterministic digest over the `StoreAndHash` files of a tree. Ported from
 /// `harvest_core::fs::hash_dir`, plus a classification filter and the length prefixing above.
-pub(crate) fn digest_tree(root: &Path) -> Result<TreeDigest> {
+///
+/// PRIVATE to this module, and reached only through [`Scrubbed`]. That is what makes the seal's
+/// restore -> widen -> scrub -> digest order a compile-time property instead of a comment: there is no
+/// other door, so a digest taken over an unscrubbed tree -- every key a per-run nonce -- cannot be
+/// written from anywhere in the crate.
+fn digest_tree(root: &Path) -> Result<TreeDigest> {
     hash_tree(root, &|d| d == Disposition::StoreAndHash)
 }
 
-pub(crate) fn hash_tree(root: &Path, admits: &dyn Fn(Disposition) -> bool) -> Result<TreeDigest> {
+fn hash_tree(root: &Path, admits: &dyn Fn(Disposition) -> bool) -> Result<TreeDigest> {
     let mut files: std::collections::BTreeMap<RelPath, PathBuf> = Default::default();
     visit(root, root, false, admits, &mut |rel, abs| {
         files.insert(rel.clone(), abs.to_path_buf());
@@ -213,13 +218,37 @@ pub(crate) fn visit(
 pub const C_SRC: &str = crate::domain::contents::C_ORACLE_DIR;
 pub const TRANSLATION: &str = crate::domain::contents::TRANSLATION_DIR;
 
+/// The PINNED C a case is translated from, checked once where it is derived.
+///
+/// A newtype because every function that touches a working dir took a bare `&Path` for it, and the
+/// C reference is the one path whose substitution is SILENT: `seal` restores `c_src/` from it, so a
+/// results directory or a scratch dir passed here would be hashed into the key as though it were the
+/// corpus, and the entry would look ordinary. `Roots` (`io/workdir.rs`) is the same move, made after
+/// a transposed root produced keys no second machine could reproduce.
+#[derive(Clone, Debug)]
+pub struct Corpus(PathBuf);
+
+impl Corpus {
+    /// The one construction point. Existence is checked HERE rather than at the first copy, so a
+    /// missing corpus refuses before a scratch tree is cut for it.
+    pub fn at(dir: impl Into<PathBuf>) -> Result<Self> {
+        let dir = dir.into();
+        anyhow::ensure!(
+            dir.is_dir(),
+            "no C reference at {} -- a working dir cannot be laid out without one",
+            dir.display()
+        );
+        Ok(Self(dir))
+    }
+}
+
 /// A directory an agent may run in.
 ///
 /// Remembers the corpus its C came from, so [`Self::seal`] restores from the SAME reference the
 /// agent was given: a caller free to pass another at seal time could swap the oracle silently.
 pub struct WorkDir {
     root: PathBuf,
-    corpus_c: PathBuf,
+    corpus_c: Corpus,
     /// Shared, so N cases can be cut from one scratch root rather than N, and held so the
     /// directory outlives every path taken from it.
     _scratch: std::sync::Arc<tempfile::TempDir>,
@@ -227,25 +256,24 @@ pub struct WorkDir {
 
 impl WorkDir {
     /// The first work dir of a chain: the C from the corpus, an empty translation.
-    pub fn assemble(corpus_c: &Path) -> Result<Self> {
+    pub fn assemble(corpus_c: &Corpus) -> Result<Self> {
         let scratch = std::sync::Arc::new(crate::io::workdir::tempdir("harvest-work-")?);
         let root = scratch.path().to_path_buf();
         Self::lay_out(&root, corpus_c)?;
         std::fs::create_dir_all(root.join(TRANSLATION))?;
         Ok(Self {
             root,
-            corpus_c: corpus_c.to_path_buf(),
+            corpus_c: corpus_c.clone(),
             _scratch: scratch,
         })
     }
 
-    fn lay_out(root: &Path, corpus_c: &Path) -> Result<()> {
-        anyhow::ensure!(
-            corpus_c.is_dir(),
-            "no C reference at {} -- a working dir cannot be laid out without one",
-            corpus_c.display()
-        );
-        copy_carrying(corpus_c, &root.join(C_SRC))
+    fn lay_out(root: &Path, corpus_c: &Corpus) -> Result<()> {
+        // The field, not an accessor: `Corpus` hands its location to nobody. The only reader is this
+        // copy, in the same module, and a `pub(crate) fn as_path` was still a path escape the
+        // architecture gate refused -- rightly, since a caller holding it could run a command in the
+        // pinned corpus.
+        copy_carrying(&corpus_c.0, &root.join(C_SRC))
     }
 
     /// Where the agent runs.
@@ -258,23 +286,117 @@ impl WorkDir {
         self.root.join(TRANSLATION)
     }
 
-    /// RESTORE, SCRUB, DIGEST -- the three steps that used to hide inside one `seal`. The restore
-    /// is why no tamper check is needed: the agent may do what it likes to `c_src/`, and the tree
-    /// that is hashed, stored and handed on always holds the corpus's C.
+    /// RESTORE, WIDEN, SCRUB, DIGEST -- and the ORDER IS TYPED, not commented.
+    ///
+    /// Each step consumes the previous step's witness, so the sequence cannot be reordered or a step
+    /// dropped without the compiler objecting. It was four statements in a row whose order was
+    /// load-bearing and enforced by prose: "Must precede any digest" on `scrub`, and nothing at all on
+    /// the widening. Both matter. A digest taken before the scrub carries the scratch directory's
+    /// random name, so every key is a nonce; a scrub taken before the widening SILENTLY SKIPS what it
+    /// cannot read, so an agent's own `0o000` fixture reaches the digest unrewritten.
+    ///
+    /// The restore is why no tamper check is needed: the agent may do what it likes to `c_src/`, and
+    /// the tree that is hashed, stored and handed on always holds the corpus's C.
     pub fn seal(self) -> Result<Tree> {
+        let digest = self.restore()?.widen()?.scrub()?.digest()?;
+        Ok(Tree {
+            digest,
+            at: self.root,
+            _scratch: Some(self._scratch),
+        })
+    }
+
+    fn restore(&self) -> Result<Restored<'_>> {
         std::fs::remove_dir_all(self.root.join(C_SRC)).or_else(|e| {
             (e.kind() == std::io::ErrorKind::NotFound)
                 .then_some(())
                 .ok_or(e)
         })?;
         Self::lay_out(&self.root, &self.corpus_c)?;
-        scrub(&self.root)?;
-        Ok(Tree {
-            digest: digest_tree(&self.root)?,
-            at: self.root,
-            _scratch: Some(self._scratch),
-        })
+        Ok(Restored(&self.root))
     }
+}
+
+/// `c_src/` is the corpus's again, whatever the agent did to it.
+struct Restored<'a>(&'a Path);
+/// Every file the digest will read can be read. See [`widen`].
+struct Readable<'a>(&'a Path);
+/// No absolute path from this run survives in any hashed file. See [`scrub`].
+struct Scrubbed<'a>(&'a Path);
+
+impl<'a> Restored<'a> {
+    fn widen(self) -> Result<Readable<'a>> {
+        widen(self.0)?;
+        Ok(Readable(self.0))
+    }
+}
+
+impl<'a> Readable<'a> {
+    fn scrub(self) -> Result<Scrubbed<'a>> {
+        scrub(self.0)?;
+        Ok(Scrubbed(self.0))
+    }
+}
+
+impl Scrubbed<'_> {
+    /// The ONLY way to obtain a digest of a tree on disk.
+    ///
+    /// A stored tree is the one legitimate exception, and it says so by name -- see
+    /// [`Scrubbed::already_stored`].
+    fn digest(&self) -> Result<TreeDigest> {
+        digest_tree(self.0)
+    }
+
+    /// A tree the store already holds: scrubbed and widened when it was WRITTEN, and read-only since.
+    /// Named for what it asserts, so the exception is visible at the call site rather than being a
+    /// second unlabelled door into `digest_tree`.
+    fn already_stored(at: &Path) -> Scrubbed<'_> {
+        Scrubbed(at)
+    }
+}
+
+/// Widen permissions on what the seal is about to read. Reached only through [`Restored::widen`]. Agents leave files unreadable ON PURPOSE --
+/// `static-vars-fpts` left `_ref/data/noperm.txt` at `0o000` to exercise a failing open -- and one
+/// breaks both steps below: `digest_tree` fails the case with EACCES, voiding all 42 of claude's
+/// B02_synthetic, and `scrub` SILENTLY skips what it cannot read, so an unscrubbed scratch path
+/// reaches the digest as a per-run nonce. No key moves: the digest feeds paths and bytes, not modes.
+///
+/// Its own walk, though `visit` is THE traversal elsewhere: `visit` must `read_dir` a directory to
+/// reach what is beneath it, so an unreadable DIRECTORY defeats it before it can emit -- the
+/// condition being repaired. Drift from its pruning is harmless: widening a file the digest ignores
+/// costs nothing, and one this skips is one nothing reads.
+fn widen(root: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fn walk(root: &Path, dir: &Path) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Ok(Ok(rel)) = path.strip_prefix(root).map(RelPath::new) else {
+                continue;
+            };
+            if classify(&rel, false) == Disposition::BuildOutput {
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(&path)?;
+            // chmod follows symlinks, so widening one would widen a target outside this tree.
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let is_dir = meta.is_dir();
+            let mode = meta.permissions().mode() & 0o777;
+            // Writable too, not merely readable: `scrub` rewrites the files it finds a path in.
+            let want = mode | if is_dir { 0o700 } else { 0o600 };
+            if want != mode {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(want))
+                    .with_context(|| format!("widening permissions on {}", path.display()))?;
+            }
+            if is_dir {
+                walk(root, &path)?;
+            }
+        }
+        Ok(())
+    }
+    walk(root, root).with_context(|| format!("widening permissions under {}", root.display()))
 }
 
 /// Rewrite per-run absolute paths to a stable token, so a digest of agent output does not change
@@ -346,7 +468,7 @@ impl Tree {
     /// corrupt -- which is the check the whole design rests on, since a `before` that no longer
     /// reproduces its own name cannot be re-keyed.
     pub(crate) fn adopt_stored(at: PathBuf, recorded: &str) -> Result<Self> {
-        let digest = digest_tree(&at)?;
+        let digest = Scrubbed::already_stored(&at).digest()?;
         anyhow::ensure!(
             digest.as_str() == recorded,
             "the stored tree at {} hashes to {digest:?} but its entry records {recorded}",
@@ -370,7 +492,7 @@ impl Tree {
     #[cfg(test)]
     pub(crate) fn for_test(at: &Path) -> Result<Self> {
         Ok(Self {
-            digest: digest_tree(at)?,
+            digest: Scrubbed::already_stored(at).digest()?,
             at: at.to_path_buf(),
             _scratch: None,
         })
@@ -390,14 +512,14 @@ impl Tree {
 
     /// A fresh working dir holding this tree's bytes. `corpus_c` is stated rather than remembered
     /// because a stored tree does not know which corpus it came from.
-    pub fn materialise(&self, corpus_c: &Path) -> Result<WorkDir> {
+    pub fn materialise(&self, corpus_c: &Corpus) -> Result<WorkDir> {
         let scratch = std::sync::Arc::new(crate::io::workdir::tempdir("harvest-work-")?);
         let root = scratch.path().to_path_buf();
         copy_carrying(&self.at, &root)?;
         std::fs::create_dir_all(root.join(TRANSLATION))?;
         Ok(WorkDir {
             root,
-            corpus_c: corpus_c.to_path_buf(),
+            corpus_c: corpus_c.clone(),
             _scratch: scratch,
         })
     }
@@ -429,13 +551,49 @@ mod tests {
 
     /// A corpus C reference: two files, one of them a `.bak` that only hashes because
     /// `is_ignored` exempts everything under `c_src/`.
-    fn corpus() -> (tempfile::TempDir, PathBuf) {
+    fn corpus() -> (tempfile::TempDir, Corpus) {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
-        let c = tmp.path().join("test_case");
-        std::fs::create_dir_all(c.join("src")).unwrap();
-        std::fs::write(c.join("src/lib.c"), "int f(void){return 1;}\n").unwrap();
-        std::fs::write(c.join("doc.html.bak"), "reference\n").unwrap();
+        let at = tmp.path().join("test_case");
+        std::fs::create_dir_all(at.join("src")).unwrap();
+        std::fs::write(at.join("src/lib.c"), "int f(void){return 1;}\n").unwrap();
+        std::fs::write(at.join("doc.html.bak"), "reference\n").unwrap();
+        let c = Corpus::at(&at).unwrap();
         (tmp, c)
+    }
+
+    /// An agent's own `0o000` fixture must cost it neither its case nor the stability of its key --
+    /// both failures [`make_readable`] names, asserted where each would be observed.
+    #[test]
+    fn an_unreadable_file_the_agent_left_loses_neither_the_case_nor_the_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, c) = corpus();
+        let seal_leaving_noperm = |payload: &str| {
+            let w = WorkDir::assemble(&c).unwrap();
+            std::fs::write(w.translation().join("lib.rs"), "pub fn f() {}\n").unwrap();
+            let at = w.root().join("_ref/data");
+            std::fs::create_dir_all(&at).unwrap();
+            let f = at.join("noperm.txt");
+            std::fs::write(&f, format!("{payload} at {}\n", w.root().display())).unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let sealed = w
+                .seal()
+                .expect("an unreadable fixture must not lose the case");
+            let text = std::fs::read_to_string(sealed.at.join("_ref/data/noperm.txt")).unwrap();
+            (sealed.digest().as_str().to_string(), text)
+        };
+
+        let (first, text) = seal_leaving_noperm("one");
+        assert!(
+            text.contains("$HARVEST_WORKDIR") && !text.contains("/harvest-work-"),
+            "the scrub must have reached it, or its key carries a per-run nonce: {text}"
+        );
+        // Non-vacuity: the file is HASHED, so the two assertions above are about a file that is
+        // really part of the tree rather than one the digest never looked at.
+        let (second, _) = seal_leaving_noperm("two");
+        assert_ne!(
+            first, second,
+            "an unreadable file's bytes must still reach the digest"
+        );
     }
 
     #[test]

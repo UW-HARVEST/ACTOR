@@ -351,6 +351,7 @@ fn test_corpus_job(
     Ok(match case {
         battery::Case::Independent(c) => Job {
             name: c.name.clone(),
+            corpus: crate::tree::Corpus::at(input_dir.join(&c.name).join(CORPUS_C))?,
             case_inputs: input_dir.join(&c.name),
             case_dir: paths.case_dir(battery, &c.name),
             shape: Shape::of(c.is_lib, false),
@@ -370,6 +371,7 @@ fn test_corpus_job(
         // and the real case is the TEMPLATE they are derived from, so it keeps both targets.
         battery::Case::SharedSource(g) => Job {
             name: g.real_case.clone(),
+            corpus: crate::tree::Corpus::at(input_dir.join(&g.real_case).join(CORPUS_C))?,
             case_inputs: input_dir.join(&g.real_case),
             case_dir: paths.case_dir(battery, &g.real_case),
             shape: Shape::Shared,
@@ -382,15 +384,21 @@ fn test_corpus_job(
             followers: g
                 .configs
                 .iter()
-                .map(|cfg| Follower {
-                    case_inputs: input_dir.join(&cfg.name),
-                    case_dir: paths.case_dir(battery, &cfg.name),
-                    cfg: cfg.clone(),
+                .map(|cfg| {
+                    Ok(Follower {
+                        corpus: crate::tree::Corpus::at(input_dir.join(&cfg.name).join(CORPUS_C))?,
+                        case_inputs: input_dir.join(&cfg.name),
+                        case_dir: paths.case_dir(battery, &cfg.name),
+                        cfg: cfg.clone(),
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
         },
     })
 }
+
+/// Both datasets spell the C the same way, and this is the only place either says so.
+const CORPUS_C: &str = "test_case";
 
 struct HarvestBench;
 
@@ -422,6 +430,7 @@ impl Benchmark for HarvestBench {
         let p = battery::HarvestBenchProject::resolve(&paths.corpus_dir, project)?;
         Ok(vec![Job {
             name: p.name().to_string(),
+            corpus: crate::tree::Corpus::at(p.test_case())?,
             case_inputs: paths.input_dir(project),
             case_dir: paths.output_dir(project),
             shape: Shape::Library,

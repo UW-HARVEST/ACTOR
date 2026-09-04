@@ -10,14 +10,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # One job per TOOL plus one covering all three, in parallel. They CAN pass -- no agent, no credentials,
-  # and `--replay-only` makes a miss a refusal. The 7-arm `test all --check` matrix that was here had not
-  # passed once in 100 runs, so every PR merged on `type safety` alone.
+  # ONE JOB PER TOOL. They CAN pass -- no agent, no credentials, and `--replay-only` makes a miss a
+  # refusal. The 7-arm `test all --check` matrix that was here had not passed once in 100 runs, so every
+  # PR merged on `type safety` alone.
   #
   # Split by tool because a tool is what the store either covers or does not: `reproduce.sh` replayed
-  # claude alone for months while four agents published `0/128` for P01. Only the all-three run may DIFF
-  # the tables: `numbers.tex` is named macros covering every tool, so a codex-only run correctly writes
-  # `--` for the others and its output is comparable to nothing without special-casing files.
+  # claude alone for months while four agents published `0/128` for P01, and "codex misses the store" and
+  # "kiro misses the store" are different findings.
+  #
+  # There used to be a FOURTH arm, `claude,codex,kiro`, for one reason: `tables/` is written from every
+  # tool's attestation MERGED, an attestation was only ever produced by a RUN, and so no per-tool arm
+  # could diff the tables. That arm took forty minutes, replayed both datasets a second time, and was the
+  # only place `tables/` was checked. It is gone: `harvest-tools tables` derives the scope by walking the
+  # COMMITTED results (`Attested::test_corpus_from_committed`) and regenerates them in seconds, which the
+  # `type safety` workflow now does on every push. Measured before removing the arm: over the results tree
+  # at this PR's pin, that command reproduces all seven committed tables byte for byte.
   reproduce:
     name: Reproduce ${{ matrix.tool }} from the cache
     runs-on: ubuntu-24.04
@@ -25,7 +32,7 @@ jobs:
       # "codex misses the store" and "kiro misses the store" are different findings.
       fail-fast: false
       matrix:
-        tool: [claude, codex, kiro, "claude,codex,kiro"]
+        tool: [claude, codex, kiro]
     steps:
       - uses: actions/checkout@v5
         with:

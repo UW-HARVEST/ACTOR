@@ -64,7 +64,7 @@ fn a_harvest_bench_project_reaches_its_agent_and_wants_only_a_stored_entry() {
         .expect("the dataset must be able to describe its own corpus");
     assert_eq!(jobs.len(), 1, "a project is one case");
 
-    let two_steps = prompt::chain(Tool::Claude, Variant::Default);
+    let two_steps = prompt::chain(Variant::Default);
     assert_eq!(two_steps.len(), 2, "claude runs translate then verify");
 
     let s = store::Store::open(root, Mode::ReplayOnly).unwrap();

@@ -174,6 +174,15 @@ pub struct AgentRecord {
     /// it from, and a `0` there would be a measurement nobody made.
     pub cost_usd: Option<f64>,
     pub cli: String,
+    /// Whether the CLI's own transcript confirmed the model it was pinned to. `default` because every
+    /// entry written before the check was wired has no answer, and inventing `Confirmed` for those
+    /// would be the claim this field exists to stop making.
+    #[serde(default)]
+    pub pin: crate::domain::health::PinReport,
+    /// Whether the agent that produced this entry was confined to its working dir. `default` for the
+    /// same reason: entries written before this was recorded have no answer.
+    #[serde(default)]
+    pub sandboxed: crate::io::sandbox::Sandboxed,
 }
 
 /// Whether the agent ran, CLASSIFIED from the transcript rather than read off an exit code: every
@@ -248,10 +257,37 @@ impl From<&crate::domain::health::Health> for Outcome {
     }
 }
 
-/// One invocation's stored result: the tree it produced, and what it cost to get.
+/// One invocation's stored result: the tree it produced, what it cost to get, and the transcript.
 pub struct Stored {
     pub after: Tree,
     pub record: AgentRecord,
+    /// The entry's `run.log`. PRIVATE, and reachable only by [`Self::republish_transcript`], which
+    /// takes a destination: a public path field is a path escape, and the architecture gate says so.
+    transcript: Option<PathBuf>,
+}
+
+impl Stored {
+    /// Put the stored transcript where the run would have written it, if the entry kept one.
+    ///
+    /// Returns whether it did. The store keeps entries at `0o444`, so the copy is made writable --
+    /// otherwise the next run cannot overwrite it and every case after the first fails with EACCES.
+    pub fn republish_transcript(&self, to: &Path) -> Result<bool> {
+        let Some(from) = &self.transcript else {
+            return Ok(false);
+        };
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::remove_file(to) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("replacing {}", to.display())),
+        }
+        std::fs::copy(from, to)
+            .with_context(|| format!("republishing {} to {}", from.display(), to.display()))?;
+        crate::tree::set_read_only(to, crate::tree::Access::Writable)?;
+        Ok(true)
+    }
 }
 
 #[derive(Default)]
@@ -316,7 +352,12 @@ impl Store {
             Err(e) => return Err(e),
         };
         self.count(|c| c.hits += 1);
-        Ok(Some(Stored { after, record }))
+        let transcript = dir.join("run.log");
+        Ok(Some(Stored {
+            after,
+            record,
+            transcript: transcript.is_file().then_some(transcript),
+        }))
     }
 
     /// Write the entry. `before` is written once per input tree and shared by every prompt beneath
@@ -425,6 +466,71 @@ impl Store {
         Ok(out)
     }
 
+    /// Re-hash every stored `before/` and `after/` against the digest it is filed under.
+    ///
+    /// The check the store was missing. `lookup` validates only `after` (via `Tree::adopt_stored`),
+    /// and `write` treats `before/`'s mere EXISTENCE as proof it is complete:
+    /// `if !before_at.exists() { before.copy_into(..) }`. `copy_carrying` copies file by file with no
+    /// staging, so a sweep killed mid-copy -- Ctrl-C, OOM, the session's own `ulimit -f` -- leaves a
+    /// truncated `before/`, and every later entry under that input tree takes the `!exists()` branch as
+    /// false and skips the copy. The entry is then served for ever from a tree that does not hash to its
+    /// own directory name, which is the definition of corrupt in this design: "a `before/` that no
+    /// longer reproduces its own directory name is a corrupt entry".
+    ///
+    /// Zero agent invocations, so CI can run it on every push. Returns what it checked, because a
+    /// verifier that inspects nothing must not report success.
+    pub fn verify(&self) -> Result<(usize, Vec<String>)> {
+        let mut checked = 0usize;
+        let mut corrupt = Vec::new();
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries: Vec<_> = match std::fs::read_dir(&dir) {
+                Ok(rd) => rd.filter_map(std::result::Result::ok).collect(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| format!("walking {}", dir.display())),
+            };
+            for e in entries {
+                let at = e.path();
+                if !at.is_dir() {
+                    continue;
+                }
+                // A tree's own directory NAME is the digest it must reproduce: `before/` is filed under
+                // the input digest one level up, and `after/`'s is recorded in `agent.json` beside it.
+                let recorded = match at.file_name().and_then(|n| n.to_str()) {
+                    Some("before") => dir.file_name().and_then(|n| n.to_str()).map(|d| {
+                        // `digest_dir` is the only lossy step between a digest and a path.
+                        d.replacen('-', ":", 1)
+                    }),
+                    Some("after") => {
+                        let record = dir.join("agent.json");
+                        match std::fs::read_to_string(&record) {
+                            Ok(text) => {
+                                serde_json::from_str::<AgentRecord>(&text)
+                                    .with_context(|| format!("reading {}", record.display()))?
+                                    .output_tree
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(e) => {
+                                return Err(e)
+                                    .with_context(|| format!("reading {}", record.display()))
+                            }
+                        }
+                    }
+                    _ => {
+                        stack.push(at);
+                        continue;
+                    }
+                };
+                let Some(recorded) = recorded else { continue };
+                checked += 1;
+                if let Err(e) = Tree::adopt_stored(at.clone(), &recorded) {
+                    corrupt.push(format!("{}: {e:#}", at.display()));
+                }
+            }
+        }
+        Ok((checked, corrupt))
+    }
+
     pub fn count(&self, f: impl FnOnce(&mut Counts)) {
         if let Ok(mut c) = self.counts.lock() {
             f(&mut c);
@@ -455,7 +561,7 @@ mod corrupt_tests {
         let corpus = tmp.path().join("test_case");
         std::fs::create_dir_all(&corpus).unwrap();
         std::fs::write(corpus.join("lib.c"), "int f(void);\n").unwrap();
-        let before = crate::tree::WorkDir::assemble(&corpus)
+        let before = crate::tree::WorkDir::assemble(&crate::tree::Corpus::at(&corpus).unwrap())
             .unwrap()
             .seal()
             .unwrap();
@@ -470,10 +576,12 @@ mod corrupt_tests {
         };
 
         let store = Store::open(tmp.path(), Mode::ReadWrite).unwrap();
-        let w = crate::tree::WorkDir::assemble(&corpus).unwrap();
+        let w = crate::tree::WorkDir::assemble(&crate::tree::Corpus::at(&corpus).unwrap()).unwrap();
         std::fs::write(w.translation().join("lib.rs"), "pub fn f() {}\n").unwrap();
         let after = w.seal().unwrap();
         let record = AgentRecord {
+            pin: crate::domain::health::PinReport::Confirmed,
+            sandboxed: crate::io::sandbox::Sandboxed::Enforced,
             outcome: Outcome::Completed,
             output_tree: Some(after.digest().as_str().to_string()),
             wall_secs: 1,
@@ -594,19 +702,83 @@ mod tests {
         let c = tmp.path().join("test_case");
         std::fs::create_dir_all(&c).unwrap();
         std::fs::write(c.join("lib.c"), "int f(void);\n").unwrap();
-        let w = crate::tree::WorkDir::assemble(&c).unwrap();
+        let w = crate::tree::WorkDir::assemble(&crate::tree::Corpus::at(&c).unwrap()).unwrap();
         std::fs::write(w.translation().join("lib.rs"), text).unwrap();
         (tmp, w.seal().unwrap())
     }
 
     fn record(outcome: Outcome, after: Option<&crate::tree::Tree>) -> AgentRecord {
         AgentRecord {
+            pin: crate::domain::health::PinReport::Confirmed,
+            sandboxed: crate::io::sandbox::Sandboxed::Enforced,
             outcome,
             output_tree: after.map(|t| t.digest().as_str().to_string()),
             wall_secs: 12,
             cost_usd: Some(0.5),
             cli: "claude 2.1.235".into(),
         }
+    }
+
+    /// A truncated `before/` is served for ever unless something re-hashes it.
+    ///
+    /// `write` is `if !before_at.exists() { before.copy_into(..) }` and `copy_carrying` copies file by
+    /// file with no staging, so a sweep killed mid-copy (Ctrl-C, OOM, the session's own `ulimit -f`)
+    /// leaves that directory PRESENT and incomplete -- and every later entry under the same input tree
+    /// takes the `!exists()` branch as false and skips the copy. `lookup` validates only `after`, so
+    /// nothing ever looked, and there was no `cache verify` to look with.
+    ///
+    /// Non-vacuity: the store is clean before the file is removed, so the failure is the damage and
+    /// not the walk.
+    #[test]
+    fn a_truncated_stored_tree_is_detected_by_cache_verify() {
+        let repo = crate::io::workdir::test_tempdir().unwrap();
+        let store = Store::open(repo.path(), Mode::ReadWrite).unwrap();
+        let (_b, before) = sealed_tree("before\n");
+        let (_a, after) = sealed_tree("after\n");
+        let prompt = Prompt::new("do the thing");
+        let key = Key {
+            tool: "claude",
+            model: "global.anthropic.claude-opus-5[1m]",
+            before: before.digest(),
+            prompt: &prompt,
+        };
+        store
+            .write(
+                &key,
+                &before,
+                Some(&after),
+                &record(Outcome::Completed, Some(&after)),
+                None,
+            )
+            .unwrap();
+
+        let (checked, corrupt) = store.verify().unwrap();
+        assert!(checked >= 2, "both trees must be inspected, saw {checked}");
+        assert!(
+            corrupt.is_empty(),
+            "a freshly written store is clean: {corrupt:?}"
+        );
+
+        // Exactly what an interrupted `copy_into` leaves: the directory present, a file missing.
+        let victim = key
+            .input_dir(&repo.path().join("results/.cache"))
+            .join("before/translation/lib.rs");
+        crate::tree::set_read_only(victim.parent().unwrap(), crate::tree::Access::Writable)
+            .unwrap();
+        std::fs::remove_file(&victim).unwrap();
+
+        let (checked, corrupt) = store.verify().unwrap();
+        assert!(checked >= 2, "still inspecting both trees");
+        assert_eq!(
+            corrupt.len(),
+            1,
+            "the truncated tree must be named: {corrupt:?}"
+        );
+        assert!(
+            corrupt[0].contains("before"),
+            "and named as the BEFORE tree, which `lookup` never validates: {}",
+            corrupt[0]
+        );
     }
 
     #[test]

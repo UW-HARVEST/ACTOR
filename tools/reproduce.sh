@@ -15,8 +15,11 @@ TARGET="${1:-all}"
 # `0/128` for P01 and nobody noticed, "because `reproduce.sh` replays claude only".
 ALL_TOOLS="claude,codex,kiro"
 TOOLS="${TOOLS:-$ALL_TOOLS}"
-# `tables/` is written ONCE per run from every tool's attestation MERGED, so only a run covering every
-# tool can be diffed at all. A subset run proves its own tool replays and leaves the tables alone.
+# `tables/` is written ONCE per run from every tool's attestation MERGED, so a per-tool run cannot be
+# compared against the committed files -- it correctly writes `--` for the tools it did not replay. That
+# is no longer a reason for a fourth all-tools job: `harvest-tools tables` regenerates them from the
+# COMMITTED results in seconds and `type-safety.yaml` diffs them on every push. Here, a run that covers
+# every tool still diffs them, because it has just re-derived every row.
 if [ "$TOOLS" = "$ALL_TOOLS" ]; then TABLES=identical; else TABLES=subset; fi
 if [ "$TARGET" = all ]; then LEGS=(all HB); else LEGS=("$TARGET"); fi
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -77,6 +80,18 @@ if grep 'cache:' "$log" | grep -qvE '/ 0 run'; then
 fi
 echo
 echo "✅ every phase replayed: $tallies tally line(s), all '0 run', all '0 agent invocation(s)'"
+
+# COVERAGE, not just cost. Every check above asks "was anything paid for"; none asks "was everything
+# measured". A battery whose store coverage is incomplete goes OUT OF SCOPE, scores nothing, and emits
+# no tally line -- so `tallies` merely drops and "all 0 run" stays trivially true for the batteries that
+# did score. Measured: codex silently lost all 128 P01_sphincs_plus cases, 332/338 -> 204/338, and its
+# own per-tool arm went green; only the merged arm caught it, and only because it diffs the tables.
+if grep -qE 'out of scope|no stored entry for the' "$log"; then
+  grep -hE 'out of scope|no stored entry for the' "$log" | sed 's/^/   /' | sort -u >&2
+  die "a battery went out of scope, or a step had no stored entry. The store does not cover what the
+   committed tables claim, so those numbers rest on cases this replay never scored."
+fi
+echo "✅ every battery in scope: no case unresolved, no battery skipped"
 
 # PR #116 removes the tree even when the score exits 1; one left standing is one the next run reads.
 [ -z "$(find .eval -mindepth 1 2>/dev/null | head -1)" ] || die ".eval/ still holds files"

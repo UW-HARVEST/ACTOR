@@ -3,8 +3,8 @@
 //! describe. Reachable code on purpose -- after a diverging `unimplemented!()` rustc skips the move
 //! analysis this case exists to assert.
 fn main() {
-    let work =
-        harvest_tools::tree::WorkDir::assemble(std::path::Path::new("c_src")).expect("assemble");
+    let corpus = harvest_tools::tree::Corpus::at("c_src").expect("corpus");
+    let work = harvest_tools::tree::WorkDir::assemble(&corpus).expect("assemble");
     let _sealed = work.seal();
     let _again = work.translation();
 }

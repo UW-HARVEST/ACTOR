@@ -16,6 +16,26 @@
 //! a session that is itself fine — that is a *result*. Exit codes are therefore
 //! reported as corroborating detail only.
 
+/// What the transcript proved about the model pin.
+///
+/// This exists so the CHECK cannot go dead. `assert_pins_honoured` had zero callers while
+/// `runners/mod.rs` and `reproduce.sh` both asserted in prose that it runs -- and it is the check that
+/// catches a CLI silently substituting a model, the failure that made 338 kiro rows unattributable.
+/// [`crate::invocation::Ran`] now requires one of these, so the only way to build a `Ran` in
+/// `Cli::execute` is to have called the check, and deleting the call stops compiling.
+///
+/// `NotReported` is not a pass. It is recorded in `agent.json`, so an artifact says whether its pin was
+/// confirmed instead of leaving the reader to assume it.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PinReport {
+    /// The session reported the model, and it is the one asked for.
+    Confirmed,
+    /// The transcript carries no model record: kiro writes prose, codex its own JSON.
+    #[default]
+    NotReported,
+}
+
 /// What a backend's log can prove about completion ON ITS OWN.
 ///
 /// Named, because the two kinds make the *same* observation mean opposite things: a
@@ -124,12 +144,22 @@ impl Health {
 /// ignored -- see the module docs on `SIGXFSZ`: a test binary killed by a signal fails commands inside
 /// a session that is itself fine, and that is a *result*.
 pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
+    // `Exhausted` BEFORE the per-format arms, for every backend. It used to be reachable only from the
+    // `Opaque` arm, because the other two never received `exit` -- so one wall-clock kill of a session
+    // that was still writing was `Exhausted { secs }` for kiro and `Infra { "truncated" }` for claude
+    // and codex. `Infra` is transient, so the identical event was RETRIED three times for two backends
+    // and RECORDED as a terminal answer for the third. Which backend it was cannot be what decides.
+    if exit == Exit::Exhausted {
+        return Health::Exhausted { secs: 0 };
+    }
     match format {
         LogFormat::StreamJson => classify_stream_json(text),
         LogFormat::CodexJson => classify_codex_json(text),
         // An opaque log cannot distinguish "finished" from "killed", so the exit
         // status carries the whole burden of proof.
         LogFormat::Opaque => match exit {
+            // `Exhausted` is handled above, for every backend.
+            Exit::Exhausted => unreachable!("returned before the format is consulted"),
             Exit::Success => Health::Completed,
             // The run was cut off: there is no measurement, exactly as a truncated
             // stream-json log has none.
@@ -137,7 +167,6 @@ pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
                 reason: "timeout".into(),
                 detail: "the agent was killed at the wall clock".into(),
             },
-            Exit::Exhausted => Health::Exhausted { secs: 0 },
             // A tool that ran and failed is a RESULT and stays in the denominator; treating that as
             // infra inflates the score. The PROVIDER saying "temporarily unavailable" is NOT that, and
             // `Unknown` made it neither retryable nor visible to the gate.

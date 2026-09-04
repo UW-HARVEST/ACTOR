@@ -11,7 +11,7 @@
 //! the pinned toolchain from `rustc`, [`crate::runners::CliVersion`] from
 //! `<program> --version`, both spawned without a shell. On this machine those two
 //! PATHs already disagree about which `node` is found, and node is what runs claude
-//! and opencode.
+//! and kiro.
 
 use crate::store::ModelId;
 use anyhow::Result;
@@ -55,7 +55,7 @@ pub struct Caps {
 
 impl Caps {
     /// The SAME caps for every backend. They used to be `Option<Caps>`, `Some` for claude and `None`
-    /// for codex, kiro and opencode -- so three of four agents ran with no file-size limit at all, and
+    /// for codex and kiro -- so two of three agents ran with no file-size limit at all, and
     /// kiro wrote a 9.3 GB transcript for one case. Not a `tee` inheritance problem as first supposed:
     /// `tee` is in the same pipeline and inherits fine, the limit was simply never set. A resource cap
     /// that varies by tool is the same defect as a wall-clock ceiling that varies by tool, and the
@@ -155,28 +155,6 @@ impl Session {
         Self { script, ..s }
     }
 
-    /// No `--pure`: it clears external plugins, disabling the compaction plugin
-    /// [`crate::agents::opencode::materialize_config`] writes.
-    pub fn opencode(phase: crate::agents::opencode::Phase, timeout_secs: u64) -> Self {
-        let s = Self {
-            program: "opencode",
-            timeout_secs,
-            max_turns: None,
-            permission_mode: None,
-            caps: Caps::UNIFORM,
-            agents_json: "",
-            agent_env: &[],
-            script: String::new(),
-        };
-        let script = format!(
-            "{} run --format json --thinking --dangerously-skip-permissions \
-             --agent {} --model \"$1\" \"$2\" < /dev/null 2>&1 | tee \"$3\"",
-            s.prefix(),
-            phase.agent_name(),
-        );
-        Self { script, ..s }
-    }
-
     fn prefix(&self) -> String {
         let c = self.caps;
         let ulimit = format!("ulimit -f {} -d {}; ", c.fsize_blocks, c.data_kb);
@@ -200,11 +178,15 @@ impl Session {
         f
     }
 
-    /// Every field plus the rendered script, as one canonical line for the cache key.
+    /// Every field plus the rendered script, as one canonical line.
     ///
-    /// Hashing the script is what makes this complete: a flag nobody thought to add as
-    /// a field still changes the key. Machine-independent by construction — the script
-    /// carries no paths, they all arrive as positional arguments or environment.
+    /// `#[cfg(test)]`, and the doc used to say "for the cache key" -- which was false. #109 removed the
+    /// recipe from the key deliberately (`Key` is tool, model, before-tree and prompt), so nothing in
+    /// production ever called this, and a `pub fn` whose doc claims it is key material is how the next
+    /// reader concludes that changing a session flag re-keys a sweep. It does not: halving a ceiling
+    /// and replaying serves the same entries. This is the rendering the tests below compare recipes
+    /// with, and nothing more.
+    #[cfg(test)]
     pub fn shape(&self) -> String {
         let mut out = format!("program={} timeout={}", self.program, self.timeout_secs);
         if let Some(n) = self.max_turns {
@@ -324,32 +306,6 @@ impl Session {
         c.arg(prompt).arg(log).arg(model.as_str()).current_dir(cwd);
         c
     }
-
-    pub fn opencode_command(&self, run: OpencodeRun<'_>) -> Command {
-        let mut c = self.shell();
-        c.arg(run.model_arg)
-            .arg(run.prompt)
-            .arg(run.log)
-            .env("XDG_CONFIG_HOME", run.xdg_config_home)
-            .current_dir(run.cwd);
-        c
-    }
-}
-
-/// The per-case values an opencode session needs.
-///
-/// A struct rather than five positional parameters for the same reason [`ClaudeRun`]
-/// is one: three of them are `&Path` with no type distinction between them, so
-/// transposing `log` and `xdg_config_home` compiles and writes the agent's transcript
-/// where its config belongs.
-pub struct OpencodeRun<'a> {
-    pub cwd: &'a Path,
-    pub prompt: &'a str,
-    pub log: &'a Path,
-    pub model_arg: &'a str,
-    /// Per-case config root, so parallel opencode agents cannot share credentials
-    /// state.
-    pub xdg_config_home: &'a Path,
 }
 
 /// The per-case values a claude session needs, in one struct so the positional order
@@ -375,7 +331,6 @@ mod tests {
             Session::kiro(2_700),
             // Was absent, so every rule below silently exempted the backend it was added for.
             Session::codex(10_800),
-            Session::opencode(crate::agents::opencode::Phase::Verify, 10_800),
         ]
     }
 
@@ -403,10 +358,7 @@ mod tests {
         let claude = Session::claude(10_800);
         assert!(claude.shape().contains("max_turns=1000"));
         assert!(claude.shape().contains("permission_mode=bypassPermissions"));
-        for s in [
-            Session::kiro(2_700),
-            Session::opencode(crate::agents::opencode::Phase::Verify, 10_800),
-        ] {
+        for s in [Session::kiro(2_700), Session::codex(10_800)] {
             let shape = s.shape();
             assert!(!shape.contains("max_turns"), "{}: {shape}", s.program);
             assert!(!shape.contains("permission_mode"), "{}: {shape}", s.program);
@@ -457,8 +409,8 @@ mod tests {
     }
 
     /// A resource cap that varies by tool is the defect a per-tool wall-clock ceiling already was.
-    /// `caps` was `Option<Caps>`: `Some` for claude, `None` for codex, kiro and opencode -- so three of
-    /// four agents ran with no file-size limit, and kiro wrote a 9.3 GB transcript for one case of
+    /// `caps` was `Option<Caps>`: `Some` for claude, `None` for codex and kiro -- so two of
+    /// three agents ran with no file-size limit, and kiro wrote a 9.3 GB transcript for one case of
     /// B01_synthetic before anyone looked.
     #[test]
     fn every_backend_caps_its_agent_the_same_way() {
@@ -466,10 +418,6 @@ mod tests {
             ("claude", Session::claude(60)),
             ("codex", Session::codex(60)),
             ("kiro", Session::kiro(60)),
-            (
-                "opencode",
-                Session::opencode(crate::agents::opencode::Phase::Verify, 60),
-            ),
         ];
         let want = format!(
             "ulimit -f {} -d {}",
@@ -478,7 +426,7 @@ mod tests {
         );
         for (name, s) in &sessions {
             // `assert_declares` compares the script text against the fields, so it refuses exactly
-            // when the cap is absent from the script -- which is what never ran for three of four.
+            // when the cap is absent from the script -- which is what never ran for two of three.
             assert!(
                 s.shape()
                     .contains(&crate::io::workdir::AGENT_FSIZE_BLOCKS.to_string()),
@@ -547,11 +495,7 @@ mod tests {
     fn the_timeout_reaches_the_script_rather_than_a_literal() {
         assert!(Session::claude(42).script.contains("timeout 42 claude"));
         assert!(Session::kiro(43).script.contains("timeout 43 kiro-cli"));
-        assert!(
-            Session::opencode(crate::agents::opencode::Phase::Translate, 44)
-                .script
-                .contains("timeout 44 opencode")
-        );
+        assert!(Session::codex(44).script.contains("timeout 44 codex"));
     }
 
     #[test]

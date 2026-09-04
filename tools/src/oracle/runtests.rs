@@ -202,7 +202,14 @@ fn score_pass(paths: &Paths, pass: &Pass, scoring: &Scoring<'_>) -> Result<()> {
         summary.vectors_passed
     );
 
-    write_results(paths, pass, &summary, &per_case, scoring.covers)
+    write_results(
+        paths,
+        pass,
+        &summary,
+        &per_case,
+        scoring.covers,
+        scoring.provenance,
+    )
 }
 
 /// A record that cannot be read is a MISMATCH, never a pass: a `--check` printing OK having compared
@@ -253,11 +260,15 @@ fn nothing_to_score(paths: &Paths, battery: &str) -> Result<()> {
 }
 
 /// Out of the materialised crate, so a phase that wrote no transcript cannot borrow another's.
-fn transcripts(crate_root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
-    let logs = crate_root.join("logs");
+/// Both steps' transcripts, from the CASE dir in the results tree where the runner tee'd them.
+///
+/// It used to build them from the eval tree's crate root, where no `logs/` can exist -- see
+/// [`Role::transcript_in`]. Measured on the shipped tree: 316 committed `result.json` files carry no
+/// agent metadata as a result.
+fn transcripts(case_dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     (
-        logs.join(Role::Translate.log()),
-        logs.join(Role::Verify.log()),
+        Role::Translate.transcript_in(case_dir),
+        Role::Verify.transcript_in(case_dir),
     )
 }
 
@@ -358,21 +369,36 @@ fn run_runtests(
     print!("{text}");
     let _ = std::fs::write(paths.output_dir(battery).join("test.log"), &text);
 
-    let extract = |pattern: &str| -> usize {
-        Regex::new(pattern)
-            .ok()
-            .and_then(|re| re.captures(&text))
+    // REFUSES rather than defaulting. `unwrap_or(0)` here published an unparsed line as a measured
+    // zero, and the guard below only protects the CASE counts -- `reconcile` compares case names and
+    // the case denominator, so a zeroed `cases_discovered` fails, while the three VECTOR counts had
+    // nothing checking them at all. A reworded summary line in the vendored test-corpus submodule would
+    // have printed `0/0` vectors and regenerated `tables/` from it.
+    let extract = |label: &str, pattern: &str| -> Result<usize> {
+        let re = Regex::new(pattern).context("the extraction pattern itself is invalid")?;
+        let raw = re
+            .captures(&text)
             .and_then(|c| c.get(1))
-            .and_then(|m| m.as_str().parse().ok())
-            .unwrap_or(0)
+            .with_context(|| {
+                format!(
+                    "runtests printed no `{label}` line, so there is no number to record. Its \
+                     output format moved, or it never got that far; either way a 0 here would be a \
+                     measurement nobody made. The output is in {}.",
+                    paths.output_dir(battery).join("test.log").display()
+                )
+            })?
+            .as_str()
+            .to_string();
+        raw.parse()
+            .with_context(|| format!("`{label}` is `{raw}`, which is not a count"))
     };
 
-    let cases_discovered = extract(r"Test Cases Discovered:\s+(\d+)");
-    let cases_tested = extract(r"Test Cases Tested:\s+(\d+)");
-    let cases_failed = extract(r"Test Cases Failed:\s+(\d+)");
-    let vectors_passed = extract(r"Test Vectors Passed:\s+(\d+)");
-    let vectors_failed = extract(r"Test Vectors Failed:\s+(\d+)");
-    let vectors_skipped = extract(r"Test Vectors Skipped:\s+(\d+)");
+    let cases_discovered = extract("Test Cases Discovered", r"Test Cases Discovered:\s+(\d+)")?;
+    let cases_tested = extract("Test Cases Tested", r"Test Cases Tested:\s+(\d+)")?;
+    let cases_failed = extract("Test Cases Failed", r"Test Cases Failed:\s+(\d+)")?;
+    let vectors_passed = extract("Test Vectors Passed", r"Test Vectors Passed:\s+(\d+)")?;
+    let vectors_failed = extract("Test Vectors Failed", r"Test Vectors Failed:\s+(\d+)")?;
+    let vectors_skipped = extract("Test Vectors Skipped", r"Test Vectors Skipped:\s+(\d+)")?;
 
     anyhow::ensure!(
         !measured_nothing(cases_discovered, cases_tested, cases_failed),
@@ -540,12 +566,47 @@ fn cases_in_report(xml: &str) -> Result<Vec<String>> {
     Ok(re.captures_iter(xml).map(|c| c[1].to_string()).collect())
 }
 
+/// The commit that produced a record, written INTO it -- and PRESERVED where the record has not moved.
+///
+/// `provenance::harness_id` existed and was called by nothing but the warning string promising that
+/// artifacts are stamped, so a `--allow-dirty` run's `result.json` and `summary.json` were
+/// byte-indistinguishable from a clean run's. The key is `harness`, the word this repo uses for "the
+/// ACTOR commit" everywhere else.
+///
+/// The preservation is what keeps this compatible with the reproducibility check. Byte-identity of a
+/// replay against the committed artifact IS that check, so a field naming the CURRENT commit would make
+/// every later commit's replay differ and the check would have to be weakened to tolerate it. A replay
+/// re-derives the same numbers from the same store, so the record has not moved and neither should its
+/// stamp: it names the code that MEASURED this, which a replay did not change. When any other field
+/// does move, the stamp moves with it -- so a scoring change is attributed to the commit that made it.
+pub(crate) fn stamp(
+    val: &mut serde_json::Value,
+    at: &Path,
+    provenance: &crate::provenance::Provenance,
+) {
+    let Some(obj) = val.as_object_mut() else {
+        return;
+    };
+    let previous = std::fs::read_to_string(at)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|mut old| {
+            let was = old.as_object_mut()?.remove("harness")?;
+            (old.as_object() == Some(&*obj)).then_some(was)
+        });
+    obj.insert(
+        "harness".to_string(),
+        previous.unwrap_or_else(|| serde_json::Value::String(provenance.as_str().to_string())),
+    );
+}
+
 fn write_results(
     paths: &Paths,
     pass: &Pass,
     summary: &Summary,
     per_case: &HashMap<String, serde_json::Value>,
     covers: Covers<'_>,
+    provenance: &crate::provenance::Provenance,
 ) -> Result<()> {
     for case in pass.tree.cases() {
         let Some(data) = per_case.get(&case.name) else {
@@ -553,22 +614,24 @@ fn write_results(
         };
         let mut val = data.clone();
         let crate_root = pass.tree.crate_root(&case.name);
-        let (tlog, vlog) = transcripts(&crate_root);
+        let (tlog, vlog) = transcripts(&case.case_dir);
         Enrichment::compute(
             &crate_root.join("src"),
             &[("translate", &tlog), ("verify", &vlog)],
         )
         .merge_into(&mut val);
+        let at = case.record_into.join("result.json");
+        stamp(&mut val, &at, provenance);
         let json = serde_json::to_string_pretty(&val)?;
-        std::fs::write(case.record_into.join("result.json"), format!("{json}\n"))?;
+        std::fs::write(&at, format!("{json}\n"))?;
     }
     match covers {
         Covers::WholeBattery => {
-            let json = serde_json::to_string_pretty(summary)?;
-            std::fs::write(
-                paths.output_dir(&pass.battery).join(pass.record),
-                format!("{json}\n"),
-            )?;
+            let at = paths.output_dir(&pass.battery).join(pass.record);
+            let mut val = serde_json::to_value(summary)?;
+            stamp(&mut val, &at, provenance);
+            let json = serde_json::to_string_pretty(&val)?;
+            std::fs::write(&at, format!("{json}\n"))?;
         }
         // `analyse::report` rebuilds `tables/` from this file, and a subset's count is not the battery's.
         Covers::Subset(regex) => println!(
@@ -677,7 +740,8 @@ mod tests {
         let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
         let gate = gate_at(&paths);
         let scoring = Scoring {
-            roles: crate::prompt::chain(paths.tool, paths.variant),
+            provenance: &crate::provenance::Provenance::for_test("deadbeef"),
+            roles: crate::prompt::chain(paths.variant),
             resolved: &resolved,
             tree: &tree,
             gate: &gate,
@@ -724,7 +788,8 @@ mod tests {
             paths,
             "B01",
             &Scoring {
-                roles: crate::prompt::chain(paths.tool, paths.variant),
+                provenance: &crate::provenance::Provenance::for_test("deadbeef"),
+                roles: crate::prompt::chain(paths.variant),
                 resolved,
                 tree,
                 gate: &gate,
@@ -734,17 +799,21 @@ mod tests {
         .unwrap()
     }
 
-    /// Which summary a verify-less agent's translate score is filed as. Only `claude/*` and `kiro/*`
-    /// hold `summary_translated.json`; measured, `c2rust/B01_synthetic` is 85 `translated/` crates, no
-    /// `verified/` crate, and `summary.json` at 85/85 (393v) -- so the translate score IS the headline.
+    /// Which summary a ONE-STEP chain's translate score is filed as: the headline, not
+    /// `summary_translated.json`, because there is no verify score for it to sit beneath.
+    ///
+    /// The one-step chain is now an ABLATION (`Variant::Combined` folds verification into the
+    /// translate prompt) rather than a verify-less tool -- the transpilers this was written against are
+    /// deleted. Same property, and it still has to hold for the archive to find the score and for
+    /// `analyse::report` to read it.
     #[test]
-    fn a_verify_less_agents_translate_score_is_the_battery_headline() {
+    fn a_one_step_chains_translate_score_is_the_battery_headline() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         corpus_battery(tmp.path(), "B01", &["only"]);
         let paths = paths_at(
             tmp.path(),
-            crate::cli::Tool::C2rust,
-            crate::cli::Variant::Default,
+            crate::cli::Tool::Claude,
+            crate::cli::Variant::Combined,
         );
         let case = paths.case_dir("B01", "only");
         crate_at(&case.join(Role::Translate.dir()));
@@ -759,12 +828,117 @@ mod tests {
         assert_eq!(
             passes.len(),
             1,
-            "an agent with no verify phase gets exactly the translate pass"
+            "a one-step chain gets exactly the translate pass"
         );
         assert_eq!(
             passes[0].record, HEADLINE_SUMMARY,
             "and its translate score IS the battery headline, which is where the archive files it \
              and where analyse::report reads it"
+        );
+    }
+
+    /// Every artifact a score writes names the commit that produced it.
+    ///
+    /// `provenance::harness_id` had ONE caller: the warning string in `require_reproducible` promising
+    /// "Artifacts will be stamped `<sha>-dirty`". Nothing wrote it. So `harvest-tools run all
+    /// --allow-dirty` over an edited `prompts/` tree produced a `result.json` and a `summary.json`
+    /// byte-indistinguishable from a clean run's -- the exact confusion the message claims to prevent.
+    /// `Provenance` is now obtainable only from that check and required by the writers, so the promise
+    /// is kept by the type rather than by the comment.
+    #[test]
+    fn every_artifact_a_score_writes_names_the_commit_that_produced_it() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        corpus_battery(tmp.path(), "B01", &["only"]);
+        let paths = paths_at(
+            tmp.path(),
+            crate::cli::Tool::Claude,
+            crate::cli::Variant::Combined,
+        );
+        let case = paths.case_dir("B01", "only");
+        crate_at(&case.join(Role::Translate.dir()));
+        let mut resolved = crate::eval::Resolved::new();
+        resolved.insert(
+            case.join(Role::Translate.dir()),
+            tree_of(&case.join("tree")),
+        );
+        let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
+        let passes = one_case_pass(&paths, &tree, &resolved, Covers::WholeBattery);
+
+        let per_case: HashMap<String, serde_json::Value> = [(
+            "only".to_string(),
+            serde_json::json!({"battery": "B01", "case": "only", "passed": true}),
+        )]
+        .into_iter()
+        .collect();
+        write_results(
+            &paths,
+            &passes[0],
+            &Summary::default(),
+            &per_case,
+            Covers::WholeBattery,
+            &crate::provenance::Provenance::for_test("cafe1234-dirty"),
+        )
+        .unwrap();
+
+        for at in [
+            case.join(Role::Translate.dir()).join("result.json"),
+            paths.output_dir("B01").join(HEADLINE_SUMMARY),
+        ] {
+            let text = fs::read_to_string(&at)
+                .unwrap_or_else(|e| panic!("{} was not written: {e}", at.display()));
+            let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                doc["harness"],
+                serde_json::json!("cafe1234-dirty"),
+                "{} does not name what produced it",
+                at.display()
+            );
+        }
+    }
+
+    /// A replay must not move the stamp, or byte-identity -- the reproducibility check itself -- fails
+    /// on every commit after the one that scored.
+    ///
+    /// The two halves are in tension and this is where they meet: an artifact must record what produced
+    /// it, AND a replay must reproduce the committed artifact byte for byte. A record a replay
+    /// re-derives unchanged was measured by the code already named in it; a record whose numbers MOVE
+    /// was not, and takes the current commit.
+    #[test]
+    fn a_replay_keeps_the_stamp_and_a_changed_record_takes_the_new_one() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let at = tmp.path().join("result.json");
+        let write = |v: &serde_json::Value, p: &crate::provenance::Provenance| {
+            let mut val = v.clone();
+            stamp(&mut val, &at, p);
+            fs::write(&at, serde_json::to_string_pretty(&val).unwrap() + "\n").unwrap();
+            fs::read_to_string(&at).unwrap()
+        };
+        let measured = serde_json::json!({"battery": "B01", "case": "only", "passed": true});
+        let first = write(
+            &measured,
+            &crate::provenance::Provenance::for_test("aaaa111"),
+        );
+        assert!(first.contains("aaaa111"), "a new record names its commit");
+
+        // The same numbers, re-derived by a later commit: nothing measured, nothing moves.
+        let replayed = write(
+            &measured,
+            &crate::provenance::Provenance::for_test("bbbb222"),
+        );
+        assert_eq!(
+            first, replayed,
+            "a replay rewrote the record, so `git diff` can no longer be the reproducibility check"
+        );
+
+        // A number that moved WAS measured by the newer code, and is attributed to it.
+        let changed = serde_json::json!({"battery": "B01", "case": "only", "passed": false});
+        let after = write(
+            &changed,
+            &crate::provenance::Provenance::for_test("bbbb222"),
+        );
+        assert!(
+            after.contains("bbbb222") && !after.contains("aaaa111"),
+            "a changed record must name the commit that changed it: {after}"
         );
     }
 
@@ -851,7 +1025,8 @@ mod tests {
             paths,
             target,
             &Scoring {
-                roles: crate::prompt::chain(paths.tool, paths.variant),
+                provenance: &crate::provenance::Provenance::for_test("deadbeef"),
+                roles: crate::prompt::chain(paths.variant),
                 resolved: &resolved,
                 tree,
                 gate: &gate,
@@ -869,7 +1044,7 @@ mod tests {
         corpus_battery(tmp.path(), "B01", &["case1"]);
         let paths = paths_at(
             tmp.path(),
-            crate::cli::Tool::C2rust,
+            crate::cli::Tool::Claude,
             crate::cli::Variant::Default,
         );
         let case = paths.case_dir("B01", "case1");
@@ -894,7 +1069,7 @@ mod tests {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         let paths = paths_at(
             tmp.path(),
-            crate::cli::Tool::C2rust,
+            crate::cli::Tool::Claude,
             crate::cli::Variant::Default,
         );
         crate_at(&paths.case_dir("B01", "case1").join(Role::Translate.dir()));
@@ -940,10 +1115,12 @@ mod tests {
     fn a_subset_sweep_does_not_file_its_own_count_under_the_batterys_name() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         corpus_battery(tmp.path(), "B01", &["one", "two"]);
+        // A one-step chain, so the translate pass writes the HEADLINE summary -- which is the file
+        // this test is about clobbering.
         let paths = paths_at(
             tmp.path(),
-            crate::cli::Tool::C2rust,
-            crate::cli::Variant::Default,
+            crate::cli::Tool::Claude,
+            crate::cli::Variant::Combined,
         );
         let case = paths.case_dir("B01", "one");
         crate_at(&case.join(Role::Translate.dir()));
@@ -972,6 +1149,7 @@ mod tests {
             &subset,
             &HashMap::new(),
             Covers::Subset("one"),
+            &crate::provenance::Provenance::for_test("deadbeef"),
         )
         .unwrap();
         assert_eq!(
@@ -986,6 +1164,7 @@ mod tests {
             &subset,
             &HashMap::new(),
             Covers::WholeBattery,
+            &crate::provenance::Provenance::for_test("deadbeef"),
         )
         .unwrap();
         assert_eq!(

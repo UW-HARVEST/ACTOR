@@ -27,30 +27,21 @@ pub struct Ran {
     pub wall_secs: u64,
     pub cost_usd: Option<f64>,
     pub cli: String,
+    /// Required, with no default, so a backend cannot return a `Ran` without having checked that the
+    /// CLI honoured its model pin -- see [`crate::domain::health::PinReport`].
+    pub pin: crate::domain::health::PinReport,
+    /// Likewise required: a backend must STATE whether the agent it ran was confined.
+    pub sandboxed: crate::io::sandbox::Sandboxed,
 }
 
-/// How an invocation executes, and whether the store may name it.
-///
-/// The model lives in the `Agent` arm, so a `Baseline` has nothing to key on and
-/// `Invocation::key` cannot produce one for it: storing an unkeyed run is unrepresentable rather
-/// than something a caller must remember not to do. Only agentic runs are worth memoising -- a
-/// transpiler is deterministic, and a docker baseline is cheap next to an iterating agent.
-pub enum Runner<'a> {
-    Agent {
-        model: &'a ModelId,
-        exec: &'a dyn Execute,
-    },
-    Baseline {
-        exec: &'a dyn Execute,
-    },
-}
-
-impl<'a> Runner<'a> {
-    fn exec(&self) -> &'a dyn Execute {
-        match self {
-            Runner::Agent { exec, .. } | Runner::Baseline { exec } => *exec,
-        }
-    }
+/// How an invocation executes. A struct, not an enum: the `Baseline` arm carried no model, so
+/// `Invocation::key` returned `Option<Key>` and every store call had to handle a `None` that only the
+/// transpilers and docker baselines could produce. They are gone, so EVERY run is keyed and the
+/// `Option` with it -- "an unkeyed run cannot be written to the store" is now true because an unkeyed
+/// run cannot be spelled.
+pub struct Runner<'a> {
+    pub model: &'a ModelId,
+    pub exec: &'a dyn Execute,
 }
 
 pub struct Invocation<'a> {
@@ -60,17 +51,12 @@ pub struct Invocation<'a> {
 }
 
 impl<'a> Invocation<'a> {
-    /// `None` where the runner is not keyed. There is no second way to reach the store, so an
-    /// unkeyed run cannot be written to it.
-    fn key(&'a self, before: &'a Tree) -> Option<Key<'a>> {
-        match &self.runner {
-            Runner::Agent { model, .. } => Some(Key {
-                tool: self.tool,
-                model: model.as_str(),
-                before: before.digest(),
-                prompt: self.prompt,
-            }),
-            Runner::Baseline { .. } => None,
+    fn key(&'a self, before: &'a Tree) -> Key<'a> {
+        Key {
+            tool: self.tool,
+            model: self.runner.model.as_str(),
+            before: before.digest(),
+            prompt: self.prompt,
         }
     }
 }
@@ -98,31 +84,35 @@ pub fn run_or_replay(
     inv: &Invocation<'_>,
     before: &Tree,
     store: &Store,
-    corpus_c: &Path,
+    corpus_c: &crate::tree::Corpus,
     log: &Path,
 ) -> Result<Produced> {
     let key = inv.key(before);
 
-    if let Some(key) = &key {
-        if let Some(hit) = store.lookup(key)? {
-            return Ok(Produced::Done {
-                after: hit.after,
-                record: hit.record,
-                replayed: true,
-            });
+    if let Some(hit) = store.lookup(&key)? {
+        // Put the transcript back where the run would have written it. Without this a replay left
+        // `logs/<role>.log` as whatever filesystem history happened to hold -- the ONE part of
+        // `results/` that was not a function of the store, and the reason a fresh checkout's published
+        // logs came from git rather than from the entry being replayed. `agent_health::audit` reads
+        // exactly these files, so it was auditing a different run's evidence.
+        hit.republish_transcript(log)?;
+        return Ok(Produced::Done {
+            after: hit.after,
+            record: hit.record,
+            replayed: true,
+        });
+    }
+    // Above the execution, which is where the money is: refusing instead IS the mode.
+    if store.mode() == Mode::ReplayOnly {
+        // A TERMINAL answer replays as itself; `Infra`/`Unknown` have nothing to serve.
+        if let Some(record) = store.terminal_record(&key)? {
+            return Ok(Produced::DidNotComplete(record));
         }
-        // Above the execution, which is where the money is: refusing instead IS the mode.
-        if store.mode() == Mode::ReplayOnly {
-            // A TERMINAL answer replays as itself; `Infra`/`Unknown` have nothing to serve.
-            if let Some(record) = store.terminal_record(key)? {
-                return Ok(Produced::DidNotComplete(record));
-            }
-            return Ok(Produced::Unavailable);
-        }
+        return Ok(Produced::Unavailable);
     }
 
     let work = before.materialise(corpus_c)?;
-    let ran = inv.runner.exec().execute(&work, inv.prompt.text(), log)?;
+    let ran = inv.runner.exec.execute(&work, inv.prompt.text(), log)?;
     store.count(|c| c.invocations += 1);
     let outcome = Outcome::from(&ran.health);
 
@@ -133,13 +123,13 @@ pub fn run_or_replay(
             wall_secs: ran.wall_secs,
             cost_usd: ran.cost_usd,
             cli: ran.cli,
+            pin: ran.pin,
+            sandboxed: ran.sandboxed,
         };
         // Recorded even though it is not servable: a re-run replaces it, and until then it is the
         // only account of what went wrong. This is what removes the `failed/` subtree.
-        if let Some(key) = &key {
-            if let Err(e) = store.write(key, before, None, &record, Some(log)) {
-                eprintln!("  cache: the failed run was NOT recorded: {e:#}");
-            }
+        if let Err(e) = store.write(&key, before, None, &record, Some(log)) {
+            eprintln!("  cache: the failed run was NOT recorded: {e:#}");
         }
         return Ok(Produced::DidNotComplete(record));
     }
@@ -151,15 +141,15 @@ pub fn run_or_replay(
         wall_secs: ran.wall_secs,
         cost_usd: ran.cost_usd,
         cli: ran.cli,
+        pin: ran.pin,
+        sandboxed: ran.sandboxed,
     };
     // LOUD BUT NOT FATAL. By this line the agent has run and the money is spent -- a measured
     // $795.59 per harvest-bench sweep -- and `after` exists. Propagating a store failure would
     // discard a paid artifact to protect an optimisation. Storing is the optimisation; the tree is
     // the deliverable, and a failed store costs exactly one future miss.
-    if let Some(key) = &key {
-        if let Err(e) = store.write(key, before, Some(&after), &record, Some(log)) {
-            eprintln!("  cache: NOT stored, continuing anyway: {e:#}");
-        }
+    if let Err(e) = store.write(&key, before, Some(&after), &record, Some(log)) {
+        eprintln!("  cache: NOT stored, continuing anyway: {e:#}");
     }
     Ok(Produced::Done {
         after,
@@ -219,6 +209,8 @@ mod tests {
             std::fs::write(work.translation().join("lib.rs"), self.writes)?;
             std::fs::write(log, "transcript\n")?;
             Ok(Ran {
+                pin: crate::domain::health::PinReport::NotReported,
+                sandboxed: crate::io::sandbox::Sandboxed::Enforced,
                 health: (self.health)(),
                 wall_secs: 7,
                 cost_usd: Some(1.25),
@@ -230,7 +222,7 @@ mod tests {
     struct Fixture {
         _repo: tempfile::TempDir,
         _corpus: tempfile::TempDir,
-        corpus_c: std::path::PathBuf,
+        corpus_c: crate::tree::Corpus,
         log: std::path::PathBuf,
         first: Tree,
     }
@@ -238,9 +230,10 @@ mod tests {
     fn fixture() -> Fixture {
         let repo = crate::io::workdir::test_tempdir().unwrap();
         let corpus = crate::io::workdir::test_tempdir().unwrap();
-        let corpus_c = corpus.path().join("test_case");
-        std::fs::create_dir_all(&corpus_c).unwrap();
-        std::fs::write(corpus_c.join("lib.c"), "int f(void);\n").unwrap();
+        let corpus_dir = corpus.path().join("test_case");
+        std::fs::create_dir_all(&corpus_dir).unwrap();
+        std::fs::write(corpus_dir.join("lib.c"), "int f(void);\n").unwrap();
+        let corpus_c = crate::tree::Corpus::at(&corpus_dir).unwrap();
         let log = repo.path().join("run.log");
         let first = WorkDir::assemble(&corpus_c).unwrap().seal().unwrap();
         Fixture {
@@ -266,7 +259,7 @@ mod tests {
         let inv = Invocation {
             tool: "claude",
             prompt: &prompt,
-            runner: Runner::Agent {
+            runner: Runner {
                 model: &m,
                 exec: &exec,
             },
@@ -308,7 +301,7 @@ mod tests {
             let inv = Invocation {
                 tool: "kiro",
                 prompt: &prompt,
-                runner: Runner::Agent {
+                runner: Runner {
                     model: &m,
                     exec: &exec,
                 },
@@ -354,7 +347,7 @@ mod tests {
         let mut inv = Invocation {
             tool: "claude",
             prompt: &p1,
-            runner: Runner::Agent {
+            runner: Runner {
                 model: &m,
                 exec: &exec,
             },
@@ -365,26 +358,52 @@ mod tests {
         assert_eq!(exec.calls(), 2, "each prompt is its own entry");
     }
 
+    /// A replay must put the transcript back, or `results/` is not a function of the store.
+    ///
+    /// `run_or_replay` returned on a hit before touching `log`, so a published `logs/<role>.log` was
+    /// whatever filesystem history happened to hold -- the ONE part of `results/` that was not derived.
+    /// `agent_health::audit` reads exactly those files, so it was auditing a different run's evidence,
+    /// and a fresh checkout's logs came from git rather than from the entry being replayed.
     #[test]
-    fn an_unkeyed_runner_is_never_stored_and_never_replayed() {
-        // Only agentic runs are keyed. A baseline has no model to key on, so `key` yields nothing
-        // and there is no path from here into the store.
+    fn a_replay_republishes_the_transcript_it_recorded() {
         let f = fixture();
         let store = Store::open(f._repo.path(), Mode::ReadWrite).unwrap();
         let exec = Fake::completing("pub fn f() {}\n");
-        let prompt = Prompt::new("transpile");
+        let prompt = Prompt::new("translate");
         let inv = Invocation {
-            tool: "c2rust",
+            tool: "claude",
             prompt: &prompt,
-            runner: Runner::Baseline { exec: &exec },
+            runner: Runner {
+                model: &ModelId::new("global.anthropic.claude-opus-5[1m]").unwrap(),
+                exec: &exec,
+            },
         };
         run_or_replay(&inv, &f.first, &store, &f.corpus_c, &f.log).unwrap();
-        run_or_replay(&inv, &f.first, &store, &f.corpus_c, &f.log).unwrap();
-        assert_eq!(exec.calls(), 2, "an unkeyed run cannot be replayed");
-        let entries = std::fs::read_dir(f._repo.path().join("results/.cache"))
-            .unwrap()
-            .count();
-        assert_eq!(entries, 0, "and must leave the store empty");
+        let written = std::fs::read_to_string(&f.log).expect("the run wrote a transcript");
+        assert!(
+            !written.is_empty(),
+            "the fixture must leave one, or this proves nothing"
+        );
+
+        // Exactly what a fresh checkout has: the entry, and no published log beside it.
+        std::fs::remove_file(&f.log).unwrap();
+        assert!(!f.log.exists());
+
+        let again = run_or_replay(&inv, &f.first, &store, &f.corpus_c, &f.log).unwrap();
+        assert!(
+            matches!(again, Produced::Done { replayed: true, .. }),
+            "must be served from the store, not re-run"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f.log).expect("the replay put the transcript back"),
+            written,
+            "a replay must republish the transcript the entry recorded"
+        );
+        // And it must be writable, or the next run cannot overwrite it: the store keeps entries 0o444.
+        assert!(
+            !std::fs::metadata(&f.log).unwrap().permissions().readonly(),
+            "republished read-only, so the next run fails with EACCES"
+        );
     }
 
     #[test]
@@ -399,7 +418,7 @@ mod tests {
         let inv = Invocation {
             tool: "claude",
             prompt: &prompt,
-            runner: Runner::Agent {
+            runner: Runner {
                 model: &m,
                 exec: &exec,
             },
@@ -421,7 +440,7 @@ mod tests {
         let inv = Invocation {
             tool: "claude",
             prompt: &prompt,
-            runner: Runner::Agent {
+            runner: Runner {
                 model: &m,
                 exec: &failing,
             },

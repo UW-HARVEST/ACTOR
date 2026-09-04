@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 // Never re-declare these with `mod` here; see the note in lib.rs.
 use harvest_tools::analyse::report;
 use harvest_tools::cli::{Cli, Command, Dataset};
@@ -12,14 +12,19 @@ fn main() -> Result<()> {
 
     // Before, not after, a run that can take hours: a binary that does not match the checkout cannot
     // produce an attributable measurement.
-    if cli.command.produces_artifacts() {
-        provenance::require_reproducible(if cli.allow_dirty {
+    // `Provenance` is the stamp every artifact carries, and the only way to obtain one is this check.
+    // `Enrich` produces no artifact of its own, so it needs none.
+    let provenance = if cli.command.produces_artifacts() {
+        let p = provenance::require_reproducible(if cli.allow_dirty {
             provenance::OnUnreproducible::WarnAndStamp
         } else {
             provenance::OnUnreproducible::Refuse
         })?;
         harvest_tools::refusal::require_pinned_toolchain()?;
-    }
+        Some(p)
+    } else {
+        None
+    };
 
     anyhow::ensure!(!cli.tool.is_empty(), "--tool names no tool");
     // Refused before any work: an ablation on a tool with no ablation prompts would otherwise read
@@ -53,6 +58,10 @@ fn main() -> Result<()> {
             let on_infra_failure = agent_health::OnInfraFailure::from_allow_infra_failures_flag(
                 cli.allow_infra_failures,
             );
+            // `Run` produces artifacts, so the preflight above yielded a stamp.
+            let stamp = provenance
+                .as_ref()
+                .expect("a Run produces artifacts, so provenance was established above");
             let attested: Vec<report::Attested> = std::thread::scope(|scope| {
                 let handles: Vec<_> = cli
                     .tool
@@ -68,11 +77,12 @@ fn main() -> Result<()> {
                                 inner,
                                 steps,
                                 include_regex: include_regex.as_deref(),
-                                parallel: cli.parallel,
+                                parallel: usize::from(cli.parallel),
                                 mode,
                                 enforcement,
                                 keep,
                                 on_infra_failure,
+                                provenance: stamp,
                             })
                         })
                     })
@@ -122,6 +132,62 @@ fn main() -> Result<()> {
                     println!("  {outcome:?}  {at}");
                 }
             }
+            cli::CacheAction::Bound => {
+                let mut bounded = 0usize;
+                let mut checked = 0usize;
+                let mut stack = vec![repo_root.join("results")];
+                while let Some(dir) = stack.pop() {
+                    let entries = match std::fs::read_dir(&dir) {
+                        Ok(rd) => rd.filter_map(std::result::Result::ok).collect::<Vec<_>>(),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => {
+                            return Err(e).with_context(|| format!("walking {}", dir.display()))
+                        }
+                    };
+                    for e in entries {
+                        let at = e.path();
+                        if at.is_dir() {
+                            stack.push(at);
+                        } else if at.extension().is_some_and(|x| x == "log") {
+                            checked += 1;
+                            if agent_health::bound_transcript(&at)? {
+                                println!("  \u{2702}\u{fe0f}  bounded {}", at.display());
+                                bounded += 1;
+                            }
+                        }
+                    }
+                }
+                anyhow::ensure!(
+                    checked > 0,
+                    "found no transcript under {}/results, so this proves nothing",
+                    repo_root.display()
+                );
+                println!("\u{2705} {checked} transcript(s) checked, {bounded} bounded");
+            }
+            cli::CacheAction::Verify => {
+                let (checked, corrupt) = store::Store::open(&repo_root, mode)?.verify()?;
+                // A verifier that inspected nothing must not report success: an empty store and a
+                // clean one print the same line otherwise, and CI would go green over neither.
+                anyhow::ensure!(
+                    checked > 0,
+                    "cache verify inspected no stored tree at all, so this proves nothing about \
+                     {}/results/.cache",
+                    repo_root.display()
+                );
+                for line in &corrupt {
+                    eprintln!("  \u{274c} {line}");
+                }
+                anyhow::ensure!(
+                    corrupt.is_empty(),
+                    "{} of {checked} stored tree(s) do not hash to the digest they are filed under. \
+                     An entry whose `before/` no longer reproduces its own directory name is corrupt: \
+                     it is served for ever from bytes the key does not describe. `write` treats that \
+                     directory's existence as proof it is complete, so a sweep killed mid-copy leaves \
+                     one and every later entry beneath it skips the copy.",
+                    corrupt.len()
+                );
+                println!("\u{2705} {checked} stored tree(s) hash to what they are filed under");
+            }
             cli::CacheAction::Stats => {
                 let (entries, bytes) = store::Store::open(&repo_root, mode)?.stats()?;
                 println!(
@@ -131,6 +197,29 @@ fn main() -> Result<()> {
                 );
             }
         },
+        Command::Tables => {
+            // BOTH datasets, from what is committed. Each writes only its own files, so a missing
+            // dataset leaves the other's tables alone rather than blanking them.
+            let tc = report::Attested::test_corpus_from_committed(
+                &repo_root.join("results/Test-Corpus"),
+            )?;
+            let hb = report::Attested::harvest_bench_from_committed(
+                &repo_root.join("results/HarvestBench"),
+            )?;
+            anyhow::ensure!(
+                !tc.is_empty() || !hb.is_empty(),
+                "no committed result names a unit under {}/results, so every table would be written \
+                 from nothing",
+                repo_root.display()
+            );
+            if !tc.is_empty() {
+                report::generate(&repo_root, &tc)?;
+            }
+            if !hb.is_empty() {
+                report::generate_harvest_bench(&repo_root, &hb)?;
+            }
+            println!("\u{1f4ca} Tables regenerated from the committed results (tables/)");
+        }
         Command::Enrich { ref target } => {
             let dataset = Dataset::detect(target);
             let paths = battery::Paths::new(
@@ -174,6 +263,7 @@ struct RunTool<'a> {
     enforcement: harvest_tools::io::sandbox::Enforcement,
     keep: eval::Keep,
     on_infra_failure: agent_health::OnInfraFailure,
+    provenance: &'a provenance::Provenance,
 }
 
 /// One tool, end to end: preflight, run every unit's chain, score, and report what it attested.
@@ -226,7 +316,7 @@ fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
     }
 
     let (publishable, attested) = benchmark::InScope::derive(&paths, &units, &resolved)?;
-    let all_roles = harvest_tools::prompt::chain(r.tool, r.variant);
+    let all_roles = harvest_tools::prompt::chain(r.variant);
     let roles = &all_roles[..r.steps.map_or(all_roles.len(), |n| n.min(all_roles.len()))];
     for unit in publishable.units() {
         run_test(
@@ -234,6 +324,7 @@ fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
             &paths,
             unit,
             Score {
+                provenance: r.provenance,
                 on_failure: r.on_infra_failure,
                 keep: r.keep,
                 roles,
@@ -246,6 +337,7 @@ fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
 }
 
 struct Score<'a> {
+    provenance: &'a provenance::Provenance,
     on_failure: agent_health::OnInfraFailure,
     keep: eval::Keep,
     roles: &'a [harvest_tools::prompt::Role],
@@ -263,6 +355,7 @@ fn run_test(
     score: Score<'_>,
 ) -> Result<()> {
     let Score {
+        provenance,
         on_failure,
         keep,
         roles,
@@ -284,6 +377,7 @@ fn run_test(
             tree: &tree,
             gate: &gate,
             covers,
+            provenance,
         },
     )
 }
@@ -363,7 +457,7 @@ mod tests {
         let unchecked = || {
             battery::Paths::new(
                 tmp.path(),
-                cli::Tool::C2rust,
+                cli::Tool::Claude,
                 cli::Variant::Default,
                 Dataset::HarvestBench,
                 None,
@@ -426,6 +520,12 @@ mod tests {
             &paths,
             "B01",
             Score {
+                // The real check, not a test-only constructor: `WarnAndStamp` never refuses, so this
+                // works in any tree, and `Provenance` keeps exactly one production door.
+                provenance: &provenance::require_reproducible(
+                    provenance::OnUnreproducible::WarnAndStamp,
+                )
+                .expect("--allow-dirty never refuses"),
                 on_failure: agent_health::OnInfraFailure::Refuse,
                 keep: eval::Keep::Discard,
                 roles: &[harvest_tools::prompt::Role::Translate],

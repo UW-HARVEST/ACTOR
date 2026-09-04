@@ -5,7 +5,7 @@
 //! were one enum -- so a verify prompt could not depend on the shape and every executable case was
 //! told to produce a cdylib. Splitting them makes that unrepresentable rather than a known bug.
 //!
-//! The chain is declared HERE, by tool and variant, and nowhere else. It used to be stated twice --
+//! The chain is declared HERE, by variant, and nowhere else. It used to be stated twice --
 //! `has_verify_phase` and a `Verify => None` arm in the prompt table -- with two tests existing only
 //! to hold the two in step.
 
@@ -35,6 +35,24 @@ impl Role {
             Role::Translate => "translation.log",
             Role::Verify => "verify.log",
         }
+    }
+
+    /// This step's transcript inside its own PHASE dir.
+    pub fn log_in(self, phase_dir: &Path) -> std::path::PathBuf {
+        phase_dir.join("logs").join(self.log())
+    }
+
+    /// This step's transcript from the CASE dir, which is one level up.
+    ///
+    /// THE definition, because two readers derived it themselves and both were wrong. `runtests`
+    /// and `gtest` built it from `Materialised::crate_root` -- an EVAL-TREE path -- and the eval tree
+    /// is assembled by `copy_carrying`, which skips `Disposition::Ignore`, and every `*.log` is
+    /// `Ignore`. So `translated_rust/logs/` cannot exist, `extract_agent_meta` returned `None` (absence,
+    /// not error), and every `result.json` was written with no agent metadata at all: no cost, no
+    /// model, no turn count. `gtest` also hardcoded the `translate` key onto a verify log, which
+    /// `analyse::report` sums separately.
+    pub fn transcript_in(self, case_dir: &Path) -> std::path::PathBuf {
+        self.log_in(&case_dir.join(self.dir()))
     }
 }
 
@@ -73,12 +91,12 @@ pub fn supports(tool: Tool, variant: Variant) -> Result<()> {
     Ok(())
 }
 
-/// The steps this tool and variant runs, in order.
+/// The steps this variant runs, in order.
 ///
 /// A one-step chain is not a tool "without a verify phase" -- it is a prompt that folds
 /// verification into translation (`Variant::Combined`), or a backend that has only ever had one
 /// step. Either way the chain length follows the prompt, which is the only place that knows.
-pub fn chain(tool: Tool, variant: Variant) -> &'static [Role] {
+pub fn chain(variant: Variant) -> &'static [Role] {
     const BOTH: &[Role] = &[Role::Translate, Role::Verify];
     const ONE: &[Role] = &[Role::Translate];
     match variant {
@@ -90,44 +108,34 @@ pub fn chain(tool: Tool, variant: Variant) -> &'static [Role] {
         | Variant::NoFeatures
         | Variant::NoSubtask
         | Variant::CrossPrompt => ONE,
-        Variant::Default => match tool {
-            Tool::Claude | Tool::Codex | Tool::Kiro | Tool::OpenCode => BOTH,
-            // A single-shot API call and the transpilers have one step and no prompt to give a
-            // second one to.
-            Tool::Oneshot | Tool::Kimi => ONE,
-            Tool::C2rust | Tool::Laertes | Tool::C2SaferRust | Tool::SmartC2Rust => ONE,
-        },
+        // No longer per tool: the arm that made it so listed the one-shot callers and the
+        // transpilers, and none of them exists any more. Chain length is a fact about the PROMPT,
+        // which is what this function has always claimed and can now state without a tool.
+        Variant::Default => BOTH,
     }
 }
 
 /// The one place a prompt file is chosen, relative to the tool's prompt directory.
 ///
-/// `None` means this tool reads no prompt for that role at all -- the transpilers are given none.
 /// Returning the NAME rather than the text is what lets a test check the choice against the files on
 /// disk, so a renamed prompt fails in CI instead of reaching a paid run as an empty one.
-pub fn file_for(tool: Tool, variant: Variant, role: Role, shape: Shape) -> Option<&'static str> {
+///
+/// No longer per tool, and no longer `Option`: the backend varies, the methodology does not, and the
+/// only arms that returned `None` were the transpilers, which are gone. A missing prompt is now a
+/// missing FILE, which [`read`] reports by path.
+pub fn file_for(variant: Variant, role: Role, shape: Shape) -> &'static str {
     if let Some(f) = ablation_file(variant, role, shape) {
-        return Some(f);
+        return f;
     }
-    match tool {
-        // One arm on purpose: the backend varies, the methodology does not.
-        Tool::Kiro | Tool::Claude | Tool::OpenCode | Tool::Codex => Some(match (role, shape) {
-            (Role::Translate, Shape::Library) => "translate-library.md",
-            (Role::Translate, Shape::Executable) => "translate-executable.md",
-            (Role::Translate, Shape::Shared) => "translate-shared.md",
-            // Shape-dispatched, unlike the single `verify.md` this replaces: an executable case
-            // told to produce a cdylib is being asked for the wrong artifact.
-            (Role::Verify, Shape::Library) => "verify-library.md",
-            (Role::Verify, Shape::Executable) => "verify-executable.md",
-            (Role::Verify, Shape::Shared) => "verify-shared.md",
-        }),
-        Tool::Oneshot | Tool::Kimi => match (role, shape) {
-            (Role::Translate, Shape::Library | Shape::Shared) => Some("translate-library.md"),
-            (Role::Translate, Shape::Executable) => Some("translate-executable.md"),
-            (Role::Verify, _) => None,
-        },
-        // Transpilers and docker baselines read nothing.
-        Tool::C2rust | Tool::Laertes | Tool::C2SaferRust | Tool::SmartC2Rust => None,
+    match (role, shape) {
+        (Role::Translate, Shape::Library) => "translate-library.md",
+        (Role::Translate, Shape::Executable) => "translate-executable.md",
+        (Role::Translate, Shape::Shared) => "translate-shared.md",
+        // Shape-dispatched, unlike the single `verify.md` this replaces: an executable case told to
+        // produce a cdylib is being asked for the wrong artifact.
+        (Role::Verify, Shape::Library) => "verify-library.md",
+        (Role::Verify, Shape::Executable) => "verify-executable.md",
+        (Role::Verify, Shape::Shared) => "verify-shared.md",
     }
 }
 
@@ -186,21 +194,12 @@ enum Body {
     OwnDir,
 }
 
-fn body(tool: Tool, file: &str) -> Body {
+fn body(file: &str) -> Body {
     // An ablation forks the whole document, protocol included.
     if file.starts_with("ablations/") {
         return Body::OwnDir;
     }
-    match tool {
-        Tool::Claude | Tool::OpenCode | Tool::Codex | Tool::Kiro => Body::Shared,
-        // No agentic loop, so no protocol tail to differ in.
-        Tool::Kimi
-        | Tool::Oneshot
-        | Tool::C2rust
-        | Tool::Laertes
-        | Tool::C2SaferRust
-        | Tool::SmartC2Rust => Body::OwnDir,
-    }
+    Body::Shared
 }
 
 fn read_part(path: &Path) -> Result<String> {
@@ -214,19 +213,9 @@ fn read_part(path: &Path) -> Result<String> {
     Ok(text)
 }
 
-/// Where a tool's own prompts live.
+/// Where a tool's own prompts live: one directory per tool, named as `--tool` spells it.
 pub fn dir_for(repo_root: &Path, tool: Tool) -> std::path::PathBuf {
-    let prompts = repo_root.join("prompts");
-    match tool {
-        // The one-shot calls share a prompt set: neither runs an agentic loop, so neither has a
-        // protocol part to differ in.
-        Tool::Oneshot | Tool::Kimi => prompts.join("oneshot"),
-        // OpenCode drives Claude models through a different CLI, and has always been given claude's
-        // set -- including its sub-agent protocol. Stated here rather than left to a fallback: if
-        // OpenCode ever needs its own protocol, this is the line that has to change.
-        Tool::OpenCode => prompts.join("claude"),
-        _ => prompts.join(crate::cli::tool_dir(tool)),
-    }
+    repo_root.join("prompts").join(crate::cli::tool_dir(tool))
 }
 
 const FLAGS: &str = "CMAKE_BUILD_FLAGS";
@@ -268,12 +257,10 @@ pub fn read(
     role: Role,
     shape: Shape,
     case_inputs: &Path,
-) -> Result<Option<String>> {
-    let Some(file) = file_for(tool, variant, role, shape) else {
-        return Ok(None);
-    };
+) -> Result<String> {
+    let file = file_for(variant, role, shape);
     let own = dir_for(repo_root, tool);
-    let text = match body(tool, file) {
+    let text = match body(file) {
         Body::OwnDir => read_part(&own.join(file))?,
         // Concatenated with no separator: the body keeps its own trailing newline, so the
         // composition is byte-for-byte what the two files were as one.
@@ -282,25 +269,14 @@ pub fn read(
                 + &read_part(&own.join(PROTOCOL_PART))?
         }
     };
-    Ok(Some(text.replace(FLAGS, &cmake_flags(case_inputs))))
+    Ok(text.replace(FLAGS, &cmake_flags(case_inputs)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const TOOLS: &[Tool] = &[
-        Tool::Claude,
-        Tool::Codex,
-        Tool::Kiro,
-        Tool::OpenCode,
-        Tool::Oneshot,
-        Tool::Kimi,
-        Tool::C2rust,
-        Tool::Laertes,
-        Tool::C2SaferRust,
-        Tool::SmartC2Rust,
-    ];
+    const TOOLS: &[Tool] = &[Tool::Claude, Tool::Codex, Tool::Kiro];
     const VARIANTS: &[Variant] = &[
         Variant::Default,
         Variant::Combined,
@@ -325,21 +301,13 @@ mod tests {
                     continue;
                 }
                 for &shape in SHAPES {
-                    for &role in chain(tool, variant) {
-                        let named = file_for(tool, variant, role, shape).is_some();
-                        // A transpiler runs one step and reads no prompt at all; that is the one
-                        // legitimate absence, and it is a property of the tool, not of the role.
-                        let reads_prompts = !matches!(
-                            tool,
-                            Tool::C2rust | Tool::Laertes | Tool::C2SaferRust | Tool::SmartC2Rust
-                        );
-                        if reads_prompts {
-                            assert!(
-                                named,
-                                "{tool:?}/{variant:?} schedules {role:?} for {shape:?} with no prompt"
-                            );
-                            checked += 1;
-                        }
+                    for &role in chain(variant) {
+                        // `file_for` is total now, so "schedules a step with no prompt" can only mean
+                        // the FILE is missing -- which is what `every_named_prompt_exists_on_disk`
+                        // asserts. What is left to check here is that the two tables agree on which
+                        // (role, shape) pairs exist at all, exhaustively over both.
+                        let _: &str = file_for(variant, role, shape);
+                        checked += 1;
                     }
                 }
             }
@@ -364,10 +332,8 @@ mod tests {
                 }
                 for &shape in SHAPES {
                     for &role in &[Role::Translate, Role::Verify] {
-                        let Some(file) = file_for(tool, variant, role, shape) else {
-                            continue;
-                        };
-                        let at = match body(tool, file) {
+                        let file = file_for(variant, role, shape);
+                        let at = match body(file) {
                             Body::OwnDir => dir_for(&root, tool).join(file),
                             Body::Shared => root.join("prompts/shared").join(file),
                         };
@@ -376,7 +342,7 @@ mod tests {
                             "{tool:?}/{variant:?}/{role:?}/{shape:?} names {} which does not exist",
                             at.display()
                         );
-                        if matches!(body(tool, file), Body::Shared) {
+                        if matches!(body(file), Body::Shared) {
                             let protocol = dir_for(&root, tool).join(PROTOCOL_PART);
                             assert!(
                                 protocol.is_file(),
@@ -407,18 +373,14 @@ mod tests {
                     continue;
                 }
                 for &shape in SHAPES {
-                    for &role in chain(tool, variant) {
-                        let Some(text) = read(&root, tool, variant, role, shape, &inputs).unwrap()
-                        else {
-                            continue;
+                    for &role in chain(variant) {
+                        let text = read(&root, tool, variant, role, shape, &inputs).unwrap();
+                        let named = file_for(variant, role, shape);
+                        let at = match body(named) {
+                            Body::OwnDir => dir_for(&root, tool).join(named),
+                            Body::Shared => root.join("prompts/shared").join(named),
                         };
-                        let raw = file_for(tool, variant, role, shape)
-                            .map(|f| match body(tool, f) {
-                                Body::OwnDir => dir_for(&root, tool).join(f),
-                                Body::Shared => root.join("prompts/shared").join(f),
-                            })
-                            .map(|p| std::fs::read_to_string(p).unwrap_or_default())
-                            .unwrap_or_default();
+                        let raw = std::fs::read_to_string(at).unwrap_or_default();
                         if raw.contains(FLAGS) {
                             saw_a_substitution = true;
                         }
@@ -444,14 +406,8 @@ mod tests {
     fn a_verify_prompt_depends_on_the_shape_of_the_case() {
         // The whole reason Role and Shape are separate axes: one `verify.md` told an executable
         // case to produce a cdylib, which is the wrong artifact for it.
-        let lib = file_for(Tool::Claude, Variant::Default, Role::Verify, Shape::Library);
-        let exe = file_for(
-            Tool::Claude,
-            Variant::Default,
-            Role::Verify,
-            Shape::Executable,
-        );
-        assert!(lib.is_some() && exe.is_some());
+        let lib = file_for(Variant::Default, Role::Verify, Shape::Library);
+        let exe = file_for(Variant::Default, Role::Verify, Shape::Executable);
         assert_ne!(lib, exe, "verify must not be shape-blind");
     }
 }

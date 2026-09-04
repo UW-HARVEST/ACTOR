@@ -125,6 +125,94 @@ impl Attested {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Derive the attestation from what is COMMITTED under `results/<dataset>`, so `tables/` can be
+    /// checked without replaying anything.
+    ///
+    /// This is what lets CI drop its fourth arm. `tables/` is written from every tool's attestation
+    /// MERGED, and an attestation was only ever produced by a RUN -- so a per-tool arm could not diff
+    /// the tables (a codex-only run correctly writes `--` for the others), and a fourth
+    /// `claude,codex,kiro` job existed for no other purpose than to have all three at once. It took
+    /// forty minutes, replayed both datasets a second time, and was the only place `tables/` was
+    /// checked at all. The rows themselves never needed a run: `generate` reads the committed
+    /// `result.json` and `summary.json` files off disk. Only the SCOPE did.
+    ///
+    /// A unit is attested iff its record is present, which is the same predicate `InScope` applies to a
+    /// live run -- there, every case must be served for the battery to publish; here, the record's
+    /// presence IS that having happened. `<tool>/<model>/<variant>/<unit>`, every level required, so a
+    /// stray directory at the wrong depth contributes nothing.
+    /// Test-Corpus: a unit is a BATTERY, and its record is the headline `summary.json` that
+    /// `generate` reads.
+    pub fn test_corpus_from_committed(results_root: &Path) -> Result<Self> {
+        Self::from_committed(results_root, &|unit| unit.join("summary.json").is_file())
+    }
+
+    /// harvest-bench: a unit is a PROJECT, and its record is the `result.json` in whichever phase was
+    /// scored -- the same `scored_phase_dir` `generate_harvest_bench` reads it from.
+    pub fn harvest_bench_from_committed(results_root: &Path) -> Result<Self> {
+        Self::from_committed(results_root, &|unit| {
+            scored_phase_dir(unit).join("result.json").is_file()
+        })
+    }
+
+    fn from_committed(results_root: &Path, has_record: &dyn Fn(&Path) -> bool) -> Result<Self> {
+        let mut out = Self::default();
+        let Some(tools) = dirs_in(results_root)? else {
+            return Ok(out);
+        };
+        for tool in tools {
+            for model in dirs_in(&tool)?.unwrap_or_default() {
+                for variant in dirs_in(&model)?.unwrap_or_default() {
+                    for unit in dirs_in(&variant)?.unwrap_or_default() {
+                        if !has_record(&unit) {
+                            continue;
+                        }
+                        let name =
+                            |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+                        let (Some(t), Some(m), Some(v), Some(u)) =
+                            (name(&tool), name(&model), name(&variant), name(&unit))
+                        else {
+                            continue;
+                        };
+                        let label = if v == crate::cli::Variant::Default.dir() {
+                            t.clone()
+                        } else {
+                            format!("{t}-{v}")
+                        };
+                        out.0.insert((
+                            Run {
+                                label,
+                                dir: format!("{t}/{m}/{v}"),
+                            },
+                            u,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Sub-directories of `dir`, sorted; `None` where `dir` does not exist. `Err` for any other reason, so
+/// an unreadable results tree cannot look like an empty one.
+fn dirs_in(dir: &Path) -> Result<Option<Vec<PathBuf>>> {
+    match sorted_read_dir(dir) {
+        Ok(entries) => Ok(Some(
+            entries
+                .into_iter()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect(),
+        )),
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// One row per upstream C library. Separate from [`generate`] because the datasets are earned by separate
@@ -151,9 +239,9 @@ pub fn generate_harvest_bench(repo_root: &Path, attested: &Attested) -> Result<(
     for (run, project) in attested.entries() {
         let record =
             scored_phase_dir(&results_dir.join(&run.dir).join(project)).join("result.json");
-        let r: HarvestBenchRow = read_json(&record).with_context(|| {
+        let r: HarvestBenchRow = read_json(&record)?.with_context(|| {
             format!(
-                "{}/{project} is in this run's scope but has no readable record at {}",
+                "{}/{project} is in this run's scope but has no record at {}",
                 run.label,
                 record.display()
             )
@@ -197,6 +285,11 @@ struct HarvestBenchRow {
     loc: Option<crate::analyse::metrics::LocCounts>,
 }
 
+/// Tables are a RENDERING of records that each carry their own `harness` stamp, so they are not
+/// stamped themselves. A header naming the current commit would make every later commit's regenerated
+/// tables differ from the committed ones -- byte-identity is the reproducibility check, and a field
+/// that changes on every commit destroys it while adding nothing a reader cannot get from the
+/// `result.json` a number came from.
 pub fn generate(repo_root: &Path, attested: &Attested) -> Result<()> {
     anyhow::ensure!(
         !attested.is_empty(),
@@ -233,13 +326,22 @@ pub fn generate(repo_root: &Path, attested: &Attested) -> Result<()> {
                 continue;
             }
 
+            // An ATTESTED battery with no readable record is a refusal, not a skip. This was a bare
+            // `continue`, and the three invariants below cannot see the gap: (1) and (1b) compare
+            // MAXIMA per agent and per battery, so another tool still supplies the max, and (1c) only
+            // checks that the run's directory exists. Its sibling `generate_harvest_bench` documents
+            // exactly this failure -- "a missing record dropped its row ... the table published N-1
+            // rows of N and announced success".
             let summary_path = bat_dir.join("summary.json");
-            let summary: Summary = match read_json(&summary_path) {
-                Some(s) => s,
-                None => continue,
-            };
+            let summary: Summary = read_json(&summary_path)?.with_context(|| {
+                format!(
+                    "{agent}/{battery} is attested but has no record at {}. A row cannot be dropped \
+                     silently: the table would publish N-1 of N and report success.",
+                    summary_path.display()
+                )
+            })?;
 
-            let totals = aggregate_cases(&bat_dir, &test_corpus_dir.join(&battery));
+            let totals = aggregate_cases(&bat_dir, &test_corpus_dir.join(&battery))?;
 
             let c_loc = *c_loc_cache
                 .entry(battery.clone())
@@ -262,12 +364,14 @@ pub fn generate(repo_root: &Path, attested: &Attested) -> Result<()> {
             // agent row so \ActorKiroNoValidate* and TRACTOR_TABLE_ROWS can key
             // on it without a separate results tree.
             if agent == "kiro" {
-                if let Some(nv) = read_json::<Summary>(&bat_dir.join("summary_translated.json")) {
+                // Absent is legitimate here: only kiro publishes a pre-verify summary. Unreadable is
+                // not, and `?` now says which it was.
+                if let Some(nv) = read_json::<Summary>(&bat_dir.join("summary_translated.json"))? {
                     let nv_totals = aggregate_cases_phase(
                         &bat_dir,
                         &test_corpus_dir.join(&battery),
                         Some(crate::battery::TRANSLATED),
-                    );
+                    )?;
                     rows.push(BatteryRow {
                         agent: "kiro-translate".to_string(),
                         battery: battery.clone(),
@@ -379,7 +483,7 @@ pub fn generate(repo_root: &Path, attested: &Attested) -> Result<()> {
     println!("✅ Wrote {}", tex_path.display());
 
     let kiro_dir = attested_dir(attested, "kiro");
-    let numbers = generate_numbers_tex(&rows, repo_root, kiro_dir.as_deref());
+    let numbers = generate_numbers_tex(&rows, repo_root, kiro_dir.as_deref())?;
     let numbers_path = tables_dir.join("numbers.tex");
     std::fs::write(&numbers_path, &numbers)?;
     println!("✅ Wrote {}", numbers_path.display());
@@ -786,66 +890,6 @@ fn scored_phase_dir(case_dir: &Path) -> PathBuf {
     }
 }
 
-/// Keyed `"battery/case"`; the value is the runner's own build result.
-fn case_builds(repo_root: &Path, agent: &str) -> std::collections::BTreeMap<String, bool> {
-    let mut out = std::collections::BTreeMap::new();
-    let agent_dir = repo_root.join("results/Test-Corpus").join(agent);
-    let Ok(bats) = sorted_read_dir(&agent_dir) else {
-        return out;
-    };
-    for be in bats {
-        if !be.path().is_dir() {
-            continue;
-        }
-        let battery = be.file_name().to_string_lossy().to_string();
-        let Ok(cases) = sorted_read_dir(&be.path()) else {
-            continue;
-        };
-        for ce in cases {
-            if !ce.path().is_dir() {
-                continue;
-            }
-            let case = ce.file_name().to_string_lossy().to_string();
-            let rp = scored_phase_dir(&ce.path()).join("result.json");
-            let Some(r) = read_json::<CaseResult>(&rp) else {
-                continue;
-            };
-            out.insert(
-                format!("{battery}/{case}"),
-                r.error.as_deref() != Some("build failed"),
-            );
-        }
-    }
-    out
-}
-
-/// The paper's Laertes claim is the *direction* of these two counts, so they are named:
-/// as a `(u32, u32)` the two are interchangeable at every call site and swapping them
-/// reverses the claim without changing a type.
-struct LaertesDelta {
-    /// Compilations Laertes breaks that C2Rust had working.
-    broke: u32,
-    /// Ones it fixes that C2Rust could not build.
-    fixed: u32,
-}
-
-fn laertes_vs_c2rust(repo_root: &Path) -> LaertesDelta {
-    let c2 = case_builds(repo_root, "c2rust");
-    let la = case_builds(repo_root, "laertes");
-    let mut d = LaertesDelta { broke: 0, fixed: 0 };
-    for (case, c2_ok) in &c2 {
-        if let Some(&la_ok) = la.get(case) {
-            if *c2_ok && !la_ok {
-                d.broke += 1;
-            }
-            if !*c2_ok && la_ok {
-                d.fixed += 1;
-            }
-        }
-    }
-    d
-}
-
 struct KiroCost {
     credits: Credits,
     /// The verify phase's share OF `credits`, not an addition to it — the published
@@ -859,15 +903,19 @@ struct KiroCost {
 /// verified one already carries the full translate+verify credit breakdown, so
 /// reading both would double-count the translate phase. Shared-source
 /// duplicates carry no credits, so they do not inflate the total.
-fn kiro_cost(base: &Path) -> KiroCost {
+fn kiro_cost(base: &Path) -> Result<KiroCost> {
     let zero = || KiroCost {
         credits: Credits::new(0.0),
         verify_credits: Credits::new(0.0),
         wall_secs: 0,
     };
     let (mut total, mut verify, mut secs) = (0.0f64, 0.0f64, 0u64);
-    let Ok(rd) = std::fs::read_dir(base) else {
-        return zero();
+    // Absent is legitimate -- a tool with no results has no cost -- so this stays a fallback rather
+    // than a refusal. It is `NotFound` only; anything else says why.
+    let rd = match std::fs::read_dir(base) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(zero()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", base.display())),
     };
     let mut stack: Vec<std::path::PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
     while let Some(p) = stack.pop() {
@@ -878,7 +926,7 @@ fn kiro_cost(base: &Path) -> KiroCost {
         // its phase dirs — each carries a result.json and would double-count.
         if crate::battery::phase_dir(&p, crate::battery::TRANSLATED).is_dir() {
             let rp = scored_phase_dir(&p).join("result.json");
-            if let Some(r) = read_json::<serde_json::Value>(&rp) {
+            if let Some(r) = read_json::<serde_json::Value>(&rp)? {
                 for ph in ["translate", "verify"] {
                     let c = r
                         .pointer(&format!("/{ph}/credits"))
@@ -899,17 +947,21 @@ fn kiro_cost(base: &Path) -> KiroCost {
             stack.extend(rd.filter_map(|e| e.ok().map(|e| e.path())));
         }
     }
-    KiroCost {
+    Ok(KiroCost {
         credits: Credits::new(total),
         verify_credits: Credits::new(verify),
         wall_secs: secs,
-    }
+    })
 }
 
 /// Named constants for result numbers quoted in the prose, so text and tables
 /// cannot disagree. Only numbers derived directly from the committed results
 /// appear here; anything the data does not reproduce is left to the paper text.
-fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path, kiro_dir: Option<&str>) -> String {
+fn generate_numbers_tex(
+    rows: &[BatteryRow],
+    repo_root: &Path,
+    kiro_dir: Option<&str>,
+) -> Result<String> {
     use std::collections::HashMap;
     let mut total_tests: HashMap<&str, u32> = HashMap::new();
     let mut p01_tests: HashMap<&str, u32> = HashMap::new();
@@ -969,7 +1021,7 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path, kiro_dir: Option<
         .map(|d| vec![("Tractor", d, tractor_rust_loc)])
         .unwrap_or_default();
     for (name, base, rust_loc) in &cost_rows {
-        let cost = kiro_cost(&repo_root.join(base));
+        let cost = kiro_cost(&repo_root.join(base))?;
         let credits = cost.credits.as_f64();
         if credits <= 0.0 {
             continue;
@@ -997,7 +1049,9 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path, kiro_dir: Option<
             cost.verify_credits.as_f64() / credits * 100.0
         ));
     }
-    let p01 = kiro_dir.map(|d| kiro_cost(&repo_root.join(d).join("P01_sphincs_plus")));
+    let p01 = kiro_dir
+        .map(|d| kiro_cost(&repo_root.join(d).join("P01_sphincs_plus")))
+        .transpose()?;
     if let Some(p01) = p01.filter(|c| c.credits.as_f64() > 0.0) {
         o.push_str(&format!(
             "\\newcommand{{\\CostPOne}}{{{:.2}}}\n",
@@ -1036,16 +1090,7 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path, kiro_dir: Option<
         "\\newcommand{{\\ActorKiroNoValidatePOneTests}}{{{}}}\n",
         scored(&p01_tests, "kiro-translate", 128)
     ));
-    let laertes = laertes_vs_c2rust(repo_root);
-    o.push_str(&format!(
-        "\\newcommand{{\\LaertesBreaks}}{{{}}}\n",
-        laertes.broke
-    ));
-    o.push_str(&format!(
-        "\\newcommand{{\\LaertesFixes}}{{{}}}\n",
-        laertes.fixed
-    ));
-    o
+    Ok(o)
 }
 
 /// In paper order: ACTOR harness rows first, then transpiler/LLM baselines.
@@ -1062,11 +1107,6 @@ fn display_label(run_label: &str) -> String {
         "claude" => "ACTOR (Claude Code)".to_string(),
         "codex" => "ACTOR (Codex)".to_string(),
         NO_VALIDATE => "\\makebox[\\knvLength][l]{ACTOR (Kiro, no validate)}".to_string(),
-        "c2rust" => "C2Rust".to_string(),
-        "laertes" => "Laertes".to_string(),
-        "c2saferrust" => "C2SaferRust".to_string(),
-        "smartc2rust" => "SmartC2Rust".to_string(),
-        "kimi" => "Kimi K2.5 (query)".to_string(),
         // An ablation or a tool with no paper spelling prints its own label rather than vanishing.
         other => other.to_string(),
     }
@@ -1091,7 +1131,7 @@ fn agent_rows(rows: &[BatteryRow]) -> Vec<(String, String, bool)> {
         a == NO_VALIDATE
             || crate::cli::Tool::value_variants()
                 .iter()
-                .any(|t| crate::cli::is_agentic(*t) && a.starts_with(crate::cli::tool_dir(*t)))
+                .any(|t| a.starts_with(crate::cli::tool_dir(*t)))
     };
     let mut out: Vec<(String, String, bool)> = agents
         .iter()
@@ -1293,20 +1333,30 @@ struct CaseTotals {
 /// multiplies it. Followers are identified by a symlinked corpus `test_case/`, authoritative rather than
 /// a LOC-ratio guess; without the corpus that is unresolvable, so LOC/unsafe sum every case (correct for
 /// the all-independent batteries, and only P00/P01 need dedup).
-fn aggregate_cases(bat_dir: &Path, corpus_bat_dir: &Path) -> CaseTotals {
+fn aggregate_cases(bat_dir: &Path, corpus_bat_dir: &Path) -> Result<CaseTotals> {
     aggregate_cases_phase(bat_dir, corpus_bat_dir, None)
 }
 
 /// `phase`: `Some("translated")` for the pre-verify (no-validate) numbers, `None` for the phase [`scored_phase_dir`] picks.
-fn aggregate_cases_phase(bat_dir: &Path, corpus_bat_dir: &Path, phase: Option<&str>) -> CaseTotals {
+fn aggregate_cases_phase(
+    bat_dir: &Path,
+    corpus_bat_dir: &Path,
+    phase: Option<&str>,
+) -> Result<CaseTotals> {
     let corpus_present = corpus_bat_dir.is_dir();
     let (mut total_loc, mut total_unsafe, mut built) = (0u32, 0u32, 0u32);
-    let Ok(entries) = std::fs::read_dir(bat_dir) else {
-        return CaseTotals {
-            total_loc: 0,
-            unsafe_lines: 0,
-            cases_built: 0,
-        };
+    // A battery this run did not score has no directory, which is legitimate; anything else naming a
+    // reason is not, and used to read the same.
+    let entries = match std::fs::read_dir(bat_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CaseTotals {
+                total_loc: 0,
+                unsafe_lines: 0,
+                cases_built: 0,
+            })
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", bat_dir.display())),
     };
     for entry in entries.flatten() {
         if !entry.path().is_dir() {
@@ -1317,9 +1367,10 @@ fn aggregate_cases_phase(bat_dir: &Path, corpus_bat_dir: &Path, phase: Option<&s
             None => scored_phase_dir(&entry.path()),
         };
         let result_path = phase_dir.join("result.json");
-        let cr: CaseResult = match read_json(&result_path) {
-            Some(r) => r,
-            None => continue,
+        // A case dir with no record is a case this run did not score; an UNREADABLE record is a
+        // corrupt artifact, and the two used to be the same `continue`.
+        let Some(cr) = read_json::<CaseResult>(&result_path)? else {
+            continue;
         };
         if cr.error.as_deref() != Some("build failed") {
             built += 1;
@@ -1334,16 +1385,29 @@ fn aggregate_cases_phase(bat_dir: &Path, corpus_bat_dir: &Path, phase: Option<&s
         total_loc += cr.loc.map_or(0, |l| l.code);
         total_unsafe += cr.unsafe_.map_or(0, |u| u.lines);
     }
-    CaseTotals {
+    Ok(CaseTotals {
         total_loc,
         unsafe_lines: total_unsafe,
         cases_built: built,
-    }
+    })
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    let data = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
+/// Read a record, distinguishing ABSENT from UNREADABLE.
+///
+/// It used to return `Option` and collapse both, so a truncated `summary.json` -- `fs::write`
+/// truncates before it writes, and a SIGKILLed sweep leaves one -- was indistinguishable from a
+/// battery that had never been scored, and the row simply vanished. Adding one field to
+/// `report::Summary` without `#[serde(default)]` would do the same to EVERY row. `Ok(None)` is
+/// "nothing here"; an `Err` names the file and what was wrong with it.
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    serde_json::from_str(&data)
+        .map(Some)
+        .with_context(|| format!("parsing {}", path.display()))
 }
 
 fn sorted_read_dir(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
@@ -1427,7 +1491,8 @@ mod tests {
             &[row("claude"), row("codex"), row("kiro")],
             tmp.path(),
             None,
-        );
+        )
+        .unwrap();
         for name in ["ActorClaudeTests", "ActorCodexTests", "ActorKiroTests"] {
             let line = out
                 .lines()
@@ -1438,7 +1503,7 @@ mod tests {
                 "{name} must carry the number its rows prove: {line}"
             );
         }
-        let alone = generate_numbers_tex(&[row("claude")], tmp.path(), None);
+        let alone = generate_numbers_tex(&[row("claude")], tmp.path(), None).unwrap();
         let codex = alone
             .lines()
             .find(|l| l.contains("ActorCodexTests"))
@@ -1475,12 +1540,15 @@ mod tests {
             keys.contains(&"codex"),
             "codex produced rows and must be printable: {keys:?}"
         );
-        // ACTOR harnesses first, baselines after -- order declared, membership not.
+        // ACTOR harnesses first, everything else after -- order declared, membership not.
         let actor: Vec<bool> = got.iter().map(|(_, _, a)| *a).collect();
         assert_eq!(actor, vec![true, true, true, false], "{keys:?}");
+        // A label with no hardcoded spelling prints ITSELF rather than vanishing. The four baseline
+        // spellings went with the tools: none of them ever produced a `result.json`, so a row for one
+        // could only have come from a directory nothing wrote.
         assert_eq!(
-            got[3].0, "C2Rust",
-            "a baseline still gets its paper spelling"
+            got[3].0, "c2rust",
+            "an unrecognised label must print verbatim, not disappear"
         );
         // A tool with NO rows must not appear at all: an absent system is a dash, never a zero.
         assert!(

@@ -9,6 +9,10 @@ pub struct Scoring<'a> {
     pub tree: &'a crate::eval::EvalTree,
     pub gate: &'a crate::agent_health::Gate<'a>,
     pub covers: Covers<'a>,
+    /// Proof that provenance was established, and the stamp every artifact this scoring writes
+    /// carries. Required, so a `result.json` or a `summary.json` cannot be written by a run whose
+    /// code no commit describes without saying so.
+    pub provenance: &'a crate::provenance::Provenance,
 }
 
 /// Which of a battery's cases a score covers: all the corpus holds, or the subset a `--include-regex`
