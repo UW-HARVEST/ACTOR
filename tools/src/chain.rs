@@ -279,7 +279,7 @@ fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
 
 /// Where a step publishes: WRITE-ONLY, by construction.
 ///
-/// It yields no readable path -- [`Self::at`] returns one for the `Resolved` map and for `logs/`, and
+/// It yields no readable path -- `at` returns one for the `Resolved` map and for `logs/`, and
 /// nothing here reads the directory's CONTENTS. That is the same trick [`Tree`] uses ("yields no path,
 /// so nothing runs in one"), and it is what makes the defect this replaces unspellable: `reseal(&Path)
 /// -> Tree` turned a published OUTPUT directory back into the next step's INPUT, its digest became a

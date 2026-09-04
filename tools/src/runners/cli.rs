@@ -68,7 +68,7 @@ pub enum Backend {
 /// `<work>/.claude/settings.json` sitting unread beside them, so the repo -- the graded oracle's
 /// `test_vectors/` and every sibling agent's translation -- was readable, while `Enforcement::Required`
 /// refused to launch on the grounds that it was not. `require_enforceable` only probes PATH, so it
-/// passed. Now the backend states it and [`Enforcement`] decides.
+/// passed. Now the backend states it and [`crate::io::sandbox::Enforcement`] decides.
 pub enum Sandboxing {
     /// Reads `--settings <file>`: the policy can be enforced.
     Settings,
