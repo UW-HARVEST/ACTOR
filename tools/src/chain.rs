@@ -12,7 +12,7 @@ use crate::eval::Resolved;
 use crate::invocation::{run_or_replay, Invocation, Produced};
 use crate::prompt::{self, Role, Shape};
 use crate::store::{Prompt, Store};
-use crate::tree::{Tree, WorkDir, TRANSLATION};
+use crate::tree::{Corpus, Tree, WorkDir, TRANSLATION};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -22,6 +22,9 @@ pub struct Job {
     pub name: String,
     /// The case root: `test_case/` and, for Test-Corpus, `CMakePresets.json` sit directly inside it.
     pub case_inputs: PathBuf,
+    /// The pinned C, checked once where the dataset derives it. A [`Corpus`] rather than a path
+    /// because `seal` restores `c_src/` from it, so substituting it is silent -- see the type.
+    pub corpus: Corpus,
     /// Where each role publishes. Not derivable from `case_inputs`: only one dataset nests.
     pub case_dir: PathBuf,
     pub shape: Shape,
@@ -35,17 +38,13 @@ pub struct Job {
 pub struct Follower {
     pub cfg: battery::Config,
     pub case_inputs: PathBuf,
+    pub corpus: Corpus,
     pub case_dir: PathBuf,
 }
 
 /// Attempts per invocation on a transient provider failure, and the backoff. Per HARNESS, not per tool.
 const TRANSIENT_ATTEMPTS: usize = 3;
 const BACKOFF_SECS: u64 = 30;
-
-/// Both datasets spell the C the same way.
-fn corpus_case(case_inputs: &Path) -> PathBuf {
-    case_inputs.join("test_case")
-}
 
 /// Every directory a unit's jobs publish into, FOLLOWERS INCLUDED.
 ///
@@ -155,9 +154,8 @@ struct CaseOutcome {
 /// what once scored a five-day-old artifact as this run's.
 fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
     let job = c.job;
-    let corpus_c = corpus_case(&job.case_inputs);
     let work_base = crate::io::workdir::base()?;
-    let mut tree = WorkDir::assemble(&corpus_c)
+    let mut tree = WorkDir::assemble(&job.corpus)
         .with_context(|| format!("laying out a working dir for {}", job.name))?
         .seal()?;
     let mut published = Vec::new();
@@ -174,9 +172,10 @@ fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
         )?;
         let roots = crate::io::workdir::Roots::resolve(&work_base, &c.paths.repo_root);
         let prompt = Prompt::new(crate::store::normalise(&text, &roots));
-        let phase_dir = job.case_dir.join(role.dir());
-        std::fs::create_dir_all(phase_dir.join("logs"))?;
-        let log = phase_dir.join("logs").join(role.log());
+        // Opened, which CLEARS it: a phase dir is output, and nothing ever emptied it, so sweep 1's
+        // files survived sweep 2's publish.
+        let publish = Publish::open(&job.case_dir.join(role.dir()))?;
+        let log = publish.log(role)?;
 
         let runner = crate::runners::build(c.paths, role)?;
         let invocation = Invocation {
@@ -194,7 +193,7 @@ fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
         loop {
             produced = {
                 let _permit = c.pool.acquire();
-                run_or_replay(&invocation, &tree, c.store, &corpus_c, &log)?
+                run_or_replay(&invocation, &tree, c.store, &job.corpus, &log)?
             };
             let transient =
                 matches!(&produced, Produced::DidNotComplete(r) if r.outcome.is_transient());
@@ -228,8 +227,12 @@ fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
                     "  \u{1f6ab} {}: {role:?} answered no: {:?}",
                     job.name, record.outcome
                 );
-                let empty = reseal(&phase_dir, &corpus_c)?;
-                published.push((phase_dir.clone(), empty));
+                // The tree for a step that produced nothing is the FIRST tree of a chain: the corpus's
+                // C and an empty translation. Derived from the corpus, not by reading the phase dir
+                // back -- which is what `reseal` did, and which picked up whatever crate an earlier
+                // sweep had left there, so a refusal was scored on someone else's artifact.
+                let empty = WorkDir::assemble(&job.corpus)?.seal()?;
+                published.push((publish.at().to_path_buf(), empty));
                 refused.push(format!("{}/{role:?}", job.name));
                 break;
             }
@@ -249,34 +252,91 @@ fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
 
         // Publish for the scorer and for a human, then derive the next step's input from the STORED
         // artifact -- never by reading the tree we just wrote. Output must not feed the next key.
-        publish(&after, &phase_dir)?;
-        crate::transform::post_process(&phase_dir, &job.artifact)?;
-        tree = next_input(&after, &job.artifact, &corpus_c)?;
-        published.push((phase_dir.clone(), tree.clone()));
+        publish.write(&after)?;
+        publish.transform(&job.artifact)?;
+        tree = next_input(&after, &job.artifact, &job.corpus)?;
+        published.push((publish.at().to_path_buf(), tree.clone()));
 
-        // Per step: publishability is checked per role, so each must serve its followers.
+        // Per step: publishability is checked per role, so each must serve its followers. Each is
+        // `transform(leader's STORED artifact, its own config)`, computed in scratch -- not a copy of
+        // the leader's published directory, which carried whatever else was in it into 129 graded
+        // trees.
         for follower in &job.followers {
-            let follower_dir = follower.case_dir.join(role.dir());
-            crate::transform::propagate_config(&phase_dir, &follower_dir, &follower.cfg)
-                .with_context(|| {
+            let into = Publish::open(&follower.case_dir.join(role.dir()))?;
+            let derived =
+                follower_input(&after, &follower.cfg, &follower.corpus).with_context(|| {
                     format!(
                         "deriving {} from {} for {role:?}",
                         follower.cfg.name, job.name
                     )
                 })?;
-            let follower_tree = reseal(&follower_dir, &corpus_case(&follower.case_inputs))?;
-            published.push((follower_dir, follower_tree));
+            into.write(&derived)?;
+            published.push((into.at().to_path_buf(), derived));
         }
     }
     Ok(CaseOutcome { published, refused })
 }
 
-/// Write the step's crate into the results tree. Only the translation: `c_src/` is the pinned corpus
-/// and re-derived wherever a working dir is assembled, so publishing it would store the same bytes
-/// once per case per step.
-fn publish(tree: &Tree, phase_dir: &Path) -> Result<()> {
-    tree.copy_subtree_into(TRANSLATION, phase_dir)
-        .with_context(|| format!("publishing into {}", phase_dir.display()))
+/// Where a step publishes: WRITE-ONLY, by construction.
+///
+/// It yields no readable path -- [`Self::at`] returns one for the `Resolved` map and for `logs/`, and
+/// nothing here reads the directory's CONTENTS. That is the same trick [`Tree`] uses ("yields no path,
+/// so nothing runs in one"), and it is what makes the defect this replaces unspellable: `reseal(&Path)
+/// -> Tree` turned a published OUTPUT directory back into the next step's INPUT, its digest became a
+/// cache key, and because `results/.gitignore` drops two files the digest covers, a fresh checkout
+/// computed a different key -- codex 332/338 -> 204/338, all 128 P01 cases unservable.
+///
+/// `open` CLEARS the crate. Nothing ever did, so a re-run's publish overwrote what it had and left the
+/// rest: sweep 1's `src/aes.rs` survived sweep 2, inflating `enrich`'s LOC and `unsafe` counts over
+/// files no `lib.rs` declares. `logs/` survives, because the transcript is written before the artifact.
+pub struct Publish(PathBuf);
+
+impl Publish {
+    pub fn open(dir: &Path) -> Result<Self> {
+        for entry in std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+        {
+            if entry.file_name() == "logs" {
+                continue;
+            }
+            let at = entry.path();
+            let removed = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                std::fs::remove_dir_all(&at)
+            } else {
+                std::fs::remove_file(&at)
+            };
+            removed.with_context(|| format!("clearing {}", at.display()))?;
+        }
+        std::fs::create_dir_all(dir.join("logs"))
+            .with_context(|| format!("preparing {}", dir.display()))?;
+        Ok(Self(dir.to_path_buf()))
+    }
+
+    /// Where the transcript goes. Per role, from the one table that names them.
+    fn log(&self, role: Role) -> Result<PathBuf> {
+        Ok(self.0.join("logs").join(role.log()))
+    }
+
+    /// The directory itself, for the `Resolved` map the oracle looks a case up in. Not a licence to
+    /// read it: no caller does, and `reseal` is gone.
+    fn at(&self) -> &Path {
+        &self.0
+    }
+
+    /// Only the translation: `c_src/` is the pinned corpus and re-derived wherever a working dir is
+    /// assembled, so publishing it would store the same bytes once per case per step.
+    fn write(&self, tree: &Tree) -> Result<()> {
+        tree.copy_subtree_into(TRANSLATION, &self.0)
+            .with_context(|| format!("publishing into {}", self.0.display()))
+    }
+
+    /// The harness transform, applied to what was just written. Deterministic and OUTSIDE the cache,
+    /// so changing it never invalidates an entry that is still good.
+    fn transform(&self, artifact: &crate::transform::Artifact) -> Result<()> {
+        crate::transform::post_process(&self.0, artifact)
+    }
 }
 
 /// The next step's input: `transform(stored artifact)`, computed in a scratch dir.
@@ -290,18 +350,21 @@ fn publish(tree: &Tree, phase_dir: &Path) -> Result<()> {
 fn next_input(
     after: &Tree,
     artifact: &crate::transform::Artifact,
-    corpus_case: &Path,
+    corpus: &Corpus,
 ) -> Result<Tree> {
-    let work = after.materialise(corpus_case)?;
+    let work = after.materialise(corpus)?;
     crate::transform::post_process(&work.translation(), artifact)?;
     work.seal()
 }
 
-/// Seal what is on disk in `phase_dir`. Only for a REFUSED or EXHAUSTED step, which publishes no
-/// artifact and therefore has no stored tree to derive one from.
-fn reseal(phase_dir: &Path, corpus_case: &Path) -> Result<Tree> {
-    let work = WorkDir::assemble(corpus_case)?;
-    crate::tree::copy_plain(phase_dir, &work.translation())?;
+/// A follower's tree: the leader's ONE translation under the follower's own CMake configuration.
+///
+/// A function of the leader's STORED artifact, computed in scratch. It used to be
+/// `propagate_config(leader's published dir, ..)` followed by reading that directory back, so anything
+/// else sitting in the leader's `translated/` reached 129 followers' graded trees.
+fn follower_input(after: &Tree, cfg: &battery::Config, corpus: &Corpus) -> Result<Tree> {
+    let work = after.materialise(corpus)?;
+    crate::transform::apply_config(&work.translation(), cfg)?;
     work.seal()
 }
 
@@ -310,20 +373,27 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
-    /// A results tree is OUTPUT: residue in it must not move the next step's key.
+    /// A results tree is OUTPUT: residue in it must reach neither the next step's key nor the score,
+    /// and a step must not inherit an earlier sweep's files.
     ///
-    /// `reseal` read the published dir back, so any file the seal hashes but `.gitignore` skips changed
-    /// the hash in a fresh checkout. Measured: codex lost all 128 P01_sphincs_plus cases in CI,
-    /// 332/338 -> 204/338, over `.cargo/config.toml` and `Cargo.lock`. Non-vacuity asserts the same
-    /// residue really does move a disk-derived seal, so the fixture carries the trap it claims to.
+    /// `reseal(&Path) -> Tree` read the published dir back, so any file the seal hashes but
+    /// `.gitignore` skips changed the hash in a fresh checkout: codex lost all 128 P01_sphincs_plus
+    /// cases in CI, 332/338 -> 204/338, over `.cargo/config.toml` and `Cargo.lock`. That function is
+    /// gone and cannot be rewritten -- [`Publish`] yields no readable contents -- so what is left to
+    /// pin is the other half: `Publish::open` CLEARS, and the next input is a function of the store.
+    ///
+    /// Non-vacuity is asserted twice: the residue is really there before `open`, and it is really
+    /// hashed (the same bytes inside the tree DO move a digest), so neither claim is about a file the
+    /// digest ignores.
     #[test]
-    fn residue_in_the_published_tree_cannot_move_the_next_steps_input() {
+    fn residue_in_a_published_dir_reaches_neither_the_next_key_nor_the_score() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
-        let corpus_case = tmp.path().join("test_case");
-        std::fs::create_dir_all(&corpus_case).unwrap();
-        std::fs::write(corpus_case.join("lib.c"), "int f(void){return 1;}\n").unwrap();
+        let corpus_dir = tmp.path().join("test_case");
+        std::fs::create_dir_all(&corpus_dir).unwrap();
+        std::fs::write(corpus_dir.join("lib.c"), "int f(void){return 1;}\n").unwrap();
+        let corpus = Corpus::at(&corpus_dir).unwrap();
 
-        let work = WorkDir::assemble(&corpus_case).unwrap();
+        let work = WorkDir::assemble(&corpus).unwrap();
         std::fs::create_dir_all(work.translation().join("src")).unwrap();
         std::fs::write(
             work.translation().join("Cargo.toml"),
@@ -336,32 +406,68 @@ mod tests {
         let artifact = crate::transform::Artifact::Cdylib {
             lib_name: "x".to_string(),
         };
-        let phase_dir = tmp.path().join("published");
-        publish(&after, &phase_dir).unwrap();
-        crate::transform::post_process(&phase_dir, &artifact).unwrap();
+        let dir = tmp.path().join("published");
 
-        let from_store = next_input(&after, &artifact, &corpus_case).unwrap();
-        let from_disk = reseal(&phase_dir, &corpus_case).unwrap();
+        // An earlier sweep's output, including exactly the class of file `.gitignore` skipped and the
+        // seal hashed, plus a source file no later translation has.
+        std::fs::create_dir_all(dir.join(".cargo")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::write(dir.join(".cargo/config.toml"), "[net]\noffline = true\n").unwrap();
+        std::fs::write(dir.join("src/aes.rs"), "pub fn stale() {}\n").unwrap();
+        std::fs::write(dir.join("Cargo.lock"), "# from sweep 1\n").unwrap();
+        std::fs::write(dir.join("logs/translation.log"), "sweep 1\n").unwrap();
+        assert!(dir.join("src/aes.rs").is_file(), "the trap must be present");
 
-        // Exactly the class of file `.gitignore` skipped and the seal hashed.
-        std::fs::create_dir_all(phase_dir.join(".cargo")).unwrap();
+        let publish = Publish::open(&dir).unwrap();
+        publish.write(&after).unwrap();
+        publish.transform(&artifact).unwrap();
+
+        // What the scorer will grade holds the published crate and NOTHING from sweep 1 --
+        assert!(
+            !dir.join("src/aes.rs").exists(),
+            "a stale source file survived the publish"
+        );
+        assert!(!dir.join(".cargo").exists(), "stale build config survived");
+        assert!(
+            !dir.join("Cargo.lock").exists(),
+            "a stale lock file survived"
+        );
+        assert!(
+            dir.join("src/lib.rs").is_file(),
+            "the new crate was published"
+        );
+        // -- except the transcript, which is written BEFORE the artifact and must survive.
+        assert!(
+            dir.join("logs/translation.log").is_file(),
+            "clearing must not take the transcript with it"
+        );
+
+        // And the next step's input is a function of the STORE, not of that directory: putting the
+        // residue back changes nothing.
+        let before_residue = next_input(&after, &artifact, &corpus).unwrap();
+        std::fs::create_dir_all(dir.join(".cargo")).unwrap();
+        std::fs::write(dir.join(".cargo/config.toml"), "[net]\noffline = true\n").unwrap();
+        assert_eq!(
+            next_input(&after, &artifact, &corpus).unwrap().digest(),
+            before_residue.digest(),
+            "the next input must be a function of the store, not of the results tree"
+        );
+
+        // Non-vacuity: those same bytes INSIDE a tree really do move a digest, so the equality above
+        // is not over a file the digest ignores.
+        let moved = WorkDir::assemble(&corpus).unwrap();
+        crate::tree::copy_plain(&dir, &moved.translation()).unwrap();
+        std::fs::create_dir_all(moved.translation().join(".cargo")).unwrap();
         std::fs::write(
-            phase_dir.join(".cargo/config.toml"),
+            moved.translation().join(".cargo/config.toml"),
             "[net]\noffline = true\n",
         )
         .unwrap();
-
-        assert_eq!(
-            next_input(&after, &artifact, &corpus_case)
-                .unwrap()
-                .digest(),
-            from_store.digest(),
-            "the next input must be a function of the STORE, not of the results tree"
-        );
         assert_ne!(
-            reseal(&phase_dir, &corpus_case).unwrap().digest(),
-            from_disk.digest(),
-            "non-vacuity: this residue must really move a disk-derived seal"
+            moved.seal().unwrap().digest(),
+            before_residue.digest(),
+            "non-vacuity: this residue must really move a seal taken over it"
         );
     }
 

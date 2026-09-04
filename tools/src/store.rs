@@ -253,10 +253,37 @@ impl From<&crate::domain::health::Health> for Outcome {
     }
 }
 
-/// One invocation's stored result: the tree it produced, and what it cost to get.
+/// One invocation's stored result: the tree it produced, what it cost to get, and the transcript.
 pub struct Stored {
     pub after: Tree,
     pub record: AgentRecord,
+    /// The entry's `run.log`. PRIVATE, and reachable only by [`Self::republish_transcript`], which
+    /// takes a destination: a public path field is a path escape, and the architecture gate says so.
+    transcript: Option<PathBuf>,
+}
+
+impl Stored {
+    /// Put the stored transcript where the run would have written it, if the entry kept one.
+    ///
+    /// Returns whether it did. The store keeps entries at `0o444`, so the copy is made writable --
+    /// otherwise the next run cannot overwrite it and every case after the first fails with EACCES.
+    pub fn republish_transcript(&self, to: &Path) -> Result<bool> {
+        let Some(from) = &self.transcript else {
+            return Ok(false);
+        };
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::remove_file(to) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("replacing {}", to.display())),
+        }
+        std::fs::copy(from, to)
+            .with_context(|| format!("republishing {} to {}", from.display(), to.display()))?;
+        crate::tree::set_read_only(to, crate::tree::Access::Writable)?;
+        Ok(true)
+    }
 }
 
 #[derive(Default)]
@@ -321,7 +348,12 @@ impl Store {
             Err(e) => return Err(e),
         };
         self.count(|c| c.hits += 1);
-        Ok(Some(Stored { after, record }))
+        let transcript = dir.join("run.log");
+        Ok(Some(Stored {
+            after,
+            record,
+            transcript: transcript.is_file().then_some(transcript),
+        }))
     }
 
     /// Write the entry. `before` is written once per input tree and shared by every prompt beneath
@@ -460,7 +492,7 @@ mod corrupt_tests {
         let corpus = tmp.path().join("test_case");
         std::fs::create_dir_all(&corpus).unwrap();
         std::fs::write(corpus.join("lib.c"), "int f(void);\n").unwrap();
-        let before = crate::tree::WorkDir::assemble(&corpus)
+        let before = crate::tree::WorkDir::assemble(&crate::tree::Corpus::at(&corpus).unwrap())
             .unwrap()
             .seal()
             .unwrap();
@@ -475,7 +507,7 @@ mod corrupt_tests {
         };
 
         let store = Store::open(tmp.path(), Mode::ReadWrite).unwrap();
-        let w = crate::tree::WorkDir::assemble(&corpus).unwrap();
+        let w = crate::tree::WorkDir::assemble(&crate::tree::Corpus::at(&corpus).unwrap()).unwrap();
         std::fs::write(w.translation().join("lib.rs"), "pub fn f() {}\n").unwrap();
         let after = w.seal().unwrap();
         let record = AgentRecord {
@@ -600,7 +632,7 @@ mod tests {
         let c = tmp.path().join("test_case");
         std::fs::create_dir_all(&c).unwrap();
         std::fs::write(c.join("lib.c"), "int f(void);\n").unwrap();
-        let w = crate::tree::WorkDir::assemble(&c).unwrap();
+        let w = crate::tree::WorkDir::assemble(&crate::tree::Corpus::at(&c).unwrap()).unwrap();
         std::fs::write(w.translation().join("lib.rs"), text).unwrap();
         (tmp, w.seal().unwrap())
     }

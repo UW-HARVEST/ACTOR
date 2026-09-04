@@ -306,7 +306,6 @@ impl Session {
         c.arg(prompt).arg(log).arg(model.as_str()).current_dir(cwd);
         c
     }
-
 }
 
 /// The per-case values a claude session needs, in one struct so the positional order

@@ -389,11 +389,7 @@ mod tests {
         // The whole reason Role and Shape are separate axes: one `verify.md` told an executable
         // case to produce a cdylib, which is the wrong artifact for it.
         let lib = file_for(Variant::Default, Role::Verify, Shape::Library);
-        let exe = file_for(
-            Variant::Default,
-            Role::Verify,
-            Shape::Executable,
-        );
+        let exe = file_for(Variant::Default, Role::Verify, Shape::Executable);
         assert_ne!(lib, exe, "verify must not be shape-blind");
     }
 }

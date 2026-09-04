@@ -87,34 +87,20 @@ pub fn post_process(crate_dir: &Path, artifact: &Artifact) -> Result<()> {
     Ok(())
 }
 
-/// Derive a shared-source follower from the crate its group's real case produced: one translation,
-/// rebuilt under each follower's CMake features and graded against its own vectors. Deterministic, so
-/// it stays outside the cache. Without it `attests` voids the battery -- 2 followers cost B02_synthetic
-/// all three tools, and P01_sphincs_plus is 127 of 128 cases.
-pub fn propagate_config(
-    real_dir: &Path,
-    follower_dir: &Path,
-    cfg: &crate::battery::Config,
-) -> Result<()> {
-    anyhow::ensure!(
-        real_dir != follower_dir,
-        "refusing to derive {} onto itself",
-        real_dir.display()
-    );
-    anyhow::ensure!(
-        real_dir.join("Cargo.toml").is_file(),
-        "{} published no crate, so nothing can be derived from it",
-        real_dir.display()
-    );
-    // Replace, not merge: a stale follower would keep files this translation no longer has.
-    if follower_dir.exists() {
-        std::fs::remove_dir_all(follower_dir)
-            .with_context(|| format!("clearing {}", follower_dir.display()))?;
-    }
-    crate::tree::copy_plain(real_dir, follower_dir)
-        .with_context(|| format!("deriving {}", follower_dir.display()))?;
-
-    let cargo_path = follower_dir.join("Cargo.toml");
+/// A shared-source follower's OWN CMake configuration, applied to a crate already in place.
+///
+/// One translation, rebuilt under each follower's features and graded against its own vectors.
+/// Deterministic, so it stays outside the cache. Without it `attests` voids the battery -- 2 followers
+/// cost B02_synthetic all three tools, and P01_sphincs_plus is 127 of 128 cases.
+///
+/// Takes the crate directory and nothing else. It used to take the leader's PUBLISHED directory and
+/// copy it -- so residue in `translated/` reached every follower, and 129 graded trees with it -- and
+/// the copy is now the caller's, from the leader's stored `Tree` into scratch (`chain::follower_input`).
+/// The `real_dir != follower_dir` and "published no crate" guards go with the copy: there is no second
+/// directory here to confuse with this one, and a crate that does not exist fails at `CargoToml::open`
+/// naming the path.
+pub fn apply_config(crate_dir: &Path, cfg: &crate::battery::Config) -> Result<()> {
+    let cargo_path = crate_dir.join("Cargo.toml");
     let mut cargo = CargoToml::open(&cargo_path)?;
     // Only features the crate defines: a CMake variable the agent did not model as a cargo feature
     // would otherwise fail the build for a reason that is not the translation's fault.
@@ -128,7 +114,7 @@ pub fn propagate_config(
             cargo.set_lib(lib);
         }
         cargo.save()?;
-        cargo_toml::strip_for_lib(follower_dir)?;
+        cargo_toml::strip_for_lib(crate_dir)?;
     } else {
         cargo.save()?;
     }
@@ -220,7 +206,8 @@ mod tests {
     }
 
     fn translated(case: &Path) -> Tree {
-        let w = WorkDir::assemble(&case.join("test_case")).unwrap();
+        let w =
+            WorkDir::assemble(&crate::tree::Corpus::at(case.join("test_case")).unwrap()).unwrap();
         std::fs::create_dir_all(w.translation().join("src")).unwrap();
         std::fs::write(
             w.translation().join("Cargo.toml"),
@@ -319,26 +306,32 @@ mod tests {
         assert!(lt.get("bin").is_none() && !lib_dir.join("src/main.rs").exists());
     }
 
+    /// A follower is the leader's ONE translation under the follower's own features.
+    ///
+    /// `apply_config` now takes the crate directory alone. It used to take the leader's PUBLISHED
+    /// directory and copy it, which is how residue in `translated/` reached 129 followers' graded
+    /// trees; the copy belongs to the caller and comes from the leader's stored `Tree`
+    /// (`chain::follower_input`). The two guards that went with the copy are unrepresentable rather
+    /// than checked: there is no second directory here to confuse with this one.
     #[test]
     fn a_follower_is_the_real_crate_rebuilt_under_its_own_features() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
-        let real = tmp.path().join("macrodepth_add_5/translated");
-        std::fs::create_dir_all(real.join("src")).unwrap();
+        let follower = tmp.path().join("macrodepth_mul_4/translated");
+        std::fs::create_dir_all(follower.join("src")).unwrap();
         std::fs::write(
-            real.join("Cargo.toml"),
+            follower.join("Cargo.toml"),
             "[package]\nname = \"t\"\nedition = \"2021\"\n\n[features]\ndefault = []\nop_add = []\nop_mul = []\n",
         )
         .unwrap();
-        std::fs::write(real.join("src/lib.rs"), "pub fn f() -> i32 { 1 }\n").unwrap();
+        std::fs::write(follower.join("src/lib.rs"), "pub fn f() -> i32 { 1 }\n").unwrap();
 
-        let follower = tmp.path().join("macrodepth_mul_4/translated");
         let cfg = crate::battery::Config {
             name: "macrodepth_mul_4".into(),
             features: vec!["op_mul".into(), "op_bogus".into()],
             is_lib: true,
             lib_name: Some("macrodepth_mul_4".into()),
         };
-        propagate_config(&real, &follower, &cfg).unwrap();
+        apply_config(&follower, &cfg).unwrap();
 
         let toml = std::fs::read_to_string(follower.join("Cargo.toml")).unwrap();
         let doc: toml_edit::DocumentMut = toml.parse().unwrap();
@@ -363,18 +356,12 @@ mod tests {
             "the follower is the SAME translation, not a re-translation"
         );
 
+        // Idempotent: a re-run of the same step must not accumulate feature selections.
         let once = std::fs::read_to_string(follower.join("Cargo.toml")).unwrap();
-        propagate_config(&real, &follower, &cfg).unwrap();
+        apply_config(&follower, &cfg).unwrap();
         assert_eq!(
             once,
             std::fs::read_to_string(follower.join("Cargo.toml")).unwrap()
-        );
-
-        let err = propagate_config(&real, &real, &cfg).expect_err("self-derivation must refuse");
-        assert!(format!("{err:#}").contains("onto itself"));
-        assert!(
-            real.join("src/lib.rs").is_file(),
-            "and the real crate survives the refusal"
         );
     }
 
@@ -402,7 +389,9 @@ mod tests {
             "the C must not reach the graded tree at any depth"
         );
         // Non-vacuous: the tree it came FROM really did carry the C.
-        let work = tree.materialise(&case.join("test_case")).unwrap();
+        let work = tree
+            .materialise(&crate::tree::Corpus::at(case.join("test_case")).unwrap())
+            .unwrap();
         assert!(
             work.root().join(C_SRC).join("src/lib.c").is_file(),
             "otherwise this test proves nothing about exclusion"
@@ -452,7 +441,9 @@ mod tests {
     fn post_processing_names_the_lib_from_the_corpus_and_is_idempotent() {
         let (_tmp, case) = corpus();
         let tree = translated(&case);
-        let work = tree.materialise(&case.join("test_case")).unwrap();
+        let work = tree
+            .materialise(&crate::tree::Corpus::at(case.join("test_case")).unwrap())
+            .unwrap();
         let crate_dir = work.translation();
 
         let artifact = Artifact::Cdylib {

@@ -115,7 +115,11 @@ impl Backend {
 /// never ran. The CLI build has the same problem from the other end — it auto-updates
 /// through a shim, so the binary can change between the probe and the run. The
 /// transcript's `init` record is the CLI's own report of both.
-pub fn assert_pins_honoured(log_path: &Path, want: &ModelId, cli: &CliVersion) -> Result<PinReport> {
+pub fn assert_pins_honoured(
+    log_path: &Path,
+    want: &ModelId,
+    cli: &CliVersion,
+) -> Result<PinReport> {
     let text = match std::fs::read_to_string(log_path) {
         Ok(t) => t,
         // The health classifier already treats a missing log as a non-completion.

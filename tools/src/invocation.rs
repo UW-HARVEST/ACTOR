@@ -82,12 +82,18 @@ pub fn run_or_replay(
     inv: &Invocation<'_>,
     before: &Tree,
     store: &Store,
-    corpus_c: &Path,
+    corpus_c: &crate::tree::Corpus,
     log: &Path,
 ) -> Result<Produced> {
     let key = inv.key(before);
 
     if let Some(hit) = store.lookup(&key)? {
+        // Put the transcript back where the run would have written it. Without this a replay left
+        // `logs/<role>.log` as whatever filesystem history happened to hold -- the ONE part of
+        // `results/` that was not a function of the store, and the reason a fresh checkout's published
+        // logs came from git rather than from the entry being replayed. `agent_health::audit` reads
+        // exactly these files, so it was auditing a different run's evidence.
+        hit.republish_transcript(log)?;
         return Ok(Produced::Done {
             after: hit.after,
             record: hit.record,
@@ -211,7 +217,7 @@ mod tests {
     struct Fixture {
         _repo: tempfile::TempDir,
         _corpus: tempfile::TempDir,
-        corpus_c: std::path::PathBuf,
+        corpus_c: crate::tree::Corpus,
         log: std::path::PathBuf,
         first: Tree,
     }
@@ -219,9 +225,10 @@ mod tests {
     fn fixture() -> Fixture {
         let repo = crate::io::workdir::test_tempdir().unwrap();
         let corpus = crate::io::workdir::test_tempdir().unwrap();
-        let corpus_c = corpus.path().join("test_case");
-        std::fs::create_dir_all(&corpus_c).unwrap();
-        std::fs::write(corpus_c.join("lib.c"), "int f(void);\n").unwrap();
+        let corpus_dir = corpus.path().join("test_case");
+        std::fs::create_dir_all(&corpus_dir).unwrap();
+        std::fs::write(corpus_dir.join("lib.c"), "int f(void);\n").unwrap();
+        let corpus_c = crate::tree::Corpus::at(&corpus_dir).unwrap();
         let log = repo.path().join("run.log");
         let first = WorkDir::assemble(&corpus_c).unwrap().seal().unwrap();
         Fixture {

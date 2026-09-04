@@ -945,12 +945,7 @@ mod provenance_tests {
         assert!(m.model.is_none());
         assert!(m.tokens.is_none());
         let json = serde_json::to_string(&m).unwrap();
-        for k in [
-            "total_cost_usd",
-            "model",
-            "tokens",
-            "num_turns",
-        ] {
+        for k in ["total_cost_usd", "model", "tokens", "num_turns"] {
             assert!(
                 !json.contains(k),
                 "{k} must be omitted, not zero-valued: {json}"
@@ -982,7 +977,6 @@ mod provenance_tests {
         assert!((m.total_cost_usd.unwrap() - 90.00792925).abs() < 1e-9);
         assert_eq!(m.num_turns, Some(193));
     }
-
 
     #[test]
     fn interleaved_stderr_does_not_defeat_extraction() {
