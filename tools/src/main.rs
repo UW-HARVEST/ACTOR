@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 // Never re-declare these with `mod` here; see the note in lib.rs.
 use harvest_tools::analyse::report;
 use harvest_tools::cli::{Cli, Command, Dataset};
@@ -131,6 +131,38 @@ fn main() -> Result<()> {
                 for (at, outcome) in &failures {
                     println!("  {outcome:?}  {at}");
                 }
+            }
+            cli::CacheAction::Bound => {
+                let mut bounded = 0usize;
+                let mut checked = 0usize;
+                let mut stack = vec![repo_root.join("results")];
+                while let Some(dir) = stack.pop() {
+                    let entries = match std::fs::read_dir(&dir) {
+                        Ok(rd) => rd.filter_map(std::result::Result::ok).collect::<Vec<_>>(),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => {
+                            return Err(e).with_context(|| format!("walking {}", dir.display()))
+                        }
+                    };
+                    for e in entries {
+                        let at = e.path();
+                        if at.is_dir() {
+                            stack.push(at);
+                        } else if at.extension().is_some_and(|x| x == "log") {
+                            checked += 1;
+                            if agent_health::bound_transcript(&at)? {
+                                println!("  \u{2702}\u{fe0f}  bounded {}", at.display());
+                                bounded += 1;
+                            }
+                        }
+                    }
+                }
+                anyhow::ensure!(
+                    checked > 0,
+                    "found no transcript under {}/results, so this proves nothing",
+                    repo_root.display()
+                );
+                println!("\u{2705} {checked} transcript(s) checked, {bounded} bounded");
             }
             cli::CacheAction::Verify => {
                 let (checked, corrupt) = store::Store::open(&repo_root, mode)?.verify()?;

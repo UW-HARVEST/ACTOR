@@ -278,6 +278,13 @@ pub enum CacheAction {
     /// Re-hash every stored tree against the digest it is filed under. No agent invocations, so a
     /// reproducibility check can run it on every push.
     Verify,
+    /// Bound every transcript under `results/` to what the store can carry, keeping both ends.
+    ///
+    /// A repair for logs written before the run applied the bound itself. One runaway log makes the
+    /// whole store unpushable, so it also makes it unbankable -- and the rule lives in ONE function
+    /// (`agent_health::bound_transcript`), which is why this is a subcommand rather than a shell
+    /// one-liner that would be a second copy of it.
+    Bound,
 }
 
 impl Command {
