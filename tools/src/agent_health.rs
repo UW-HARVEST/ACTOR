@@ -48,49 +48,10 @@ pub fn classify_log(log: &Path, format: LogFormat, exit: Exit) -> Health {
     }
 }
 
-fn read_metrics(metrics_json: &Path) -> Option<serde_json::Value> {
-    serde_json::from_str(&std::fs::read_to_string(metrics_json).ok()?).ok()
-}
-
-/// Report-only detail. Deliberately not a classifier: see the docs on
-/// [`crate::domain::health`] and `SIGXFSZ`.
-pub fn exit_code(metrics_json: &Path) -> Option<i64> {
-    read_metrics(metrics_json)?.get("exit_code")?.as_i64()
-}
-
-/// How the agent process ended, as the run itself recorded it beside the transcript: for a
-/// [`LogFormat::Opaque`] backend it is the gate's only sight of a wall-clock kill, which is
-/// `Infra { "timeout" }` and not a result. No record stays [`Exit::Unobserved`] rather than getting a
-/// verdict nobody observed — and since the store records the outcome, nothing writes these any more.
-pub fn recorded_exit(metrics_json: &Path) -> Exit {
-    let Some(metrics) = read_metrics(metrics_json) else {
-        return Exit::Unobserved;
-    };
-    // Both keys are written or neither, and a null `exit_code` is a real observation of a
-    // signal kill — so presence, not parseability, says it was watched.
-    let Some(code) = metrics.get("exit_code") else {
-        return Exit::Unobserved;
-    };
-    let code = code.as_i64();
-    let timed_out = metrics.get("timed_out").and_then(|t| t.as_bool());
-    // `timeout` exits 124; records written before `timed_out` existed carry only the code.
-    if timed_out == Some(true) || code == Some(124) {
-        return Exit::Timeout;
-    }
-    match code {
-        Some(0) => Exit::Success,
-        Some(c) => Exit::Failure {
-            code: i32::try_from(c).ok(),
-        },
-        None => Exit::Failure { code: None },
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct CaseHealth {
     pub name: String,
     pub health: Health,
-    pub exit_code: Option<i64>,
     pub log: PathBuf,
 }
 
@@ -99,25 +60,32 @@ pub struct Run {
     pub case_dir: PathBuf,
 }
 
-/// Classify each run in the ROSTER, preferring the verify log where both exist. A roster and not a root
-/// to recurse from: `audit(paths.results_dir, ..)` refused B01_synthetic with all 85 cases fresh, for
-/// 27 dead runs in other batteries. One `format`, because a roster is agent-scoped.
+/// Classify each run in the ROSTER from its TRANSCRIPT, preferring the verify log where both exist. A
+/// roster and not a root to recurse from: `audit(paths.results_dir, ..)` refused B01_synthetic with all
+/// 85 cases fresh, for 27 dead runs in other batteries. One `format`, because a roster is agent-scoped.
+///
+/// [`Exit::Unobserved`], stated once and here: this runs AFTER the process is gone, so there is no exit
+/// to observe. It used to read `<phase>/{verification,translation}.json` for one -- files nothing in
+/// this crate has ever written (`find results -name verification.json` returns 0), so every call
+/// already passed `Unobserved` while two functions and a `CaseHealth.exit_code` field maintained the
+/// appearance of a second source of evidence. The authoritative record is the store's
+/// `AgentRecord.outcome`, classified at run time WITH the observed exit; this gate is a backstop over
+/// published transcripts and says so.
 pub fn audit(runs: &[Run], format: LogFormat) -> Vec<CaseHealth> {
     let mut out = Vec::new();
     for run in runs {
         let verify = run.case_dir.join("verified/logs/verify.log");
         let translate = run.case_dir.join("translated/logs/translation.log");
-        let (log, metrics) = if verify.is_file() {
-            (verify, run.case_dir.join("verified/verification.json"))
+        let log = if verify.is_file() {
+            verify
         } else if translate.is_file() {
-            (translate, run.case_dir.join("translated/translation.json"))
+            translate
         } else {
             continue;
         };
         out.push(CaseHealth {
             name: run.name.clone(),
-            health: classify_log(&log, format, recorded_exit(&metrics)),
-            exit_code: exit_code(&metrics),
+            health: classify_log(&log, format, Exit::Unobserved),
             log,
         });
     }
@@ -186,11 +154,7 @@ pub fn describe_infra_failures(audit: &[CaseHealth]) -> Option<String> {
     );
     for c in bad.iter().take(30) {
         if let Health::Infra { detail, .. } = &c.health {
-            let ec = c
-                .exit_code
-                .map(|e| format!(" exit={e}"))
-                .unwrap_or_default();
-            s.push_str(&format!("  {}{ec}\n     {detail}\n", c.name));
+            s.push_str(&format!("  {}\n     {detail}\n", c.name));
         }
     }
     if bad.len() > 30 {
@@ -214,7 +178,6 @@ pub fn record_infra_failures(results_dir: &Path, audit: &[CaseHealth]) -> Result
                 "case": c.name,
                 "reason": reason,
                 "detail": detail,
-                "exit_code": c.exit_code,
                 "log": c.log.to_string_lossy(),
             })
         })
@@ -302,22 +265,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn audit_reads_exit_code_as_corroboration_only() {
-        let tmp = crate::io::workdir::test_tempdir().unwrap();
-        let case = tmp.path().join("hb/jansson");
-        write(&case, "verified/logs/verify.log", DEAD);
-        std::fs::write(
-            case.join("verified/verification.json"),
-            r#"{"exit_code":1,"success":true,"duration_secs":4569}"#,
-        )
-        .unwrap();
-        let a = audit(&roster(tmp.path(), &["hb/jansson"]), LogFormat::StreamJson);
-        assert_eq!(a[0].exit_code, Some(1));
-        // `success:true` here is the cargo-check gate, NOT agent health.
-        assert!(a[0].health.is_infra());
-    }
-
     /// Making translate's four log paths one function of the phase put the prose and docker
     /// transcripts under `translated/logs/` where the audit finds them. Reading them as
     /// stream-json calls every healthy laertes/c2saferrust/kimi/oneshot run
@@ -358,89 +305,40 @@ mod tests {
     /// `Exit::Unobserved` made `Unknown` their only possible verdict, and both consumers of the
     /// gate filter on `is_infra` — so it could not fire for them at all, no INFRA_FAILURES.json
     /// was written, and a run killed at three hours was scored as a result.
+    /// A wall-clock kill is the SAME outcome whichever backend it happened to.
+    ///
+    /// `Exit::Exhausted` used to be consumed only by the `Opaque` arm, because `classify_stream_json`
+    /// and `classify_codex_json` never received `exit` -- so one `timeout` kill of a session that was
+    /// still writing was `Exhausted` for kiro and `Infra { "truncated" }` for claude and codex.
+    /// `Infra` is transient, so the identical event was retried three times for two backends and
+    /// recorded as a terminal answer for the third. Which backend it was cannot be what decides.
+    ///
+    /// This replaces a test that hand-wrote `<phase>/translation.json` fixtures. Nothing in this crate
+    /// has ever written that file -- `find results -name translation.json` returns 0 -- so it proved
+    /// only that the classifier reads a shape no run produces. `audit` now says in one place that it
+    /// has no exit to observe, and the authoritative record is the store's `AgentRecord.outcome`,
+    /// classified here at run time WITH the exit.
     #[test]
-    fn a_wall_clock_killed_opaque_run_is_an_infra_failure() {
-        let tmp = crate::io::workdir::test_tempdir().unwrap();
-        // One transcript shape for all three cases, so only the recorded exit can tell them
-        // apart — which is the whole claim under test.
-        for case in ["HB/jansson", "HB/mujs", "HB/zlib"] {
-            write(
-                &tmp.path().join(case),
-                "translated/logs/translation.log",
-                KIRO_KILLED,
+    fn a_wall_clock_kill_is_exhausted_for_every_backend_not_just_the_opaque_one() {
+        for format in [
+            LogFormat::StreamJson,
+            LogFormat::CodexJson,
+            LogFormat::Opaque,
+        ] {
+            assert!(
+                matches!(
+                    crate::domain::health::classify(KIRO_KILLED, format, Exit::Exhausted),
+                    Health::Exhausted { .. }
+                ),
+                "{format:?} calls an exhausted session something else"
             );
         }
-        for (case, record) in [
-            // Killed at the wall clock: `timeout` exits 124.
-            (
-                "HB/jansson",
-                r#"{"exit_code":124,"timed_out":true,"success":false,"duration_secs":10800}"#,
-            ),
-            (
-                "HB/mujs",
-                r#"{"exit_code":0,"timed_out":false,"success":true,"duration_secs":912}"#,
-            ),
-            // A backend that records no exit at all.
-            ("HB/zlib", r#"{"success":false,"duration_secs":10800}"#),
-        ] {
-            std::fs::write(
-                tmp.path().join(case).join("translated/translation.json"),
-                record,
-            )
-            .unwrap();
-        }
-
-        let a = audit(
-            &roster(tmp.path(), &["HB/jansson", "HB/mujs", "HB/zlib"]),
-            LogFormat::Opaque,
-        );
-        let health = |name: &str| {
-            a.iter()
-                .find(|c| c.name == name)
-                .unwrap_or_else(|| panic!("{name} not audited"))
-                .health
-                .clone()
-        };
-        match health("HB/jansson") {
-            Health::Infra { reason, detail } => {
-                assert_eq!(reason, "timeout");
-                assert!(detail.contains("wall clock"), "{detail}");
-            }
-            other => panic!("a run killed at the wall clock has no measurement: {other:?}"),
-        }
+        // Non-vacuity: without the observed exit, a truncated transcript is still infra for the two
+        // JSON formats, so the assertion above is about the EXIT and not about the text.
         assert!(
-            !health("HB/mujs").is_infra(),
-            "a run watched to a clean exit has a measurement: {:?}",
-            health("HB/mujs")
-        );
-        assert!(
-            !health("HB/zlib").is_infra(),
-            "an unrecorded exit is no evidence of failure: {:?}",
-            health("HB/zlib")
-        );
-
-        let msg = describe_infra_failures(&a).expect("the gate must fire for an opaque backend");
-        assert!(msg.contains("1 of 3"), "counts: {msg}");
-        assert!(msg.contains("HB/jansson"), "names the case: {msg}");
-        record_infra_failures(tmp.path(), &a).unwrap();
-        let doc: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp.path().join("INFRA_FAILURES.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(doc["infra_failures"], serde_json::json!(1));
-        assert_eq!(doc["cases"][0]["case"], serde_json::json!("HB/jansson"));
-        assert_eq!(doc["cases"][0]["exit_code"], serde_json::json!(124));
-
-        // The fixture is the transcript the hardcoded stream-json reading called
-        // `Infra { "truncated" }`: the killed run is still blocked — now on the evidence rather
-        // than on a misread — and its two healthy neighbours no longer with it.
-        let as_stream_json = audit(
-            &roster(tmp.path(), &["HB/jansson", "HB/mujs", "HB/zlib"]),
-            LogFormat::StreamJson,
-        );
-        assert!(
-            as_stream_json.iter().all(|c| c.health.is_infra()),
-            "fixture must trip the hardcoded classifier, or this proves nothing: {as_stream_json:?}"
+            crate::domain::health::classify(KIRO_KILLED, LogFormat::StreamJson, Exit::Unobserved)
+                .is_infra(),
+            "an unobserved truncated stream-json log must still be infra"
         );
     }
 

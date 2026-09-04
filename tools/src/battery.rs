@@ -439,9 +439,6 @@ pub struct AgentRunMeta {
     pub terminal_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_error_status: Option<i64>,
-    /// Process exit status, from the sibling `verification.json` / `translation.json`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i64>,
 
     // ── effort and cost ─────────────────────────────────────────────────────
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -536,18 +533,6 @@ fn extract_stream_json_meta(log_path: &Path) -> Option<AgentRunMeta> {
             m.wall_secs = ms / 1000;
         }
     }
-
-    // Written beside the log by agents::run::write_phase_metrics.
-    m.exit_code = log_path
-        .parent()
-        .and_then(|logs| logs.parent())
-        .and_then(|phase| {
-            ["verification.json", "translation.json"]
-                .iter()
-                .map(|f| phase.join(f))
-                .find(|p| p.is_file())
-        })
-        .and_then(|p| crate::agent_health::exit_code(&p));
 
     if found {
         Some(m)
@@ -965,7 +950,6 @@ mod provenance_tests {
             "model",
             "tokens",
             "num_turns",
-            "exit_code",
         ] {
             assert!(
                 !json.contains(k),
@@ -999,22 +983,6 @@ mod provenance_tests {
         assert_eq!(m.num_turns, Some(193));
     }
 
-    #[test]
-    fn exit_code_is_read_from_the_sibling_metrics_file() {
-        let tmp = crate::io::workdir::test_tempdir().unwrap();
-        let p = log(tmp.path(), &format!("{INIT}\n{DEAD}\n"));
-        std::fs::write(
-            tmp.path().join("verified/verification.json"),
-            r#"{"exit_code":1,"success":true,"duration_secs":4569}"#,
-        )
-        .unwrap();
-        let m = extract_agent_meta(&p).unwrap();
-        assert_eq!(
-            m.exit_code,
-            Some(1),
-            "already on disk, previously read by nothing"
-        );
-    }
 
     #[test]
     fn interleaved_stderr_does_not_defeat_extraction() {

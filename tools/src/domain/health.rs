@@ -144,12 +144,22 @@ impl Health {
 /// ignored -- see the module docs on `SIGXFSZ`: a test binary killed by a signal fails commands inside
 /// a session that is itself fine, and that is a *result*.
 pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
+    // `Exhausted` BEFORE the per-format arms, for every backend. It used to be reachable only from the
+    // `Opaque` arm, because the other two never received `exit` -- so one wall-clock kill of a session
+    // that was still writing was `Exhausted { secs }` for kiro and `Infra { "truncated" }` for claude
+    // and codex. `Infra` is transient, so the identical event was RETRIED three times for two backends
+    // and RECORDED as a terminal answer for the third. Which backend it was cannot be what decides.
+    if exit == Exit::Exhausted {
+        return Health::Exhausted { secs: 0 };
+    }
     match format {
         LogFormat::StreamJson => classify_stream_json(text),
         LogFormat::CodexJson => classify_codex_json(text),
         // An opaque log cannot distinguish "finished" from "killed", so the exit
         // status carries the whole burden of proof.
         LogFormat::Opaque => match exit {
+            // `Exhausted` is handled above, for every backend.
+            Exit::Exhausted => unreachable!("returned before the format is consulted"),
             Exit::Success => Health::Completed,
             // The run was cut off: there is no measurement, exactly as a truncated
             // stream-json log has none.
@@ -157,7 +167,6 @@ pub fn classify(text: &str, format: LogFormat, exit: Exit) -> Health {
                 reason: "timeout".into(),
                 detail: "the agent was killed at the wall clock".into(),
             },
-            Exit::Exhausted => Health::Exhausted { secs: 0 },
             // A tool that ran and failed is a RESULT and stays in the denominator; treating that as
             // infra inflates the score. The PROVIDER saying "temporarily unavailable" is NOT that, and
             // `Unknown` made it neither retryable nor visible to the gate.

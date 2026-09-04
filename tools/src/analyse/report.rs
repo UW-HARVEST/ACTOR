@@ -786,66 +786,6 @@ fn scored_phase_dir(case_dir: &Path) -> PathBuf {
     }
 }
 
-/// Keyed `"battery/case"`; the value is the runner's own build result.
-fn case_builds(repo_root: &Path, agent: &str) -> std::collections::BTreeMap<String, bool> {
-    let mut out = std::collections::BTreeMap::new();
-    let agent_dir = repo_root.join("results/Test-Corpus").join(agent);
-    let Ok(bats) = sorted_read_dir(&agent_dir) else {
-        return out;
-    };
-    for be in bats {
-        if !be.path().is_dir() {
-            continue;
-        }
-        let battery = be.file_name().to_string_lossy().to_string();
-        let Ok(cases) = sorted_read_dir(&be.path()) else {
-            continue;
-        };
-        for ce in cases {
-            if !ce.path().is_dir() {
-                continue;
-            }
-            let case = ce.file_name().to_string_lossy().to_string();
-            let rp = scored_phase_dir(&ce.path()).join("result.json");
-            let Some(r) = read_json::<CaseResult>(&rp) else {
-                continue;
-            };
-            out.insert(
-                format!("{battery}/{case}"),
-                r.error.as_deref() != Some("build failed"),
-            );
-        }
-    }
-    out
-}
-
-/// The paper's Laertes claim is the *direction* of these two counts, so they are named:
-/// as a `(u32, u32)` the two are interchangeable at every call site and swapping them
-/// reverses the claim without changing a type.
-struct LaertesDelta {
-    /// Compilations Laertes breaks that C2Rust had working.
-    broke: u32,
-    /// Ones it fixes that C2Rust could not build.
-    fixed: u32,
-}
-
-fn laertes_vs_c2rust(repo_root: &Path) -> LaertesDelta {
-    let c2 = case_builds(repo_root, "c2rust");
-    let la = case_builds(repo_root, "laertes");
-    let mut d = LaertesDelta { broke: 0, fixed: 0 };
-    for (case, c2_ok) in &c2 {
-        if let Some(&la_ok) = la.get(case) {
-            if *c2_ok && !la_ok {
-                d.broke += 1;
-            }
-            if !*c2_ok && la_ok {
-                d.fixed += 1;
-            }
-        }
-    }
-    d
-}
-
 struct KiroCost {
     credits: Credits,
     /// The verify phase's share OF `credits`, not an addition to it — the published
@@ -1036,15 +976,6 @@ fn generate_numbers_tex(rows: &[BatteryRow], repo_root: &Path, kiro_dir: Option<
         "\\newcommand{{\\ActorKiroNoValidatePOneTests}}{{{}}}\n",
         scored(&p01_tests, "kiro-translate", 128)
     ));
-    let laertes = laertes_vs_c2rust(repo_root);
-    o.push_str(&format!(
-        "\\newcommand{{\\LaertesBreaks}}{{{}}}\n",
-        laertes.broke
-    ));
-    o.push_str(&format!(
-        "\\newcommand{{\\LaertesFixes}}{{{}}}\n",
-        laertes.fixed
-    ));
     o
 }
 
@@ -1062,11 +993,6 @@ fn display_label(run_label: &str) -> String {
         "claude" => "ACTOR (Claude Code)".to_string(),
         "codex" => "ACTOR (Codex)".to_string(),
         NO_VALIDATE => "\\makebox[\\knvLength][l]{ACTOR (Kiro, no validate)}".to_string(),
-        "c2rust" => "C2Rust".to_string(),
-        "laertes" => "Laertes".to_string(),
-        "c2saferrust" => "C2SaferRust".to_string(),
-        "smartc2rust" => "SmartC2Rust".to_string(),
-        "kimi" => "Kimi K2.5 (query)".to_string(),
         // An ablation or a tool with no paper spelling prints its own label rather than vanishing.
         other => other.to_string(),
     }
@@ -1475,12 +1401,15 @@ mod tests {
             keys.contains(&"codex"),
             "codex produced rows and must be printable: {keys:?}"
         );
-        // ACTOR harnesses first, baselines after -- order declared, membership not.
+        // ACTOR harnesses first, everything else after -- order declared, membership not.
         let actor: Vec<bool> = got.iter().map(|(_, _, a)| *a).collect();
         assert_eq!(actor, vec![true, true, true, false], "{keys:?}");
+        // A label with no hardcoded spelling prints ITSELF rather than vanishing. The four baseline
+        // spellings went with the tools: none of them ever produced a `result.json`, so a row for one
+        // could only have come from a directory nothing wrote.
         assert_eq!(
-            got[3].0, "C2Rust",
-            "a baseline still gets its paper spelling"
+            got[3].0, "c2rust",
+            "an unrecognised label must print verbatim, not disappear"
         );
         // A tool with NO rows must not appear at all: an absent system is a dash, never a zero.
         assert!(
