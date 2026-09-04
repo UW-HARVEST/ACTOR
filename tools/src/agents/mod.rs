@@ -6,7 +6,6 @@
 //! translation module to reach its OWN work tree, and why three of the module cycles ran
 //! through that one file.
 
-pub mod opencode;
 pub mod session;
 
 use std::sync::{Condvar, Mutex};

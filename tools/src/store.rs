@@ -174,6 +174,11 @@ pub struct AgentRecord {
     /// it from, and a `0` there would be a measurement nobody made.
     pub cost_usd: Option<f64>,
     pub cli: String,
+    /// Whether the CLI's own transcript confirmed the model it was pinned to. `default` because every
+    /// entry written before the check was wired has no answer, and inventing `Confirmed` for those
+    /// would be the claim this field exists to stop making.
+    #[serde(default)]
+    pub pin: crate::domain::health::PinReport,
 }
 
 /// Whether the agent ran, CLASSIFIED from the transcript rather than read off an exit code: every
@@ -474,6 +479,7 @@ mod corrupt_tests {
         std::fs::write(w.translation().join("lib.rs"), "pub fn f() {}\n").unwrap();
         let after = w.seal().unwrap();
         let record = AgentRecord {
+            pin: crate::domain::health::PinReport::Confirmed,
             outcome: Outcome::Completed,
             output_tree: Some(after.digest().as_str().to_string()),
             wall_secs: 1,
@@ -601,6 +607,7 @@ mod tests {
 
     fn record(outcome: Outcome, after: Option<&crate::tree::Tree>) -> AgentRecord {
         AgentRecord {
+            pin: crate::domain::health::PinReport::Confirmed,
             outcome,
             output_tree: after.map(|t| t.digest().as_str().to_string()),
             wall_secs: 12,

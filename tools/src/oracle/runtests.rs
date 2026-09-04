@@ -677,7 +677,7 @@ mod tests {
         let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
         let gate = gate_at(&paths);
         let scoring = Scoring {
-            roles: crate::prompt::chain(paths.tool, paths.variant),
+            roles: crate::prompt::chain(paths.variant),
             resolved: &resolved,
             tree: &tree,
             gate: &gate,
@@ -724,7 +724,7 @@ mod tests {
             paths,
             "B01",
             &Scoring {
-                roles: crate::prompt::chain(paths.tool, paths.variant),
+                roles: crate::prompt::chain(paths.variant),
                 resolved,
                 tree,
                 gate: &gate,
@@ -734,17 +734,21 @@ mod tests {
         .unwrap()
     }
 
-    /// Which summary a verify-less agent's translate score is filed as. Only `claude/*` and `kiro/*`
-    /// hold `summary_translated.json`; measured, `c2rust/B01_synthetic` is 85 `translated/` crates, no
-    /// `verified/` crate, and `summary.json` at 85/85 (393v) -- so the translate score IS the headline.
+    /// Which summary a ONE-STEP chain's translate score is filed as: the headline, not
+    /// `summary_translated.json`, because there is no verify score for it to sit beneath.
+    ///
+    /// The one-step chain is now an ABLATION (`Variant::Combined` folds verification into the
+    /// translate prompt) rather than a verify-less tool -- the transpilers this was written against are
+    /// deleted. Same property, and it still has to hold for the archive to find the score and for
+    /// `analyse::report` to read it.
     #[test]
-    fn a_verify_less_agents_translate_score_is_the_battery_headline() {
+    fn a_one_step_chains_translate_score_is_the_battery_headline() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         corpus_battery(tmp.path(), "B01", &["only"]);
         let paths = paths_at(
             tmp.path(),
-            crate::cli::Tool::C2rust,
-            crate::cli::Variant::Default,
+            crate::cli::Tool::Claude,
+            crate::cli::Variant::Combined,
         );
         let case = paths.case_dir("B01", "only");
         crate_at(&case.join(Role::Translate.dir()));
@@ -759,7 +763,7 @@ mod tests {
         assert_eq!(
             passes.len(),
             1,
-            "an agent with no verify phase gets exactly the translate pass"
+            "a one-step chain gets exactly the translate pass"
         );
         assert_eq!(
             passes[0].record, HEADLINE_SUMMARY,
@@ -851,7 +855,7 @@ mod tests {
             paths,
             target,
             &Scoring {
-                roles: crate::prompt::chain(paths.tool, paths.variant),
+                roles: crate::prompt::chain(paths.variant),
                 resolved: &resolved,
                 tree,
                 gate: &gate,
@@ -869,7 +873,7 @@ mod tests {
         corpus_battery(tmp.path(), "B01", &["case1"]);
         let paths = paths_at(
             tmp.path(),
-            crate::cli::Tool::C2rust,
+            crate::cli::Tool::Claude,
             crate::cli::Variant::Default,
         );
         let case = paths.case_dir("B01", "case1");
@@ -894,7 +898,7 @@ mod tests {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         let paths = paths_at(
             tmp.path(),
-            crate::cli::Tool::C2rust,
+            crate::cli::Tool::Claude,
             crate::cli::Variant::Default,
         );
         crate_at(&paths.case_dir("B01", "case1").join(Role::Translate.dir()));
@@ -940,10 +944,12 @@ mod tests {
     fn a_subset_sweep_does_not_file_its_own_count_under_the_batterys_name() {
         let tmp = crate::io::workdir::test_tempdir().unwrap();
         corpus_battery(tmp.path(), "B01", &["one", "two"]);
+        // A one-step chain, so the translate pass writes the HEADLINE summary -- which is the file
+        // this test is about clobbering.
         let paths = paths_at(
             tmp.path(),
-            crate::cli::Tool::C2rust,
-            crate::cli::Variant::Default,
+            crate::cli::Tool::Claude,
+            crate::cli::Variant::Combined,
         );
         let case = paths.case_dir("B01", "one");
         crate_at(&case.join(Role::Translate.dir()));

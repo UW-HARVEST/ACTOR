@@ -1,11 +1,18 @@
 use clap::Parser;
 /// WHICH program runs an invocation.
 ///
-/// Ten variants, not eighteen. The six `claude-*` ablations were the same tool at a different
+/// Three variants, not eighteen. The six `claude-*` ablations were the same tool at a different
 /// prompt, so they are [`Variant`]s now; the three codex entries were the same tool at a different
 /// model, so they are `--model` values. Neither distinction ever belonged in this enum -- the key
 /// carries tool, model and prompt separately, so encoding two of them in the third could only make
 /// them disagree.
+///
+/// The other seven -- opencode, oneshot, kimi, c2rust, laertes, c2saferrust, smartc2rust -- are gone
+/// because not one of them ever produced a `result.json`, in `Test-Corpus` or in any other tree, while
+/// every match over this enum still had to carry an arm for each. Their cost was not the arms: opencode
+/// had a 551-line module of protections (`external_directory` deny, a compaction plugin, a 32k output
+/// cap) whose functions had no non-test caller, so the backend was launched with none of them and the
+/// doc comments said otherwise. A variant nothing runs is a variant nothing checks.
 #[derive(clap::ValueEnum, Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Tool {
     /// Claude Code.
@@ -16,20 +23,6 @@ pub enum Tool {
     /// kiro-cli. Takes `--model` like every other agent -- a comment once claimed otherwise, and
     /// because nothing passed the flag, every kiro row ever published is unattributable.
     Kiro,
-    /// OpenCode CLI; `--model <provider>/<model-id>` chooses the backend model.
-    #[value(name = "opencode", alias = "oc")]
-    OpenCode,
-    /// One-shot LLM call, no agentic loop. `--model` is its identity.
-    Oneshot,
-    /// Kimi via Bedrock, one shot.
-    Kimi,
-    /// c2rust: a transpiler. Deterministic, so nothing is gained by keying it.
-    C2rust,
-    Laertes,
-    #[value(name = "c2saferrust")]
-    C2SaferRust,
-    #[value(name = "smartc2rust")]
-    SmartC2Rust,
 }
 
 /// WHICH prompt an invocation is handed, where a tool has more than one.
@@ -79,25 +72,7 @@ pub fn tool_dir(tool: Tool) -> &'static str {
         Tool::Claude => "claude",
         Tool::Codex => "codex",
         Tool::Kiro => "kiro",
-        Tool::OpenCode => "opencode",
-        Tool::Oneshot => "oneshot",
-        Tool::Kimi => "kimi",
-        Tool::C2rust => "c2rust",
-        Tool::Laertes => "laertes",
-        Tool::C2SaferRust => "c2saferrust",
-        Tool::SmartC2Rust => "smartc2rust",
     }
-}
-
-/// Whether this tool runs an agentic loop, and so whether the store may name its runs.
-///
-/// A transpiler is deterministic and a one-shot call is cheap; neither is worth memoising, and
-/// neither has the iterating session that makes a cache entry valuable.
-pub fn is_agentic(tool: Tool) -> bool {
-    matches!(
-        tool,
-        Tool::Claude | Tool::Codex | Tool::Kiro | Tool::OpenCode
-    )
 }
 
 /// Which benchmark dataset to use.

@@ -1091,7 +1091,7 @@ fn agent_rows(rows: &[BatteryRow]) -> Vec<(String, String, bool)> {
         a == NO_VALIDATE
             || crate::cli::Tool::value_variants()
                 .iter()
-                .any(|t| crate::cli::is_agentic(*t) && a.starts_with(crate::cli::tool_dir(*t)))
+                .any(|t| a.starts_with(crate::cli::tool_dir(*t)))
     };
     let mut out: Vec<(String, String, bool)> = agents
         .iter()

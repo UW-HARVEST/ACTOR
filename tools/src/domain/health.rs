@@ -16,6 +16,26 @@
 //! a session that is itself fine — that is a *result*. Exit codes are therefore
 //! reported as corroborating detail only.
 
+/// What the transcript proved about the model pin.
+///
+/// This exists so the CHECK cannot go dead. `assert_pins_honoured` had zero callers while
+/// `runners/mod.rs` and `reproduce.sh` both asserted in prose that it runs -- and it is the check that
+/// catches a CLI silently substituting a model, the failure that made 338 kiro rows unattributable.
+/// [`crate::invocation::Ran`] now requires one of these, so the only way to build a `Ran` in
+/// `Cli::execute` is to have called the check, and deleting the call stops compiling.
+///
+/// `NotReported` is not a pass. It is recorded in `agent.json`, so an artifact says whether its pin was
+/// confirmed instead of leaving the reader to assume it.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PinReport {
+    /// The session reported the model, and it is the one asked for.
+    Confirmed,
+    /// The transcript carries no model record: kiro writes prose, codex its own JSON.
+    #[default]
+    NotReported,
+}
+
 /// What a backend's log can prove about completion ON ITS OWN.
 ///
 /// Named, because the two kinds make the *same* observation mean opposite things: a

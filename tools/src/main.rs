@@ -226,7 +226,7 @@ fn run_tool(r: RunTool<'_>) -> Result<report::Attested> {
     }
 
     let (publishable, attested) = benchmark::InScope::derive(&paths, &units, &resolved)?;
-    let all_roles = harvest_tools::prompt::chain(r.tool, r.variant);
+    let all_roles = harvest_tools::prompt::chain(r.variant);
     let roles = &all_roles[..r.steps.map_or(all_roles.len(), |n| n.min(all_roles.len()))];
     for unit in publishable.units() {
         run_test(
@@ -363,7 +363,7 @@ mod tests {
         let unchecked = || {
             battery::Paths::new(
                 tmp.path(),
-                cli::Tool::C2rust,
+                cli::Tool::Claude,
                 cli::Variant::Default,
                 Dataset::HarvestBench,
                 None,

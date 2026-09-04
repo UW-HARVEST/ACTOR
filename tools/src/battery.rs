@@ -613,8 +613,9 @@ pub struct Paths {
     /// KEPT, not merely used to derive the dirs above: a step's wall-clock ceiling depends on it, and
     /// recovering it from `results_dir`'s spelling would be a string where a type belongs.
     pub dataset: Dataset,
-    /// What the agent will be asked for. `None` only where a backend runs no model.
-    pub model: Option<crate::store::ModelId>,
+    /// What the agent will be asked for. Not `Option`: every remaining tool pins a model, so
+    /// "this run has no model" -- which once named 338 rows `kiro/unpinned` -- cannot be spelled.
+    pub model: crate::store::ModelId,
     /// A required parameter of `new` rather than a default, so the compiler names every construction
     /// site that would otherwise silently get read-write caching.
     pub cache_mode: crate::store::Mode,
@@ -649,10 +650,7 @@ impl Paths {
         // being the same tool at the same model.
         let results_dir = results_root
             .join(crate::cli::tool_dir(tool))
-            .join(match &model {
-                Some(m) => crate::store::model_dir(m.as_str()),
-                None => "none".to_string(),
-            })
+            .join(crate::store::model_dir(model.as_str()))
             .join(variant.dir());
         Ok(Self {
             repo_root: repo_root.to_path_buf(),
@@ -709,7 +707,7 @@ mod tests {
             )
             .unwrap()
         };
-        let tools = [Tool::Claude, Tool::Codex, Tool::Kiro, Tool::OpenCode];
+        let tools = [Tool::Claude, Tool::Codex, Tool::Kiro];
         let results: Vec<_> = tools.iter().map(|t| paths_for(*t).results_dir).collect();
         let unique: std::collections::BTreeSet<_> = results.iter().collect();
         assert_eq!(

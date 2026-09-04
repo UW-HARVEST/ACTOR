@@ -82,7 +82,7 @@ pub fn run_all(
     steps: Option<usize>,
     pool: &crate::agents::Pool,
 ) -> Result<Ran> {
-    let roles = prompt::chain(paths.tool, paths.variant);
+    let roles = prompt::chain(paths.variant);
     let roles = &roles[..steps.map_or(roles.len(), |n| n.min(roles.len()))];
 
     let queue: Vec<(&str, &Job)> = units
@@ -171,13 +171,7 @@ fn run_case(c: RunCase<'_>) -> Result<CaseOutcome> {
             role,
             job.shape,
             &job.case_inputs,
-        )?
-        .with_context(|| {
-            format!(
-                "{:?}/{:?} has no {role:?} prompt for a {:?} case, yet the chain schedules one",
-                c.paths.tool, c.paths.variant, job.shape
-            )
-        })?;
+        )?;
         let roots = crate::io::workdir::Roots::resolve(&work_base, &c.paths.repo_root);
         let prompt = Prompt::new(crate::store::normalise(&text, &roots));
         let phase_dir = job.case_dir.join(role.dir());
