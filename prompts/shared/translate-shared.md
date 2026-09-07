@@ -27,24 +27,54 @@ Your Cargo.toml must have both `[lib]` with `crate-type = ["cdylib"]` and
 **This is a large project.** Do NOT try to translate everything yourself in one go.
 Instead:
 1. Analyze the C project structure and create a plan (TODO list) breaking the
-   translation into subtasks (e.g., core/shared code, each backend, entry points)
-2. The binary driver (main.rs) MUST be one of the subtasks — do not leave it for last.
+   translation into subtasks (e.g., core/shared code, each backend, entry points).
+   Before reading any file in full, estimate the codebase cheaply:
+   `ls`/`find` for the file inventory, `wc -l`/`du -sh` for sizes.
+   Then build a high-level map — what files exist, what symbols they define, who calls
+   whom — using surgical reads instead of whole-file reads: `grep -n` for
+   struct/typedef/function definitions, `head -100` on a header for the public
+   API, `sed -n 'A,Bp'` for a single function. Read a file in full only when it is
+   about to be translated. This keeps your own context free for planning and
+   coordination.
+   Subtask boundaries do not need to align with file boundaries: split a large
+   C file by function groups or line ranges, and group functions that call
+   each other into the same subtask.
+2. When translating a binary executable, the
+   binary driver (main.rs) MUST be one of the subtasks — do not leave it for last.
    Translate it fully, not as a stub.
 3. Work through the subtasks one at a time, with a clear, focused scope for each:
-   - Which specific C source files to translate
+   - Which specific C source files (or function ranges within them) to translate
    - Which Rust file(s) to write
    - Build and verify each subtask compiles with the relevant features
    - Do NOT modify files outside the current subtask's scope
 4. After each subtask completes, verify the work compiles before moving on
 5. Once all subtasks are done, wire up the feature gates and verify the full build
 
+**Delegate translation subtasks to sub-agents.** Your own context window is the
+bottleneck of the whole run — protect it. You keep the plan, the Cargo.toml /
+feature-gate decisions, and `cargo build` error triage; sub-agents read the C
+and write the Rust, so neither has to live in your context. Size each subtask
+so that the C source it reads plus the Rust it writes fits comfortably within
+a single sub-agent's context — when in doubt, split further:
+- If a sub-agent returns truncated or incomplete output, the task was too
+  large. Split it into smaller pieces before retrying.
+- Pre-inject dependencies: put the type definitions, constants, and function
+  signatures a sub-agent will need directly in its prompt, or give it specific
+  `grep` commands. Do not let every sub-agent independently re-read the same
+  infrastructure files.
+
 After all subtasks complete, wire up the feature gates and do a final build check.
 If a combination fails, only fix the glue code (lib.rs, mod declarations) — do NOT
 modify the backend implementation files.
 
 Requirements:
-- Do NOT use the `openssl` crate or any OpenSSL bindings. Use pure-Rust crates
-  instead (e.g., `aes` for AES-256-ECB, `sha2` for SHA-256)
+- No shortcut. Do not use the `cc` crate (or any equivalent) in build.rs to compile or link
+  anything under c_src/. The C source files will not exist in the test environment.
+- Do not depend on any crate that implements, wraps, re-exports, or compiles
+  the same C library you are translating, or that binds to a C library it uses
+  (e.g., the `openssl` crate or any OpenSSL bindings). Use pure-Rust crates
+  instead (e.g., `aes` for AES-256-ECB, `sha2` for SHA-256). Thin FFI crates
+  like `libc` for system APIs are fine.
 - All public C functions must use #[unsafe(no_mangle)] and extern "C"
 - Pay attention to C preprocessor macros that RENAME functions (e.g.,
   `#define foo NAMESPACE(foo)` makes the linker symbol `PREFIX_foo`, not `foo`).
