@@ -161,6 +161,32 @@ fn require_python_310() -> Result<()> {
     Ok(())
 }
 
+/// Scoring lints every crate it grades, and a linter that cannot be spawned leaves the whole battery
+/// unmeasured -- discovered at the END of a sweep, after the money.
+///
+/// Probes the SPAWN SHAPE `lint_crate` uses, `timeout` included, and not merely `cargo clippy`:
+/// `timeout` is coreutils and absent on macOS, where a preflight that asked only about clippy passed
+/// and then every case came back 127. A preflight that probes something other than what runs is not
+/// a preflight.
+fn require_clippy() -> Result<()> {
+    let ok = std::process::Command::new("timeout")
+        .args(["60", "cargo", "clippy", "--version"])
+        .output()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "`timeout` is not runnable ({e}), and every scored crate is linted under it"
+            )
+        })?;
+    anyhow::ensure!(
+        ok.status.success(),
+        "`timeout cargo clippy` is unavailable (exit {:?}), so no scored crate could be linted. \
+         On macOS `timeout` ships as `gtimeout` in coreutils. {}",
+        ok.status.code(),
+        String::from_utf8_lossy(&ok.stderr).trim()
+    );
+    Ok(())
+}
+
 pub trait Benchmark {
     /// Everything a phase needs HOURS from now: binaries, interpreters, corpus dirs. Required, not
     /// defaulted, so a dataset added later cannot quietly have none.
@@ -314,6 +340,7 @@ impl Benchmark for TestCorpus {
             paths.corpus_dir.display()
         );
         require_python_310()?;
+        require_clippy()?;
         Ok(Preflighted(paths))
     }
 
