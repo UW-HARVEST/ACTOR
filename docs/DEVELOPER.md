@@ -10,7 +10,9 @@ ACTOR cannot be run in a sandboxed environment on macOS because there are no mac
   dependencies used to sandbox an agent (see below).
 ACTOR can be run in unsandboxed mode with the `--allow-unsandboxed` flag.
 
-- [Rust and the `Cargo` package manager](https://rust-lang.org/tools/install/)
+- [Rust and the `Cargo` package manager](https://rust-lang.org/tools/install/), including the
+  `clippy` component (`rust-toolchain.toml` pins it): scoring lints every crate it grades, and
+  `test` refuses at preflight if `cargo clippy` is unavailable
 - For sandboxing:
   - [`socat`](https://linux.die.net/man/1/socat)
   - [bubblewrap (`bwrap`)](https://github.com/containers/bubblewrap)
