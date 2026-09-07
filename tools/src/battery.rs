@@ -411,7 +411,7 @@ pub struct Tokens {
     pub cache_read: u64,
 }
 
-/// Provenance for ONE agent CLI invocation. `--agent claude` passes no
+/// Provenance for ONE agent CLI invocation. `--tool claude` passes no
 /// `--model`, so the model is whatever the CLI defaulted to at invocation time,
 /// and the CLI auto-updates mid-sweep — it must be recorded per run.
 ///

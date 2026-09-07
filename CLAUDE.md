@@ -178,7 +178,7 @@ ACTOR commit, not the toolchain. Neither can influence the entry, because the ca
 cache. `output_tree` stays, not as bookkeeping but as an integrity check on the `after/` beside it —
 the same reason a `before/` that no longer reproduces its own directory name is a corrupt entry.
 
-`<tool>` is the spelling `--agent` accepts (`claude`, `codex`, `kiro`), so the path cannot drift
+`<tool>` is the spelling `--tool` accepts (`claude`, `codex`, `kiro`), so the path cannot drift
 from the CLI surface. Today's function is called `harness_dir`, which collides with `harness`
 meaning the ACTOR commit everywhere else; it is the TOOL level and should say so.
 

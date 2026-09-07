@@ -34,8 +34,8 @@ cd tools && cargo install --path .
 ```
 
 One-shot LLM agents require API keys:
-- `--agent kimi`: AWS Bedrock access (account `121913092579` via `ada-auth`)
-- `--agent oneshot`: `OPENROUTER_API_KEY` environment variable
+- `--tool kimi`: AWS Bedrock access (account `121913092579` via `ada-auth`)
+- `--tool oneshot`: `OPENROUTER_API_KEY` environment variable
 
 ## Configuring Different Models for Claude Code
 
@@ -43,7 +43,7 @@ To run translation with the non-default model for Claude Code ([configured here]
     run the following command:
 
 ```sh
-% HARVEST_CLAUDE_MODEL=claude-sonnet-5 harvest-tools --agent claude translate <TARGET>
+% HARVEST_CLAUDE_MODEL=claude-sonnet-5 harvest-tools --tool claude translate <TARGET>
 ```
 
 ## Evaluation Benchmarks and Results
@@ -58,19 +58,19 @@ git submodule update --init --recursive
 
 ```bash
 # Full pipeline: translate → verify → test
-harvest-tools --agent kiro run B01_synthetic
+harvest-tools --tool kiro run B01_synthetic
 
 # Translate only
-harvest-tools --agent c2rust translate B02_organic
+harvest-tools --tool c2rust translate B02_organic
 
 # One-shot LLM translation
-harvest-tools --agent oneshot --model openai/gpt-5.4 translate B01_organic
+harvest-tools --tool oneshot --model openai/gpt-5.4 translate B01_organic
 
 # Reproduce the published numbers from the cache: a miss refuses, so this cannot spend money
-harvest-tools --agent claude --replay-only run all
+harvest-tools --tool claude --replay-only run all
 
 # Single case
-harvest-tools --agent kiro run B01_synthetic/001_helloworld
+harvest-tools --tool kiro run B01_synthetic/001_helloworld
 ```
 
 ## FAQs

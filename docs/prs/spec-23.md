@@ -22,9 +22,9 @@ earned, replay every phase from the cache, prove it called no agent, score it, r
 and fail if the tables move.**
 
 ```
-harvest-tools --agent claude --replay-only translate B01_synthetic
-harvest-tools --agent claude --replay-only verify    B01_synthetic
-harvest-tools --agent claude test B01_synthetic --check
+harvest-tools --tool claude --replay-only translate B01_synthetic
+harvest-tools --tool claude --replay-only verify    B01_synthetic
+harvest-tools --tool claude test B01_synthetic --check
 harvest-tools report
 git diff --exit-code tables/
 ```
