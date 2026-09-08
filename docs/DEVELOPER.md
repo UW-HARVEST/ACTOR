@@ -64,7 +64,7 @@ git submodule update --init --recursive
 harvest-tools --tool kiro run B01_synthetic
 
 # A prefix of the chain -- one step is translate, with no verify
-harvest-tools --tool kiro --steps 1 run B01_synthetic
+harvest-tools --tool kiro run --steps 1 B01_synthetic
 
 # All three tools, three invocations in flight each
 harvest-tools --tool claude,codex,kiro --parallel 3 run all
