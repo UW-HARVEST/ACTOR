@@ -94,6 +94,23 @@ def enum_values(flag: str) -> set[str]:
     return values
 
 
+def submodules() -> set[str]:
+    """The submodule paths, from `.gitmodules`.
+
+    A path INSIDE one cannot be judged from this repo: the index holds only the gitlink, and
+    the `tests` job checks no submodule out because it needs none. So the verdict must not
+    depend on whether they happen to be populated -- that is the environment leaking into a
+    gate, and it is why this passed locally and failed in CI on `test-corpus/Public-Tests/`.
+    """
+    out = subprocess.run(
+        ["git", "config", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    return {line.split()[-1] for line in out.stdout.splitlines() if line.strip()}
+
+
 def tracked() -> set[str]:
     """Paths git knows about, plus the directories containing them.
 
@@ -149,9 +166,17 @@ def main() -> int:
                         f"{sorted(unknown)}; it accepts {sorted(tools)}"
                     )
 
-    known = tracked()
-    missing, checked = [], 0
+    known, subs = tracked(), submodules()
+    missing, checked, deferred = [], 0, 0
     for doc, p in paths():
+        head = p.split("/", 1)[0]
+        if head in subs:
+            # The gitlink itself is ours to check; what is under it is not.
+            if head not in known:
+                missing.append(f"{doc}: {p} (submodule {head} is not registered)")
+            else:
+                deferred += 1
+            continue
         checked += 1
         if p not in known and not (ROOT / p).is_dir():
             missing.append(f"{doc}: {p}")
@@ -178,7 +203,10 @@ def main() -> int:
         )
         return 1
 
-    print(f"docs: {ran} command(s) parse, {checked} path(s) exist ({skipped} placeholder(s) skipped)")
+    print(
+        f"docs: {ran} command(s) parse, {checked} path(s) exist "
+        f"({skipped} placeholder(s), {deferred} inside submodules)"
+    )
     return 0
 
 
