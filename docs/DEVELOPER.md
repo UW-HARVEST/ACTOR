@@ -33,18 +33,21 @@ Run the following comand from the root of ACTOR:
 cd tools && cargo install --path .
 ```
 
-One-shot LLM agents require API keys:
-- `--tool kimi`: AWS Bedrock access (account `121913092579` via `ada-auth`)
-- `--tool oneshot`: `OPENROUTER_API_KEY` environment variable
+Each tool needs its own CLI on `PATH`, already logged in: `claude`, `codex` and
+`kiro-cli`. A run refuses at preflight if one is missing rather than partway
+through, so a missing login costs nothing.
 
 ## Configuring Different Models for Claude Code
 
-To run translation with the non-default model for Claude Code ([configured here](../tools/src/agents/invocation.rs)),
+To run with a non-default model for Claude Code ([resolved here](../tools/src/runners/mod.rs)),
     run the following command:
 
 ```sh
-% HARVEST_CLAUDE_MODEL=claude-sonnet-5 harvest-tools --tool claude translate <TARGET>
+% HARVEST_CLAUDE_MODEL=claude-sonnet-5 harvest-tools --tool claude run <TARGET>
 ```
+
+The model is part of the cache key, so changing it is a different invocation and
+will not be served by entries earned under the previous one.
 
 ## Evaluation Benchmarks and Results
 
@@ -57,20 +60,28 @@ git submodule update --init --recursive
 ## Usage
 
 ```bash
-# Full pipeline: translate → verify → test
+# The whole chain for one battery: every step the prompt variant declares, then score, then tables
 harvest-tools --tool kiro run B01_synthetic
 
-# Translate only
-harvest-tools --tool c2rust translate B02_organic
+# A prefix of the chain -- one step is translate, with no verify
+harvest-tools --tool kiro --steps 1 run B01_synthetic
 
-# One-shot LLM translation
-harvest-tools --tool oneshot --model openai/gpt-5.4 translate B01_organic
+# All three tools, three invocations in flight each
+harvest-tools --tool claude,codex,kiro --parallel 3 run all
+
+# Single case, and harvest-bench instead of Test-Corpus
+harvest-tools --tool kiro run B01_synthetic/001_helloworld
+harvest-tools --tool claude run HB
 
 # Reproduce the published numbers from the cache: a miss refuses, so this cannot spend money
 harvest-tools --tool claude --replay-only run all
 
-# Single case
-harvest-tools --tool kiro run B01_synthetic/001_helloworld
+# Both datasets, every tool, and diff the regenerated tables against the committed ones
+TOOLS=claude,codex,kiro tools/reproduce.sh all
+
+# Inspect the cache without touching an agent
+harvest-tools cache stats
+harvest-tools cache verify      # every stored tree must hash to the name it is filed under
 ```
 
 ## FAQs
