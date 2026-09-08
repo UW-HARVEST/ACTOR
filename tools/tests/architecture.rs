@@ -344,7 +344,7 @@ fn no_public_path_escapes_the_artifact_modules() {
 /// A digest that can be constructed from an arbitrary string is a digest that can
 /// be wrong, and the cache compares them to decide whether to reuse an artifact.
 /// `AgentKey` and `CliVersion` are the same hazard from the other side: they name WHAT
-/// ran, so a caller able to spell one without deriving it from `--agent`, or from the
+/// ran, so a caller able to spell one without deriving it from `--tool`, or from the
 /// CLI itself, is how a key comes to name something that did not run.
 #[test]
 fn digests_cannot_be_fabricated() {
@@ -569,7 +569,7 @@ fn nothing_new_runs_inside_the_results_tree() {
 /// directory, the field `load` re-validates, and the `"agent"` of every result file — so
 /// renaming a variant silently renamed the identity of a run, and `Debug` is not a
 /// serialization contract. It has already happened: 208 files under `codex-gpt55/`
-/// record `"agent": "codex"`, which no `--agent` value has spelled since. `AgentKey`,
+/// record `"agent": "codex"`, which no `--tool` value has spelled since. `AgentKey`,
 /// derived from clap's `ValueEnum` name, is the one spelling.
 ///
 /// Matched on tokens rather than raw text, so the word "agent" inside a message and a

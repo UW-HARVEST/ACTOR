@@ -24,7 +24,7 @@ pub enum Mode {
     ReplayOnly,
 }
 
-/// The model the agent will actually use. Must be pinned before the run: `--agent
+/// The model the agent will actually use. Must be pinned before the run: `--tool
 /// claude` passes no `--model`, so the resolved model appears only in the log's `init`
 /// record, after the fact — and the CLI auto-updates, so an unkeyed model could hand
 /// back output produced by a different one.
