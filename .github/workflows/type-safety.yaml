@@ -149,6 +149,16 @@ jobs:
         # too, so a broken intra-doc link or an unclosed HTML tag is already an error.
         run: cargo doc --locked --no-deps --manifest-path tools/Cargo.toml
 
+      - name: Build the binary the docs check parses against
+        # `cargo test --bin` leaves none behind. Debug: only PARSING is exercised.
+        run: cargo build --locked --manifest-path tools/Cargo.toml --bin harvest-tools
+
+      - name: Documented commands parse and documented paths exist
+        # Every `harvest-tools ...` line in the docs, run with `--help`: clap parses the
+        # whole argv and exits touching no agent and no store. Nothing checked this, and the
+        # docs had drifted to a flag, a subcommand, six backends and four files long gone.
+        run: python3 tools/check_docs.py
+
       - name: Comment budget
         # tokei and scc score `///` and `//!` as code, which reports this repo at 11%
         # and could never fire -- the bloat is in `//!` module headers. tools/
