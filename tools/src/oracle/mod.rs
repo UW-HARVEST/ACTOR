@@ -1,9 +1,11 @@
 //! Running a reference implementation and grading a translation against it.
 
+pub mod clippy;
 pub mod gtest;
 pub mod runtests;
 pub mod score;
 
+pub use clippy::{Clippy, ClippyTotals};
 pub use gtest::run_harvest_bench_test;
 pub use runtests::run_test_corpus;
 pub use score::{Covers, Scoring, Summary};

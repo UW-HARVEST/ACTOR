@@ -51,4 +51,8 @@ pub struct Summary {
     pub vectors_failed: usize,
     pub vectors_skipped: usize,
     pub failed_cases: Vec<String>,
+    /// `default` because every record written before clippy was measured has no answer, and a
+    /// missing field must not read as a battery that tripped no lints.
+    #[serde(default)]
+    pub clippy: crate::oracle::clippy::ClippyTotals,
 }

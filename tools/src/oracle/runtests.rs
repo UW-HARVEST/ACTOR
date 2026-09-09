@@ -1,3 +1,4 @@
+use super::clippy::{lint_crate, Clippy, ClippyTotals};
 use super::{openssl_dir, Covers, Enrichment, Scoring, Summary};
 use crate::agent_health::Run;
 use crate::battery::Paths;
@@ -183,9 +184,24 @@ fn materialise_role(
 }
 
 fn score_pass(paths: &Paths, pass: &Pass, scoring: &Scoring<'_>) -> Result<()> {
-    let (summary, per_case) = run_runtests(paths, pass)?;
+    let (mut summary, per_case) = run_runtests(paths, pass)?;
     let scored: BTreeSet<String> = per_case.keys().cloned().collect();
+    // Before the lint pass, so the roster the totals are over is the one `write_results` records:
+    // reconcile refuses unless the materialised and scored sets are equal.
     pass.tree.reconcile(summary.cases_tested, &scored)?;
+
+    let clippy: HashMap<String, Clippy> = pass
+        .tree
+        .cases()
+        .iter()
+        .map(|case| {
+            Ok((
+                case.name.clone(),
+                lint_crate(&pass.tree.crate_root(&case.name))?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    summary.clippy = ClippyTotals::of(clippy.values());
 
     let vt = summary.vectors_passed + summary.vectors_failed;
     let pct = if vt > 0 {
@@ -194,12 +210,16 @@ fn score_pass(paths: &Paths, pass: &Pass, scoring: &Scoring<'_>) -> Result<()> {
         "N/A".to_string()
     };
     println!(
-        "  {} [{}]: {}/{} cases, {}/{vt} vectors ({pct})",
+        "  {} [{}]: {}/{} cases, {}/{vt} vectors ({pct}), {} clippy warning(s) over {} case(s) \
+         ({} unlinted)",
         pass.battery,
         pass.phase,
         summary.cases_passed,
         summary.cases_tested,
-        summary.vectors_passed
+        summary.vectors_passed,
+        summary.clippy.warnings,
+        summary.clippy.cases_measured,
+        summary.clippy.cases_unmeasured,
     );
 
     write_results(
@@ -207,6 +227,7 @@ fn score_pass(paths: &Paths, pass: &Pass, scoring: &Scoring<'_>) -> Result<()> {
         pass,
         &summary,
         &per_case,
+        &clippy,
         scoring.covers,
         scoring.provenance,
     )
@@ -551,6 +572,8 @@ fn run_runtests(
             vectors_failed,
             vectors_skipped,
             failed_cases,
+            // The oracle takes no lint verdict; `score_pass` fills this from the pass it linted.
+            clippy: ClippyTotals::default(),
         },
         per_case,
     ))
@@ -605,6 +628,7 @@ fn write_results(
     pass: &Pass,
     summary: &Summary,
     per_case: &HashMap<String, serde_json::Value>,
+    clippy: &HashMap<String, Clippy>,
     covers: Covers<'_>,
     provenance: &crate::provenance::Provenance,
 ) -> Result<()> {
@@ -620,6 +644,11 @@ fn write_results(
             &[("translate", &tlog), ("verify", &vlog)],
         )
         .merge_into(&mut val);
+        // Outside `Enrichment`, which is the one definition of what is computed from the crate's
+        // SOURCE and is also called by `enrich_cases`, a backfill with no eval tree to lint.
+        if let Some(verdict) = clippy.get(&case.name) {
+            val["clippy"] = serde_json::to_value(verdict)?;
+        }
         let at = case.record_into.join("result.json");
         stamp(&mut val, &at, provenance);
         let json = serde_json::to_string_pretty(&val)?;
@@ -875,6 +904,7 @@ mod tests {
             &passes[0],
             &Summary::default(),
             &per_case,
+            &HashMap::new(),
             Covers::WholeBattery,
             &crate::provenance::Provenance::for_test("cafe1234-dirty"),
         )
@@ -894,6 +924,102 @@ mod tests {
                 at.display()
             );
         }
+    }
+
+    /// A crate the linter could not judge must reach `result.json` SAYING SO. Written as a bare
+    /// count it reads as a crate that tripped no lints, so the record of the crates that failed
+    /// hardest would be the cleanest column in the table.
+    #[test]
+    fn an_unlinted_crate_is_recorded_as_unmeasured_and_never_as_zero_warnings() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        corpus_battery(tmp.path(), "B01", &["only"]);
+        let paths = paths_at(
+            tmp.path(),
+            crate::cli::Tool::Claude,
+            crate::cli::Variant::Combined,
+        );
+        let case = paths.case_dir("B01", "only");
+        crate_at(&case.join(Role::Translate.dir()));
+        let mut resolved = crate::eval::Resolved::new();
+        resolved.insert(
+            case.join(Role::Translate.dir()),
+            tree_of(&case.join("tree")),
+        );
+        let tree = EvalTree::create_empty(&paths, "T", Keep::ForPostMortem).unwrap();
+        let passes = one_case_pass(&paths, &tree, &resolved, Covers::WholeBattery);
+        let per_case: HashMap<String, serde_json::Value> = [(
+            "only".to_string(),
+            serde_json::json!({"battery": "B01", "case": "only", "passed": true}),
+        )]
+        .into_iter()
+        .collect();
+        let at = case.join(Role::Translate.dir()).join("result.json");
+
+        let recorded = |verdict: Clippy| {
+            write_results(
+                &paths,
+                &passes[0],
+                &Summary::default(),
+                &per_case,
+                &[("only".to_string(), verdict)].into_iter().collect(),
+                Covers::WholeBattery,
+                &crate::provenance::Provenance::for_test("deadbeef"),
+            )
+            .unwrap();
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&at).unwrap()).unwrap()
+        };
+
+        let unmeasured = recorded(Clippy::Unmeasured {
+            why: "cannot find value `x`".into(),
+        });
+        assert_eq!(
+            unmeasured["clippy"]["unmeasured"]["why"],
+            serde_json::json!("cannot find value `x`"),
+            "the reason the crate went unlinted is what distinguishes it from a clean one"
+        );
+        assert!(
+            unmeasured["clippy"]["measured"].is_null(),
+            "and it carries no counts at all, so nothing can average it in as a zero"
+        );
+
+        // Non-vacuity: the SAME writer does record counts, so the assertions above are about the
+        // unmeasured shape and not about a `clippy` key nothing ever writes.
+        let measured = recorded(Clippy::Measured(crate::oracle::clippy::ClippyCounts {
+            warnings: 3,
+            errors: 0,
+            by_lint: std::collections::BTreeMap::from([(
+                "clippy::needless_range_loop".to_string(),
+                3,
+            )]),
+        }));
+        assert_eq!(measured["clippy"]["measured"]["warnings"], 3);
+    }
+
+    /// A `summary.json` written before clippy was measured still reads, and reads as a count over
+    /// NOTHING: `cases_measured` is 0, so `warnings: 0` cannot be mistaken for a clean battery.
+    /// Without `#[serde(default)]` on the field it would not deserialize at all, and
+    /// [`crate::analyse::report`] refuses a battery whose record it cannot read.
+    #[test]
+    fn a_summary_written_before_clippy_existed_still_reads_and_claims_no_lint_measurement() {
+        let tmp = crate::io::workdir::test_tempdir().unwrap();
+        let stored = tmp.path().join("summary.json");
+        let before = r#"{"cases_tested":2,"cases_passed":2,"vectors_passed":14,
+             "vectors_failed":0,"vectors_skipped":0,"failed_cases":[]}"#;
+        assert!(
+            !before.contains("clippy"),
+            "the fixture must really predate the field, or this asserts nothing"
+        );
+        fs::write(&stored, before).unwrap();
+        let summary = stored_summary(&stored).unwrap();
+        assert_eq!(
+            summary.cases_tested, 2,
+            "the record it does carry still reads"
+        );
+        assert_eq!(
+            (summary.clippy.cases_measured, summary.clippy.warnings),
+            (0, 0),
+            "and it claims no lint measurement rather than a clean one"
+        );
     }
 
     /// A replay must not move the stamp, or byte-identity -- the reproducibility check itself -- fails
@@ -1148,6 +1274,7 @@ mod tests {
             &passes[0],
             &subset,
             &HashMap::new(),
+            &HashMap::new(),
             Covers::Subset("one"),
             &crate::provenance::Provenance::for_test("deadbeef"),
         )
@@ -1162,6 +1289,7 @@ mod tests {
             &paths,
             &passes[0],
             &subset,
+            &HashMap::new(),
             &HashMap::new(),
             Covers::WholeBattery,
             &crate::provenance::Provenance::for_test("deadbeef"),
